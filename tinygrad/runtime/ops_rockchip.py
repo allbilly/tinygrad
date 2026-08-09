@@ -11,6 +11,7 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _PC_DATA_AMOUNT_MAX = (1 << 16) - 1
+_SUBMIT_TIMEOUT_MS = 30_000
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
@@ -71,7 +72,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
     rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-      flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
+      flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
       task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
       regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
       subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))

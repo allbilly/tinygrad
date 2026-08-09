@@ -4757,3 +4757,33 @@ The CPU-cheat audit found no Tinygrad-core or runtime change and no tensor-value
 static graph topology, shapes, offsets, and constants. Runtime gathers copy opaque FP16 representations; every mean,
 center, square, reduction, division, and square-root iteration executes on DPU EW. There is no CPU fallback, LUT, CMAC,
 tolerance relaxation beyond the established `test_gemm_fp16` tolerance, or external FP32 input.
+
+---
+
+## 2026-08-10 — batched no-LUT exponential and composite functions
+
+A no-LUT binary16 EXP2 construction now combines native FLOOR, FP16 Horner arithmetic, and exact power-of-two scaling.
+LOG2 uses binary mantissa normalization and an odd atanh polynomial. Tinygrad's scalar unrolled mapped reductions are
+factored back into one vector map followed by the existing balanced ADD arena, preventing loss functions from expanding
+the transcendental expression once per input lane. Native FLOOR and FDIV begin explicit stateful DPU mode segments;
+this replaces the unsuccessful fixed task-cap experiments while retaining command/task arenas sized from their emitted
+register and descriptor bytes. The blocking submit timeout is 30 seconds.
+
+Thirty-one unchanged upstream methods pass together in one serial fresh-process batch in **26.68 s**. Coverage includes
+EXP/EXP2, sigmoid/logsigmoid, softplus, GELU/ERF, ELU/CELU/SELU, SiLU/Swish/Mish, asin/acos/atanh, tanh, softmax,
+log-softmax, softmin, logsumexp, logaddexp, and binary cross entropy. The complete unchanged
+`test_binary_crossentropy` method passes in **11.15 s**; its main 475-stage vector map executes without a timeout after
+the shared FLOOR/FDIV mode-boundary fix.
+
+- `test_rockchip.py`: **393 upstream-only cases**, representing **370 unique upstream methods**.
+- `test_rockchip2.py`: **197 backend-only cases**. Authoritative upstream-name remainder: **51 of 421**.
+- A single-process census of all 80 then-unselected forward methods found 27 immediate passes before the promotion batch;
+  late results were contaminated by attention timeouts and retained-program GEM pressure, so remaining families are
+  retested in fresh-process batches rather than interpreted individually.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after every timeout encountered during bring-up.
+- `sz.py`: renderer/runtime **6,670/353 executable lines**, total **32,078**.
+
+The CPU-cheat audit found no Tinygrad-core change, runtime tensor-value inspection, host numeric reduction, LUT, or CMAC.
+Compilation evaluates only graph structure and static layout; all data-dependent approximation, masking, normalization,
+reduction, and special-function arithmetic executes on DPU EW. Tolerance remains capped at the established FP16
+`test_gemm_fp16` limit.

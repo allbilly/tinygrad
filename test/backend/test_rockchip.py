@@ -787,6 +787,49 @@ class TestRockchipSignOps(unittest.TestCase):
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipTranscendentalOps(unittest.TestCase):
+  """No-LUT EXP2/LOG2 polynomial compositions executed entirely by DPU EW."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_exp2_log2_zero_times_negative = _test_ops.TestOps.test_exp2_log2_zero_times_negative
+  test_asin = _test_ops.TestOps.test_asin
+  test_acos = _test_ops.TestOps.test_acos
+  test_celu = _test_ops.TestOps.test_celu
+  test_selu = _test_ops.TestOps.test_selu
+  test_silu = _test_ops.TestOps.test_silu
+  test_swish = _test_ops.TestOps.test_swish
+  test_exp = _test_ops.TestOps.test_exp
+  test_exp2 = _test_ops.TestOps.test_exp2
+  test_logaddexp = _test_ops.TestOps.test_logaddexp
+  test_sigmoid = _test_ops.TestOps.test_sigmoid
+  test_sigmoid_extreme = _test_ops.TestOps.test_sigmoid_extreme
+  test_logsigmoid = _test_ops.TestOps.test_logsigmoid
+  test_softplus = _test_ops.TestOps.test_softplus
+  test_erf = _test_ops.TestOps.test_erf
+  test_gelu = _test_ops.TestOps.test_gelu
+  test_gelu_extreme = _test_ops.TestOps.test_gelu_extreme
+  test_quick_gelu = _test_ops.TestOps.test_quick_gelu
+  test_quick_gelu_extreme = _test_ops.TestOps.test_quick_gelu_extreme
+  test_elu = _test_ops.TestOps.test_elu
+  test_mish = _test_ops.TestOps.test_mish
+  test_softmax = _test_ops.TestOps.test_softmax
+  test_softmax_other_axis = _test_ops.TestOps.test_softmax_other_axis
+  test_log_softmax = _test_ops.TestOps.test_log_softmax
+  test_log_softmax_other_axis = _test_ops.TestOps.test_log_softmax_other_axis
+  test_softmin = _test_ops.TestOps.test_softmin
+  test_logsumexp = _test_ops.TestOps.test_logsumexp
+  test_tanh = _test_ops.TestOps.test_tanh
+  test_tanh_extreme = _test_ops.TestOps.test_tanh_extreme
+  test_atanh = _test_ops.TestOps.test_atanh
+  test_binary_crossentropy = _test_ops.TestOps.test_binary_crossentropy
+
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCastOps(unittest.TestCase):
   """Native DPU conversion from FP16 inputs to boolean, INT32, and FP32 outputs."""
 
