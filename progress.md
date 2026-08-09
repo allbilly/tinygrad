@@ -4443,3 +4443,41 @@ calculation, CPU fallback, LUT, CMAC, tolerance relaxation, or floating-point wi
 The direct upstream failure census remains incomplete. The selected census now covers 329 of 427 nodes; among the
 remaining 98, `test_sort`, `test_cast`, and `test_pow_zero_exponent` are confirmed failures, `test_masked_select` is
 unresolved after a compile-time runaway, and **94** remain unclassified.
+
+---
+
+## 2026-08-10 — batched upstream remainder census and promotion
+
+The remainder workflow now operates by capability batch rather than one method per milestone. Fresh collection of
+`TestOps` contains **421 method nodes**; the selected Rockchip census represented 306 unique upstream method names,
+leaving 115 names for direct classification. A validation batch and a 14-method data/indexing batch ran without an
+RKNPU timeout, followed by a clean 60/60 vendor health check.
+
+Eight unchanged upstream methods were promoted together: `test_nonzero`, `test_max_unpool2d`,
+`test_scatter_no_reduce_tensor_src`, all three missing fancy-indexing families, `test_slice_fancy_indexing_errors`, and
+`test_scaled_dot_product_attention_gqa_errors`. `test_rockchip.py` now collects **337 upstream-only cases**;
+`test_rockchip2.py` remains **186 backend-only cases**, for **523 combined**.
+
+The same batch classified shared gaps rather than stopping at first failure:
+
+- Full/partial broadcast passes ADD/SUB/MUL/DIV but fails only its dynamic POW subtests.
+- Direct `argmax`/`argmin`, general scatter/reduce, and repeated-integer `topk` reach unsupported integer graphs or
+  FP16 encoding of an INT32 sentinel. These form the next shared integer-lowering batch.
+- `scatter_reduce_errors` and `scatter_reduce_prod_zeros` currently fail in the Torch reference before Rockchip numeric
+  execution because the upstream FP16-default dtype differs from the fixture's FP32 tensors.
+- Attention length mismatch reaches a large unsupported softmax graph. Transcendental softmax/POW cases remain outside
+  the no-LUT scope rather than receiving CPU fallbacks.
+
+Two passing methods exceeded the 30-second policy and were profiled together:
+
+| Method | Wall | Renderer | Program calls | Submit ioctls | Tasks | Ioctl wall |
+|---|---:|---:|---:|---:|---:|---:|
+| `test_nonzero` | 33.439 s | 5.632 s / 16 | 18.049 s / 17 | 192 | 8,148 | 0.063 s |
+| `test_max_unpool2d` | 31.186 s | 7.274 s / 9 | 21.735 s / 9 | 225 | 3,351 | 0.108 s |
+
+Both are dominated by host render/command construction and precision-transition/reset handling, not NPU ioctl time.
+The batch also measured `dim_inject_none` at 29.93 s. These profiles define a shared host-overhead optimization target.
+
+The CPU-cheat audit is unchanged: this milestone modifies only the selected test census and documentation. All promoted
+methods were executed directly from unchanged upstream bodies. There is no host result calculation, CPU fallback, LUT,
+CMAC, tolerance change, or Tinygrad-core change. The batch health check passed **60/60** vendor probes.

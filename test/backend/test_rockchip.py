@@ -267,6 +267,8 @@ for _name, _test in vars(_test_ops.TestOps).items():
 class TestRockchipMaxUnpoolOps(unittest.TestCase):
   """FP16 MaxUnpool scatter from the upstream operator census."""
 
+  test_max_unpool2d = _test_ops.TestOps.test_max_unpool2d
+
   def test_max_unpool2d_inf(self):
     data = np.array([[[[math.inf, -math.inf, math.nan], [1.0, 2.0, 3.0]]]], dtype=np.float16)
     expected = torch.nn.functional.max_unpool2d(
@@ -357,6 +359,7 @@ class TestRockchipMaskedSelectOps(unittest.TestCase):
 class TestRockchipNonzeroOps(unittest.TestCase):
   """Fixed FP16/integer nonzero coordinates selected by DPU prefix/equality stages."""
 
+  test_nonzero = _test_ops.TestOps.test_nonzero
   test_nonzero_size = _test_ops.TestOps.test_nonzero_size
 
 
@@ -373,6 +376,10 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_fancy_indexing_inf = _test_ops.TestOps.test_fancy_indexing_inf
+  test_slice_fancy_indexing_dim_inject_none = _test_ops.TestOps.test_slice_fancy_indexing_dim_inject_none
+  test_slice_fancy_indexing_errors = _test_ops.TestOps.test_slice_fancy_indexing_errors
+  test_slice_fancy_indexing_list_indices = _test_ops.TestOps.test_slice_fancy_indexing_list_indices
+  test_slice_fancy_indexing_tuple_indices = _test_ops.TestOps.test_slice_fancy_indexing_tuple_indices
   test_slice_fancy_indexing_with_tensors = _test_ops.TestOps.test_slice_fancy_indexing_with_tensors
 
   def test_slice_fancy_indexing_dim_inject_and_collapse(self):
@@ -398,6 +405,14 @@ class TestRockchipScatterOps(unittest.TestCase):
 
   test_scatter_add = _test_ops.TestOps.test_scatter_add
   test_scatter_mul = _test_ops.TestOps.test_scatter_mul
+  test_scatter_no_reduce_tensor_src = _test_ops.TestOps.test_scatter_no_reduce_tensor_src
+
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipValidationOps(unittest.TestCase):
+  """Upstream argument-validation cases that complete before unsupported numeric execution."""
+
+  test_scaled_dot_product_attention_gqa_errors = _test_ops.TestOps.test_scaled_dot_product_attention_gqa_errors
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
