@@ -2844,3 +2844,40 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Host evaluation re
 only compile-time candidates to derive and validate static addresses. Runtime gathers preserve opaque 1/2/4-byte
 representations and never interpret an index or floating value. There is no host fancy indexing, dynamic NumPy
 evaluation, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — bounded dynamic INT32 Scatter with exact FP16 representations
+
+Rockchip Scatter now accepts one external INT32 index buffer for bounded FP16 tensor-source updates. The exact-bit
+regression covers unique destinations and an overlapping destination with last-source-wins semantics. Its base and
+source lanes include `+inf`, `-inf`, signed zero, and distinct NaN payloads, and every result is compared as raw
+`uint16` rather than through a relaxed floating tolerance.
+
+Tinygrad lowers this Scatter form to a nested WHERE selector. The strict matcher proves one direct dynamic-index load
+per candidate, consecutive static candidate positions, static output coordinates, statically bounded base/source
+addresses, and the complete last-wins selector truth table. The shared four-byte INT32 equality fragment now accepts a
+different statically proved index offset row for each candidate. DPU masks are traversed in reverse candidate order to
+construct mutually exclusive effective masks, raw FP16 source/base bytes are selected independently, and DPU
+INT32-output conversion plus raw post-gathers reconstruct the exact FP16 output.
+
+Historical direct-Scatter commit `16ea0c339` routed this family through a typed NumPy evaluator that read and computed
+tensor values on the host, so it was not ported. `~/npu/include/old/rknn_ops.md` marks ScatterElements unsupported;
+`~/rk3588` contains the upstream tests and RKNN runtime strings but no verified native DPU Scatter instruction. This
+milestone therefore composes only the already proven DPU EW equality, mask, reduction, and representation-movement
+primitives. It intentionally admits only one index buffer with one to eight candidates; wider/general N-D Scatter
+graphs remain unsupported until they have a bounded hardware plan.
+
+- Exact dynamic Scatter: **1 passed, 2 subtests passed in 5.43 s**, sequentially.
+- Shared OneHot, Gather, fancy-index, and Scatter regression: **18 passed, 2 subtests passed in 56.01 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **378 passed, 9 skipped, 182 subtests passed in
+  505.83 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `git diff --check`: pass. `sz.py`: renderer/runtime **2,747/281
+  executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The parser evaluates only static coordinates and an
+abstract Boolean selector truth table; it never reads a runtime index, base, or source value. Runtime NumPy code only
+moves opaque bytes at compile-time-proved addresses. Dynamic INT32 conversion and equality, last-wins choice, FP16-byte
+selection, and reductions all execute on DPU EW. There is no host Scatter, typed tensor evaluator, LUT, CMAC, CNA, PPU
+fallback, tolerance relaxation, or floating input wider than FP16.
