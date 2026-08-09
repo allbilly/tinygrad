@@ -200,7 +200,8 @@ class RockchipProgram(Program['RockchipDevice']):
         offset = start*2
         stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
                               RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
-                              RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg, stateful=op.stateful)
+                              RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
+                              stateful=op.stateful or op.int16_output, int16_output=op.int16_output)
         bodies.append(patch_stage(stage, address))
     if bodies: self._submit_pcchain(bodies)
 

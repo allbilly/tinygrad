@@ -3152,3 +3152,53 @@ byte/digit path for indices above signed INT16 range, so it would currently add 
 The CPU-cheat audit found no runtime or Tinygrad-core change. The renderer only matches static IR structure and emits
 DPU EW stages; it never reads or numerically evaluates a tensor buffer. There is no LUT, CMAC, CNA, PPU fallback,
 typed host rounding, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — dimension-injected dynamic FP16 fancy indexing
+
+The three forward cases from `TestOps.test_slice_fancy_indexing_dim_inject_and_collapse` now run on Rockchip. They
+combine dynamic INT32 tensor indices with collapsed integer dimensions, inserted `None` dimensions, and an ellipsis.
+The original upstream method exceeded the 30-second per-test policy when all three cases shared one item, so the exact
+expressions are retained as three independently bounded Rockchip methods.
+
+Tinygrad emits two graph forms for this group. One is a complete Cartesian ADD of masked source loads; the new strict
+matcher proves every canonical negative-normalization root, every equality predicate, the unique complete coordinate
+product, all source/index buffer bounds, and every candidate address. The other form keeps one bounds-masked dynamic
+load and is handled by the existing multi-index matcher. Positive coordinate equality and its equivalent negative
+spelling are now ORed per axis on DPU before the axis masks are conjoined, so a 5x6 selection needs 30 candidate rows
+instead of duplicating all four positive/negative sign combinations into 120 rows.
+
+The first implementation was correct but too slow. A representative first case realized in **48.735 s**: INT32
+conversion consumed **48.162 s**, including **45.668 s in 434 soft resets**; its 521 submit ioctls consumed only
+0.186 s. Raw source bytes had been duplicated over every candidate row before conversion. Converting each statically
+reachable source lane once and then striping the converted bytes through a mid-image raw gather reduced realization to
+**4.619 s**, conversion to **3.858 s**, resets to 36, submits to 123, and tasks from 6,099 to 519.
+
+Output-byte reconstruction exposed the same issue in the 3,000-lane ellipsis case. The decoded
+`~/rk3588/examples/elementwise_int.py` FP16-to-INT16 recipe was translated to the current RKNPU ioctl ABI and extended
+from comparison masks to neutral MAX conversion. Exact probes passed for 3, 8, and 3,000 FP16 integer lanes spanning
+0 through 255. RKImage v27 therefore records a native INT16 output stage. DPU converts the selected numeric byte lanes
+to contiguous INT16 in full-width tasks; runtime copies only their opaque low bytes into the FP16 result. A submit
+boundary before each precision transition is required and covered by the nonfinite regression. This reduced the
+ellipsis realization from **17.611 s** to **5.517 s**, resets from 156 to 48, submits from 201 to 93, and tasks from
+2,161 to 663.
+
+`~/npu/include/old/rknn_ops.md` marks advanced indexing and `aten::index` unsupported, and `~/rk3588` contains no native
+Gather/fancy-index instruction example. Historical broad support used a typed NumPy evaluator and remains unported.
+The current implementation instead extends the immutable equality/gather image shared by OneHot, Gather, Scatter,
+MaskedSelect, and Nonzero.
+
+- Complete fancy-index class: **7 passed in 23.07 s**, sequentially; every individual test is below 30 seconds.
+- Complete Gather class: **2 passed in 14.46 s**. Exact full-byte OneHot and dynamic Scatter regressions also pass.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the final focused runs. No new RKNPU timeout,
+  invalid IRQ, IOMMU fault, or kernel oops appeared.
+- Rockchip collection: **403 tests**. Repository-wide Tinygrad mypy (216 files), Ruff, and `git diff --check`: pass.
+  `sz.py`: renderer/runtime **3,463/282 executable lines**, total **28,800**.
+
+The CPU-cheat audit found no Tinygrad-core change and only one runtime executable-line change, forwarding the immutable
+INT16-output flag to command emission. Compile-time code proves UOp structure, integer coordinates, and raw addresses;
+it never reads a dynamic index or FP16 value. Runtime gathers move opaque 1/2/4-byte representations. Dynamic INT32
+conversion, positive/negative equality, axis conjunction, FP16-byte selection, reduction, and INT16 writeback all run
+on DPU EW. There is no host fancy indexing or numeric conversion, LUT, CMAC, CNA, PPU fallback, tolerance relaxation,
+or floating input wider than FP16.

@@ -12,7 +12,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 26
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 27
 _HEADER = struct.Struct("<4sHHHHIIIIII")  # magic/version/target, scratch/gather counts, ops/constants, phase split, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
@@ -57,10 +57,10 @@ class RKFill: dst: RKArg; count: int; itemsize: int = 2
 
 @dataclass(frozen=True)
 class RKEWOp:
-  """One contiguous FP16 DPU elementwise operation."""
+  """One contiguous DPU elementwise operation."""
   dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int
   submit_barrier: bool = False; compare: bool = False; stateful: bool = False
-  int32_output: bool = False; int32_input: bool = False; bool_output: bool = False
+  int32_output: bool = False; int32_input: bool = False; bool_output: bool = False; int16_output: bool = False
 
 @dataclass(frozen=True)
 class RKImage:
@@ -93,8 +93,9 @@ def encode_image(image:RKImage) -> bytes:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
   for op in image.ew_ops:
     if op.bool_output and not op.int32_output: raise ValueError("bool output requires INT32 conversion")
+    if op.int16_output and (op.int32_output or op.int32_input): raise ValueError("conflicting integer conversion")
     op_flags = (int(op.submit_barrier) | int(op.compare)<<1 | int(op.stateful)<<2 | int(op.int32_output)<<3 |
-                int(op.int32_input)<<4 | int(op.bool_output)<<5)
+                int(op.int32_input)<<4 | int(op.bool_output)<<5 | int(op.int16_output)<<6)
     out += _EWOP.pack(int(op.dst.kind), op_flags, op.dst.index,
                       int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
     out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
@@ -131,14 +132,15 @@ def decode_image(blob:bytes) -> RKImage:
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
-    if op_flags & ~0x3f or op_flags & 0x18 == 0x18 or op_flags & 0x20 and not op_flags & 0x08:
+    if op_flags & ~0x7f or op_flags & 0x18 == 0x18 or op_flags & 0x20 and not op_flags & 0x08 or \
+       op_flags & 0x40 and op_flags & 0x18:
       raise ValueError("invalid RKEWOp flags")
     count, ew_cfg = _EWOP2.unpack_from(blob, off); off += _EWOP2.size
     da, la, ra = struct.unpack_from("<iii", blob, off); off += 12
     ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
                          RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg,
                          bool(op_flags & 1), bool(op_flags & 2), bool(op_flags & 4), bool(op_flags & 8), bool(op_flags & 16),
-                         bool(op_flags & 32)))
+                         bool(op_flags & 32), bool(op_flags & 64)))
   fill = None
   if flags & 1:
     dst_kind, itemsize, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
@@ -189,6 +191,7 @@ _EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_
 _EW_STAGE_FP32_OUT = 1 << 29  # software tag consumed before writing EW_CFG
 _DPU_DATA_FORMAT_FP16 = (2<<29)|(2<<26)|2
 _DPU_DATA_FORMAT_FP32_OUT = (5<<29)|(2<<26)|2
+_DPU_DATA_FORMAT_INT16_OUT = (1<<29)|(2<<26)|2
 _DPU_DATA_FORMAT_INT32_OUT = (4<<29)|(2<<26)|2
 _DPU_DATA_FORMAT_INT32_IN = (2<<29)|(4<<26)|4
 _BS_BN_BYPASS = 1|(1<<1)|(1<<4)|(1<<6)
@@ -242,7 +245,7 @@ def _emit_fp32_out_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int)
   return RKStage(tuple(commands), tuple(relocs))
 
 def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
-                         int32_output:bool=False, int32_input:bool=False) -> RKStage:
+                         int32_output:bool=False, int32_input:bool=False, int16_output:bool=False) -> RKStage:
   """Emit a self-contained DPU EW stage, optionally consuming or producing native INT32."""
   if not (0 < count <= (4 if int32_output or int32_input else _MAX_EW_ELEMS_FP16)):
     raise ValueError(f"stateful EW count {count} out of range")
@@ -258,14 +261,14 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
     (_DPU,rk.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),(_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE))
   regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
     (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
-    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_INT32_OUT if int32_output else
+    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_INT32_OUT if int32_output else _DPU_DATA_FORMAT_INT16_OUT if int16_output else
                                   _DPU_DATA_FORMAT_INT32_IN if int32_input else _DPU_DATA_FORMAT_FP16),
     (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,width),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
     (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,((lanes-1)<<16)|(lanes-1))) + pipeline + (
     (_DPU,rk.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else
                                (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else ew_cfg),
     (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
-    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if int32_output or is_div else (1<<16)|1),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
+    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if int32_output or int16_output or is_div else (1<<16)|1),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
     (_DPU,rk.REG_DPU_SURFACE_ADD,4<<4),(_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
@@ -280,11 +283,11 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
   return RKStage(tuple(commands), tuple(relocs))
 
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
-                  stateful:bool=False, int32_output:bool=False, int32_input:bool=False) -> RKStage:
+                  stateful:bool=False, int32_output:bool=False, int32_input:bool=False, int16_output:bool=False) -> RKStage:
   """Build one DPU EW command body without its PC-chain tail."""
   if ew_cfg & _EW_STAGE_FP32_OUT: return _emit_fp32_out_stage(dst, lhs, rhs, count, ew_cfg & ~_EW_STAGE_FP32_OUT)
-  if compare or stateful or int32_output or int32_input:
-    return _emit_stateful_stage(dst, lhs, rhs, count, ew_cfg, compare, int32_output, int32_input)
+  if compare or stateful or int32_output or int32_input or int16_output:
+    return _emit_stateful_stage(dst, lhs, rhs, count, ew_cfg, compare, int32_output, int32_input, int16_output)
   if not (0 < count <= _MAX_EW_ELEMS_FP16): raise ValueError(f"EW fp16 count {count} out of range")
   is_div = ew_cfg == _EW_CFG[Ops.FDIV]
   width = (count + 7) // 8 - 1
@@ -914,50 +917,69 @@ class RKByteEquality:
   vector_bytes:int; vector_lanes:int; matrix_lanes:int; tiles:int
 
 RKIndexEquality = tuple[int, int, tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]
-def _int32_equality_matrix(indices:tuple[RKIndexEquality, ...], count:int) -> RKByteEquality|None:
+RKCoordinateRows = tuple[tuple[int, ...], ...]
+def _int32_equality_matrix(indices:tuple[RKIndexEquality, ...], count:int,
+                           alternate_coordinates:tuple[tuple[RKCoordinateRows, ...], ...]|None=None) -> RKByteEquality|None:
   """Expand one or more exact dynamic INT32 byte equalities over aligned candidate rows."""
   rows = len(indices[0][3]) if indices else 0
   vector_bytes, vector_lanes, matrix_lanes = ((count*2, count, count) if rows == 1 else _stripe_layout(count, rows))
+  coordinate_sets = tuple((index[3],)+alternates for index,alternates in zip(
+    indices, alternate_coordinates if alternate_coordinates is not None else ((),)*len(indices)))
   if (not rows or any(len(offsets) != rows or len(coords) != rows or
                       any(len(row) != count for row in (*offsets, *coords)) for _,_,offsets,coords in indices) or
+      len(coordinate_sets) != len(indices) or any(not sets or any(len(coords) != rows or
+        any(len(row) != count for row in coords) for coords in sets) for sets in coordinate_sets) or
       matrix_lanes > _MAX_EW_ELEMS_FP16): return None
   one, next_slot = 0, 1
-  layouts:list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
-  for _ in indices:
+  layouts:list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...]]] = []
+  for sets in coordinate_sets:
     raw = tuple(range(next_slot, next_slot+4)); half = tuple(range(next_slot+4, next_slot+8))
-    matrix = tuple(range(next_slot+8, next_slot+12)); coords = tuple(range(next_slot+12, next_slot+16)); next_slot += 16
+    matrix = tuple(range(next_slot+8, next_slot+12)); next_slot += 12
+    coords = tuple(tuple(range(next_slot+i*4, next_slot+(i+1)*4)) for i in range(len(sets))); next_slot += len(sets)*4
     layouts.append((raw, half, matrix, coords))
   tiles = next_slot; next_slot += 1
   diff, magnitude, unequal, equal = range(next_slot, next_slot+4); next_slot += 4
-  masks = tuple(range(next_slot, next_slot+len(indices))); next_slot += len(indices)
+  masks:list[tuple[int, ...]] = []
+  for sets in coordinate_sets:
+    masks.append(tuple(range(next_slot, next_slot+len(sets)))); next_slot += len(sets)
   scratch_sizes = [_scratch_bytes(matrix_lanes)] * next_slot
   scratch_sizes[tiles] = _int32_tiles_bytes(max(index_count for _,index_count,_,_ in indices))
   gathers:list[RKGather] = []
   mid:list[RKGather] = []
   pre:list[RKEWOp] = []
   def arg(slot:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot)
-  for (index_slot,index_count,index_offset_rows,coordinate_rows),(raw,half,matrix,coords) in zip(indices, layouts):
+  for (index_slot,index_count,index_offset_rows,_),sets,(raw,half,matrix,coordinate_slots) in zip(indices, coordinate_sets, layouts):
     for slot in raw: scratch_sizes[slot] = index_count*4
     for slot in half: scratch_sizes[slot] = _scratch_bytes(index_count)
     gathers.extend(RKGather(index_slot, slot, index_count,
       offsets=tuple(lane*4+byte for lane in range(index_count)), dst_stride=4, itemsize=1) for byte,slot in enumerate(raw))
-    for byte,slot in enumerate(coords):
-      bits = tuple(tuple(_fp16_bits((value >> (byte*8)) & 0xff) for value in row) for row in coordinate_rows)
-      gathers.extend(_stripe_gathers(index_slot, slot, count, bits, vector_lanes, values=True))
+    for coordinate_matrix,coordinate_group in zip(sets, coordinate_slots):
+      for byte,coordinate_slot in enumerate(coordinate_group):
+        bits = tuple(tuple(_fp16_bits((value >> (byte*8)) & 0xff) for value in row) for row in coordinate_matrix)
+        gathers.extend(_stripe_gathers(index_slot, coordinate_slot, count, bits, vector_lanes, values=True))
     mid.extend(RKGather(src, dst, count, offsets=index_offsets, dst_addend=row*vector_lanes, src_kind=RKBufferKind.SCRATCH)
                for src,dst in zip(half, matrix) for row,index_offsets in enumerate(index_offset_rows))
     pre.extend(RKEWOp(arg(dst), arg(src), arg(tiles), index_count, _EW_CFG[Ops.MAX], int32_input=True) for src,dst in zip(raw, half))
   ops:list[RKEWOp] = []
-  for (_,_,matrix,coords),mask in zip(layouts, masks):
-    result = arg(one)
-    for lhs,rhs in zip(matrix, coords):
-      byte_equal = _ew_integer_eq_mask(ops, arg, lhs, rhs, (diff, magnitude, unequal, equal), one, matrix_lanes)
-      ops.append(RKEWOp(arg(mask), result, byte_equal, matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
-      result = arg(mask)
-  result = arg(masks[0])
-  for mask in masks[1:]:
-    ops.append(RKEWOp(result, result, arg(mask), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
-  return RKByteEquality(tuple(scratch_sizes), tuple(gathers), tuple(mid), tuple(pre), tuple(ops), result,
+  axis_masks:list[RKArg] = []
+  for (_,_,matrix,coordinate_slots),axis_slots in zip(layouts, masks):
+    for coordinate_group,mask_slot in zip(coordinate_slots, axis_slots):
+      byte_result = arg(one)
+      for lhs,rhs in zip(matrix, coordinate_group):
+        byte_equal = _ew_integer_eq_mask(ops, arg, lhs, rhs, (diff, magnitude, unequal, equal), one, matrix_lanes)
+        ops.append(RKEWOp(arg(mask_slot), byte_result, byte_equal, matrix_lanes,
+                          _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+        byte_result = arg(mask_slot)
+    axis_mask = arg(axis_slots[0])
+    for alternate_mask in axis_slots[1:]:
+      ops.append(RKEWOp(axis_mask, axis_mask, arg(alternate_mask), matrix_lanes,
+                        _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True))
+    axis_masks.append(axis_mask)
+  final_mask:RKArg = axis_masks[0]
+  for axis_mask in axis_masks[1:]:
+    ops.append(RKEWOp(final_mask, final_mask, axis_mask, matrix_lanes,
+                      _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+  return RKByteEquality(tuple(scratch_sizes), tuple(gathers), tuple(mid), tuple(pre), tuple(ops), final_mask,
                         vector_bytes, vector_lanes, matrix_lanes, tiles)
 
 def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:Callable[[int], RKArg],
@@ -1890,10 +1912,12 @@ def _append_byte_conversions(ops:list[RKEWOp], arg:Callable[[int], RKArg], raw:t
   ops.extend(RKEWOp(arg(dst), arg(src), arg(tiles), count, _EW_CFG[Ops.MAX], int32_input=True) for src,dst in zip(raw, half))
 
 def _raw_fp16_output(ops:list[RKEWOp], arg:Callable[[int], RKArg], values:tuple[RKArg, RKArg], count:int, tiles:int,
-                     int_slots:tuple[int, int], out_slot:int) -> tuple[RKGather, ...]:
-  ops.extend(RKEWOp(arg(dst), value, arg(tiles), count, _EW_CFG[Ops.MAX], int32_output=True)
+                     int_slots:tuple[int, int], out_slot:int, int16_output:bool=False) -> tuple[RKGather, ...]:
+  ops.extend(RKEWOp(arg(dst), value, value if int16_output else arg(tiles), count, _EW_CFG[Ops.MAX],
+                    submit_barrier=int16_output, int32_output=not int16_output, int16_output=int16_output)
              for value,dst in zip(values, int_slots))
-  offsets = tuple(range(0, count*4, 4))
+  itemsize = 2 if int16_output else 4
+  offsets = tuple(range(0, count*itemsize, itemsize))
   return tuple(RKGather(slot, out_slot, count, offsets=offsets, dst_stride=2, dst_addend=byte,
                         dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
                for byte,slot in enumerate(int_slots))
@@ -1952,39 +1976,54 @@ def _lower_bounded_exact_fp16_copysign(uops:list[UOp]) -> RKImage|None:
   return None if (tagged:=_fold_copysign(output[4])) is None else _lower_exact_fp16_copysign((*output[:4], tagged))
 
 def _dynamic_fp16_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIndex, ...], plans:tuple[RKGather, ...],
-                               coordinates:tuple[tuple[int, ...], ...]) -> RKImage|None:
+                               coordinates:tuple[tuple[int, ...], ...],
+                               alternate_coordinates:tuple[tuple[tuple[int, ...], ...], ...]|None=None) -> RKImage|None:
   """Select raw FP16 representations with exact byte-wise dynamic INT32 equality."""
   if len(coordinates) != len(indices) or any(len(axis) != len(plans) for axis in coordinates): return None
   equality_inputs = tuple((slot, index_count, (index_offsets,)*len(plans), tuple((candidate,)*count for candidate in axis))
                           for (slot,index_count,index_offsets),axis in zip(indices, coordinates))
-  if (equality:=_int32_equality_matrix(equality_inputs, count)) is None: return None
+  alternates = None if alternate_coordinates is None else tuple(tuple(tuple((candidate,)*count for candidate in axis)
+    for axis in alternatives) for alternatives in alternate_coordinates)
+  if (equality:=_int32_equality_matrix(equality_inputs, count, alternates)) is None: return None
   rows, matrix_lanes = len(plans), equality.matrix_lanes
+  plan_offsets = tuple(_plan_offsets(plan) for plan in plans)
+  compact_offsets = tuple(sorted({offset for row in plan_offsets for offset in row}))
+  compact_index = {offset:i for i,offset in enumerate(compact_offsets)}
+  compact_rows = tuple(tuple(compact_index[offset] for offset in row) for row in plan_offsets)
+  compact_lanes = len(compact_offsets)
   next_slot = len(equality.scratch_sizes)
-  raw_value = (next_slot, next_slot+1); half_value = (next_slot+2, next_slot+3)
-  selected_low, selected_high, int_tiles, int_low, int_high = range(next_slot+4, next_slot+9)
-  scratch_sizes = list(equality.scratch_sizes) + [_scratch_bytes(matrix_lanes)] * 9
-  scratch_sizes[equality.tiles] = _int32_tiles_bytes(max(matrix_lanes, *(index_count for _,index_count,_ in indices)))
-  for slot in raw_value: scratch_sizes[slot] = matrix_lanes*4
-  scratch_sizes[int_tiles] = _int32_tiles_bytes(count)
-  scratch_sizes[int_low] = scratch_sizes[int_high] = count*4
+  raw_value = (next_slot, next_slot+1); compact_value = (next_slot+2, next_slot+3)
+  matrix_value = (next_slot+4, next_slot+5)
+  selected_low, selected_high, int_low, int_high = range(next_slot+6, next_slot+10)
+  scratch_sizes = list(equality.scratch_sizes) + [_scratch_bytes(matrix_lanes)] * 10
+  scratch_sizes[equality.tiles] = _int32_tiles_bytes(max(matrix_lanes, compact_lanes,
+    *(index_count for _,index_count,_ in indices)))
+  for slot in raw_value: scratch_sizes[slot] = compact_lanes*4
+  for slot in compact_value: scratch_sizes[slot] = _scratch_bytes(compact_lanes)
+  scratch_sizes[int_low] = scratch_sizes[int_high] = count*2
 
   if len({plan.src_index for plan in plans}) != 1: return None
-  gathers = list(equality.gathers + _raw_fp16_gathers(plans[0].src_index, raw_value, count,
-                 tuple(_plan_offsets(plan) for plan in plans), equality.vector_lanes))
+  gathers = list(equality.gathers + _raw_fp16_gathers(plans[0].src_index, raw_value, compact_lanes,
+                 (compact_offsets,), compact_lanes))
+  mid_gathers = list(equality.mid_gathers)
+  mid_gathers.extend(RKGather(src, dst, count, offsets=row, dst_addend=candidate*equality.vector_lanes,
+    src_kind=RKBufferKind.SCRATCH) for src,dst in zip(compact_value, matrix_value)
+    for candidate,row in enumerate(compact_rows))
 
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   ops = list(equality.pre_ops)
-  _append_byte_conversions(ops, arg, raw_value, half_value, equality.tiles, matrix_lanes)
+  _append_byte_conversions(ops, arg, raw_value, compact_value, equality.tiles, compact_lanes)
   ops.extend(equality.mask_ops)
-  ops.extend((RKEWOp(arg(selected_low), arg(half_value[0]), equality.mask, matrix_lanes,
+  ops.extend((RKEWOp(arg(selected_low), arg(matrix_value[0]), equality.mask, matrix_lanes,
                      _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
-              RKEWOp(arg(selected_high), arg(half_value[1]), equality.mask, matrix_lanes,
+              RKEWOp(arg(selected_high), arg(matrix_value[1]), equality.mask, matrix_lanes,
                      _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)))
   low = _reduce_rows(ops, [arg(selected_low, row*equality.vector_bytes) for row in range(rows)], count, _EW_CFG[Ops.ADD])
   high = _reduce_rows(ops, [arg(selected_high, row*equality.vector_bytes) for row in range(rows)], count, _EW_CFG[Ops.ADD])
-  post_gathers = _raw_fp16_output(ops, arg, (low, high), count, int_tiles, (int_low, int_high), out_slot)
+  post_gathers = _raw_fp16_output(ops, arg, (low, high), count, equality.tiles,
+                                  (int_low, int_high), out_slot, int16_output=True)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
-                 gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=equality.mid_gathers,
+                 gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid_gathers),
                  gather_after=len(equality.pre_ops)+len(raw_value),
                  post_gathers=post_gathers)
 
@@ -2430,6 +2469,67 @@ def _lower_dynamic_fp16_gather(output:RKOutput) -> RKImage|None:
   return _dynamic_fp16_gather_image(out_param.arg.slot, count, ((index_param.arg.slot, index_count, index_offsets),), plans,
                                     (coordinates,))
 
+def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
+  """Collapse Tinygrad's unrolled multi-index selection into compact exact INT32 equality rows."""
+  _, out_param, count, out_index, root = output
+  terms = _flatten_binary(root, Ops.ADD)
+  if count <= 0 or len(terms) < 2: return None
+  normalized = tuple((node, *parsed) for node in root.toposort() if (parsed:=_negative_normalized_index(node)) is not None)
+  if not normalized or len({load.key for _,load,_ in normalized}) != len(normalized): return None
+  normalized_roots = {node.key:(axis, extent) for axis,(node,_,extent) in enumerate(normalized)}
+  dynamic_loads = tuple(load for _,load,_ in normalized)
+  if {u.key for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int} != {u.key for u in dynamic_loads}:
+    return None
+
+  candidates:dict[tuple[int, ...], UOp] = {}
+  for term in terms:
+    if term.op is not Ops.WHERE or term.dtype.scalar() is not dtypes.half: return None
+    loads = [arm for arm in term.src[1:] if arm.op is Ops.LOAD and arm.dtype.scalar() is dtypes.half and
+             len(arm.src) == 1 and arm.src[0].op is Ops.INDEX]
+    zeros = [arm for arm in term.src[1:] if arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.half and float(arm.arg) == 0.0]
+    if len(loads) != 1 or len(zeros) != 1 or term.src[1] is not loads[0]: return None
+    candidate_coordinates:list[int|None] = [None]*len(normalized)
+    predicates = _flatten_binary(term.src[0], Ops.AND)
+    if len(predicates) != len(normalized): return None
+    for predicate in predicates:
+      if (pair:=_equality_pair(predicate)) is None: return None
+      matches = [(normalized_roots[value.key], constant) for value,constant in (pair, pair[::-1])
+                 if value.key in normalized_roots and constant.op is Ops.CONST and constant.dtype.scalar() is dtypes.int]
+      if len(matches) != 1: return None
+      (axis,extent),constant = matches[0]; coordinate = int(constant.arg)
+      if candidate_coordinates[axis] is not None or not 0 <= coordinate < extent: return None
+      candidate_coordinates[axis] = coordinate
+    if any(coordinate is None for coordinate in candidate_coordinates): return None
+    key = tuple(coordinate for coordinate in candidate_coordinates if coordinate is not None)
+    if key in candidates: return None
+    candidates[key] = loads[0]
+
+  combinations:tuple[tuple[int, ...], ...] = ((),)
+  for _,_,extent in normalized: combinations = tuple(prefix+(value,) for prefix in combinations for value in range(extent))
+  if set(candidates) != set(combinations): return None
+  candidate_loads = tuple(candidates[values] for values in combinations)
+  params = tuple(_root_param(load.src[0]) for load in candidate_loads)
+  index_params = tuple(_root_param(load.src[0]) for load in dynamic_loads)
+  if (any(param is None or param.dtype.scalar() is not dtypes.half or
+      param.src[0].op is not Ops.CONST for param in params) or len({param.arg.slot for param in params if param is not None}) != 1 or
+      any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in index_params)):
+    return None
+  data_param = next(param for param in params if param is not None)
+  try:
+    plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index, load.src[0].src[1], None, count) for load in candidate_loads)
+  except RuntimeError: return None
+  concrete_indices = tuple(param for param in index_params if param is not None)
+  try: offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in dynamic_loads)
+  except RuntimeError: return None
+  data_count = int(data_param.src[0].arg)
+  index_counts = tuple(int(param.src[0].arg) for param in concrete_indices)
+  if (any(not 0 <= offset < size for row,size in zip(offsets, index_counts) for offset in row) or
+      any(not 0 <= offset < data_count for plan in plans for offset in _plan_offsets(plan))): return None
+  indices = tuple((param.arg.slot, size, row) for param,size,row in zip(concrete_indices, index_counts, offsets))
+  coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(normalized)))
+  alternates = tuple((tuple(value-extent for value in axis),) for axis,(_,_,extent) in zip(coordinates, normalized))
+  return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
+
 def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   """Lower a bounded FP16 load addressed by one or more negative-normalized INT32 tensors."""
   _, out_param, count, out_index, load = output
@@ -2446,7 +2546,7 @@ def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   params = tuple(_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads)
   if any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params): return None
   concrete = tuple(param for param in params if param is not None)
-  options = tuple(tuple(range(extent))+tuple(range(-extent, 0)) for _,_,extent in normalized)
+  options = tuple(tuple(range(extent)) for _,_,extent in normalized)
   vector_lanes = ((count*2+63)&-64)//2
   combinations:tuple[tuple[int, ...], ...] = ((),)
   for axis in options:
@@ -2465,7 +2565,8 @@ def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   indices = tuple((param.arg.slot, index_count, axis_offsets)
                   for param,index_count,axis_offsets in zip(concrete, index_counts, offsets))
   coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(loads)))
-  return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates)
+  alternates = tuple((tuple(value-extent for value in axis),) for axis,(_,_,extent) in zip(coordinates, normalized))
+  return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
 def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
   """Lower a bounded last-wins Scatter selector with one external INT32 index buffer."""
@@ -3108,6 +3209,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
     if (max_unpool:=_lower_unrolled_max_unpool(half_output)) is not None: return max_unpool
     if (fixed_masked_select:=_lower_fixed_fp16_masked_select(half_output)) is not None: return fixed_masked_select
+    if (unrolled_fancy:=_lower_unrolled_multi_fp16_fancy_index(half_output)) is not None: return unrolled_fancy
     if (dynamic_gather:=_lower_dynamic_fp16_gather(half_output)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_fp16_fancy_index(half_output)) is not None: return fancy_index
     if (scatter_reduce:=_lower_dynamic_scalar_scatter_reduce(half_output)) is not None: return scatter_reduce

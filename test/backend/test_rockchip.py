@@ -542,6 +542,8 @@ class TestRockchipNonzeroOps(unittest.TestCase):
 class TestRockchipFancyIndexOps(unittest.TestCase):
   """Dynamic INT32 fancy indices with exact negative normalization and FP16 bits."""
 
+  _get_index_randoms = _test_ops.TestOps._get_index_randoms
+
   @classmethod
   def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
 
@@ -550,6 +552,18 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
 
   test_fancy_indexing_inf = _test_ops.TestOps.test_fancy_indexing_inf
   test_slice_fancy_indexing_with_tensors = _test_ops.TestOps.test_slice_fancy_indexing_with_tensors
+
+  def test_slice_fancy_indexing_dim_inject_and_collapse(self):
+    _,b,_,d,_,_,j,_,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[1,b,None,d,1], lambda x:x[1,j,None,o,1])
+
+  def test_slice_fancy_indexing_dim_inject_and_collapse_leading_none(self):
+    _,b,_,d,_,_,j,_,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,b,2,d,None], lambda x:x[None,j,2,o,None])
+
+  def test_slice_fancy_indexing_dim_inject_and_collapse_ellipsis(self):
+    _,_,_,d,_,_,_,_,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[...,1,d,None], lambda x:x[...,1,o,None])
 
   def test_fancy_indexing_negative_nonfinite_bits(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
