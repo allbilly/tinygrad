@@ -4152,3 +4152,34 @@ The CPU-cheat audit found no runtime or core change and no host value inspection
 fixed-output compact-index graph and buffer extents. Boolean counting, compact-index equality, validity masks, raw-byte
 selection, and fill composition all execute on DPU. There is no host compaction/result calculation, NumPy backend
 evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact fixed-size INT16 nonzero on DPU
+
+Fixed-size `nonzero` now returns exact INT32 coordinates for signed-INT16 inputs, including rank-two layouts,
+truncation, padding, and the `-32768` representation. The first compile probe exposed that fixed Nonzero consists of
+two integer kernels: an unrolled predicate prefix and the final compact-coordinate selection. Both existing INT32
+lowerers are now typed by source dtype and byte width. INT16 checks two opaque representation bytes while INT32 keeps
+four; any nonzero byte becomes a native INT16 mask, then the shared prefix/equality/coordinate pipeline completes on
+DPU.
+
+No other branch, `~/npu`, or `~/rk3588` contains an integrated INT16 Nonzero implementation. Historical commits
+`78a38f384` and `aa7cac490` provide the fixed FP16 and exact-byte INT32 graph proofs, while
+`~/rk3588/examples/elementwise_int.py` proves the native INT16 MIN/MAX, reduction, and INT32 writeback operations used
+by the shared image.
+
+- Exact rank-one values `{0, -32768, 256, -256, 32767, -1}` and rank-two coordinate/fill selection pass in focused
+  cold runs of **3.79 s** and **3.61 s**; they take **0.85 s** and **0.75 s** within the warm class run.
+- The complete Nonzero class passes **12/12 in 49.15 s**. The slowest individual method is the pre-existing dynamic
+  rank-two FP16 case at **22.15 s**, below the 30-second profiling threshold.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **485 tests**.
+- `sz.py`: renderer/runtime **4,892/331 executable lines**, total **30,278**. Sharing the two integer stages adds only
+  three renderer lines, no runtime lines, and no Tinygrad-core changes.
+
+The CPU-cheat audit found no runtime/core change or input-value inspection. Compile time proves only the static prefix
+coverage, coordinate layouts, and bounds. Runtime gathers opaque source bytes; byte nonzero masks, prefix counts,
+compact-index equality, coordinate selection, validity/fill composition, and INT32 writeback execute on DPU. There is
+no host Nonzero/result calculation, NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or floating input wider
+than FP16.
