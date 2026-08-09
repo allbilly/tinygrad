@@ -748,6 +748,8 @@ class TestRockchipSignOps(unittest.TestCase):
 class TestRockchipCastOps(unittest.TestCase):
   """Native DPU conversion from FP16 inputs to boolean, INT32, and FP32 outputs."""
 
+  test_cast = _test_ops.TestOps.test_cast
+
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBitcastOps(unittest.TestCase):
@@ -1149,6 +1151,8 @@ class TestRockchipReductionOps(unittest.TestCase):
   test_var_zero_in_axis = _test_ops.TestOps.test_var_zero_in_axis
   test_var_one_in_axis = _test_ops.TestOps.test_var_one_in_axis
   test_var_keepdim = _test_ops.TestOps.test_var_keepdim
+  test_std_mean_loaded_nan = _test_ops.TestOps.test_std_mean_loaded_nan
+  test_std_zero_in_axis = _test_ops.TestOps.test_std_zero_in_axis
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):

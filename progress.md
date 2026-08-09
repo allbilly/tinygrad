@@ -4539,3 +4539,32 @@ The CPU-cheat audit found no runtime or Tinygrad-core modification and no tensor
 only static graph topology, offsets, weights, and byte layout. Runtime gathers opaque bytes; all comparisons, equality
 masks, first-tie updates, weighted reductions, and INT32 writeback execute as native DPU INT16 EW tasks. There is no
 host result calculation, CPU fallback, LUT, CMAC, tolerance relaxation, or floating-point input wider than FP16.
+
+---
+
+## 2026-08-10 — batched integer/boolean casts and empty std cases
+
+The unchanged upstream `test_cast` now passes by composing two existing DPU converters: INT32 input is converted to an
+FP16 numeric tile, then widened into the required FP32 output layout. Boolean bytes are zero-extended into the same
+INT32 tile format before conversion. Four-lane groups use the DPU's required 16-byte FP32 conversion stride. Existing
+FP16-to-INT32, FP16-to-boolean, and FP16-to-FP32 paths remain unchanged.
+
+The remainder batch also identified and promoted two already-correct empty-axis methods,
+`test_std_mean_loaded_nan` and `test_std_zero_in_axis`. They exercise empty-shape/NaN semantics and do not claim native
+SQRT support; all non-empty standard-deviation methods remain outside the current no-LUT hardware scope.
+
+- The full upstream `test_cast`, both upstream empty-axis std methods, and a backend-only integer/boolean conversion
+  regression pass together: **4/4 in 4.42 s**.
+- The backend regression covers dynamic signed INT32 values and boolean values; all expected values are exactly
+  representable through the NPU's FP16 intermediate.
+- `test_rockchip.py` now collects **349 upstream-only cases** (326 unique upstream names), and `test_rockchip2.py`
+  collects **190 backend-only cases**. The authoritative remainder falls from 98 to **95 of 421**.
+- The same batch classified general scatter/scatter-reduce as one dynamic-index WHERE lowering gap, non-empty std as a
+  SQRT gap, and masked-select as a CPU-bound compiler runaway rather than an NPU timeout.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,639/331 executable lines**, total **31,025**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime/core change and no tensor-value inspection. The renderer validates only CAST
+structure and static offsets. Runtime movement zero-extends opaque boolean bytes; both numeric conversions and FP32
+writeback execute on DPU. There is no CPU arithmetic, fallback, LUT, CMAC, tolerance change, or wider input contract.

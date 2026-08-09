@@ -1333,6 +1333,41 @@ def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
       root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
   return _typed_int_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)))
 
+def _lower_integer_fp32_cast(output:RKOutput) -> RKImage|None:
+  """Compose the DPU INT32-to-FP16 and FP16-to-FP32 converters for integer and boolean inputs."""
+  _, out_param, count, out_index, root = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.float or len(root.src) != 1 or
+      (load:=root.src[0]).op is not Ops.LOAD or load.dtype.scalar() not in (dtypes.int, dtypes.bool) or
+      len(load.src) != 1 or load.src[0].op is not Ops.INDEX or
+      (source:=_root_param(load.src[0])) is None or source.src[0].op is not Ops.CONST): return None
+  try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
+  except RuntimeError: return None
+  if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
+  fp16_slot, tiles_slot = 0, 1
+  groups = tuple(range(0, count, _EW_ELEMS_32BIT))
+  scratch_sizes = [max(64, len(groups)*16), _int32_tiles_bytes(_EW_ELEMS_32BIT)]
+  gathers:tuple[RKGather, ...] = ()
+  input_arg = RKArg(RKBufferKind.ARG, source.arg.slot)
+  if load.dtype.scalar() is dtypes.bool or offsets != tuple(range(count)):
+    raw_slot = len(scratch_sizes)
+    scratch_sizes.append(max(64, count*4))
+    gathers = (RKGather(source.arg.slot, raw_slot, count, offsets=offsets,
+                        dst_stride=4 if load.dtype.scalar() is dtypes.bool else 1,
+                        itemsize=1 if load.dtype.scalar() is dtypes.bool else 4),)
+    input_arg = RKArg(RKBufferKind.SCRATCH, raw_slot)
+  ops:list[RKEWOp] = []
+  for group,start in enumerate(groups):
+    lanes = min(_EW_ELEMS_32BIT, count-start)
+    ops.append(RKEWOp(RKArg(RKBufferKind.SCRATCH, fp16_slot, group*16), replace(input_arg, addend=start*4),
+                      RKArg(RKBufferKind.SCRATCH, tiles_slot), lanes, _EW_CFG[Ops.MAX], int32_input=True))
+  for group,start in enumerate(groups):
+    lanes = min(_EW_ELEMS_32BIT, count-start)
+    value = RKArg(RKBufferKind.SCRATCH, fp16_slot, group*16)
+    ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot, group*16), value, value, lanes,
+                        _EW_CFG[Ops.MAX] | _EW_STAGE_FP32_OUT))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=gathers, ew_ops=tuple(ops))
+
 def _lower_fp16_fp32_cast(output:RKOutput) -> RKImage|None:
   """Widen a direct or statically gathered FP16 load with the DPU output converter."""
   _, out_param, count, out_index, root = output
@@ -5471,8 +5506,9 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (dynamic_gather:=_lower_dynamic_16bit_gather(int16_output, dtypes.int16)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return fancy_index
     if (scatter:=_lower_dynamic_16bit_scatter(int16_output, dtypes.int16)) is not None: return scatter
-  if (float_output:=_output_store(uops, dtypes.float)) is not None and \
-     (fp16_cast:=_lower_fp16_fp32_cast(float_output)) is not None: return fp16_cast
+  if (float_output:=_output_store(uops, dtypes.float)) is not None:
+    if (integer_cast:=_lower_integer_fp32_cast(float_output)) is not None: return integer_cast
+    if (fp16_cast:=_lower_fp16_fp32_cast(float_output)) is not None: return fp16_cast
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
     if bool_output[4].op is Ops.CONST:
       return RKImage(RKTarget.RK3588, constants=struct.pack("<?", bool(bool_output[4].arg)),

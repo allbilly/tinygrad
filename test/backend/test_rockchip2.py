@@ -874,6 +874,11 @@ class TestRockchipCastOps(_base.TestRockchipCastOps):
     _fp16_test_op([(3,3)], lambda x:x.int(), forward_only=True)
     _fp16_test_op(None, lambda x:x.int(), vals=[[-2.9, -2.5, -1.9, -0.9, -0., 0., 0.9, 1.9, 2.5, 2.9]], forward_only=True)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
+  def test_cast_integer_and_bool_to_float(self):
+    integers = np.array([-2048, -257, -1, 0, 1, 257, 2048], dtype=np.int32)
+    booleans = np.array([False, True, True, False], dtype=np.bool_)
+    np.testing.assert_array_equal(Tensor(integers).float().numpy(), integers.astype(np.float32))
+    np.testing.assert_array_equal(Tensor(booleans).float().numpy(), booleans.astype(np.float32))
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
