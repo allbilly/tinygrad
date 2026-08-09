@@ -3791,3 +3791,31 @@ Tinygrad's other hardware-specific canonicalizations; the generic runtime remain
 The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only recognizes branch identity in a static
 WHERE/CMPLT graph. Every input-dependent MIN/MAX and nested clamp executes on DPU INT16 EW. There is no host comparison,
 selection, or clipping, no NumPy tensor evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — native signed-INT16 sign on DPU
+
+Signed-INT16 `sign()` now lowers as the exact identity `min(max(x,-1),1)`, using two native extrema tasks. Tinygrad's
+scheduled form is `WHERE(x!=0, WHERE(x<0,-1,1), 0)`. A dedicated sign rewrite runs before the general INT16 WHERE pass,
+matching the existing FP16 backend organization; otherwise the inner selection is expanded first and the opportunity to
+recover the two-stage clamp is lost.
+
+Historical commit `6b00f28ae` supplied the corresponding four-stage FP16 sign matcher, while
+`~/rk3588/examples/elementwise_int.py` proves the INT16 MIN/MAX operations used by the smaller integer formulation.
+There is no separate Tinygrad `signbit` method; its meaningful integer form, `x<0`, is already covered by the exact
+signed-comparison milestone. Internal sign constants remain weak integers in scheduled IR, so the INT16 structural
+constant helper now accepts both explicit INT16 and weak-integer constants inside this already typed graph.
+
+- The first diagnostic run was numerically exact but exposed **13 tasks**, proving the general WHERE path was used. The
+  dedicated pre-pass reduces the same full-range case to the asserted **2 tasks / 1 ioctl**; call time is **0.11 s**.
+- With renderer caching disabled, the complete native INT16 class passes **17/17 in 3.53 s**. No case approaches 30 s.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused and class runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **471 tests**.
+- `sz.py`: renderer/runtime **4,669/327 executable lines**, total **30,051**. The dedicated structural pass adds ten
+  renderer lines and no runtime lines.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time validates the exact sign tree and replaces it
+with native extrema UOps. Every input-dependent sign result is computed by two DPU INT16 EW tasks; runtime only submits
+the existing image. There is no host classification, comparison, or selection, no NumPy tensor evaluation, LUT, CMAC,
+tolerance relaxation, or floating input wider than FP16.
