@@ -2717,11 +2717,24 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   terms = _flatten_binary(root, Ops.ADD)
   if count <= 0 or len(terms) < 2: return None
   normalized = tuple((node, *parsed) for node in root.toposort() if (parsed:=_negative_normalized_index(node)) is not None)
-  if not normalized or len({load.key for _,load,_ in normalized}) != len(normalized): return None
-  normalized_roots = {node.key:(axis, extent) for axis,(node,_,extent) in enumerate(normalized)}
-  dynamic_loads = tuple(load for _,load,_ in normalized)
-  if {u.key for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int} != {u.key for u in dynamic_loads}:
-    return None
+  normalized_by_load = {load.key:(node, extent) for node,load,extent in normalized}
+  dynamic_loads = tuple({u.key:u for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
+  if not dynamic_loads or len(normalized_by_load) != len(normalized): return None
+  direct_domains:dict[UOp, set[int]] = {load:set() for load in dynamic_loads if load.key not in normalized_by_load}
+  for predicate in root.toposort():
+    if (pair:=_equality_pair(predicate)) is None: continue
+    for value,constant in (pair, pair[::-1]):
+      if value in direct_domains and constant.op is Ops.CONST and constant.dtype.scalar() is dtypes.int:
+        direct_domains[value].add(int(constant.arg))
+  axes:list[tuple[UOp, UOp, int, bool]] = []
+  for load in dynamic_loads:
+    if load.key in normalized_by_load: node, extent, wrapped = *normalized_by_load[load.key], True
+    else:
+      domain = direct_domains[load]
+      if not domain or domain != set(range(max(domain)+1)): return None
+      node, extent, wrapped = load, max(domain)+1, False
+    axes.append((node, load, extent, wrapped))
+  axis_roots = {node.key:(axis, extent) for axis,(node,_,extent,_) in enumerate(axes)}
 
   candidates:dict[tuple[int, ...], UOp] = {}
   for term in terms:
@@ -2730,13 +2743,13 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
              len(arm.src) == 1 and arm.src[0].op is Ops.INDEX]
     zeros = [arm for arm in term.src[1:] if arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.half and float(arm.arg) == 0.0]
     if len(loads) != 1 or len(zeros) != 1 or term.src[1] is not loads[0]: return None
-    candidate_coordinates:list[int|None] = [None]*len(normalized)
+    candidate_coordinates:list[int|None] = [None]*len(axes)
     predicates = _flatten_binary(term.src[0], Ops.AND)
-    if len(predicates) != len(normalized): return None
+    if len(predicates) != len(axes): return None
     for predicate in predicates:
       if (pair:=_equality_pair(predicate)) is None: return None
-      matches = [(normalized_roots[value.key], constant) for value,constant in (pair, pair[::-1])
-                 if value.key in normalized_roots and constant.op is Ops.CONST and constant.dtype.scalar() is dtypes.int]
+      matches = [(axis_roots[value.key], constant) for value,constant in (pair, pair[::-1])
+                 if value.key in axis_roots and constant.op is Ops.CONST and constant.dtype.scalar() is dtypes.int]
       if len(matches) != 1: return None
       (axis,extent),constant = matches[0]; coordinate = int(constant.arg)
       if candidate_coordinates[axis] is not None or not 0 <= coordinate < extent: return None
@@ -2747,7 +2760,7 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
     candidates[key] = loads[0]
 
   combinations:tuple[tuple[int, ...], ...] = ((),)
-  for _,_,extent in normalized: combinations = tuple(prefix+(value,) for prefix in combinations for value in range(extent))
+  for _,_,extent,_ in axes: combinations = tuple(prefix+(value,) for prefix in combinations for value in range(extent))
   if set(candidates) != set(combinations): return None
   candidate_loads = tuple(candidates[values] for values in combinations)
   params = tuple(_root_param(load.src[0]) for load in candidate_loads)
@@ -2768,8 +2781,9 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   if (any(not 0 <= offset < size for row,size in zip(offsets, index_counts) for offset in row) or
       any(not 0 <= offset < data_count for plan in plans for offset in _plan_offsets(plan))): return None
   indices = tuple((param.arg.slot, size, row) for param,size,row in zip(concrete_indices, index_counts, offsets))
-  coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(normalized)))
-  alternates = tuple((tuple(value-extent for value in axis),) for axis,(_,_,extent) in zip(coordinates, normalized))
+  coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(axes)))
+  alternates = tuple((tuple(value-extent for value in axis),) if wrapped else ()
+                     for axis,(_,_,extent,wrapped) in zip(coordinates, axes))
   return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
 def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:

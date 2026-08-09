@@ -3342,3 +3342,27 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Static stride anal
 it never reads the list/tuple buffers. Runtime moves opaque bytes and native INT16 DPU EW computes exact byte equality,
 bounds conjunction, weighted index reconstruction, FP16 selection, and reduction. There is no host fancy indexing,
 LUT, CMAC, tolerance change, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — tuple fancy indexing
+
+All six forward expressions from upstream `test_slice_fancy_indexing_tuple_indices` are now independent Rockchip
+methods. They cover nested static tuples, positive and negative leading tuples mixed with dynamic tensors, trailing
+tuples, column-shaped tuples, and tuple indices around an inserted `None` dimension.
+
+Five forms reused the static-list milestone unchanged. The final form lowers to a 3,400-node unrolled selector because
+Tinygrad materializes its tuples as external INT32 buffers. The strict unrolled matcher now recognizes direct
+positive-only axes only when equality predicates prove a complete contiguous coordinate domain and the complete
+Cartesian candidate product is present exactly once. Negative-normalized axes retain their signed alternatives.
+
+- Tuple-index group: **6/6 passed individually**, from **2.94 s** to **8.41 s** pytest time.
+- The original five-axis all-negative-normalized unrolled regression passes after the matcher extension.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. Rockchip collection: **441 tests**.
+- `sz.py`: renderer/runtime **3,724/307 executable lines**, total **29,086**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Direct tuple buffers remain opaque on host; compile-time
+IR predicates prove only their allowed coordinate domains. Native INT16 DPU EW performs exact byte equality,
+conjunction, FP16 selection, and reduction. There is no host tuple evaluation, LUT, CMAC, tolerance change, or floating
+input wider than FP16.
