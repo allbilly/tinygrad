@@ -430,13 +430,19 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBitwiseOps(unittest.TestCase):
-  """Exact INT32 and boolean bitwise operations through the native DPU integer EW pipeline."""
+  """Exact INT32 bitwise operations and shifts through the native DPU integer EW pipeline."""
 
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
   test_xor = _test_ops.TestOps.test_xor
   test_and = _test_ops.TestOps.test_and
   test_or = _test_ops.TestOps.test_or
   test_bitwise_not = _test_ops.TestOps.test_bitwise_not
   test_int_or = _test_ops.TestOps.test_int_or
+  test_lshift = _test_ops.TestOps.test_lshift
+  test_rshift = _test_ops.TestOps.test_rshift
+  test_lshift_signed = _test_ops.TestOps.test_lshift_signed
+  test_rshift_signed = _test_ops.TestOps.test_rshift_signed
+  test_idiv_shift_rewrite_negative = _test_ops.TestOps.test_idiv_shift_rewrite_negative
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

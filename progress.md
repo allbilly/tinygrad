@@ -4481,3 +4481,32 @@ The batch also measured `dim_inject_none` at 29.93 s. These profiles define a sh
 The CPU-cheat audit is unchanged: this milestone modifies only the selected test census and documentation. All promoted
 methods were executed directly from unchanged upstream bodies. There is no host result calculation, CPU fallback, LUT,
 CMAC, tolerance change, or Tinygrad-core change. The batch health check passed **60/60** vendor probes.
+
+---
+
+## 2026-08-10 — batched exact INT32 shifts
+
+One native INT16 barrel-shifter lowerer now covers the full upstream 32-bit shift family: signed and unsigned inputs,
+left and right shifts, scalar constants, and tensor shift counts. Four opaque input bytes are decomposed into exact
+0/1 INT16 bit planes. Five DPU stages conditionally shift by 1, 2, 4, 8, and 16 bits; arithmetic right shift replicates
+the original sign bit. Weighted INT16 row reductions reconstruct the four raw output bytes without FP16 integer
+encoding, CPU arithmetic, CMAC, or LUTs. The existing AND/OR/XOR lowerer now shares the byte decomposition helper.
+
+- Unchanged upstream batch: `test_lshift`, `test_rshift`, `test_lshift_signed`, `test_rshift_signed`, and
+  `test_idiv_shift_rewrite_negative` passed together, **5/5 in 3.85 s**.
+- The promoted upstream bitwise/shift class plus a backend-only all-count regression passed **11/11 in 6.15 s**.
+  The local regression checks every dynamic shift count from 0 through 31 on zero, signed limits, all-ones, and mixed
+  bit patterns for signed left/right and unsigned right shift.
+- Adjacent cases were classified in the same batch: `test_div_int` still needs general INT/FP cast and integer
+  division, while integer/dynamic POW requires a separate multiply/polynomial capability. Broadcast ADD/SUB/MUL/DIV
+  subtests pass; only POW remains unsupported. `test_isclose` reaches the existing FP16 tolerance boundary and `test_cast`
+  still lacks general INT32/boolean-to-FP output conversion.
+- Selected collection is now **342 upstream-only cases**; backend-only collection is **187**. The authoritative
+  upstream-name remainder falls from 107 to **102** after this five-method promotion.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the physical batch.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,264/331 executable lines**, total **30,650**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change and no input-value inspection. Initial and mid gathers only
+move raw bytes and compiler-known constants/offsets; all data-dependent bit extraction, conditional selection, sign
+extension, weighting, and reconstruction execute as native DPU INT16 EW tasks. No tolerance was changed.

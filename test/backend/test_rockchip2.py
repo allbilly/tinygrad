@@ -552,6 +552,17 @@ class TestRockchipBitwiseOps(_base.TestRockchipBitwiseOps):
                                     numpy_op(lhs.T, rhs.T))
     self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (3,284))
 
+  def test_shift_all_counts(self):
+    values = np.asarray([0, 1, -1, np.iinfo(np.int32).min, np.iinfo(np.int32).max, 0x12345678]*6, dtype=np.int32)[:32]
+    shifts = np.arange(32, dtype=np.int32)
+    signed, unsigned = Tensor(values), Tensor(values.view(np.uint32))
+    np.testing.assert_array_equal((signed << 2).numpy(), np.left_shift(values, 2))
+    np.testing.assert_array_equal((signed << Tensor(shifts)).numpy(), np.left_shift(values, shifts))
+    np.testing.assert_array_equal((signed >> Tensor(shifts)).numpy(), np.right_shift(values, shifts))
+    unsigned_shifts = shifts.view(np.uint32)
+    np.testing.assert_array_equal(((unsigned >> Tensor(unsigned_shifts)).cast(dtypes.int32)).numpy(),
+                                  np.right_shift(values.view(np.uint32), unsigned_shifts).view(np.int32))
+
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(_base.TestRockchipLogicalPredicateOps):

@@ -1442,6 +1442,23 @@ def _lower_bool_byte_logic(output:RKOutput) -> RKImage|None:
   return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(count)),)*3, gathers=gathers, ew_ops=ops,
                  post_gathers=(_int16_low_bytes(result, out_param.arg.slot, count),))
 
+def _int16_byte_bits(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
+                     value:RKArg, lanes:int) -> tuple[RKArg, ...]:
+  """Split unsigned byte lanes into eight exact native INT16 0/1 planes."""
+  integer = dict(int16_input=True, int16_output=True)
+  result:list[RKArg|None] = [None]*8
+  remainder = value
+  for bit in range(7, 0, -1):
+    delta, positive, flag, scaled, next_remainder = (allocate() for _ in range(5))
+    ops.extend((RKEWOp(delta, remainder, constants[(1<<bit)-1], lanes, _EW_CFG[Ops.SUB], **integer),
+                RKEWOp(positive, delta, constants[0], lanes, _EW_CFG[Ops.MAX], **integer),
+                RKEWOp(flag, positive, constants[1], lanes, _EW_CFG_MIN, **integer),
+                RKEWOp(scaled, flag, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **integer),
+                RKEWOp(next_remainder, remainder, scaled, lanes, _EW_CFG[Ops.SUB], **integer)))
+    result[bit], remainder = flag, next_remainder
+  result[0] = remainder
+  return typing_cast(tuple[RKArg, ...], tuple(result))
+
 def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
   """Evaluate exact INT32 AND/OR/XOR by decomposing opaque bytes into native INT16 bit lanes."""
   _, out_param, count, out_index, root = output
@@ -1479,20 +1496,8 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
                             dst_addend=slot.addend//2, itemsize=2))
   integer = dict(int16_input=True, int16_output=True)
   ops:list[RKEWOp] = []
-  def bits(value:RKArg) -> tuple[RKArg, ...]:
-    result:list[RKArg|None] = [None]*8
-    remainder = value
-    for bit in range(7, 0, -1):
-      delta, positive, flag, scaled, next_remainder = (allocate() for _ in range(5))
-      ops.extend((RKEWOp(delta, remainder, constants[(1<<bit)-1], lanes, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(positive, delta, constants[0], lanes, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(flag, positive, constants[1], lanes, _EW_CFG_MIN, **integer),
-                  RKEWOp(scaled, flag, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(next_remainder, remainder, scaled, lanes, _EW_CFG[Ops.SUB], **integer)))
-      result[bit], remainder = flag, next_remainder
-    result[0] = remainder
-    return typing_cast(tuple[RKArg, ...], tuple(result))
-  lhs, rhs = bits(values[0]), bits(values[1])
+  lhs, rhs = _int16_byte_bits(ops, allocate, constants, values[0], lanes), \
+             _int16_byte_bits(ops, allocate, constants, values[1], lanes)
   weighted:list[RKArg] = []
   for bit,(left,right) in enumerate(zip(lhs, rhs)):
     combined = allocate()
@@ -1505,6 +1510,124 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
   result = _reduce_rows(ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True)
   return RKImage(RKTarget.RK3588, (RKScratch(rows*vector_bytes),), gathers=tuple(gathers), ew_ops=tuple(ops),
                  post_gathers=(_int16_low_bytes(result, out_param.arg.slot, lanes),))
+
+def _lower_int32_shift(output:RKOutput) -> RKImage|None:
+  """Evaluate exact 32-bit shifts with a five-stage native INT16 barrel shifter."""
+  _, out_param, count, out_index, root = output
+  if root.op is Ops.CAST and root.dtype.scalar() is dtypes.int and len(root.src) == 1: root = root.src[0]
+  if root.op not in (Ops.SHL, Ops.SHR) or root.dtype.scalar() not in (dtypes.int, dtypes.uint) or len(root.src) != 2: return None
+  value, shift = root.src
+  dtype = root.dtype.scalar()
+  if (parsed_value:=_typed_load_offsets(value, dtype, out_index, count, allow_fill=True)) is None: return None
+  source, value_offsets = parsed_value
+  shift_spec:tuple[UOp, tuple[int, ...]]|int
+  if shift.op is Ops.CONST and shift.dtype.scalar() in (dtypes.int, dtypes.uint): shift_spec = int(shift.arg)&0xff
+  elif shift.dtype.scalar() in (dtypes.int, dtypes.uint) and \
+       (parsed_shift:=_typed_load_offsets(shift, shift.dtype.scalar(), out_index, count, allow_fill=True)) is not None:
+    shift_spec = parsed_shift
+  else: return None
+
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, 32)
+  pre_lanes = vector_lanes*5
+  if count < 1 or matrix_lanes > _MAX_EW_ELEMS_FP16: return None
+  pre_rows = 0
+  def pre_allocate() -> RKArg:
+    nonlocal pre_rows
+    value = RKArg(RKBufferKind.SCRATCH, 0, pre_rows*pre_lanes*2); pre_rows += 1
+    return value
+  raw = pre_allocate()
+  gathers:list[RKGather] = []
+  for byte in range(4):
+    gathers.append(RKGather(source.arg.slot, 0, count,
+      offsets=tuple(offset*4+byte if offset >= 0 else -1 for offset in value_offsets),
+      dst_stride=2, dst_addend=raw.addend+byte*vector_bytes, itemsize=1))
+  if isinstance(shift_spec, int):
+    gathers.append(RKGather(source.arg.slot, 0, count, values=(shift_spec,)*count,
+                           dst_addend=raw.addend//2+4*vector_lanes, itemsize=2))
+  else:
+    shift_source, shift_offsets = shift_spec
+    gathers.append(RKGather(shift_source.arg.slot, 0, count,
+      offsets=tuple(offset*4 if offset >= 0 else -1 for offset in shift_offsets),
+      dst_stride=2, dst_addend=raw.addend+4*vector_bytes, itemsize=1))
+  constants:dict[int, RKArg] = {}
+  for constant_value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128):
+    constants[constant_value] = slot = pre_allocate()
+    gathers.append(RKGather(source.arg.slot, 0, pre_lanes, values=(constant_value,)*pre_lanes,
+                            dst_addend=slot.addend//2, itemsize=2))
+  pre_ops:list[RKEWOp] = []
+  planes = _int16_byte_bits(pre_ops, pre_allocate, constants, raw, pre_lanes)
+
+  post_rows = 0
+  def post_allocate() -> RKArg:
+    nonlocal post_rows
+    value = RKArg(RKBufferKind.SCRATCH, 1, post_rows*matrix_lanes*2); post_rows += 1
+    return value
+  bits, masks, sign, zero, weights = post_allocate(), tuple(post_allocate() for _ in range(5)), \
+                                     post_allocate(), post_allocate(), post_allocate()
+  mid:list[RKGather] = []
+  for absolute_bit in range(32):
+    plane, byte = absolute_bit&7, absolute_bit>>3
+    mid.append(RKGather(planes[plane].index, bits.index, count,
+      base=planes[plane].addend//2+byte*vector_lanes, axes=((1, count, 1),),
+      dst_addend=bits.addend//2+absolute_bit*vector_lanes, src_kind=RKBufferKind.SCRATCH))
+  for bit,mask in enumerate(masks):
+    mid.append(RKGather(planes[bit].index, mask.index, matrix_lanes,
+      base=planes[bit].addend//2+4*vector_lanes, axes=((1, vector_lanes, 1),),
+      dst_addend=mask.addend//2, src_kind=RKBufferKind.SCRATCH))
+  mid.append(RKGather(planes[7].index, sign.index, matrix_lanes,
+    base=planes[7].addend//2+3*vector_lanes, axes=((1, vector_lanes, 1),),
+    dst_addend=sign.addend//2, src_kind=RKBufferKind.SCRATCH))
+  weight_values = tuple(1 << (row&7) if lane < count else 0 for row in range(32) for lane in range(vector_lanes))
+  mid.append(RKGather(source.arg.slot, weights.index, matrix_lanes, values=weight_values,
+                      dst_addend=weights.addend//2, dst_kind=RKBufferKind.SCRATCH))
+
+  integer = dict(int16_input=True, int16_output=True)
+  ops = list(pre_ops)
+  current = bits
+  for bit,amount in enumerate((1, 2, 4, 8, 16)):
+    temp, result = post_allocate(), post_allocate()
+    if root.op is Ops.SHL:
+      normal_rows, normal_dst, shifted_src = 32-amount, amount, 0
+      boundary_rows, boundary_dst = amount, 0
+    else:
+      normal_rows, normal_dst, shifted_src = 32-amount, 0, amount
+      boundary_rows, boundary_dst = amount, 32-amount
+    normal_count, normal_addend = normal_rows*vector_lanes, normal_dst*vector_bytes
+    ops.extend((RKEWOp(RKArg(temp.kind, temp.index, temp.addend+normal_addend),
+                          RKArg(current.kind, current.index, current.addend+shifted_src*vector_bytes),
+                          RKArg(current.kind, current.index, current.addend+normal_addend), normal_count, _EW_CFG[Ops.SUB], **integer),
+                RKEWOp(RKArg(temp.kind, temp.index, temp.addend+normal_addend),
+                          RKArg(temp.kind, temp.index, temp.addend+normal_addend),
+                          RKArg(masks[bit].kind, masks[bit].index, masks[bit].addend+normal_addend),
+                          normal_count, _EW_CFG[Ops.MUL], **integer),
+                RKEWOp(RKArg(result.kind, result.index, result.addend+normal_addend),
+                          RKArg(current.kind, current.index, current.addend+normal_addend),
+                          RKArg(temp.kind, temp.index, temp.addend+normal_addend), normal_count, _EW_CFG[Ops.ADD], **integer)))
+    boundary_addend = boundary_dst*vector_bytes
+    fill = sign if root.op is Ops.SHR and dtype is dtypes.int else zero
+    ops.extend((RKEWOp(RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
+                          RKArg(fill.kind, fill.index, fill.addend+boundary_addend),
+                          RKArg(current.kind, current.index, current.addend+boundary_addend),
+                          boundary_rows*vector_lanes, _EW_CFG[Ops.SUB], **integer),
+                RKEWOp(RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
+                          RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
+                          RKArg(masks[bit].kind, masks[bit].index, masks[bit].addend+boundary_addend),
+                          boundary_rows*vector_lanes, _EW_CFG[Ops.MUL], **integer),
+                RKEWOp(RKArg(result.kind, result.index, result.addend+boundary_addend),
+                          RKArg(current.kind, current.index, current.addend+boundary_addend),
+                          RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
+                          boundary_rows*vector_lanes, _EW_CFG[Ops.ADD], **integer)))
+    current = result
+  weighted = post_allocate()
+  ops.append(RKEWOp(weighted, current, weights, matrix_lanes, _EW_CFG[Ops.MUL], **integer))
+  byte_results = tuple(_reduce_rows(ops,
+    [RKArg(weighted.kind, weighted.index, weighted.addend+(byte*8+bit)*vector_bytes) for bit in range(8)],
+    vector_lanes, _EW_CFG[Ops.ADD], int16=True) for byte in range(4))
+  post = tuple(RKGather(result.index, out_param.arg.slot, count,
+    base=result.addend, axes=((1, count, 2),), dst_stride=4, dst_addend=byte,
+    dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1) for byte,result in enumerate(byte_results))
+  return RKImage(RKTarget.RK3588, (RKScratch(pre_rows*pre_lanes*2), RKScratch(post_rows*matrix_lanes*2)),
+                 gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid), gather_after=len(pre_ops), post_gathers=post)
 
 def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
   """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
@@ -5028,6 +5151,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (bounded_lookup:=_lower_bounded_int32_lookup(int_output)) is not None: return bounded_lookup
     if (byte_not:=_lower_bytewise_not(int_output, dtypes.int)) is not None: return byte_not
     if (byte_logic:=_lower_int32_byte_logic(int_output)) is not None: return byte_logic
+    if (shift:=_lower_int32_shift(int_output)) is not None: return shift
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (int16_prefix:=_lower_unrolled_integer_prefix_count(int_output, dtypes.int16)) is not None: return int16_prefix
     if (int32_prefix:=_lower_unrolled_integer_prefix_count(int_output)) is not None: return int32_prefix
