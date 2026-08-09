@@ -594,6 +594,17 @@ class TestRockchipIntegerDivisionOps(unittest.TestCase):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipIntegerProductOps(unittest.TestCase):
+  def test_signed_limits(self):
+    lhs = np.array([dtypes.int32.min, dtypes.int32.max, -65537, -46341, -256, -1, 0, 1, 255, 46341, 65537], dtype=np.int32)
+    rhs = np.array([-1, 2, 65537, 46341, -257, dtypes.int32.min, 9, -7, 257, 46341, 65537], dtype=np.int32)
+    before = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    got = (Tensor(lhs)*Tensor(rhs)).realize().numpy()
+    np.testing.assert_array_equal(got, (lhs.astype(np.int64)*rhs.astype(np.int64)).astype(np.int32))
+    self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (1, 1468))
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(_base.TestRockchipLogicalPredicateOps):
   def test_logical_and(self):
     _fp16_test_op(None, lambda x:(1 < x) & (x < 2), forward_only=True, vals=[[1.2, 1.2, 1.2, 3.2]])

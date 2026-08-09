@@ -4632,3 +4632,31 @@ Compilation handles only graph topology, static offsets, constants, and register
 all data-dependent sign detection, two's-complement conversion, comparison, subtraction, quotient/remainder formation,
 rounding, and reconstruction execute on native DPU EW. The command cache retains immutable command qwords only. No
 LUT, CMAC, tolerance relaxation, FP32 input emulation, or wider floating-point input was added.
+
+---
+
+## 2026-08-10 — exact native INT32 product and constant powers
+
+A base-16 limb multiplier now evaluates arbitrary elementwise INT32 MUL trees exactly modulo 2^32 on native INT16
+DPU EW. Each opaque input byte is split into two nibbles; schoolbook partial products stay below 256, and exact nibble
+carry propagation keeps every intermediate within signed INT16 range. Common subexpressions are retained while walking
+Tinygrad's exponentiation-by-squaring MUL graph. The older `rockchip-2607` implementation was deliberately not ported:
+its `_try_int_power_host_subtasks` delegated the arithmetic to a typed host task, and its disabled native experiment
+documented high-word corruption from direct INT32 MUL.
+
+- Full unchanged upstream `test_int_pow_const_int` and a backend-only full-range product regression pass together:
+  **2/2 in 4.03 s**. The upstream method covers powers 0, 1, 2, 7, and 29 plus the required negative-exponent error.
+- Arbitrary two-input multiplication passes signed limits and **127 random full-range INT32 pairs** exactly. It uses
+  **1 ioctl / 1,468 DPU tasks** independent of vector length; the repeated-square power paths use 1,364 tasks for
+  exponent 2, 5,120 for exponent 7, and 8,876 for exponent 29.
+- `test_rockchip.py` collects **352 upstream-only cases** representing **329 unique upstream method names**;
+  `test_rockchip2.py` collects **193 backend-only cases**. The authoritative unselected remainder falls from 93 to
+  **92 of 421**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing. Repository-wide Tinygrad
+  mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,206/352 executable lines**, total **31,613**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core modification and no tensor-value inspection. Gathers move opaque
+bytes and compiler-known constants; nibble extraction, partial products, carries, overflow truncation, and output
+reconstruction all execute as native INT16 DPU stages. There is no host result calculation, CPU fallback, LUT, CMAC,
+tolerance change, FP32 input emulation, or wider floating-point input.

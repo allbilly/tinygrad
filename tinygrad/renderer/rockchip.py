@@ -1458,6 +1458,103 @@ def _lower_int32_byte_add(output:RKOutput) -> RKImage|None:
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers),
                  ew_ops=tuple(ops), post_gathers=post)
 
+def _lower_int32_byte_product(output:RKOutput) -> RKImage|None:
+  """Multiply arbitrary INT32 elementwise trees exactly modulo 2**32 with base-16 native INT16 limbs."""
+  _, out_param, count, out_index, root = output
+  if root.op is not Ops.MUL or root.dtype.scalar() is not dtypes.int or not 1 <= count <= _MAX_EW_ELEMS_FP16: return None
+  dynamic = [u for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int]
+  parsed_dynamic = [_typed_load_offsets(u, dtypes.int, out_index, count, allow_fill=True) for u in dynamic]
+  if not dynamic or any(x is None for x in parsed_dynamic): return None
+  constant_source = typing_cast(tuple[UOp, tuple[int, ...]], parsed_dynamic[0])[0].arg.slot
+
+  stride, rows = _reduction_stride(count), 0
+  def allocate() -> RKArg:
+    nonlocal rows
+    value = RKArg(RKBufferKind.SCRATCH, 0, rows*stride); rows += 1
+    return value
+  gathers:list[RKGather] = []
+  constants:dict[int, RKArg] = {}
+  for constant_value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128):
+    constants[constant_value] = dst = allocate()
+    gathers.append(RKGather(constant_source, 0, count, values=(constant_value,)*count,
+                            dst_addend=dst.addend//2, itemsize=2))
+  integer = dict(int16_input=True, int16_output=True)
+  ops:list[RKEWOp] = []
+
+  def split_nibbles(value:RKArg) -> tuple[RKArg, RKArg]:
+    """Return exact low and high nibbles for a value known to be in [0, 255]."""
+    remainder, weighted = value, []
+    for bit in range(7, 3, -1):
+      delta, positive, flag, scaled, next_remainder = (allocate() for _ in range(5))
+      ops.extend((RKEWOp(delta, remainder, constants[(1<<bit)-1], count, _EW_CFG[Ops.SUB], **integer),
+                  RKEWOp(positive, delta, constants[0], count, _EW_CFG[Ops.MAX], **integer),
+                  RKEWOp(flag, positive, constants[1], count, _EW_CFG_MIN, **integer),
+                  RKEWOp(scaled, flag, constants[1<<bit], count, _EW_CFG[Ops.MUL], **integer),
+                  RKEWOp(next_remainder, remainder, scaled, count, _EW_CFG[Ops.SUB], **integer)))
+      remainder = next_remainder
+      if bit == 4: weighted.append(flag)
+      else:
+        weight = allocate()
+        ops.append(RKEWOp(weight, flag, constants[1<<(bit-4)], count, _EW_CFG[Ops.MUL], **integer)); weighted.append(weight)
+    return remainder, _reduce_rows(ops, weighted, count, _EW_CFG[Ops.ADD], int16=True)
+
+  raw_cache:dict[UOp, tuple[RKArg, ...]] = {}
+  nibble_cache:dict[UOp, tuple[RKArg, ...]] = {}
+  def raw_value(node:UOp) -> tuple[RKArg, ...]:
+    if node in raw_cache: return raw_cache[node]
+    raw = tuple(allocate() for _ in range(4))
+    if node.op is Ops.CONST and node.dtype.scalar() is dtypes.int:
+      value = int(node.arg)&0xffffffff
+      for byte,dst in enumerate(raw):
+        gathers.append(RKGather(constant_source, 0, count, values=((value>>(byte*8))&0xff,)*count,
+                                dst_addend=dst.addend//2, itemsize=2))
+    elif (parsed:=_typed_load_offsets(node, dtypes.int, out_index, count, allow_fill=True)) is not None:
+      param,offsets = parsed
+      for byte,dst in enumerate(raw):
+        gathers.append(RKGather(param.arg.slot, 0, count,
+          offsets=tuple(offset*4+byte if offset >= 0 else -1 for offset in offsets), dst_stride=2,
+          dst_addend=dst.addend, itemsize=1))
+    else: raise ValueError
+    raw_cache[node] = raw
+    return raw
+
+  def nibbles(node:UOp) -> tuple[RKArg, ...]:
+    if node in nibble_cache: return nibble_cache[node]
+    if node.op is Ops.MUL and node.dtype.scalar() is dtypes.int and len(node.src) == 2:
+      value = multiply(nibbles(node.src[0]), nibbles(node.src[1]))
+    else:
+      value = tuple(limb for byte in raw_value(node) for limb in split_nibbles(byte))
+    nibble_cache[node] = value
+    return value
+
+  def multiply(lhs:tuple[RKArg, ...], rhs:tuple[RKArg, ...]) -> tuple[RKArg, ...]:
+    if len(lhs) != 8 or len(rhs) != 8: raise ValueError
+    carry, result = constants[0], []
+    for position in range(8):
+      digit, next_carry = split_nibbles(carry)
+      for left,right in zip(lhs[:position+1], reversed(rhs[:position+1])):
+        product, total = allocate(), allocate()
+        ops.extend((RKEWOp(product, left, right, count, _EW_CFG[Ops.MUL], **integer),
+                    RKEWOp(total, digit, product, count, _EW_CFG[Ops.ADD], **integer)))
+        digit, increment = split_nibbles(total)
+        updated = allocate(); ops.append(RKEWOp(updated, next_carry, increment, count, _EW_CFG[Ops.ADD], **integer))
+        next_carry = updated
+      result.append(digit); carry = next_carry
+    return tuple(result)
+
+  try: limbs = nibbles(root)
+  except ValueError: return None
+  result = []
+  for low,high in zip(limbs[::2], limbs[1::2]):
+    scaled, byte = allocate(), allocate()
+    ops.extend((RKEWOp(scaled, high, constants[16], count, _EW_CFG[Ops.MUL], **integer),
+                RKEWOp(byte, low, scaled, count, _EW_CFG[Ops.ADD], **integer)))
+    result.append(byte)
+  post = tuple(RKGather(value.index, out_param.arg.slot, count,
+    offsets=tuple(value.addend+lane*2 for lane in range(count)), dst_stride=4, dst_addend=byte,
+    dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1) for byte,value in enumerate(result))
+  return RKImage(RKTarget.RK3588, (RKScratch(rows*stride),), gathers=tuple(gathers), ew_ops=tuple(ops), post_gathers=post)
+
 def _int32_division_root(root:UOp) -> tuple[str, UOp, UOp]|None:
   """Recognize truncating quotient/remainder and Tinygrad's canonical floor corrections."""
   if root.op is Ops.CDIV and root.dtype.scalar() is dtypes.int: return "trunc", root.src[0], root.src[1]
@@ -6047,6 +6144,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (byte_not:=_lower_bytewise_not(int_output, dtypes.int)) is not None: return byte_not
     if (byte_logic:=_lower_int32_byte_logic(int_output)) is not None: return byte_logic
     if (shift:=_lower_int32_shift(int_output)) is not None: return shift
+    if (byte_product:=_lower_int32_byte_product(int_output)) is not None: return byte_product
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (division:=_lower_int32_division(int_output)) is not None: return division
     if (int16_prefix:=_lower_unrolled_integer_prefix_count(int_output, dtypes.int16)) is not None: return int16_prefix

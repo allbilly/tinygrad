@@ -316,6 +316,9 @@ class TestRockchipPolynomialLossOps(unittest.TestCase):
 class TestRockchipIntegerPowerOps(unittest.TestCase):
   """Constant integer powers composed from FP16 DPU EW multiplication and division."""
 
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+  test_int_pow_const_int = _test_ops.TestOps.test_int_pow_const_int
+
   def test_pow(self):
     before = Device["ROCKCHIP"].submit_count
     for exponent in (0, 1, 2, 3, -2):
