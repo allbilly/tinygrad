@@ -1096,6 +1096,13 @@ def _lower_raw_int32_layout(output:RKOutput) -> RKImage|None:
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 
+def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
+  """Truncate a direct FP16 load on DPU before the terminal INT32 conversion."""
+  root = output[4]
+  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.int or len(root.src) != 1 or
+      root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
+  return _typed_int_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)))
+
 def _int16_byte_sum(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[int], int], source_slot:int,
                     operands:tuple[tuple[RKArg, ...], ...], count:int) -> tuple[RKArg, ...]:
   """Add four-byte operands exactly modulo 2**32 with native INT16 byte carries."""
@@ -4444,6 +4451,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
   if int_output is not None and not any(u.op is Ops.REDUCE for u in uops):
     if (linear_index:=_lower_normalized_linear_index(int_output)) is not None: return linear_index
+    if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
     if (bounded_lookup:=_lower_bounded_int32_lookup(int_output)) is not None: return bounded_lookup
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (int32_prefix:=_lower_unrolled_int32_prefix_count(int_output)) is not None: return int32_prefix

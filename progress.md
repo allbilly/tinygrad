@@ -3621,3 +3621,29 @@ index expressions, constants, bounds, and candidate coordinate tables. Runtime g
 All input-dependent FP16 predicates, dynamic counts/prefixes, INT32 byte carries/equality, histogram reductions,
 coordinate selection, and INT32 writeback execute on DPU EW. There is no host numeric fallback, LUT, CMAC, tolerance
 change, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — truncating FP16-to-INT32 cast on DPU
+
+The FP16-input `.int()` portion of upstream `TestOps.test_cast` now passes exactly. A direct use of the existing DPU
+FP16-to-INT32 converter was tested first and rejected: it rounds to nearest, producing `1` for positive fractions where
+Tinygrad/PyTorch require truncation toward zero. The final implementation reuses the already hardware-tested
+`_fold_trunc` composition, `floor(max(x,0)) + ceil(min(x,0))`, then routes the FP16 integer through the shared terminal
+INT32 conversion arena. This also avoids multiplying sign masks by infinities.
+
+Historical commit `815003d78` was inspected but not ported because its Rockchip runtime performs the numeric conversion
+with NumPy `.astype(np.int32)`. Searches under `~/npu` and `~/rk3588` found conversion/truncation register fields but no
+separate proven FP16-to-INT32 cast sequence. Reusing the current native FLOOR/CEIL and typed-output emitters is smaller
+and keeps the hardware/host boundary consistent with the other Tinygrad backends.
+
+- Upstream random `(3,3)` FP16-to-INT32 cast plus explicit positive/negative fractions: **1 passed in 3.24 s**.
+- Complete focused Cast class: **2 passed in 3.77 s**; the two INT32 cases use **4 ioctls / 20 DPU tasks** total.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the cast runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **460 tests**.
+- `sz.py`: renderer/runtime **4,615/325 executable lines**, total **29,995**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The renderer only recognizes a direct FP16 load and builds
+the native FLOOR/CEIL UOp composition. Fractional truncation and terminal INT32 conversion execute on DPU EW; runtime
+only submits the existing typed stages and copies opaque output bytes. There is no NumPy numeric conversion, host tensor
+inspection, LUT, CMAC, tolerance change, or external floating input wider than FP16.

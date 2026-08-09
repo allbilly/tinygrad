@@ -1222,13 +1222,19 @@ class TestRockchipSignOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCastOps(unittest.TestCase):
-  """Direct FP16-to-bool conversion through native ABS and DPU positive-mask stages."""
+  """Direct FP16-to-bool and truncating FP16-to-INT32 conversion through DPU EW."""
 
   def test_cast_bool(self):
     before = Device["ROCKCHIP"].submit_count
     _fp16_test_op([(3,3)], lambda x:x.bool(), forward_only=True)
     _fp16_test_op(None, lambda x:x.bool(), vals=[[-2., -0., 0., 1., math.inf, -math.inf, math.nan]], forward_only=True)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 6)
+
+  def test_cast_int(self):
+    before = Device["ROCKCHIP"].submit_count
+    _fp16_test_op([(3,3)], lambda x:x.int(), forward_only=True)
+    _fp16_test_op(None, lambda x:x.int(), vals=[[-2.9, -2.5, -1.9, -0.9, -0., 0., 0.9, 1.9, 2.5, 2.9]], forward_only=True)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBitcastOps(unittest.TestCase):
