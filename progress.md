@@ -4722,3 +4722,38 @@ The CPU-cheat audit found no Tinygrad-core or runtime change and no tensor-value
 static shape predicates, offsets, and source constants; runtime gathers opaque bytes. External index equality,
 last-wins masking, reduction, base preservation, and output selection all execute on native INT16 DPU EW. There is no
 host result calculation, LUT, CMAC, tolerance relaxation, FP32 input emulation, or wider floating-point input.
+
+---
+
+## 2026-08-10 — batched DPU square root and standard deviation
+
+Seven unchanged upstream methods now run without LUTs: `test_sqrt`, `test_rsqrt`, `test_std`, `test_std_axis`,
+`test_std_one_in_axis`, `test_std_keepdim`, and `test_std_mean`. A shared 14-step Babylonian construction uses only
+FP16 DPU MAX, SUB, FDIV, ADD, and MUL. It clamps only the iteration input and finishes as `x / estimate`, preserving
+zero, infinity, NaN, and negative-domain behavior without FP32 input emulation.
+
+`std_mean` is handled as one combined image. Tinygrad's axis form exposes an internal FP32 sum buffer, which cannot be
+fed back through the FP16-only EW input path, so the image gathers the original FP16 data into two arenas and computes
+mean plus centered variance directly on DPU. Mean remains in scratch and an opaque post-gather writes the unaligned
+second half of the stacked output. No host arithmetic is involved.
+
+The first combined matcher accidentally followed RANGE control dependencies and attempted to enumerate
+`13,125 × 13,125 × 2` environments. A value-only range parser reduced the matcher to **0.228 s** for the largest shape;
+the complete upstream `test_std_mean` passes in **13.70 s**. The full sqrt/std/variance regression batch passes
+**14/14 in 37.35 s**; the slowest individual methods were `test_std_mean` at 9.59 s, `test_var` at 7.71 s, and
+`test_std` at 7.26 s. Two backend-only edge regressions cover non-finite sqrt/rsqrt and a deterministic FP16-only
+std/mean pipeline.
+
+- `test_rockchip.py`: **362 upstream-only cases**, representing **339 unique upstream methods**.
+- `test_rockchip2.py`: **197 backend-only cases**. Combined collection is **559**.
+- Authoritative upstream-name remainder: **82 of 421**. Of these, 78 are transcendental-dependent families; the other
+  four are two backward-only comparisons, the FP32-input scatter-product-zero fixture, and the known pre-renderer
+  `masked_select` runaway.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the physical batch.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,485/352 executable lines**, total **31,892**.
+
+The CPU-cheat audit found no Tinygrad-core or runtime change and no tensor-value inspection. Compilation handles only
+static graph topology, shapes, offsets, and constants. Runtime gathers copy opaque FP16 representations; every mean,
+center, square, reduction, division, and square-root iteration executes on DPU EW. There is no CPU fallback, LUT, CMAC,
+tolerance relaxation beyond the established `test_gemm_fp16` tolerance, or external FP32 input.

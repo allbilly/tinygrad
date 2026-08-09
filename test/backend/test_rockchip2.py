@@ -1016,6 +1016,21 @@ class TestRockchipPaddingOps(_base.TestRockchipPaddingOps):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipSqrtOps(_base.TestRockchipSqrtOps):
+  def test_sqrt_nonfinite(self):
+    values = np.array([-4.0, 0.0, 2**-14, 0.25, 2.0, 65504.0, math.inf, math.nan], dtype=np.float16)
+    with np.errstate(invalid="ignore", divide="ignore"):
+      np.testing.assert_allclose(Tensor(values).sqrt().numpy(), np.sqrt(values), equal_nan=True, **_FP16)
+      np.testing.assert_allclose(Tensor(values).rsqrt().numpy(), 1/np.sqrt(values), equal_nan=True, **_FP16)
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipReductionOps(_base.TestRockchipReductionOps):
+  def test_std_mean_fp16_input_only(self):
+    values = np.arange(12, dtype=np.float16).reshape(3, 4)
+    got = Tensor.stack(*Tensor(values).std_mean()).numpy()
+    expected = np.array([values.astype(np.float32).std(ddof=1), values.astype(np.float32).mean()], dtype=np.float16)
+    np.testing.assert_allclose(got, expected, **_FP16)
+
   def test_non_fp16_reductions(self):
     self.skipTest("Rockchip DPU accepts FP16 tensors only; FP32 dtype, boolean, and integer reductions are excluded")

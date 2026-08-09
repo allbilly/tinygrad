@@ -327,6 +327,20 @@ class TestRockchipPolynomialLossOps(unittest.TestCase):
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipSqrtOps(unittest.TestCase):
+  """FP16 square roots evaluated by shared DPU EW arithmetic."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_sqrt = _test_ops.TestOps.test_sqrt
+  test_rsqrt = _test_ops.TestOps.test_rsqrt
+
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIntegerPowerOps(unittest.TestCase):
   """Constant integer powers composed from FP16 DPU EW multiplication and division."""
 
@@ -1148,6 +1162,11 @@ class TestRockchipReductionOps(unittest.TestCase):
   test_var_zero_in_axis = _test_ops.TestOps.test_var_zero_in_axis
   test_var_one_in_axis = _test_ops.TestOps.test_var_one_in_axis
   test_var_keepdim = _test_ops.TestOps.test_var_keepdim
+  test_std = _test_ops.TestOps.test_std
+  test_std_axis = _test_ops.TestOps.test_std_axis
+  test_std_one_in_axis = _test_ops.TestOps.test_std_one_in_axis
+  test_std_keepdim = _test_ops.TestOps.test_std_keepdim
+  test_std_mean = _test_ops.TestOps.test_std_mean
   test_std_mean_loaded_nan = _test_ops.TestOps.test_std_mean_loaded_nan
   test_std_zero_in_axis = _test_ops.TestOps.test_std_zero_in_axis
 

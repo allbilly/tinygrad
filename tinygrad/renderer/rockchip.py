@@ -469,6 +469,7 @@ def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[in
 @dataclass(frozen=True)
 class RKLoopReduction:
   store:UOp; out:UOp; nodes:list[UOp]; rows:int; envs:list[dict[UOp, int]]; reduce_range:UOp; groups:int; update:UOp; post_scale:float
+  post_sqrt:bool = False
 
 def _local_add_loop(uops:list[UOp], out_index:UOp) -> tuple[UOp, int, UOp, list[UOp]]|None:
   """Parse one initialized local accumulator updated by `acc + term` over a constant range."""
@@ -505,11 +506,13 @@ def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
   rows, envs, reduce_range, groups = shape
   updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
   if len(updates) != 1: return None
-  if _local_load(root) is not None: post_scale = 1.0
-  elif root.op is Ops.MUL and (load:=next((x for x in root.src if _local_load(x) is not None), None)) is not None and \
-       (scale:=root.src[1 if root.src[0] is load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
+  post_sqrt = root.op is Ops.SQRT and len(root.src) == 1
+  value = root.src[0] if post_sqrt else root
+  if _local_load(value) is not None: post_scale = 1.0
+  elif value.op is Ops.MUL and (load:=next((x for x in value.src if _local_load(x) is not None), None)) is not None and \
+       (scale:=value.src[1 if value.src[0] is load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
   else: return None
-  return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale)
+  return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale, post_sqrt)
 
 def _spaced_reduction_gathers(src_slot:int, dst_slot:int, rows:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...],
                                stride:int|None=None, fill_bits:int=0) -> tuple[RKGather, ...]:
@@ -852,13 +855,116 @@ def _lower_centered_square_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   if (int(data_param.src[0].arg) != rows*groups or sorted(offset for block in data_blocks for offset in block) != list(range(rows*groups)) or
       center_offsets != tuple(range(rows)) or int(center_param.src[0].arg) != rows): return None
 
-  constants = () if post_scale == 1.0 else (post_scale,)
+  constants = () if post_scale == 1.0 else ((0.0,) if math.isinf(post_scale) else (post_scale,))
   center_arg = RKArg(RKBufferKind.ARG, center_param.arg.slot)
   def prepare(ops:list[RKEWOp], value:RKArg, _:dict[float, int]) -> None:
     ops.append(RKEWOp(value, value, center_arg, rows, _EW_CFG[Ops.SUB], stateful=not ops))
     ops.append(RKEWOp(value, value, value, rows, _EW_CFG[Ops.MUL]))
   return _reduction_image(out_param.arg.slot, rows, data_param.arg.slot, data_blocks, constants,
-                          _EW_CFG[Ops.ADD], fp32_out, post_scale, prepare)
+                          _EW_CFG[Ops.ADD], fp32_out, post_scale, prepare, loop.post_sqrt and not math.isinf(post_scale))
+
+def _lower_std_mean_pair(uops:list[UOp]) -> RKImage|None:
+  """Lower stacked `(std, mean)` by recomputing both from the original FP16 data on DPU."""
+  if (output:=_output_store(uops, dtypes.half, allow_local=True, reject_reduce=False)) is None: return None
+  _, out_param, count, out_index, root = output
+  root = _strip_cast(root)
+  if root.op is not Ops.WHERE or count < 2 or count % 2: return None
+
+  def value_ranges(u:UOp) -> list[UOp]:
+    """Ranges used as values, excluding END/AFTER control dependencies attached to them."""
+    ret:list[UOp] = []
+    def walk(x:UOp) -> None:
+      if x.op in (Ops.RANGE, Ops.SPECIAL):
+        if x not in ret: ret.append(x)
+      else:
+        for y in x.src: walk(y)
+    walk(u)
+    return ret
+
+  def range_envs(ranges:list[UOp]) -> list[dict[UOp, int]]:
+    """Enumerate only the selected value ranges, not their loop-order control dependencies."""
+    envs:list[dict[UOp, int]] = [{}]
+    for r in ranges:
+      if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
+      envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
+    return envs
+
+  condition = _strip_cast(root.src[0])
+  if condition.op is not Ops.CMPNE: return None
+  stack_range = next((x for x in condition.src if x.op is Ops.RANGE and x.src[0].op is Ops.CONST and int(x.src[0].arg) == 2), None)
+  zero = next((x for x in condition.src if x.op is Ops.CONST and int(x.arg) == 0), None)
+  if stack_range is None or zero is None: return None
+  rows = count//2
+  std_expr = _strip_cast(root.src[2])
+  if std_expr.op is not Ops.SQRT or len(std_expr.src) != 1: return None
+
+  row_ranges = [r for r in value_ranges(out_index) if r is not stack_range]
+  try:
+    envs = range_envs(row_ranges)
+    if (len(envs) != rows or tuple(_eval_int(out_index, {**env, stack_range:0}) for env in envs) != tuple(range(rows)) or
+        tuple(_eval_int(out_index, {**env, stack_range:1}) for env in envs) != tuple(range(rows, count))): return None
+  except RuntimeError: return None
+
+  def local_buffer(u:UOp) -> UOp|None:
+    u = _strip_cast(u)
+    if u.op in (Ops.LOAD, Ops.STORE): u = u.src[0]
+    if u.op is Ops.INDEX: u = u.src[0]
+    while u.op is Ops.AFTER: u = u.src[0]
+    return u if u.op is Ops.BUFFER else None
+
+  def scaled_sum(expr:UOp) -> tuple[tuple[UOp, ...], list[dict[UOp, int]], float]|None:
+    expr = _strip_cast(expr)
+    if expr.op is not Ops.MUL: return None
+    for reduced,scale in (expr.src, expr.src[::-1]):
+      reduced, scale = _strip_cast(reduced), _strip_cast(scale)
+      if scale.op is not Ops.CONST: continue
+      if reduced.op is Ops.REDUCE and reduced.arg[0] is Ops.ADD:
+        try: return (reduced.src[0],), range_envs(list(reduced.src[1:])), float(scale.arg)
+        except RuntimeError: return None
+      if (load:=_local_load(reduced)) is not None and (buffer:=local_buffer(load)) is not None:
+        for store in uops:
+          update = _strip_cast(store.src[1]) if store.op is Ops.STORE and local_buffer(store) is buffer else None
+          if update is None or update.op is not Ops.ADD: continue
+          acc = next((x for x in update.src if _local_load(x) is not None and local_buffer(x) is buffer), None)
+          if acc is None: continue
+          term = update.src[1 if update.src[0] is acc else 0]
+          reduce_ranges = [r for r in value_ranges(term) if r not in row_ranges and r is not stack_range]
+          if len(reduce_ranges) != 1: continue
+          try: return (term,), range_envs(reduce_ranges), float(scale.arg)
+          except RuntimeError: return None
+      if reduced.op is Ops.ADD:
+        return tuple(_flatten_binary(reduced, Ops.ADD)), [{}], float(scale.arg)
+    return None
+  if (variance:=scaled_sum(std_expr.src[0])) is None: return None
+  variance_terms, variance_envs, variance_scale = variance
+
+  def centered_data(term:UOp) -> tuple[UOp, UOp]|None:
+    square = _strip_cast(term)
+    if square.op is not Ops.MUL or square.src[0].key != square.src[1].key: return None
+    delta = _strip_cast(square.src[0])
+    if delta.op is not Ops.ADD: return None
+    direct = next((_strip_cast(x) for x in delta.src if _strip_cast(x).op is Ops.LOAD), None)
+    negated = next((_strip_cast(x) for x in delta.src if _strip_cast(x).op is Ops.MUL), None)
+    if direct is None or negated is None: return None
+    coefficient = next((x for x in negated.src if x.op is Ops.CONST), None)
+    center = next((_strip_cast(x) for x in negated.src if x is not coefficient), None)
+    return None if center is None or coefficient is None or float(coefficient.arg) != -1.0 else (direct, center)
+
+  parsed_variance = [centered_data(term) for term in variance_terms]
+  if any(x is None for x in parsed_variance): return None
+  first = next(x for x in parsed_variance if x is not None)
+  data_param, center_key = _root_param(first[0].src[0]), first[1].key
+  if (data_param is None or data_param.dtype.scalar() is not dtypes.half or data_param.src[0].op is not Ops.CONST or
+      not any(u.op is Ops.LOAD for u in first[1].toposort())): return None
+  try:
+    blocks = tuple(tuple(_eval_int(loads[0].src[0].src[1], {**row, **red}) for row in envs)
+                   for loads in parsed_variance if loads is not None for red in variance_envs)
+  except RuntimeError: return None
+  groups, data_count = len(blocks), int(data_param.src[0].arg)
+  if (groups < 2 or not math.isfinite(variance_scale) or variance_scale <= 0 or rows*groups != data_count or
+      sorted(offset for block in blocks for offset in block) != list(range(data_count)) or
+      any(loads is None or _root_param(loads[0].src[0]) is not data_param or loads[1].key != center_key for loads in parsed_variance)): return None
+  return _std_mean_image(out_param.arg.slot, rows, data_param.arg.slot, blocks, variance_scale)
 
 def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Turn a compact scalar register reduction into balanced FP16 DPU EW stages."""
@@ -1122,25 +1228,90 @@ def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:
     active = reduced
   return out if out is not None else arena(active[0])
 
+def _append_dpu_sqrt_ops(ops:list[RKEWOp], source:RKArg, out:RKArg, count:int, slots:dict[float, int],
+                         scratch:Callable[[], RKArg]) -> None:
+  """Append a nonnegative Babylonian sqrt after variance reduction."""
+  def const(value:float) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slots[value])
+  zero, one, maximum, minimum, half = (const(value) for value in (0.0, 1.0, 65504.0, 2**-24, 0.5))
+  first = True
+  def emit(dst:RKArg, lhs:RKArg, rhs:RKArg, cfg:int) -> None:
+    nonlocal first
+    ops.append(RKEWOp(dst, lhs, rhs, count, cfg, submit_barrier=first, stateful=True)); first = False
+  lower = scratch(); emit(lower, source, minimum, _EW_CFG[Ops.MAX])
+  neg_lower, neg_maximum, neg_max = scratch(), scratch(), scratch()
+  emit(neg_lower, zero, lower, _EW_CFG[Ops.SUB]); emit(neg_maximum, zero, maximum, _EW_CFG[Ops.SUB])
+  emit(neg_max, neg_lower, neg_maximum, _EW_CFG[Ops.MAX]); emit(lower, zero, neg_max, _EW_CFG[Ops.SUB])
+  estimate, quotient, summed = scratch(), scratch(), scratch()
+  emit(estimate, lower, one, _EW_CFG[Ops.MAX])
+  for _ in range(14):
+    emit(quotient, lower, estimate, _EW_CFG[Ops.FDIV]); emit(summed, estimate, quotient, _EW_CFG[Ops.ADD])
+    emit(estimate, summed, half, _EW_CFG[Ops.MUL])
+  emit(out, source, estimate, _EW_CFG[Ops.FDIV])
+
 def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...],
                      constants:tuple[float, ...], cfg:int, fp32_out:bool, post_scale:float,
-                     prepare:Callable[[list[RKEWOp], RKArg, dict[float, int]], None]|None=None) -> RKImage:
+                     prepare:Callable[[list[RKEWOp], RKArg, dict[float, int]], None]|None=None, post_sqrt:bool=False) -> RKImage:
   """Materialize row blocks, apply an optional lane transform, reduce them, and write the typed result."""
+  if post_sqrt: constants = tuple(dict.fromkeys((*constants, 0.0, 1.0, 65504.0, 2**-24, 0.5)))
   const_slots, data_slot = {value:i for i,value in enumerate(constants)}, len(constants)
   stride = _reduction_stride(rows)
   gathers = _spaced_reduction_gathers(source_slot, data_slot, rows, blocks, stride)
   def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, data_slot, offset)
+  extra:list[RKScratch] = []
+  def scratch() -> RKArg:
+    extra.append(RKScratch(rows*2)); return RKArg(RKBufferKind.SCRATCH, data_slot+len(extra))
   ops:list[RKEWOp] = []
   active = [i*stride for i in range(len(blocks))]
   if prepare is not None:
     for offset in active: prepare(ops, arena(offset), const_slots)
   out = RKArg(RKBufferKind.ARG, out_slot)
-  reduced = _reduce_arena(ops, active, rows, cfg, arena, out if post_scale == 1.0 else None, fp32_out)
+  reduced = _reduce_arena(ops, active, rows, cfg, arena, out if post_scale == 1.0 and not post_sqrt else None, fp32_out)
   if post_scale != 1.0:
-    ops.append(RKEWOp(out, reduced, RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), rows,
-                      _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
-  scratch = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(len(blocks)*stride),)
-  return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=gathers, ew_ops=tuple(ops))
+    scaled = scratch() if post_sqrt else out
+    scale_value, scale_cfg = (0.0, _EW_CFG[Ops.FDIV]) if math.isinf(post_scale) else (post_scale, _EW_CFG[Ops.MUL])
+    ops.append(RKEWOp(scaled, reduced, RKArg(RKBufferKind.SCRATCH, const_slots[scale_value]), rows,
+                      scale_cfg | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
+    reduced = scaled
+  if post_sqrt: _append_dpu_sqrt_ops(ops, reduced, out, rows, const_slots, scratch)
+  scratch_buffers = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(len(blocks)*stride), *extra)
+  return RKImage(RKTarget.RK3588, scratch_buffers, b"".join(struct.pack("<e", value) for value in constants),
+                 gathers=gathers, ew_ops=tuple(ops))
+
+def _std_mean_image(out_slot:int, rows:int, source_slot:int, blocks:tuple[tuple[int, ...], ...], variance_scale:float) -> RKImage:
+  """Compute a stacked FP16 `(std, mean)` without reading Tinygrad's internal FP32 mean buffer."""
+  groups, stride = len(blocks), _reduction_stride(rows)
+  constants = tuple(dict.fromkeys((1.0/groups, variance_scale, 0.0, 1.0, 65504.0, 2**-24, 0.5)))
+  slots = {value:i for i,value in enumerate(constants)}
+  mean_slot, variance_slot = len(constants), len(constants)+1
+  gathers = (*_spaced_reduction_gathers(source_slot, mean_slot, rows, blocks, stride),
+             *_spaced_reduction_gathers(source_slot, variance_slot, rows, blocks, stride))
+  def arena(slot:int, offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, offset)
+  extra:list[RKScratch] = []
+  def scratch() -> RKArg:
+    extra.append(RKScratch(rows*2)); return RKArg(RKBufferKind.SCRATCH, variance_slot+len(extra))
+
+  ops:list[RKEWOp] = []
+  active = [i*stride for i in range(groups)]
+  mean_sum = _reduce_arena(ops, active, rows, _EW_CFG[Ops.ADD], lambda offset:arena(mean_slot, offset))
+  if ops: ops[0] = replace(ops[0], stateful=True)
+  mean = scratch()
+  ops.append(RKEWOp(mean, mean_sum, arena(slots[1.0/groups]), rows, _EW_CFG[Ops.MUL]))
+
+  active = [i*stride for i in range(groups)]
+  for offset in active:
+    value = arena(variance_slot, offset)
+    ops.extend((RKEWOp(value, value, mean, rows, _EW_CFG[Ops.SUB]), RKEWOp(value, value, value, rows, _EW_CFG[Ops.MUL])))
+  variance_sum = _reduce_arena(ops, active, rows, _EW_CFG[Ops.ADD], lambda offset:arena(variance_slot, offset))
+  variance = scratch()
+  ops.append(RKEWOp(variance, variance_sum, arena(slots[variance_scale]), rows, _EW_CFG[Ops.MUL]))
+  _append_dpu_sqrt_ops(ops, variance, RKArg(RKBufferKind.ARG, out_slot), rows, slots, scratch)
+
+  scratch_buffers = (tuple(RKScratch(rows*2) for _ in constants) +
+                     (RKScratch(groups*stride), RKScratch(groups*stride), *extra))
+  mean_copy = RKGather(mean.index, out_slot, rows, base=mean.addend, axes=((1, rows, 1),), dst_addend=rows,
+                       dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH)
+  return RKImage(RKTarget.RK3588, scratch_buffers, b"".join(struct.pack("<e", value) for value in constants),
+                 gathers=gathers, ew_ops=tuple(ops), post_gathers=(mean_copy,))
 
 def _int16_extrema_image(out_slot:int, rows:int, source_slot:int, blocks:tuple[tuple[int, ...], ...], minimum:bool) -> RKImage:
   """Materialize signed INT16 candidates and reduce them with native MIN/MAX."""
@@ -6818,8 +6989,29 @@ _pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round
 _pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_floor_ceil)])
 _pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])
 _pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
+
+def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
+  """Approximate FP16 sqrt/rsqrt with range-independent Babylonian iterations on DPU EW."""
+  if any(_local_load(u) is not None for u in source.toposort()): return None
+  source = source.cast(dtypes.half)
+  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+  negative = _positive_mask(zero.alu(Ops.SUB, source))
+  finite = _native_min(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half))
+  safe = finite.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))
+  estimate = safe.alu(Ops.MAX, one)
+  for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
+  valid = one.alu(Ops.SUB, negative)
+  invalid_factor = valid.alu(Ops.FDIV, valid)
+  result = estimate.alu(Ops.FDIV, source) if reciprocal else source.alu(Ops.FDIV, estimate)
+  return result.alu(Ops.ADD, invalid_factor.alu(Ops.SUB, one))
+
+_pm_rsqrt = PatternMatcher([(UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float),
+  src=(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)),)), lambda source:_dpu_sqrt(source, True))])
+_pm_sqrt = PatternMatcher([(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sqrt(source))])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_rsqrt, name="rockchip rsqrt")
+  sink = graph_rewrite(sink, _pm_sqrt, name="rockchip sqrt")
   sink = graph_rewrite(sink, _pm_round, name="rockchip round")
   sink = graph_rewrite(sink, _pm_floor_ceil, name="rockchip floor/ceil")
   sink = graph_rewrite(sink, _pm_trunc, name="rockchip trunc")
@@ -6829,12 +7021,13 @@ def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
-  code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None, Ops.FDIV: lambda: None}
+  code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None,
+                 Ops.FDIV: lambda: None, Ops.SQRT: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = _lower_bounded_exact_fp16_copysign(uops)
+    image = _lower_bounded_exact_fp16_copysign(uops) or _lower_std_mean_pair(uops)
     return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
