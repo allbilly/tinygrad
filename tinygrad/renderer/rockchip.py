@@ -3920,12 +3920,12 @@ def _dynamic_16bit_gather_image(out_slot:int, count:int, indices:tuple[RKDynamic
 
 def _dynamic_16bit_scatter_image(out_slot:int, count:int, index_slot:int,
                                  index_offset_rows:tuple[tuple[int, ...], ...], coordinate_rows:tuple[tuple[int, ...], ...],
-                                 source_slot:int, source_offset_rows:tuple[tuple[int, ...], ...],
+                                 source_slot:int|None, source_rows:tuple[tuple[int, ...], ...],
                                  base_slot:int, base_offsets:tuple[int, ...]) -> RKImage|None:
   """Apply bounded last-wins Scatter through native INT16 byte equality and raw 16-bit selection."""
   rows = len(index_offset_rows)
-  if (not rows or len(coordinate_rows) != rows or len(source_offset_rows) != rows or len(base_offsets) != count or
-      any(len(row) != count for row in (*index_offset_rows, *coordinate_rows, *source_offset_rows))): return None
+  if (not rows or len(coordinate_rows) != rows or len(source_rows) != rows or len(base_offsets) != count or
+      any(len(row) != count for row in (*index_offset_rows, *coordinate_rows, *source_rows))): return None
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, rows)
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
   scratch_sizes:list[int] = []
@@ -3937,8 +3937,11 @@ def _dynamic_16bit_scatter_image(out_slot:int, count:int, index_slot:int,
                                      (coordinate_rows,), count, vector_lanes)) is None: return None
   source_bytes, base_bytes = tuple(scratch(matrix_lanes*2) for _ in range(2)), tuple(scratch(count*2) for _ in range(2))
   for byte,slot in enumerate(source_bytes):
-    gathers.extend(RKGather(source_slot, slot, count, offsets=tuple(offset*2+byte for offset in offsets), dst_stride=2,
-                            dst_addend=row*vector_bytes, itemsize=1) for row,offsets in enumerate(source_offset_rows))
+    gathers.extend(RKGather(index_slot if source_slot is None else source_slot, slot, count,
+                            offsets=() if source_slot is None else tuple(offset*2+byte for offset in source_row),
+                            values=tuple((value >> (byte*8)) & 0xff for value in source_row) if source_slot is None else (),
+                            dst_stride=2, dst_addend=row*vector_bytes, itemsize=1)
+                   for row,source_row in enumerate(source_rows))
   gathers.extend(RKGather(base_slot, slot, count, offsets=tuple(offset*2+byte for offset in base_offsets),
                           dst_stride=2, itemsize=1) for byte,slot in enumerate(base_bytes))
   one, remaining = scratch(count*2), scratch(count*2)
@@ -5100,11 +5103,12 @@ def _lower_dynamic_16bit_scatter(output:RKOutput, dtype:DType=dtypes.half) -> RK
     lhs, rhs = predicate(root.src[0], matches), predicate(root.src[1], matches)
     return lhs != rhs if root.op is Ops.CMPNE else lhs and rhs if root.op is Ops.AND else lhs or rhs
 
-  def value_leaf(root:UOp) -> tuple[UOp, UOp|None]|None:
-    if root.op is Ops.LOAD and root.dtype.scalar() is dtype and root.src and root.src[0].op is Ops.INDEX: return root, None
+  def value_leaf(root:UOp) -> tuple[UOp|None, UOp|None, UOp|None]|None:
+    if root.op is Ops.LOAD and root.dtype.scalar() is dtype and root.src and root.src[0].op is Ops.INDEX: return root, None, None
     if (root.op is Ops.WHERE and len(root.src) == 3 and _is_static_expr(root.src[0]) and
         root.src[1].op is Ops.LOAD and root.src[1].dtype.scalar() is dtype and
-        root.src[2].op is Ops.CONST and float(root.src[2].arg) == 0.0): return root.src[1], root.src[0]
+        root.src[2].op is Ops.CONST and float(root.src[2].arg) == 0.0): return root.src[1], root.src[0], None
+    if root.dtype.scalar() is dtype and _is_static_expr(root): return None, None, root
     return None
   def selected(root:UOp, matches:int) -> UOp:
     if value_leaf(root) is not None: return root
@@ -5120,25 +5124,33 @@ def _lower_dynamic_16bit_scatter(output:RKOutput, dtype:DType=dtypes.half) -> RK
   except RuntimeError: return None
   base_leaf, source_leaves = value_leaf(base), tuple(value_leaf(source) for source in sources)
   if base_leaf is None or any(leaf is None for leaf in source_leaves): return None
-  base_load, base_gate = base_leaf
+  base_load, base_gate, base_static = base_leaf
+  if base_load is None or base_static is not None: return None
   concrete_leaves = tuple(leaf for leaf in source_leaves if leaf is not None)
   base_param = _root_param(base_load.src[0])
-  source_params = tuple(_root_param(load.src[0]) for load,_ in concrete_leaves)
-  if (base_param is None or base_param.dtype.scalar() is not dtype or base_param.src[0].op is not Ops.CONST or
-      any(param is None or param.dtype.scalar() is not dtype or param.src[0].op is not Ops.CONST for param in source_params) or
-      len({param.arg.slot for param in source_params if param is not None}) != 1): return None
-  source_param = next(param for param in source_params if param is not None)
+  source_loads = tuple(load for load,_,_ in concrete_leaves if load is not None)
+  source_statics = tuple(static for _,_,static in concrete_leaves if static is not None)
+  source_params = tuple(_root_param(load.src[0]) for load in source_loads)
+  if base_param is None or base_param.dtype.scalar() is not dtype or base_param.src[0].op is not Ops.CONST: return None
+  dynamic_sources, static_sources = len(source_loads) == len(concrete_leaves), len(source_statics) == len(concrete_leaves)
+  if not dynamic_sources and not static_sources: return None
+  if dynamic_sources and (any(param is None or param.dtype.scalar() is not dtype or param.src[0].op is not Ops.CONST for param in source_params) or
+                          len({param.arg.slot for param in source_params if param is not None}) != 1): return None
+  source_param = next((param for param in source_params if param is not None), None)
   try:
     base_index, combined_base_gate = index_and_gate(base_load, base_gate)
     base_offsets = _gather_offsets(out_index, base_index, combined_base_gate, count)
-    source_offset_rows = tuple(_gather_offsets(out_index, *index_and_gate(load, gate), count) for load,gate in concrete_leaves)
+    source_rows = (tuple(_gather_offsets(out_index, *index_and_gate(load, gate), count)
+                         for load,gate,_ in concrete_leaves if load is not None)
+                   if dynamic_sources else tuple(_static_vector(out_index, static, count) for static in source_statics))
   except RuntimeError: return None
-  base_count, source_count = int(base_param.src[0].arg), int(source_param.src[0].arg)
+  base_count = int(base_param.src[0].arg)
   if (any(not 0 <= offset < base_count for offset in base_offsets) or
-      any(not -1 <= offset < source_count for offsets in source_offset_rows for offset in offsets)): return None
+      dynamic_sources and (source_param is None or
+                           any(not -1 <= offset < int(source_param.src[0].arg) for offsets in source_rows for offset in offsets))): return None
   coordinate_rows = tuple(coordinates for _,_,_,coordinates in entries)
   return _dynamic_16bit_scatter_image(out_param.arg.slot, count, index_param.arg.slot,
-                                      index_offset_rows, coordinate_rows, source_param.arg.slot, source_offset_rows,
+                                      index_offset_rows, coordinate_rows, source_param.arg.slot if source_param is not None else None, source_rows,
                                       base_param.arg.slot, base_offsets)
 
 def _affine_load_offset(root:UOp, load:UOp) -> int|None:

@@ -450,6 +450,14 @@ class TestRockchipScatterOps(_base.TestRockchipScatterOps):
     index = torch.arange(4, dtype=torch.int64).reshape(2,2)
     _fp16_test_op([(2,4)], lambda x: x.scatter(1, index, value=0.5),
                   lambda x: x.scatter(1, Tensor.arange(4, dtype=dtypes.int32).reshape(2,2), src=0.5), forward_only=True)
+  def test_scatter_dynamic_scalar_source_nonfinite(self):
+    source = np.array([[1., -2., 3.], [-4., 5., -6.]], dtype=np.float16)
+    indices = np.array([[2, 0], [1, 1]], dtype=np.int32)
+    expected = source.copy()
+    expected[0, [2, 0]] = math.inf
+    expected[1, 1] = math.inf
+    got = Tensor(source, device="ROCKCHIP").scatter(1, Tensor(indices, device="ROCKCHIP"), src=math.inf).numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
   def test_scatter_reduce_static_sum(self):
     index = torch.zeros((2,4), dtype=torch.int64)
     _fp16_test_op([(1,4), (2,4)], lambda x,src: x.scatter_reduce(0, index, src, reduce="sum"),

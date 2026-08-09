@@ -41,6 +41,20 @@ def _fp16_fp32_golden_test_op(shps, torch_fxn, tinygrad_fxn, **kwargs):
   kwargs.update(_FP16_WITH_GRAD)
   return _TEST_OPS_HELPER(shps, fp32_golden, tinygrad_fxn, **kwargs)
 
+def _fp32_test_exception(self, shps, torch_fxn, tinygrad_fxn=None, expected=None, forward_only=False, exact=False,
+                         vals=None, low=-1.5, high=1.5):
+  """Preserve upstream dtype-mismatch fixtures when DEFAULT_FLOAT=HALF would make both operands half."""
+  if shps is None: arrays = [np.asarray(value, dtype=np.float32) for value in vals]
+  else:
+    rng = np.random.default_rng(0)
+    arrays = [rng.uniform(low, high, size=shape).astype(np.float32) for shape in shps]
+  ts = [torch.tensor(array, requires_grad=not forward_only) for array in arrays]
+  tst = [Tensor(array) for array in arrays]
+  if tinygrad_fxn is None: tinygrad_fxn = torch_fxn
+  with self.assertRaises(expected) as torch_cm: torch_fxn(*ts)
+  with self.assertRaises(expected) as tinygrad_cm: tinygrad_fxn(*tst)
+  if exact: self.assertEqual(str(torch_cm.exception), str(tinygrad_cm.exception))
+
 def _ew_submits(n:int) -> int:
   """All tiles for one realized Rockchip program share one dynamically sized PC-chain."""
   return int(n > 0)
@@ -412,6 +426,8 @@ class TestRockchipScatterOps(unittest.TestCase):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
+  helper_test_exception = _fp32_test_exception
+  test_scatter = _test_ops.TestOps.test_scatter
   test_scatter_add = _test_ops.TestOps.test_scatter_add
   test_scatter_mul = _test_ops.TestOps.test_scatter_mul
   test_scatter_no_reduce_tensor_src = _test_ops.TestOps.test_scatter_no_reduce_tensor_src
@@ -422,6 +438,8 @@ class TestRockchipScatterOps(unittest.TestCase):
 class TestRockchipValidationOps(unittest.TestCase):
   """Upstream argument-validation cases that complete before unsupported numeric execution."""
 
+  helper_test_exception = _fp32_test_exception
+  test_scatter_reduce_errors = _test_ops.TestOps.test_scatter_reduce_errors
   test_scaled_dot_product_attention_gqa_errors = _test_ops.TestOps.test_scaled_dot_product_attention_gqa_errors
 
 

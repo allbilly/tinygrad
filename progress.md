@@ -4693,3 +4693,32 @@ Historical `b85d3c4b0` and `31c07151d` computed isclose predicates in host eleme
 current runtime only moves raw bytes at explicit gather boundaries; FP16 expression realization, zero normalization,
 NaN classification, equality, tolerance evaluation, and bool formation all execute on DPU EW. There is no host result
 calculation, CPU fallback, LUT, CMAC, tolerance relaxation, FP32 input emulation, or wider floating-point input.
+
+---
+
+## 2026-08-10 — dynamic scalar-source scatter batch
+
+The existing dynamic last-wins Scatter lowerer now accepts compiler-known FP16 source expressions as well as tensor
+loads. Static source words are split into opaque bytes and fed into the same native INT16 equality-mask and raw-select
+pipeline, so non-finite values never participate in FP16 mask arithmetic. This completes the unchanged upstream
+`test_scatter` method, including its six dimensions, two additional shapes, four error fixtures, scalar `3`, scalar
+infinity, and overlapping-index last-wins case. The unchanged validation-only `test_scatter_reduce_errors` method is
+also admitted; a local exception helper preserves the upstream FP32/FP16 dtype-mismatch fixture while numeric Rockchip
+inputs remain FP16.
+
+- Both complete upstream methods pass together: **2 passed in 3.72 s**; wall time including pytest startup is
+  **5.83 s**. A backend-only bit-exact dynamic infinity regression passes in **2.93 s**.
+- `test_rockchip.py` collects **355 upstream-only cases** representing **332 unique upstream method names**;
+  `test_rockchip2.py` collects **195 backend-only cases**. The authoritative unselected remainder falls from 91 to
+  **89 of 421**.
+- Of those 89, **85** belong to the deferred transcendental/LUT-dependent families. The four other exclusions are
+  backward-only `test_cmp_lt_backwards`/`test_cmp_ne_backwards`, FP32-input `test_scatter_reduce_prod_zeros`, and the
+  scalar-true half of `test_masked_select`, which runs away before the backend renderer without a Tinygrad-core hook.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing. Repository-wide Tinygrad
+  mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,313/352 executable lines**, total **31,720**.
+
+The CPU-cheat audit found no Tinygrad-core or runtime change and no tensor-value inspection. Compilation evaluates only
+static shape predicates, offsets, and source constants; runtime gathers opaque bytes. External index equality,
+last-wins masking, reduction, base preservation, and output selection all execute on native INT16 DPU EW. There is no
+host result calculation, LUT, CMAC, tolerance relaxation, FP32 input emulation, or wider floating-point input.
