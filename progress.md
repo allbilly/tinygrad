@@ -5492,3 +5492,23 @@ The matcher reads only finalized UOp structure, dtypes, static sizes, constants,
 buffer. The single output operation executes on DPU EW. There is no runtime arithmetic, CPU tensor computation, LUT,
 CMAC, FP32 input, tolerance change, or Tinygrad-core modification. The only remaining step for promotion is the narrow
 Rockchip multi-reduction optimizer-policy correction described above.
+
+---
+
+## 2026-08-10 — explicit forward/FP16 contract skips
+
+Four unchanged upstream methods are now represented in `test_rockchip.py` as explicit skips instead of being absent.
+`test_cmp_lt_backwards` and `test_cmp_ne_backwards` execute gradients despite the forward-only test configuration;
+`test_pow_const_direct` explicitly creates FP32 tensors and executes gradients; and `test_pow_int` is already marked
+unsupported by upstream. The two power methods were removed from the backend-only candidate file after entering the
+main census.
+
+- Focused Rockchip selection: **4 skipped in 2.77 s**, with no NPU submission.
+- `test_rockchip.py`: **439 collected aliases**, representing **416 of 422** upstream methods; **6 remain**.
+- Remaining methods: scalar-True `test_masked_select`, four scaled-dot-product-attention variants, and
+  `test_scatter_reduce_prod_zeros`.
+- Ruff, collection, and `git diff --check`: pass.
+
+Attention is not intrinsically CMAC-only. The base `Q @ K.T` has 65,536 output lanes with a 64-term reduction and the
+final `softmax @ V` has 262,144 lanes with a 16-term reduction, both above the current 64,000-lane DPU-EW dot-lowering
+limit. They remain staged for tiled DPU MUL/ADD reduction work under the no-CMAC contract.

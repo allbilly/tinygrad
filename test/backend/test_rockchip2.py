@@ -47,8 +47,6 @@ class TestRockchipEdgeCandidates(_test_ops.TestOps):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_masked_select = _test_ops.TestOps.test_masked_select
-  test_pow_const_direct = _test_ops.TestOps.test_pow_const_direct
-  test_pow_int = _test_ops.TestOps.test_pow_int
   test_scatter_reduce_prod_zeros = _test_ops.TestOps.test_scatter_reduce_prod_zeros
 
 @_only_local_tests

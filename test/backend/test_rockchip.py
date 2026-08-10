@@ -1,4 +1,4 @@
-"""Rockchip NPU census: ops known to pass, with DRM_IOCTL_RKNPU_SUBMIT counts.
+"""Rockchip NPU census: passing ops and explicit backend-contract skips, with DRM_IOCTL_RKNPU_SUBMIT counts.
 
 Run: FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest test/backend/test_rockchip.py -q -n0
 
@@ -952,6 +952,15 @@ class TestRockchipComparisonOps(unittest.TestCase):
   def test_cmp_ge(self): self._test_cmp(lambda x,y:x >= y)
   def test_cmp_lt(self): self._test_cmp(lambda x,y:x < y)
   def test_cmp_le(self): self._test_cmp(lambda x,y:x <= y)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipContractSkips(unittest.TestCase):
+  """Upstream methods outside the forward-only FP16-input Rockchip contract."""
+
+  test_cmp_lt_backwards = unittest.skip("Rockchip testing is forward-only")(_test_ops.TestOps.test_cmp_lt_backwards)
+  test_cmp_ne_backwards = unittest.skip("Rockchip testing is forward-only")(_test_ops.TestOps.test_cmp_ne_backwards)
+  test_pow_const_direct = unittest.skip("requires explicit FP32 inputs and backward execution")(_test_ops.TestOps.test_pow_const_direct)
+  test_pow_int = unittest.skip("unsupported by the upstream test")(_test_ops.TestOps.test_pow_int)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(unittest.TestCase):
