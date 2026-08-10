@@ -194,20 +194,20 @@ def test_static_local_accumulator_is_structurally_executed():
 
 
 def test_dependent_reduction_range_preserves_vector_output_axis():
-  def lower(rows:int):
+  def lower(rows:int, depth:int=65):
     out = UOp.param(0, dtypes.half, (rows,))
-    lhs, rhs = UOp.param(1, dtypes.half, (rows*65,)), UOp.param(2, dtypes.half, (65,))
+    lhs, rhs = UOp.param(1, dtypes.half, (rows*depth,)), UOp.param(2, dtypes.half, (depth,))
     row = UOp.range(rows, 1)
-    axis = UOp.range(65, 0, AxisType.REDUCE, src=(row,))
+    axis = UOp.range(depth, 0, AxisType.REDUCE, src=(row,))
     local = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG).index(0)
     initialize = local.store(UOp.const(0.0, dtypes.float))
-    product = lhs.index(row*65+axis).load() * rhs.index(axis).load()
+    product = lhs.index(row*depth+axis).load() * rhs.index(axis).load()
     update = local.store(local.load() + product.cast(dtypes.float))
     output = out.index(row).store(local.load().cast(dtypes.half))
     return _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
 
-  scalar, vector = lower(1), lower(45)
-  assert scalar is not None and vector is not None
+  scalar, vector, large = lower(1), lower(45), lower(128, 128)
+  assert scalar is not None and vector is not None and large is not None
   assert len(vector.ew_ops) == len(scalar.ew_ops)
 
 

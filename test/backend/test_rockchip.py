@@ -633,7 +633,7 @@ class TestRockchipDotOps(unittest.TestCase):
     for got,expected in zip(outputs, (np.full((2,4), 3, dtype=np.float16), np.full(4, 6, dtype=np.float16),
                                       np.full((1,3), 2, dtype=np.float16))):
       np.testing.assert_array_equal(got.numpy(), expected)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 3)
   test_matvecmat = _test_ops.TestOps.test_matvecmat
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
