@@ -5407,3 +5407,30 @@ reductions remain on their established loop lowerer.
 All matching, offset recovery, and transposition are compile-time UOp/RKImage construction. All arithmetic executes as
 FP16 DPU EW; there is no tensor-value host evaluation, LUT, CMAC, FP32 input, Tinygrad-core/runtime change, or tolerance
 relaxation.
+
+---
+
+## 2026-08-10 — grouped softmax argmax
+
+The unchanged upstream `test_softmax_argmax` now passes for both normalization axes. A global maximum of grouped
+softmax can be selected without materializing FP32 probabilities: each group's largest numerator is exactly one, so
+the winning group is the one with the largest reciprocal denominator; within that group, the original FP16 input is
+compared with its stored group maximum. The two exact masks are combined with first-tie coordinates and reduced using
+native INT16 DPU EW before the terminal INT32 write.
+
+Both denominator and coordinate matrices use 64-byte-striped lanes. The initial packed-scalar prototype found the
+right one-hot mask but addressed two-byte scalar rows that the DPU aliases to aligned RDMA bases. The striped layout
+keeps every independently addressed row aligned, and the coordinate reduction follows the original softmax grouping
+instead of emitting a 2,924-stage scalar chain. The matcher accepts both Tinygrad forms seen in the test: the fused
+two-dimensional axis-0 loops and the flattened axis-1 global loops over precomputed group maxima and sums.
+
+- Promoted unchanged upstream `test_softmax_argmax`: **1 passed in 5.88 s** from its final census location.
+- The surrounding argmax/softmax batch passed as **4 tests in 10.53 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after promotion; no reboot was used.
+- `test_rockchip.py`: **435 collected aliases**, representing **412 of 422** upstream methods; **10 remain**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,770/376 executable lines**, total **33,201**.
+
+All tensor topology, offsets, and constants are recovered at compile time. Runtime only performs the existing raw
+gathers and submits the generated DPU plan; there is no tensor-value host computation, tolerance change, LUT, CMAC,
+FP32 input, Tinygrad-core change, or Rockchip-runtime change.

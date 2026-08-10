@@ -33,7 +33,6 @@ class TestRockchipCompositeCandidates(_test_ops.TestOps):
   test_scaled_dot_product_attention_causal = _test_ops.TestOps.test_scaled_dot_product_attention_causal
   test_scaled_dot_product_attention_gqa = _test_ops.TestOps.test_scaled_dot_product_attention_gqa
   test_scaled_dot_product_attention_mismatch_ls = _test_ops.TestOps.test_scaled_dot_product_attention_mismatch_ls
-  test_softmax_argmax = _test_ops.TestOps.test_softmax_argmax
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

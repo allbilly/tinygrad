@@ -6220,6 +6220,146 @@ def _lower_loop_max_unpool(uops:list[UOp], output:RKOutput, native_int16:bool=Fa
 class RKArgMatch:
   source_slot:int; source_count:int; extrema:UOp; candidates:tuple[tuple[UOp, UOp, bool], ...]; extrema_plans:tuple[RKGather, ...]|None = None
 
+def _lower_softmax_argmax(uops:list[UOp]) -> RKImage|None:
+  """Select the global maximum softmax lane from group maxima and denominator reciprocals."""
+  if (output:=_output_store(uops, dtypes.int, allow_local=True)) is None: return None
+  _, out_param, count, _, root = output
+  if count != 1: return None
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
+  value_initial = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtypes.half and
+                   math.isinf(float(u.src[1].arg)) and float(u.src[1].arg) < 0]
+  index_initial = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtypes.int and
+                   int(u.src[1].arg) == -(1 << 31)]
+  value_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtypes.half]
+  index_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtypes.int]
+  if (len(ranges) not in (2, 4) or len(local_stores) != 4 or
+      not all(len(group) == 1 for group in (value_initial, index_initial, value_updates, index_updates))): return None
+  value_update, index_update = value_updates[0].src[1], index_updates[0].src[1]
+  value_current = next((x for x in value_update.src if _local_load(x) is not None), None)
+  normalized = next((x for x in value_update.src if x is not value_current), None)
+  index_current = next((x for x in index_update.src if _local_load(x) is not None), None)
+  weighted = next((x for x in index_update.src if x is not index_current), None)
+  if value_current is None or normalized is None or index_current is None or weighted is None or weighted.op is not Ops.MUL: return None
+  normalized_nodes = set(normalized.toposort())
+  value_ranges = [r for r in ranges if r in normalized_nodes]
+  index_ranges = [r for r in ranges if r not in normalized_nodes]
+  if not value_ranges or len(value_ranges) != len(index_ranges): return None
+  try: value_envs, index_envs = _iter_range_env(value_ranges), _iter_range_env(index_ranges)
+  except RuntimeError: return None
+  total = len(value_envs)
+  if not 2 <= total == len(index_envs) <= 32767: return None
+
+  def normalized_inputs(candidate:UOp, envs:list[dict[UOp, int]]) -> tuple[UOp, UOp, UOp, tuple[int, ...], tuple[int, ...]]|None:
+    candidate = _strip_cast(candidate)
+    if candidate.op is not Ops.FDIV or len(candidate.src) != 2: return None
+    exponential, sum_load = _strip_cast(candidate.src[0]), _strip_cast(candidate.src[1])
+    if exponential.op is not Ops.EXP2 or sum_load.op is not Ops.LOAD or sum_load.src[0].op is not Ops.INDEX: return None
+    sum_param = _root_param(sum_load.src[0])
+    active_ranges = set(envs[0]) if envs else set()
+    exp_loads = {u.key:u for u in exponential.toposort() if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and
+                 _root_param(u.src[0]) is not None and any(r in u.toposort() for r in active_ranges)}
+    if sum_param is None or sum_param.src[0].op is not Ops.CONST or len(exp_loads) != 2: return None
+    sized = [(_root_param(load.src[0]), load) for load in exp_loads.values()]
+    data = [(param,load) for param,load in sized if param is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg) == total]
+    maxima = [(param,load) for param,load in sized if param is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg) != total]
+    if len(data) != 1 or len(maxima) != 1: return None
+    data_param, data_load = data[0]
+    max_param, max_load = maxima[0]
+    assert data_param is not None and max_param is not None
+    group_count = int(sum_param.src[0].arg)
+    if not 2 <= group_count < total or int(max_param.src[0].arg) != group_count: return None
+    constants = [float(u.arg) for u in exponential.toposort() if u.op is Ops.CONST]
+    if (not any(math.isclose(value, math.log2(math.e), rel_tol=1e-12) for value in constants) or
+        not any(value == -1.0 for value in constants)): return None
+    try:
+      data_offsets = tuple(_eval_int(data_load.src[0].src[1], env) for env in envs)
+      max_offsets = tuple(_eval_int(max_load.src[0].src[1], env) for env in envs)
+      sum_offsets = tuple(_eval_int(sum_load.src[0].src[1], env) for env in envs)
+    except RuntimeError: return None
+    if (data_offsets != tuple(range(total)) or max_offsets != sum_offsets or
+        any(not 0 <= offset < group_count for offset in max_offsets) or set(max_offsets) != set(range(group_count))): return None
+    return data_param, max_param, sum_param, data_offsets, max_offsets
+
+  if (parsed:=normalized_inputs(normalized, value_envs)) is None: return None
+  data_param, max_param, sum_param, data_offsets, max_offsets = parsed
+  group_count = int(sum_param.src[0].arg)
+  group_members = tuple(tuple(i for i, group in enumerate(max_offsets) if group == g) for g in range(group_count))
+  if not group_members[0] or any(len(members) != len(group_members[0]) for members in group_members): return None
+  group_size = len(group_members[0])
+  matrix_offsets = tuple(group_members[group][lane] for lane in range(group_size) for group in range(group_count))
+  matrix_groups = tuple(group for _ in range(group_size) for group in range(group_count))
+  lane_stride = _reduction_stride(1)//2
+  group_lanes = row_lanes = group_count*lane_stride
+  matrix_lanes = group_size*row_lanes
+  cast = next((x for x in weighted.src if x.op is Ops.CAST and x.dtype.scalar() is dtypes.int and
+               x.src and x.src[0].dtype.scalar() is dtypes.bool), None)
+  coordinate = next((x for x in weighted.src if x is not cast), None)
+  if cast is None or coordinate is None or value_current not in cast.toposort(): return None
+  normalized_candidates = [u for u in cast.toposort() if u.op is Ops.FDIV and u.dtype.scalar() is dtypes.half and
+                           any(r in u.toposort() for r in index_ranges)]
+  if len(normalized_candidates) != 1 or (indexed:=normalized_inputs(normalized_candidates[0], index_envs)) is None: return None
+  if (indexed[0].arg.slot, indexed[1].arg.slot, indexed[2].arg.slot, indexed[3], indexed[4]) != \
+     (data_param.arg.slot, max_param.arg.slot, sum_param.arg.slot, data_offsets, max_offsets): return None
+  final_load = next((_local_load(value) for term in root.src if term.op is Ops.MUL for value in term.src
+                     if _local_load(value) is not None and any(x.op is Ops.CONST and int(x.arg) == -1 for x in term.src)), None) \
+    if root.op is Ops.ADD else None
+  try:
+    if tuple(_eval_int(coordinate, env) for env in index_envs) != tuple(total-i for i in range(total)): return None
+    if (root.op is not Ops.ADD or final_load is None or
+        any(_eval_int(root.substitute({final_load:final_load.const_like(value)}), {}) != total-value for value in (0, total))): return None
+  except RuntimeError: return None
+
+  scratch_sizes = [_scratch_bytes(matrix_lanes), _scratch_bytes(matrix_lanes)]
+  def scratch(size:int|None=None) -> int:
+    scratch_sizes.append(_scratch_bytes(matrix_lanes) if size is None else size)
+    return len(scratch_sizes)-1
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  one, limit = 0, 1
+  sums, reciprocals_all, reciprocal_reduce = scratch(), scratch(), scratch()
+  gathers:list[RKGather] = [RKGather(sum_param.arg.slot, sums, group_lanes, values=(_fp16_bits(math.inf),)*group_lanes),
+                            RKGather(sum_param.arg.slot, sums, group_count, offsets=tuple(range(group_count)),
+                                     partial=True, dst_stride=lane_stride)]
+  ops:list[RKEWOp] = [
+    RKEWOp(arg(reciprocals_all), arg(one), arg(sums), group_lanes, _EW_CFG[Ops.FDIV], submit_barrier=True, stateful=True),
+    RKEWOp(arg(reciprocal_reduce), arg(one), arg(sums), group_lanes, _EW_CFG[Ops.FDIV], submit_barrier=True, stateful=True)]
+  best = _reduce_rows(ops, [arg(reciprocal_reduce, i*_reduction_stride(1)) for i in range(group_count)], 1, _EW_CFG[Ops.MAX])
+  gather_after = len(ops)
+
+  values, maxima_values, group_values, best_values, coordinates = (scratch() for _ in range(5))
+  mid = [RKGather(data_param.arg.slot, values, total, offsets=tuple(data_offsets[i] for i in matrix_offsets),
+                  dst_stride=lane_stride),
+         RKGather(max_param.arg.slot, maxima_values, matrix_lanes, values=(_fp16_bits(1.0),)*matrix_lanes),
+         RKGather(max_param.arg.slot, maxima_values, total, offsets=matrix_groups, partial=True, dst_stride=lane_stride),
+         RKGather(reciprocals_all, group_values, total, offsets=tuple(group*lane_stride for group in matrix_groups),
+                  src_kind=RKBufferKind.SCRATCH, dst_stride=lane_stride),
+         RKGather(best.index, best_values, total, offsets=(best.addend//2,)*total,
+                  src_kind=RKBufferKind.SCRATCH, dst_stride=lane_stride),
+         RKGather(data_param.arg.slot, coordinates, total, values=tuple(total-i for i in matrix_offsets),
+                  itemsize=2, dst_stride=lane_stride)]
+  data_temps = (scratch(), scratch(), scratch(), scratch())
+  group_temps = (scratch(), scratch(), scratch(), scratch())
+  data_equal = _ew_eq_mask(ops, arg, values, maxima_values, data_temps, one, matrix_lanes)
+  group_equal = _ew_eq_mask(ops, arg, group_values, best_values, group_temps, one, matrix_lanes, (True, True))
+  selected_half, selected_int, weighted_int = scratch(), scratch(), scratch()
+  ops.extend((RKEWOp(arg(selected_half), data_equal, group_equal, matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
+              RKEWOp(arg(selected_int), arg(selected_half), arg(selected_half), matrix_lanes, _EW_CFG[Ops.MAX],
+                     submit_barrier=True, stateful=True, int16_output=True),
+              RKEWOp(arg(weighted_int), arg(selected_int), arg(coordinates), matrix_lanes, _EW_CFG[Ops.MUL],
+                     int16_input=True, int16_output=True)))
+  selected_groups = _reduce_rows(ops, [arg(weighted_int, row*row_lanes*2) for row in range(group_size)],
+                                 row_lanes, _EW_CFG[Ops.MAX], int16=True)
+  selected = _reduce_rows(ops, [replace(selected_groups, addend=selected_groups.addend+i*_reduction_stride(1))
+                                for i in range(group_count)],
+                          1, _EW_CFG[Ops.MAX], int16=True)
+  result, tiles = scratch(), scratch(_int32_tiles_bytes(1))
+  ops.extend((RKEWOp(arg(result), arg(limit), selected, 1, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True),
+              RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), arg(result), arg(tiles), 1, _EW_CFG[Ops.MAX],
+                     int16_input=True, int32_output=True)))
+  constants = struct.pack("<e", 1.0)+struct.pack("<h", total)
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), constants,
+                 gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid), gather_after=gather_after)
+
 def _lower_unrolled_arg_extrema(output:RKOutput, native_int16:bool=False) -> RKImage|None:
   """Share first-tie validation and gather packing across fused and split ArgMax/ArgMin graphs."""
   _, out_param, count, out_index, value = output
@@ -8273,7 +8413,8 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = (_lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or _lower_negative_constant_base_pow(uops) or
+    image = (_lower_softmax_argmax(uops) or _lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or
+             _lower_negative_constant_base_pow(uops) or
              _lower_std_mean_pair(uops) or _lower_unrolled_lp_cuberoot(uops) or _lower_rowwise_logsumexp(uops) or
              _lower_unrolled_mapped_add_reduction(uops) or _lower_mapped_add_loop_reduction(uops))
     return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()

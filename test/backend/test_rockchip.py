@@ -713,6 +713,7 @@ class TestRockchipArgExtremaOps(unittest.TestCase):
 
   test_argmax = _test_ops.TestOps.test_argmax
   test_argmin = _test_ops.TestOps.test_argmin
+  test_softmax_argmax = _test_ops.TestOps.test_softmax_argmax
 
   def _test(self, kind:str, values:tuple[tuple[float, ...], ...]):
     torch_fxn, tinygrad_fxn = (torch.argmax, Tensor.argmax) if kind == "max" else (torch.argmin, Tensor.argmin)
