@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from tinygrad import Tensor, Device, dtypes
 from test.backend.test_ops import slow_test
+from test.backend import test_ops as _test_ops
 from test.backend import test_rockchip as _base
 from test.backend.test_rockchip import (_FP16, _TEST_OPS_HELPER, _ew_submits, _fp16_fp32_golden_test_op, _fp16_test_op)
 
@@ -16,6 +17,30 @@ def _only_local_tests(cls):
   for name in dir(cls.__bases__[0]):
     if name.startswith("test_") and name not in cls.__dict__: setattr(cls, name, None)
   return cls
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
+  """Upstream indexed-loss candidates; passing methods move unchanged to test_rockchip.py."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_cross_entropy_class_indices = _test_ops.TestOps.test_cross_entropy_class_indices
+  test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
+  test_sparse_categorical_crossentropy = _test_ops.TestOps.test_sparse_categorical_crossentropy
+  test_sparse_categorical_crossentropy_reductions = _test_ops.TestOps.test_sparse_categorical_crossentropy_reductions
+  test_sparse_categorical_crossentropy_ignore_index = _test_ops.TestOps.test_sparse_categorical_crossentropy_ignore_index
+  test_sparse_categorical_crossentropy_label_smoothing = _test_ops.TestOps.test_sparse_categorical_crossentropy_label_smoothing
+  test_nll_loss = _test_ops.TestOps.test_nll_loss
+  test_nll_loss_3d = _test_ops.TestOps.test_nll_loss_3d
+  test_nll_loss_reductions = _test_ops.TestOps.test_nll_loss_reductions
+  test_nll_loss_weight = _test_ops.TestOps.test_nll_loss_weight
+  test_nll_loss_3d_weight = _test_ops.TestOps.test_nll_loss_3d_weight
+  test_nll_loss_ignore_index = _test_ops.TestOps.test_nll_loss_ignore_index
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

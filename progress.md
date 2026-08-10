@@ -4871,3 +4871,28 @@ the forward constant-power group.
 
 There is no Tinygrad-core change, host numerical computation, LUT, CMAC, FP32 input, or tolerance relaxation beyond the
 established `test_gemm_fp16` FP16 contract.
+
+---
+
+## 2026-08-10 — WIP batched indexed-loss lowering
+
+All twelve remaining index-target cross-entropy, sparse-categorical-cross-entropy, and NLL methods now compile through
+one shared DPU plan. Exact native INT16 byte masks select dynamic INT32 classes, raw FP16 class values are preserved by
+INT16 mask arithmetic, and weighting, smoothing, ignore-index masking, and reductions execute as FP16 DPU stages. The
+historical `5596d5a0a` implementation was inspected but rejected because it reads tensors and evaluates the loss with
+NumPy on the host. Neither `~/npu`, `~/rk3588`, nor the other local branches contain a native loss primitive to port.
+
+The scalar reducer was changed from one unaligned DPU stage per input pair to aligned 32-lane segment sums plus one
+spaced 32-value reduction. This keeps every DPU base address 64-byte aligned and reduces the 432-row weighted image from
+907 stages to a bounded segment tree plus 31 final stages. INT16-to-FP16 execution now resets at the precision boundary;
+without that transition reset, a three-row NLL vector either timed out or returned stale class selections, while the
+same vector passed within the established FP16 tolerance after the reset.
+
+- Compiler-only execution of the complete twelve-method staging class: **12 passed in 59.45 s**.
+- A physical eight-row sparse-CE vector matched its FP32 reference after FP16 rounding (maximum absolute error below
+  0.003). The full physical batch is not claimed yet.
+- This boot has accumulated repeated RKNPU timeouts, IOMMU reads at address zero, and failures in the already-passing
+  three-stage log-softmax producer. The vendor elementwise health check still passes because it resets between jobs,
+  but it does not validate multi-stage PC chains. Physical promotion is deferred until a clean boot.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. No Tinygrad-core change, host
+  numerical computation, LUT, CMAC, FP32 input, or tolerance relaxation was introduced.

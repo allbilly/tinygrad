@@ -254,6 +254,7 @@ class RockchipProgram(Program['RockchipDevice']):
         raise RuntimeError("mixed INT16 EW conversion is unsupported")
       if body_precision:
         self._submit_pcchain(bodies)
+        self.dev.reset_npu()
         bodies.clear()
         body_precision = 0
       if op.compare:

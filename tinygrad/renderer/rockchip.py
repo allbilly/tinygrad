@@ -4661,6 +4661,205 @@ def _native_integer_nonzero_mask(ops:list[RKEWOp], gathers:list[RKGather], scrat
     ops.append(RKEWOp(mask, mask, arg(slot), matrix_lanes, _EW_CFG[Ops.MAX], int16_input=True, int16_output=True))
   return mask
 
+def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
+  """Select dynamic FP16 classes with exact INT32 masks, then evaluate NLL entirely on DPU EW."""
+  if (output:=_output_store(uops, dtypes.half)) is None: return None
+  _, out_param, out_count, out_index, root = output
+  nodes = list(root.toposort())
+  params = tuple({u.key:u for u in nodes if u.op is Ops.PARAM and u.src and u.src[0].op is Ops.CONST}.values())
+  targets = [u for u in params if u.dtype.scalar() is dtypes.int]
+  if len(targets) != 1: return None
+  target, rows = targets[0], int(targets[0].src[0].arg)
+  if rows < 1 or out_count not in (1, rows): return None
+
+  target_loads = tuple(u for u in nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int and
+                       u.src and u.src[0].op is Ops.INDEX and _root_param(u.src[0]) is target)
+  dynamic_half = tuple(u for u in nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
+                       u.src and u.src[0].op is Ops.INDEX and any(load in u.src[0].src[1].toposort() for load in target_loads))
+  dynamic_params = tuple({p.key:p for load in dynamic_half if (p:=_root_param(load.src[0])) is not None}.values())
+  sources = [p for p in dynamic_params if int(p.src[0].arg) > rows and int(p.src[0].arg)%rows == 0]
+  static_selection = not sources
+  if static_selection:
+    sources = [p for p in params if p is not out_param and p.dtype.scalar() is dtypes.half and
+               int(p.src[0].arg) > rows and int(p.src[0].arg)%rows == 0]
+  if len(sources) != 1: return None
+  source, classes = sources[0], int(sources[0].src[0].arg)//rows
+  if classes < 2: return None
+  source_loads = tuple(load for load in dynamic_half if _root_param(load.src[0]) is source)
+  if not static_selection and len(source_loads) not in (1, rows): return None
+
+  excluded = {out_param.key, source.key, target.key}
+  half_params = [p for p in params if p.dtype.scalar() is dtypes.half and p.key not in excluded]
+  parents:dict[UOp, list[UOp]] = {}
+  for node in nodes:
+    for child in node.src: parents.setdefault(child, []).append(node)
+  row_params = [p for p in half_params if int(p.src[0].arg) == rows and p.key not in {x.key for x in dynamic_params}]
+  row_weights = [p for p in row_params if any(parent.op is Ops.MUL and any(other is not load and other.op is not Ops.CONST
+    for other in parent.src) for load in nodes if load.op is Ops.LOAD and _root_param(load.src[0]) is p for parent in parents.get(load, ()))]
+  class_weights = [p for p in half_params if int(p.src[0].arg) == classes and p.key in {x.key for x in dynamic_params}]
+  if len(row_weights) > 1 or len(class_weights)+len(row_weights) > 1: return None
+  weight = next(iter(class_weights+row_weights), None)
+  normalizers = [p for p in row_params if p is not weight]
+  if len(normalizers) != 2 or len(half_params) != len(normalizers)+(weight is not None): return None
+
+  target_offsets:list[int] = []
+  candidate_rows:list[tuple[int, ...]] = []
+  try:
+    if static_selection:
+      if len(target_loads) == 1 and out_count == rows:
+        target_offsets = list(_gather_offsets(out_index, target_loads[0].src[0].src[1], None, rows))
+      else: target_offsets = sorted({_eval_int(load.src[0].src[1], {}) for load in target_loads})
+      candidate_offsets = tuple(tuple(row*classes+candidate for row in range(rows)) for candidate in range(classes))
+    else:
+      for load in source_loads:
+        dependencies = [target_load for target_load in target_loads if target_load in load.src[0].src[1].toposort()]
+        if len(dependencies) != 1: return None
+        target_load = dependencies[0]
+        if out_count == rows:
+          if len(source_loads) != 1: return None
+          target_offsets = list(_gather_offsets(out_index, target_load.src[0].src[1], None, rows))
+          candidate_rows = [tuple(_gather_offsets(out_index, load.src[0].src[1].substitute(
+            {target_load:target_load.const_like(candidate)}), None, rows)) for candidate in range(classes)]
+        else:
+          target_offsets.append(_eval_int(target_load.src[0].src[1], {}))
+          candidate_rows.append(tuple(_eval_int(load.src[0].src[1].substitute(
+            {target_load:target_load.const_like(candidate)}), {}) for candidate in range(classes)))
+  except (KeyError, RuntimeError, ValueError): return None
+  if not static_selection and out_count == 1:
+    if sorted(target_offsets) != list(range(rows)): return None
+    ordered = sorted(zip(target_offsets, candidate_rows))
+    target_offsets = [offset for offset,_ in ordered]
+    candidate_rows = [candidates for _,candidates in ordered]
+    candidate_offsets = tuple(tuple(candidate_rows[row][candidate] for row in range(rows)) for candidate in range(classes))
+  elif not static_selection: candidate_offsets = tuple(candidate_rows)
+  if (tuple(target_offsets) != tuple(range(rows)) or
+      any(not 0 <= offset < int(source.src[0].arg) for offsets in candidate_offsets for offset in offsets)): return None
+
+  ignore_values = {int(const.arg) for comparison in nodes if comparison.op is Ops.CMPNE and
+                   not any(parent.op is Ops.CMPNE and any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg)
+                                                          for x in parent.src) for parent in parents.get(comparison, ()))
+                   for load,const in (comparison.src, comparison.src[::-1])
+                   if load in target_loads and const.op is Ops.CONST and const.dtype.scalar() is dtypes.int}
+  if len(ignore_values) > 1: return None
+  ignore = next(iter(ignore_values), None)
+  target_coefficients = {float(const.arg) for const in nodes if const.op is Ops.CONST and
+    const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 <= float(const.arg) <= 1.0 for parent in parents.get(const, ())
+    if parent.op is Ops.MUL for other in parent.src if other is not const and other.op is Ops.CAST and
+    set(range(classes)).issubset({int(value.arg) for value in other.toposort() if value.op is Ops.CONST and
+                                 value.dtype.scalar() is dtypes.int})}
+  if len(target_coefficients) > 1: return None
+  smoothing = 1.0-next(iter(target_coefficients)) if target_coefficients else 0.0
+  mean = out_count == 1 and (any(u.op in (Ops.FDIV, Ops.RECIPROCAL) for u in nodes) or
+    any(u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
+        abs(float(u.arg)-1.0/rows) < 1e-6 for u in nodes))
+
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(rows, classes)
+  if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
+  scratch_sizes:list[int] = []
+  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  gathers:list[RKGather] = []
+  ops:list[RKEWOp] = []
+  coordinates = tuple((candidate,)*rows for candidate in range(classes))
+  if (class_mask:=_native_int16_byte_mask(ops, gathers, scratch, target.arg.slot, tuple(target_offsets),
+                                          (coordinates,), rows, vector_lanes)) is None: return None
+  values, selected = scratch(matrix_lanes*2), scratch(matrix_lanes*2)
+  gathers.extend(_stripe_gathers(source.arg.slot, values, rows, candidate_offsets, vector_lanes))
+  ops.append(RKEWOp(arg(selected), arg(values), class_mask, matrix_lanes, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
+  selected_value = _reduce_rows(ops, [arg(selected, candidate*vector_bytes) for candidate in range(classes)], rows,
+                                _EW_CFG[Ops.ADD], int16=True)
+
+  selected_weight:RKArg|None = None
+  if class_weights:
+    weight_values, weighted = scratch(matrix_lanes*2), scratch(matrix_lanes*2)
+    gathers.extend(_stripe_gathers(class_weights[0].arg.slot, weight_values, rows,
+      tuple((candidate,)*rows for candidate in range(classes)), vector_lanes))
+    ops.append(RKEWOp(arg(weighted), arg(weight_values), class_mask, matrix_lanes,
+                      _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
+    selected_weight = _reduce_rows(ops, [arg(weighted, candidate*vector_bytes) for candidate in range(classes)], rows,
+                                   _EW_CFG[Ops.ADD], int16=True)
+  elif row_weights: selected_weight = RKArg(RKBufferKind.ARG, row_weights[0].arg.slot)
+  valid = _reduce_rows(ops, [RKArg(class_mask.kind, class_mask.index, class_mask.addend+candidate*vector_bytes)
+                             for candidate in range(classes)], rows, _EW_CFG[Ops.MAX], int16=True)
+  if ignore is not None and 0 <= ignore < classes:
+    if (ignored:=_native_int16_byte_mask(ops, gathers, scratch, target.arg.slot, tuple(target_offsets),
+                                         (((ignore,)*rows,),), rows, rows)) is None: return None
+    one, not_ignored, effective = (scratch(rows*2) for _ in range(3))
+    gathers.append(RKGather(target.arg.slot, one, rows, values=(1,)*rows))
+    ops.extend((RKEWOp(arg(not_ignored), arg(one), ignored, rows, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True),
+                RKEWOp(arg(effective), valid, arg(not_ignored), rows, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)))
+    valid = arg(effective)
+
+  reduction_lanes = ((rows+31)//32)*32 if out_count == 1 else rows
+  fp16_one, fp16_valid = scratch(rows*2), scratch(reduction_lanes*2)
+  gathers.append(RKGather(target.arg.slot, fp16_one, rows, values=(0x3c00,)*rows))
+  if reduction_lanes != rows:
+    gathers.append(RKGather(target.arg.slot, fp16_valid, reduction_lanes, values=(0,)*reduction_lanes))
+  ops.append(RKEWOp(arg(fp16_valid), valid, arg(fp16_one), rows, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
+  normalized, loss = scratch(rows*2), scratch(rows*2)
+  ops.extend((RKEWOp(arg(normalized), RKArg(RKBufferKind.ARG, normalizers[0].arg.slot),
+                     RKArg(RKBufferKind.ARG, normalizers[1].arg.slot), rows, _EW_CFG[Ops.ADD], stateful=True),
+              RKEWOp(arg(loss), arg(normalized), selected_value, rows, _EW_CFG[Ops.SUB])))
+  if smoothing:
+    mean_logits = _reduce_rows(ops, [arg(values, candidate*vector_bytes) for candidate in range(classes)], rows,
+                               _EW_CFG[Ops.ADD])
+    inv_classes, target_scale, smooth_scale = (scratch(rows*2) for _ in range(3))
+    gathers.extend((RKGather(target.arg.slot, inv_classes, rows, values=(_fp16_bits(1.0/classes),)*rows),
+                    RKGather(target.arg.slot, target_scale, rows, values=(_fp16_bits(1.0-smoothing),)*rows),
+                    RKGather(target.arg.slot, smooth_scale, rows, values=(_fp16_bits(smoothing),)*rows)))
+    scaled_logits, average_loss, target_loss, smooth_loss, combined = (scratch(rows*2) for _ in range(5))
+    ops.extend((RKEWOp(arg(scaled_logits), mean_logits, arg(inv_classes), rows, _EW_CFG[Ops.MUL], stateful=True),
+                RKEWOp(arg(average_loss), arg(normalized), arg(scaled_logits), rows, _EW_CFG[Ops.SUB]),
+                RKEWOp(arg(target_loss), arg(loss), arg(target_scale), rows, _EW_CFG[Ops.MUL]),
+                RKEWOp(arg(smooth_loss), arg(average_loss), arg(smooth_scale), rows, _EW_CFG[Ops.MUL]),
+                RKEWOp(arg(combined), arg(target_loss), arg(smooth_loss), rows, _EW_CFG[Ops.ADD])))
+    loss = combined
+  if selected_weight is not None:
+    weighted_loss = scratch(rows*2)
+    ops.append(RKEWOp(arg(weighted_loss), arg(loss), selected_weight, rows, _EW_CFG[Ops.MUL], stateful=True))
+    loss = weighted_loss
+  masked_loss = scratch(reduction_lanes*2)
+  if reduction_lanes != rows:
+    gathers.append(RKGather(target.arg.slot, masked_loss, reduction_lanes, values=(0,)*reduction_lanes))
+  ops.append(RKEWOp(arg(masked_loss), arg(loss), arg(fp16_valid), rows, _EW_CFG[Ops.MUL], stateful=True))
+  out = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  mid_gathers:tuple[RKGather, ...] = ()
+  gather_after = 0
+  if out_count == rows:
+    ops.append(RKEWOp(out, arg(masked_loss), arg(fp16_one), rows, _EW_CFG[Ops.MUL]))
+  else:
+    denominator_values = arg(fp16_valid)
+    if mean and selected_weight is not None:
+      denominator_slot = scratch(reduction_lanes*2)
+      if reduction_lanes != rows:
+        gathers.append(RKGather(target.arg.slot, denominator_slot, reduction_lanes, values=(0,)*reduction_lanes))
+      ops.append(RKEWOp(arg(denominator_slot), selected_weight, arg(fp16_valid), rows, _EW_CFG[Ops.MUL], stateful=True))
+      denominator_values = arg(denominator_slot)
+    def segment_sum(value:RKArg) -> RKArg:
+      return _reduce_rows(ops, [RKArg(value.kind, value.index, value.addend+segment*64)
+        for segment in range(reduction_lanes//32)], 32, _EW_CFG[Ops.ADD])
+    numerator_partial = segment_sum(arg(masked_loss))
+    numerator_arena = scratch(32*_reduction_stride(1))
+    mid = [RKGather(numerator_partial.index, numerator_arena, 32,
+                    offsets=tuple(numerator_partial.addend//2+lane for lane in range(32)), dst_stride=_reduction_stride(1)//2,
+                    src_kind=RKBufferKind.SCRATCH)]
+    denominator_arena:int|None = None
+    if mean:
+      denominator_partial = segment_sum(denominator_values)
+      denominator_arena = scratch(32*_reduction_stride(1))
+      mid.append(RKGather(denominator_partial.index, denominator_arena, 32,
+                          offsets=tuple(denominator_partial.addend//2+lane for lane in range(32)),
+                          dst_stride=_reduction_stride(1)//2, src_kind=RKBufferKind.SCRATCH))
+    mid_gathers, gather_after = tuple(mid), len(ops)
+    numerator = _reduce_rows(ops, [arg(numerator_arena, lane*_reduction_stride(1)) for lane in range(32)], 1, _EW_CFG[Ops.ADD])
+    if mean:
+      assert denominator_arena is not None
+      denominator = _reduce_rows(ops, [arg(denominator_arena, lane*_reduction_stride(1)) for lane in range(32)], 1, _EW_CFG[Ops.ADD])
+      ops.append(RKEWOp(out, numerator, denominator, 1, _EW_CFG[Ops.FDIV], stateful=True))
+    else: ops.append(RKEWOp(out, numerator, arg(fp16_one), 1, _EW_CFG[Ops.MUL]))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
+                 mid_gathers=mid_gathers, gather_after=gather_after)
+
 def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
   """Lower canonical positive-only or negative-normalized INT32 index bounds to one exact bool mask."""
   _, out_param, count, out_index, root = output
@@ -6581,6 +6780,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
     if (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
   if (half_output:=_output_store(uops, dtypes.half)) is not None:
+    if (indexed_nll:=_lower_indexed_nll(uops)) is not None: return indexed_nll
     if (integer_cast:=_lower_integer_fp16_cast(half_output)) is not None: return integer_cast
     if (fused_integer_cast:=_lower_fused_integer_fp16_cast(uops, half_output)) is not None: return fused_integer_cast
     if (integer_division:=_lower_int32_true_division(half_output)) is not None: return integer_division
