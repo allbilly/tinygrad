@@ -91,14 +91,20 @@ class RockchipProgram(Program['RockchipDevice']):
     return buf
 
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
-    self.dev._sync_buffer(cmd, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
-    rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-      flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
-      task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
-      regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
-      subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
+    def submit() -> None:
+      self.dev._sync_buffer(cmd, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
+        task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
+        regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
+        subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
+    try: submit()
+    except TimeoutError:
+      self.dev.timeout_retries += 1
+      self.dev.reset_npu()
+      submit()
     self.submit_count += 1
     self.dev.submit_count += 1
     self.dev.task_count += n
@@ -446,7 +452,7 @@ class RockchipProgram(Program['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
-    self.submit_count = self.task_count = 0
+    self.submit_count = self.task_count = self.timeout_retries = 0
     self._native_int16 = False
     self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
     self._program_resources:collections.OrderedDict[int, weakref.ReferenceType[RockchipProgram]] = collections.OrderedDict()
@@ -481,5 +487,7 @@ class RockchipDevice(Compiled):
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
-  def reset_npu(self): rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
+  def reset_npu(self):
+    rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
+    self._native_int16 = False
   def synchronize(self): pass

@@ -7809,6 +7809,23 @@ class RKContext:
 
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
+    if u is self.root and u.dtype.scalar() is dtypes.int and all(
+      arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.int for arm in u.src[1:]
+    ):
+      yes_int, no_int = (int(arm.arg) for arm in u.src[1:])
+      try: exact = all(_eval_cast(value, dtypes.half) == value for value in (no_int, yes_int-no_int))
+      except (OverflowError, struct.error): exact = False
+      if not exact: raise _RKGenericReject
+      selector = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+      if selector.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
+      delta, baseline = (self._constant(UOp.const(float(value), dtypes.half)) for value in (yes_int-no_int, no_int))
+      selected, result = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
+      self._emit(selected, selector, delta, _EW_CFG[Ops.MUL])
+      self._emit(result, baseline, selected, _EW_CFG[Ops.ADD])
+      tiles = self._scratch(dtypes.int, RKLayout.INT32, _int32_tiles_bytes(self.count))
+      value = RKValue(self.out, dtypes.int, self.count, RKLayout.INT32)
+      self.ew_ops.append(RKEWOp(value.arg, result.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
+      return value
     if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
       dtype = u.dtype.scalar()
       routes:dict[UOp, list[bool]] = {}

@@ -329,3 +329,26 @@ Verification:
   429 passed, 4 failed, 12 skipped, 154 subtests passed in 19m28s.
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py`: pass.
+
+### 21. Complete upstream-port census — complete
+
+- Lowered root `WHERE(bool, int_constant, int_constant)` directly in the typed UOp executor. The predicate remains a
+  canonical FP16 mask, the exact integer selection is computed as a physical EW recipe, and one explicit boundary stage
+  converts the result to the canonical INT32 output layout.
+- Removed the final fallback dependency on the legacy integer-WHERE adapter for permuted integer selection and NLL
+  indexing. Both previously surfaced as unsupported unary `NEG` nodes only after the original ternary UOp was lost.
+- Added one bounded runtime recovery for transient blocking-submit timeouts: reset the NPU and resubmit the same physical
+  PC chain once. A second timeout remains an error. This prevents one driver timeout from poisoning every later program
+  while leaving semantic execution on the NPU.
+- Added host-independent regressions for the INT32 `WHERE` boundary and the exactly-once timeout recovery policy.
+- Reached zero failures in the complete Rockchip port of upstream `test_ops`; `test_rockchip2.py` was not used.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 40 passed.
+- Fresh `TestRockchipWhereOps::test_where_permute` and `TestRockchipLossOps::test_nll_loss_reductions`: 2 passed.
+- Sustained core/INT16/comparison/attention/transcendental/loss/WHERE sequence: 106 passed in 5m42s.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -q -n0`:
+  433 passed, 12 skipped, 154 subtests passed in 18m27s.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

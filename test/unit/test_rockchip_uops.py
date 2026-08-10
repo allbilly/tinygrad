@@ -1,7 +1,9 @@
 import math, struct
+from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _EW_CFG_ABS, _NATIVE_SIGN,
   _MAX_EW_ELEMS_FP16, _iter_range_env, _lower_uop_program, decode_image, encode_image)
+from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
@@ -13,6 +15,27 @@ def _program(dtype, value, count:int=4):
 def test_rkvalue_is_the_typed_physical_abi():
   value = RKValue(RKArg(RKBufferKind.ARG, 0), dtypes.half, 1, RKLayout.FP16)
   assert value.dtype is dtypes.half and value.count == 1 and value.layout is RKLayout.FP16
+
+
+def test_submit_retries_once_after_driver_timeout(monkeypatch):
+  class FakeDevice:
+    fd_ctl, submit_count, task_count, timeout_retries, resets = object(), 0, 0, 0, 0
+    def _sync_buffer(self, _buffer, _flags): pass
+    def reset_npu(self): self.resets += 1
+    def _forget_program(self, _program): pass
+    def _gpu_free(self, _buffer): pass
+  program = object.__new__(rockchip_runtime.RockchipProgram)
+  program.dev, program.submit_count = FakeDevice(), 0
+  buffer = SimpleNamespace(meta=SimpleNamespace(obj_addr=1))
+  calls = 0
+  def submit(_fd, **_kwargs):
+    nonlocal calls
+    calls += 1
+    if calls == 1: raise TimeoutError
+  monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_SUBMIT", submit)
+  program._submit(buffer, buffer, 1)
+  assert calls == 2 and program.dev.resets == program.dev.timeout_retries == 1
+  assert program.submit_count == program.dev.submit_count == 1 and program.dev.task_count == 1
 
 
 def test_generic_fp16_uops_lower_in_dependency_order():
@@ -221,6 +244,14 @@ def test_int16_to_int32_is_an_explicit_output_boundary():
     lambda i:(lhs.index(i).load() + rhs.index(i).load()).cast(dtypes.int)))
   assert image is not None and len(image.ew_ops) == 2
   assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
+
+
+def test_int32_where_constants_convert_at_the_output_boundary():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.int, lambda i:
+    (UOp.const(0.5, dtypes.half) < source.index(i).load()).where(UOp.const(4, dtypes.int), UOp.const(2, dtypes.int))))
+  assert image is not None and len(image.ew_ops) > 3
+  assert image.ew_ops[-1].int32_output and not image.ew_ops[-1].int16_input
 
 
 def test_math_uops_own_multi_stage_recipes():
