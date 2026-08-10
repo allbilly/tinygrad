@@ -1954,6 +1954,25 @@ def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
       root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
   return _typed_int_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)))
 
+def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
+  """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
+  root = output[4]
+  zero = UOp.const(0.0, dtypes.half)
+  if root.op is Ops.CAST and root.dtype.scalar() is dtypes.uchar and len(root.src) == 1 and \
+     root.src[0].dtype.scalar() is dtypes.half: source = root.src[0]
+  elif (root.op is Ops.WHERE and root.dtype.scalar() is dtypes.uchar and len(root.src) == 3 and
+        root.src[0].op is Ops.CMPLT and root.src[0].src[0].op is Ops.CONST and float(root.src[0].src[0].arg) == 0.0 and
+        root.src[1].op is Ops.CAST and root.src[1].dtype.scalar() is dtypes.uchar and len(root.src[1].src) == 1 and
+        root.src[1].src[0].dtype.scalar() is dtypes.half and root.src[0].src[1].key == root.src[1].src[0].key and
+        root.src[2].op is Ops.CONST and int(root.src[2].arg) == 0):
+    source = root.src[1].src[0].alu(Ops.MAX, zero)
+  else: return None
+  if (relu:=_relu_operand(source)) is not None: source = relu.alu(Ops.MAX, zero)
+  truncated = _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(source,)))
+  quotient = _native_floor(truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half)))
+  remainder = truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))
+  return _typed_int16_byte_image(output, remainder)
+
 def _lower_integer_fp16_cast(output:RKOutput) -> RKImage|None:
   """Convert a direct or statically gathered INT32 input to FP16 through the DPU converter."""
   _, out_param, count, out_index, root = output
@@ -6579,6 +6598,26 @@ def _typed_int_image(output:RKOutput, value:UOp, bool_output:bool=False) -> RKIm
                 stateful=True, int32_output=True, bool_output=bool_output))
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_int32_tiles_bytes(count))), ew_ops=ops)
 
+def _typed_int16_byte_image(output:RKOutput, value:UOp) -> RKImage:
+  """Lower an exact FP16 integer expression through native INT16 output and gather its low bytes."""
+  store, out_param, count, _, _ = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  out_slot = out_param.arg.slot
+  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
+  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
+  replacement = store.replace(src=(half_index, value, *store.src[2:]))
+  image = lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(replacement,)).toposort())))
+  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
+  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.mid_gathers or image.post_gathers:
+    raise RuntimeError("RKPLAN_REJECT:uint8_terminal")
+  half_slot, int_slot = len(image.scratch), len(image.scratch)+1
+  half_result, int_result = RKArg(RKBufferKind.SCRATCH, half_slot), RKArg(RKBufferKind.SCRATCH, int_slot)
+  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=half_result),
+         RKEWOp(int_result, half_result, half_result, count, _EW_CFG[Ops.MAX], submit_barrier=True,
+                stateful=True, int16_output=True))
+  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=ops,
+                 post_gathers=(_int16_low_bytes(int_result, out_slot, count),))
+
 def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
   """Recover isclose's original operands, equal_nan mode, and its exact-equality FP16 tolerance range."""
   nodes = root.toposort()
@@ -7064,6 +7103,8 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (dynamic_gather:=_lower_dynamic_16bit_gather(int16_output, dtypes.int16)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return fancy_index
     if (scatter:=_lower_dynamic_16bit_scatter(int16_output, dtypes.int16)) is not None: return scatter
+  if (uint8_output:=_output_store(uops, dtypes.uchar)) is not None:
+    if (fp16_cast:=_lower_fp16_uint8_cast(uint8_output)) is not None: return fp16_cast
   if (float_output:=_output_store(uops, dtypes.float)) is not None:
     if (integer_cast:=_lower_integer_fp32_cast(float_output)) is not None: return integer_cast
     if (fp16_cast:=_lower_fp16_fp32_cast(float_output)) is not None: return fp16_cast

@@ -78,7 +78,6 @@ class TestRockchipEdgeCandidates(_test_ops.TestOps):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
-  test_cast_relu = _test_ops.TestOpsUint8.test_cast_relu
   test_masked_select = _test_ops.TestOps.test_masked_select
   test_pow_const_direct = _test_ops.TestOps.test_pow_const_direct
   test_pow_int = _test_ops.TestOps.test_pow_int
@@ -984,6 +983,12 @@ class TestRockchipSignOps(_base.TestRockchipSignOps):
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCastOps(_base.TestRockchipCastOps):
+  def test_cast_uint8_modulo(self):
+    values = np.array([-300., -257., -256., -255., -1.9, -0., 0., 1.9, 255., 256., 257., 300., 32768., 65504.], dtype=np.float16)
+    before = Device["ROCKCHIP"].submit_count
+    got = Tensor(values).cast(dtypes.uchar).realize().numpy()
+    np.testing.assert_array_equal(got, np.array([212,255,0,1,255,0,0,1,255,0,1,44,0,224], dtype=np.uint8))
+    self.assertGreater(Device["ROCKCHIP"].submit_count-before, 0)
   def test_cast_float(self):
     before = Device["ROCKCHIP"].submit_count
     _fp16_test_op([(3,3)], lambda x:x.float(), forward_only=True)

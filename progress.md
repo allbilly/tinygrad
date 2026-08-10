@@ -5246,3 +5246,32 @@ The unchanged upstream 320-element scalar-True `test_masked_select` is not promo
 but its output graph remains CPU-bound for minutes in Tinygrad core movement/devectorization before the Rockchip
 renderer is called. Changing that core rewrite is outside this backend milestone. No tensor values are inspected or
 computed on the host; the added runtime code only validates and moves raw conversion bytes.
+
+---
+
+## 2026-08-10 — DPU FP16-to-uint8 modulo conversion
+
+The unchanged upstream `test_cast_relu` now runs entirely through the Rockchip backend. Tinygrad pushes the cast
+through ReLU into an unsigned-byte `WHERE`; the new matcher recovers its FP16 value and evaluates truncation modulo
+256 with DPU FP16 FLOOR/MUL/SUB stages. A separate stateful DPU stage converts the exact integral remainder to INT16,
+then the existing raw gather exposes each low byte in the caller's uint8 buffer. The precision transition is an ioctl
+barrier: chaining the FP16 producer and INT16 converter in one PC chain produced stale or saturated results.
+
+`~/rk3588/examples/elementwise_int.py` proves the FP16-to-INT16 output converter and native integer precision fields.
+The older `rockchip-2607` branch instead converted typed outputs on the host, so it was inspected but not ported under
+the no-CPU-cheat rule. `~/npu` contains the same named DPU precision register fields but no better integrated uint8
+lowerer. Direct finite FP16 casts are covered across negative values, 255/256 boundaries, and the largest finite FP16
+value; the DPU modulo path matches Tinygrad's low-byte cast semantics.
+
+- Promoted unchanged upstream `test_cast_relu`: **passed in 3.12 s**; the success-census cast class plus the wide
+  modulo regression passed together as **3 tests in 3.92 s**, then the two uint8 tests passed twice consecutively.
+- The complete upstream `TestOpsUint8` batch found the direct cast and cast-ReLU methods passing; its three interpolate
+  methods and integer-min method remain unsupported (**2 passed, 4 failed in 12.32 s**).
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing; no reboot was used.
+- `test_rockchip.py`: **426 collected aliases**, representing **403 of 422** upstream method names; **19 remain**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,420/376 executable lines**, total **32,851**.
+
+The runtime change is zero: all arithmetic is encoded in `RKImage` at compile time and runs on DPU. Post-processing is
+the existing raw-byte gather only; there are no tensor-buffer reads, NumPy result calculations, LUTs, CMAC, FP32
+inputs, Tinygrad-core changes, or tolerance changes.

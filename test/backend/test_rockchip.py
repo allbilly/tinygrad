@@ -887,9 +887,10 @@ class TestRockchipLossOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCastOps(unittest.TestCase):
-  """Native DPU conversion from FP16 inputs to boolean, INT32, and FP32 outputs."""
+  """Native DPU conversion from FP16 inputs to boolean, byte, INT32, and FP32 outputs."""
 
   test_cast = _test_ops.TestOps.test_cast
+  test_cast_relu = _test_ops.TestOpsUint8.test_cast_relu
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
