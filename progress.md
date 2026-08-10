@@ -5158,6 +5158,23 @@ task—without changing arithmetic.
   renderer/runtime **7,383/368 executable lines**, total **32,806**.
 
 No Tinygrad-core change, tensor-value host computation, LUT, CMAC, FP32 input, or tolerance relaxation was introduced.
+
+---
+
+## 2026-08-10 — promote weighted NLL variants
+
+A serial physical batch covered all 17 remaining non-attention forward candidates. The unchanged upstream
+`test_nll_loss_weight` and `test_nll_loss_3d_weight` methods were the only new passes; both are promoted from the
+staging census to `test_rockchip.py`. The other candidates remain staged because they failed compilation or FP16
+numerical comparison, while upstream `test_pow_int` skipped itself. Attention remains untested under the current
+no-CMAC constraint, and forward-only mode excludes the two backward-comparison methods.
+
+- Candidate batch: **2 passed, 14 failed, 1 skipped in 71.23 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the batch; no reboot was used.
+- Upstream census: **401 of 422** method names are now promoted; **21 remain**.
+
+This milestone changes only test placement and documentation. It does not alter the renderer, runtime, tolerance,
+Tinygrad core, or device arithmetic.
 - `sz.py`: renderer/runtime **7,269/368 executable lines**, total **32,692**.
 
 The change is confined to compile-time UOp recognition and DPU FP16 masks/FDIV. It adds no host tensor reads or
