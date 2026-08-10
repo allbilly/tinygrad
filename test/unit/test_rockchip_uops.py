@@ -193,6 +193,24 @@ def test_static_local_accumulator_is_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
 
 
+def test_dependent_reduction_range_preserves_vector_output_axis():
+  def lower(rows:int):
+    out = UOp.param(0, dtypes.half, (rows,))
+    lhs, rhs = UOp.param(1, dtypes.half, (rows*65,)), UOp.param(2, dtypes.half, (65,))
+    row = UOp.range(rows, 1)
+    axis = UOp.range(65, 0, AxisType.REDUCE, src=(row,))
+    local = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG).index(0)
+    initialize = local.store(UOp.const(0.0, dtypes.float))
+    product = lhs.index(row*65+axis).load() * rhs.index(axis).load()
+    update = local.store(local.load() + product.cast(dtypes.float))
+    output = out.index(row).store(local.load().cast(dtypes.half))
+    return _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
+
+  scalar, vector = lower(1), lower(45)
+  assert scalar is not None and vector is not None
+  assert len(vector.ew_ops) == len(scalar.ew_ops)
+
+
 def test_static_structural_expansion_is_bounded():
   out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (513,))
   lane, axis = UOp.range(1, 0), UOp.range(513, 1, AxisType.REDUCE)

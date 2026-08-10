@@ -497,6 +497,14 @@ def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r: i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
+def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
+  """Enumerate only the selected structural axes, preserving dependent output axes as vector lanes."""
+  envs:list[dict[UOp, int]] = [{}]
+  for r in ranges:
+    if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
+    envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
+  return envs
+
 def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, list[dict[UOp, int]], UOp, int]|None:
   if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
   rows = int(out_param.src[0].arg)
@@ -7942,7 +7950,7 @@ def _unroll_static_reduces(root:UOp) -> UOp:
       iterations = math.prod(int(r.src[0].arg) for r in ranges)
       if iterations > _MAX_GENERIC_UNROLL or iterations*len(mapped.src[0].toposort()) > _MAX_GENERIC_EXPANDED_NODES:
         raise _RKGenericReject
-      envs = _iter_range_env(ranges)
+      envs = _iter_selected_range_env(ranges)
       if not envs: raise _RKGenericReject
       terms = [_substitute_static_ranges(mapped.src[0], {r:r.const_like(env[r]) for r in ranges}) for env in envs]
       mapped = _structural_reduce(reduce_op, u.dtype, terms)
@@ -7984,7 +7992,7 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   iterations = math.prod(int(r.src[0].arg) for r in ranges)
   if iterations > _MAX_GENERIC_UNROLL or iterations*len(term.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
   terms = [initializers[0]]
-  for env in _iter_range_env(ranges):
+  for env in _iter_selected_range_env(ranges):
     terms.append(_substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges}))
   reduced = _structural_reduce(update.op, update.dtype, terms)
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
