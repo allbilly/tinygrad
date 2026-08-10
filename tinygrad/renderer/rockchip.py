@@ -7463,6 +7463,19 @@ def _fp32_add_terms(u:UOp) -> list[UOp]:
   flatten(u)
   return terms
 
+def _accurate_add_recipe(u:UOp) -> UOp:
+  terms:list[UOp] = []
+  def flatten(x:UOp) -> None:
+    if x.op is Ops.ADD and x.dtype.scalar() is dtypes.half and x.arg is None:
+      flatten(x.src[0]); flatten(x.src[1])
+    elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half and len(x.src) == 1 and x.src[0].dtype.scalar() is dtypes.float and \
+         x.src[0].op is Ops.ADD:
+      terms.extend(_fp32_add_terms(x.src[0]))
+    else: terms.append(x)
+  flatten(u)
+  if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
+  return _precise_mul_sum(terms)
+
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
   def __init__(self, output:RKOutput):
@@ -7479,9 +7492,6 @@ class RKContext:
     self.ew_ops:list[RKEWOp] = []
     self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort())
     self.use_counts:dict[UOp, int] = {}
-    self.remaining_uses:dict[UOp, int] = {}
-    self.recyclable:set[int] = set()
-    self.free_scratch:list[int] = []
     self._register_graph(self.root)
 
   def _register_graph(self, root:UOp) -> None:
@@ -7489,27 +7499,12 @@ class RKContext:
     for node in root.toposort():
       for src in node.src: local[src] = local.get(src, 0) + 1
     for node,count in local.items():
-      merged = max(self.use_counts.get(node, 0), count)
-      self.use_counts[node] = merged
-      self.remaining_uses[node] = max(self.remaining_uses.get(node, 0), merged)
+      self.use_counts[node] = max(self.use_counts.get(node, 0), count)
 
-  def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None, *, reuse:bool=True) -> RKValue:
-    if reuse and size is None and self.free_scratch:
-      slot = self.free_scratch.pop()
-      self.recyclable.discard(slot)
-      return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
+  def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
     self.scratch.append(RKScratch(_scratch_bytes(self.count) if size is None else size))
     return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
-
-  def _release_sources(self, u:UOp, value:RKValue) -> None:
-    for src in u.src:
-      if src not in self.remaining_uses: continue
-      self.remaining_uses[src] -= 1
-      source = self.values.get(src)
-      if (self.remaining_uses[src] == 0 and source is not None and source.arg.kind is RKBufferKind.SCRATCH and
-          source.arg.index in self.recyclable and source.arg != value.arg and source.arg.index not in self.free_scratch):
-        self.free_scratch.append(source.arg.index)
 
   def _dst(self, u:UOp, dtype:DType, layout:RKLayout) -> RKValue:
     if u is self.root and self.out_param.dtype.scalar() is dtype and layout in (RKLayout.FP16, RKLayout.INT16):
@@ -7534,7 +7529,7 @@ class RKContext:
     if bits in self.constants:
       slot = self.constants[bits]
       return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
-    value = self._scratch(dtype, layout, reuse=False)
+    value = self._scratch(dtype, layout)
     self.constants[bits] = value.arg.index
     return value
 
@@ -7551,7 +7546,7 @@ class RKContext:
     else: raise _RKGenericReject
     key = (layout, vector)
     if key not in self.static_slots:
-      value = self._scratch(dtype, layout, reuse=False)
+      value = self._scratch(dtype, layout)
       self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector))
       self.static_slots[key] = value
     cached = self.static_slots[key]
@@ -7571,7 +7566,7 @@ class RKContext:
       runtime_index = _runtime_index(index)
       if (os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or gate is not None or runtime_index is None or
           runtime_index[2].key != self.out_index.key or int(runtime_index[1].src[0].arg) != self.count): raise _RKGenericReject
-      value = self._scratch(dtype, layout, reuse=False)
+      value = self._scratch(dtype, layout)
       fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
         _int16_bits(0 if default is None else default.arg)
       self.host_gathers.append(RKHostAddress(RKArg(RKBufferKind.ARG, param.arg.slot),
@@ -7586,7 +7581,7 @@ class RKContext:
     _validate_gather_bounds(plan, int(param.src[0].arg))
     key = (layout, _gather_cache_key((plan,)))
     if key not in self.gather_slots:
-      value = self._scratch(dtype, layout, reuse=False)
+      value = self._scratch(dtype, layout)
       self.gathers.append(replace(plan, dst_index=value.arg.index, itemsize=2))
       self.gather_slots[key] = value
     return self.gather_slots[key]
@@ -7651,17 +7646,7 @@ class RKContext:
     return self._emit(dst, lhs, rhs, cfg, compare=compare)
 
   def _accurate_add(self, u:UOp) -> RKValue:
-    terms:list[UOp] = []
-    def flatten(x:UOp) -> None:
-      if x.op is Ops.ADD and x.dtype.scalar() is dtypes.half and x.arg is None:
-        flatten(x.src[0]); flatten(x.src[1])
-      elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half and len(x.src) == 1 and x.src[0].dtype.scalar() is dtypes.float and \
-           x.src[0].op is Ops.ADD:
-        terms.extend(_fp32_add_terms(x.src[0]))
-      else: terms.append(x)
-    flatten(u)
-    if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
-    recipe = _precise_mul_sum(terms)
+    recipe = _accurate_add_recipe(u)
     self._register_graph(recipe)
     return self.lower(recipe)
 
@@ -7826,7 +7811,6 @@ class RKContext:
   def lower(self, u:UOp) -> RKValue:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
-    consume_sources = True
     if u.op is Ops.CONST: value = self._constant(u)
     elif (dtype in (dtypes.half, dtypes.int16, dtypes.bool) and _is_static_expr(u) and
           not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
@@ -7837,7 +7821,6 @@ class RKContext:
         recipe = _fp32_expr_to_half(u.src[0])
         self._register_graph(recipe)
         source = self.lower(recipe)
-        consume_sources = False
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
@@ -7846,20 +7829,16 @@ class RKContext:
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject
     elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None:
-      try: value, consume_sources = self._accurate_add(u), False
+      try: value = self._accurate_add(u)
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
-    elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value, consume_sources = self._compare(u), False
+    elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.int16: value = self._int16_bitwise(u)
     elif u.op is Ops.WHERE: value = self._where(u)
-    elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value, consume_sources = self._math(u), False
+    elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)
     else: raise _RKGenericReject
     self.values[u] = value
-    if u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
-                Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) and \
-       value.arg.kind is RKBufferKind.SCRATCH: self.recyclable.add(value.arg.index)
-    if consume_sources: self._release_sources(u, value)
     return value
 
   def finish(self) -> RKImage:
@@ -7919,6 +7898,9 @@ def _expand_math_uops(root:UOp) -> UOp:
       if mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
       mapped = rewrite(physical_recipe(_dpu_log2(mapped.src[0])))
     elif mapped.op is Ops.SIN: mapped = rewrite(physical_recipe(_dpu_sin(mapped.src[0])))
+    elif mapped.op is Ops.ADD and mapped.dtype.scalar() is dtypes.half and mapped.arg is None:
+      try: mapped = rewrite(_accurate_add_recipe(mapped))
+      except _RKGenericReject: pass
     cache[u] = mapped
     return mapped
   return rewrite(root)

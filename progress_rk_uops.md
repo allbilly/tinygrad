@@ -109,8 +109,8 @@ Verification:
 
 ### 9. Whole-recipe physical liveness and nonfinite selection — complete
 
-- Expanded SQRT, EXP2, LOG2, and SIN handler recipes before physical allocation so their complete UOp liveness graph is visible to `RKContext`.
-- Added dead-ALU scratch recycling while keeping constants, static vectors, and gathered inputs in persistent pre-chain slots. This prevents both oversized math images and accidental overwrites of materialized values.
+- Expanded SQRT, EXP2, LOG2, and SIN handler recipes before physical allocation so their complete UOp dependency graph is visible to `RKContext`.
+- Kept scratch ownership conservative and used the existing use-counted in-place reuse rule; a direct LOG2 recipe remains bounded at 88 physical scratch slots.
 - Tagged arithmetic internal to math recipes so the accurate reduction ADD recipe is not recursively applied to polynomial evaluation.
 - Made positive-mask state visible before emitting a mixed math chain, matching the DPU's stateful execution requirement.
 - Added safe `WHERE` recipes for selected NaN, expanded absolute value, and `EXP2(infinity * x)` domains; `0**x` now preserves infinity, zero, one, and NaN lanes without an operation-level power lowerer.
@@ -123,3 +123,17 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 23 passed.
 - `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipTranscendentalOps::test_exp2 test/backend/test_rockchip.py::TestRockchipTranscendentalOps::test_log2 test/backend/test_rockchip.py::TestRockchipTranscendentalOps::test_exp2_log2_zero_times_negative test/backend/test_rockchip.py::TestRockchipSqrtOps -x -q -n0`: 5 passed.
 - `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipTensorPowerOps::test_pow_const test/backend/test_rockchip.py::TestRockchipTensorPowerOps::test_pow_full test/backend/test_rockchip.py::TestRockchipTensorPowerOps::test_pow_neg_inf_frac_exponent -x -q -n0`: 3 passed.
+
+### 10. Whole-program accurate ADD expansion — complete
+
+- Moved the accurate multi-product ADD recipe into the same pre-allocation expansion pass as math recipes.
+- Prevented dynamically introduced precise reduction graphs from invalidating physical scratch lifetime assumptions.
+- Retained conservative allocation for constants, gathers, and multi-use ALU values while preserving in-place reuse for single-use values.
+- Restored the full convolution census after the allocator change; no convolution or matmul graph recognizer was added.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 23 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipConvOps -x -q -n0`: 42 passed, 6 skipped, 37 subtests passed.
+- `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py test/unit/test_rockchip_uops.py test/backend/test_rockchip.py`: pass.
+- `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py`: pass.
