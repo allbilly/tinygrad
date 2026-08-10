@@ -5175,6 +5175,23 @@ no-CMAC constraint, and forward-only mode excludes the two backward-comparison m
 
 This milestone changes only test placement and documentation. It does not alter the renderer, runtime, tolerance,
 Tinygrad core, or device arithmetic.
+
+---
+
+## 2026-08-10 — finite masked cumulative exponentials
+
+Tinygrad's stable cumulative log-sum-exp graph subtracts each prefix maximum before EXP2, but values outside a prefix
+are masked with negative infinity. The Rockchip rewrite moved that mask after EXP2; on `[0,100]`, the inactive second
+candidate of the first prefix became `exp2(100) * 0`, yielding `infinity * 0 = NaN`. The cumulative matcher now uses
+the existing bounded nonpositive EXP2 emitter. Valid centered terms are nonpositive, and inactive lanes remain finite
+until the final zero mask.
+
+The unchanged upstream `test_logcumsumexp_numerical` method now passes and is promoted. It and the complete existing
+nine-variant `test_logcumsumexp` method pass together in **15.12 s**. This is DPU-only arithmetic: no LUT, CMAC, host
+tensor evaluation, FP32 input, Tinygrad-core change, or tolerance relaxation.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing; no reboot was used.
+- Upstream census: **402 of 422** method names are promoted; **20 remain**.
 - `sz.py`: renderer/runtime **7,269/368 executable lines**, total **32,692**.
 
 The change is confined to compile-time UOp recognition and DPU FP16 masks/FDIV. It adds no host tensor reads or

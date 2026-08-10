@@ -7813,7 +7813,7 @@ def _fold_masked_exp2(x:UOp) -> UOp|None:
   padded = tuple(arm.op is Ops.CONST and math.isinf(float(arm.arg)) and float(arm.arg) < 0 for arm in (yes, no))
   if padded.count(True) != 1 or not _is_static_expr(gate): return None
   value, mask = (no, UOp.const(1.0, dtypes.half).alu(Ops.SUB, gate.cast(dtypes.half))) if padded[0] else (yes, gate.cast(dtypes.half))
-  return _mask_mul(_dpu_exp2(value.cast(dtypes.half).alu(Ops.MUL, factor.cast(dtypes.half))), mask)
+  return _mask_mul(_dpu_exp2_nonpositive(value.cast(dtypes.half).alu(Ops.MUL, factor.cast(dtypes.half))), mask)
 
 def _fp16_predecessor(value:float) -> float:
   """Return the previous positive binary16 value for inclusive threshold masks."""

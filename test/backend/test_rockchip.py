@@ -652,6 +652,7 @@ class TestRockchipCumulativeOps(unittest.TestCase):
   test_cumsum = _test_ops.TestOps.test_cumsum
   test_cumsum_zero_axis = _test_ops.TestOps.test_cumsum_zero_axis
   test_logcumsumexp = _test_ops.TestOps.test_logcumsumexp
+  test_logcumsumexp_numerical = _test_ops.TestOps.test_logcumsumexp_numerical
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCumulativeProductOps(unittest.TestCase):
