@@ -857,6 +857,9 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
   test_sinh = _test_ops.TestOps.test_sinh
   test_cosh = _test_ops.TestOps.test_cosh
   test_sin = _test_ops.TestOps.test_sin
+  test_cos = _test_ops.TestOps.test_cos
+  test_tan = _test_ops.TestOps.test_tan
+  test_sigmoid_alt_extreme = _test_ops.TestOps.test_sigmoid_alt_extreme
   test_binary_crossentropy = _test_ops.TestOps.test_binary_crossentropy
   test_binary_crossentropy_reductions = _test_ops.TestOps.test_binary_crossentropy_reductions
   test_binary_crossentropy_logits_pos_weights = _test_ops.TestOps.test_binary_crossentropy_logits_pos_weights

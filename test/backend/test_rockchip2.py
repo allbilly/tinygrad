@@ -34,21 +34,6 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
-class TestRockchipTranscendentalCandidates(_test_ops.TestOps):
-  """Remaining no-LUT transcendental candidates; passing methods move unchanged to test_rockchip.py."""
-
-  @classmethod
-  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
-
-  @classmethod
-  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
-
-  test_cos = _test_ops.TestOps.test_cos
-  test_sigmoid_alt_extreme = _test_ops.TestOps.test_sigmoid_alt_extreme
-  test_tan = _test_ops.TestOps.test_tan
-
-@_only_local_tests
-@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCompositeCandidates(_test_ops.TestOps):
   """Remaining cumulative, normalization, and attention candidates."""
 

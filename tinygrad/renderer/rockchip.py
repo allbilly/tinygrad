@@ -7816,6 +7816,29 @@ _pm_inverse_hyperbolic = PatternMatcher([
   (UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_inverse_hyperbolic),
 ])
 
+def _fold_alt_sigmoid_gradient(root:UOp) -> UOp|None:
+  """Recover the stable sigmoid derivative from exp(x)/(1+exp(x)) differentiation."""
+  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.half or len(root.src) != 1 or
+      (body:=root.src[0]).op is not Ops.MUL or body.dtype.scalar() is not dtypes.float): return None
+  exponential = next((u for u in body.src if u.op is Ops.EXP2), None)
+  correction = next((u for u in body.src if u is not exponential), None)
+  if exponential is None or correction is None or (scaled:=exponential.src[0]).op is not Ops.MUL: return None
+  factor = next((u for u in scaled.src if u.op is Ops.CONST and abs(float(u.arg)-1/math.log(2)) < 1e-12), None)
+  source = next((_strip_cast(u) for u in scaled.src if u is not factor), None)
+  nodes = correction.toposort()
+  if (factor is None or source is None or source.dtype.scalar() is not dtypes.half or
+      sum(u.op is Ops.FDIV for u in nodes) != 3 or
+      not any(u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and u.src[0].key == exponential.key for u in nodes) or
+      not all(any(u.op is Ops.CONST and float(u.arg) == value for u in nodes) for value in (-1.0, 1.0))): return None
+  one = UOp.const(1.0, dtypes.half)
+  denominator = one.alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(-1/math.log(2), dtypes.half)).alu(Ops.EXP2))
+  sigmoid = one.alu(Ops.FDIV, denominator)
+  return sigmoid.alu(Ops.MUL, one.alu(Ops.SUB, sigmoid))
+
+_pm_alt_sigmoid_gradient = PatternMatcher([
+  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_alt_sigmoid_gradient),
+])
+
 def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
   """Approximate FP16 sqrt/rsqrt with range-independent Babylonian iterations on DPU EW."""
   if any(_local_load(u) is not None for u in source.toposort()): return None
@@ -7871,31 +7894,65 @@ def _dpu_sin(source:UOp) -> UOp:
     Ops.MUL, UOp.const(2.0, dtypes.half)))
   return angle.alu(Ops.MUL, polynomial).alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
 
-def _dpu_tan(source:UOp) -> UOp:
-  """Approximate FP16 TAN directly, retaining a split pole distance near odd multiples of pi/2."""
+def _dpu_cos(source:UOp) -> UOp:
+  """Approximate FP16 COS after reducing the original angle, preserving large-input phase."""
   source = source.cast(dtypes.half)
-  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
-  bounded, multiple, reduced = _dpu_periodic_reduce(
-    source, 1/math.pi, (2.0, 1.0, 0.125, 0.015625, math.pi-3.140625), math.pi/2)
+  one = UOp.const(1.0, dtypes.half)
+  _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
   magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  near_pole = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(0.75, dtypes.half)))
-  reduced_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
-  distance = bounded
-  for factor,coefficient in ((multiple, 3.0), (reduced_sign, 1.5), (multiple, 0.140625), (reduced_sign, 0.0703125),
-                             (multiple, math.pi-3.140625), (reduced_sign, math.pi/2-1.5703125)):
-    distance = distance.alu(Ops.SUB, factor.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
-  pole_magnitude = UOp(Ops.MAX, dtypes.half, src=(distance, distance), arg=_NATIVE_ABS)
-  angle = _mask_mul(magnitude, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, _mask_mul(pole_magnitude, near_pole))
+  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
+  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
+    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
+  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
   square = angle.alu(Ops.MUL, angle)
+  polynomial = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320))
+  sign = one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  return polynomial.alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
+
+def _dpu_tan_magnitude(angle:UOp, pole_magnitude:UOp) -> UOp:
+  """Evaluate positive tangent magnitude directly or through reciprocal pole distance."""
+  one = UOp.const(1.0, dtypes.half)
+  near_pole = _positive_mask(angle.alu(Ops.SUB, UOp.const(0.75, dtypes.half)))
+  local = _mask_mul(angle, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, _mask_mul(pole_magnitude, near_pole))
+  square = local.alu(Ops.MUL, local)
   polynomial = UOp.const(1382/155925, dtypes.half)
   for coefficient in (62/2835, 17/315, 2/15, 1/3, 1.0):
     polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
-  tangent = angle.alu(Ops.MUL, polynomial)
+  tangent = local.alu(Ops.MUL, polynomial)
   safe_tangent = tangent.alu(Ops.ADD, one.alu(Ops.SUB, near_pole))
-  magnitude_result = _mask_mul(tangent, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, near_pole.alu(Ops.FDIV, safe_tangent))
-  distance_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, distance)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
-  sign = _mask_mul(reduced_sign, one.alu(Ops.SUB, near_pole)).alu(Ops.SUB, _mask_mul(distance_sign, near_pole))
-  return magnitude_result.alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, zero))
+  return _mask_mul(tangent, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, near_pole.alu(Ops.FDIV, safe_tangent))
+
+def _dpu_tan(source:UOp) -> UOp:
+  """Approximate FP16 TAN with precise near-pole and large-angle reductions."""
+  source = source.cast(dtypes.half)
+  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+  bounded, multiple, reduced = _dpu_periodic_reduce(source, 1/math.pi,
+    (2.0, 1.0, 0.125, 0.015625, math.pi-3.140625), math.pi/2)
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
+  reduced_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  pole_index = multiple.alu(Ops.ADD, reduced_sign.alu(Ops.MUL, UOp.const(0.5, dtypes.half)))
+  distance = bounded
+  for coefficient in (3.0, 0.140625, math.pi-3.140625):
+    distance = distance.alu(Ops.SUB, pole_index.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
+  pole_magnitude = UOp(Ops.MAX, dtypes.half, src=(distance, distance), arg=_NATIVE_ABS)
+  small = _dpu_tan_magnitude(magnitude, pole_magnitude).alu(Ops.MUL, reduced_sign)
+
+  _, _, broad = _dpu_periodic_reduce(source, 1/(2*math.pi),
+    (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
+  broad_magnitude = UOp(Ops.MAX, dtypes.half, src=(broad, broad), arg=_NATIVE_ABS)
+  reflected = _positive_mask(broad_magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
+  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, broad_magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
+    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
+  angle = _mask_mul(broad_magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
+  broad_pole = UOp.const(1.5703125, dtypes.half).alu(Ops.SUB, angle).alu(
+    Ops.ADD, UOp.const(math.pi/2-1.5703125, dtypes.half))
+  broad_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, broad)).alu(Ops.MUL, UOp.const(2.0, dtypes.half))).alu(
+    Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half))))
+  large = _dpu_tan_magnitude(angle, broad_pole).alu(Ops.MUL, broad_sign)
+  use_large = _finite_positive_mask(UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS).alu(
+    Ops.SUB, UOp.const(8.0, dtypes.half)))
+  result = small.alu(Ops.ADD, use_large.alu(Ops.MUL, large.alu(Ops.SUB, small)))
+  return result.alu(Ops.ADD, source.alu(Ops.MUL, zero))
 
 def _dpu_pow2_integer(exponent:UOp) -> UOp:
   """Build `2**exponent` for the FP16 exponent range with exact native DPU arithmetic."""
@@ -8093,21 +8150,29 @@ _pm_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), src=(UPa
 _pm_masked_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), name="x"), _fold_masked_exp2)])
 _pm_log2 = PatternMatcher([(UPat(Ops.LOG2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_log2(source))])
 _pm_sin = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sin(source))])
+def _cos_source(x:UOp) -> UOp|None:
+  """Recover x from Tinygrad's casted cos(x) = sin(pi/2-x)."""
+  x = _strip_cast(x)
+  if x.op is not Ops.SIN or len(x.src) != 1 or (phase:=_const_operand(_strip_cast(x.src[0]), Ops.ADD, math.pi/2)) is None: return None
+  negative = _const_operand(phase[0], Ops.MUL, -1.0)
+  return _strip_cast(negative[0]) if negative is not None else None
+def _fold_cos(x:UOp) -> UOp|None:
+  """Recognize cosine before FP16 loses its pi/2 phase shift."""
+  return _dpu_cos(source) if (source:=_cos_source(x)) is not None else None
+_pm_cos = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), name="x"), _fold_cos)])
 def _fold_tan(x:UOp) -> UOp|None:
   """Recognize Tensor.tan's SIN(x)/SIN(pi/2-x) expansion before either sine is rewritten."""
-  if x.op is not Ops.FDIV or len(x.src) != 2 or any(u.op is not Ops.SIN for u in x.src): return None
-  numerator, denominator = x.src
-  source_loads = {u.key for u in numerator.src[0].toposort() if u.op is Ops.LOAD}
-  denominator_loads = {u.key for u in denominator.src[0].toposort() if u.op is Ops.LOAD}
-  has_half_pi = any(u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
-                    abs(float(u.arg)-math.pi/2) < 1e-5 for u in denominator.src[0].toposort())
-  return _dpu_tan(numerator.src[0]) if len(source_loads) == 1 and source_loads == denominator_loads and has_half_pi else None
+  if x.op is not Ops.FDIV or len(x.src) != 2 or (numerator:=_strip_cast(x.src[0])).op is not Ops.SIN: return None
+  source, cosine_source = _strip_cast(numerator.src[0]), _cos_source(x.src[1])
+  return _dpu_tan(source) if cosine_source is not None and source.key == cosine_source.key else None
 _pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"), _fold_tan)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_alt_sigmoid_gradient, name="rockchip alternate sigmoid gradient")
   sink = graph_rewrite(sink, _pm_inverse_hyperbolic, name="rockchip inverse hyperbolic")
   sink = graph_rewrite(sink, _pm_atan, name="rockchip atan")
   sink = graph_rewrite(sink, _pm_tan, name="rockchip tan")
+  sink = graph_rewrite(sink, _pm_cos, name="rockchip cos")
   sink = graph_rewrite(sink, _pm_sin, name="rockchip sin")
   sink = graph_rewrite(sink, _pm_masked_exp2, name="rockchip masked exp2")
   sink = graph_rewrite(sink, _pm_exp2, name="rockchip exp2")

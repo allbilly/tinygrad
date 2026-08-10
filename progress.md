@@ -5325,3 +5325,34 @@ current no-LUT contract.
 
 All new math is encoded into `RKImage` at compile time and runs as FP16 DPU EW stages. There is no tensor-value host
 evaluation, LUT, CMAC, FP32 input, Tinygrad-core change, runtime change, or tolerance relaxation.
+
+---
+
+## 2026-08-10 — stable trigonometric edges and alternate sigmoid gradient
+
+The unchanged upstream `test_cos`, `test_tan`, and `test_sigmoid_alt_extreme` methods now pass entirely through DPU
+EW. Tinygrad represents cosine as `sin(pi/2-x)`; forming that phase in FP16 loses too much information for inputs such
+as 1,000 and 10,000. The renderer now recognizes the canonical cosine graph before sine lowering, reduces the original
+angle with split 2*pi constants, reflects it into the first quadrant, and evaluates a compact even polynomial.
+
+Tangent's canonical quotient contained finalized casts around its cosine denominator, so the old matcher never ran.
+The matcher now shares cosine-source recovery and evaluates tangent directly. Bounded inputs use a split-pi pole
+distance, while inputs above eight use the wider 2*pi reducer before quadrant reflection; both regimes share one
+polynomial/reciprocal-pole evaluator. This fixes the sensitive samples around odd multiples of pi/2 and the large
+finite FP16 range. The alternate sigmoid test differentiates `exp(x)/(1+exp(x))`, whose generated expression becomes
+infinity divided by infinity at 300. Its exact finalized derivative idiom is rewritten to the stable `s*(1-s)` form.
+
+Historical Rockchip branches and the vendor operator sources were inspected. Their broad trigonometric/sigmoid paths
+ultimately use LUT payloads or host subtasks, so those implementations were not ported under the no-LUT/no-CPU-cheat
+contract; only their canonical graph shapes informed the local matchers.
+
+- The three staged methods passed together serially in **25.89 s**; after promotion they passed from
+  `test_rockchip.py` in **26.11 s**. The longest method, `test_tan`, passed alone in **19.89 s** across its five kernels.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing; no reboot was used.
+- `test_rockchip.py`: **432 collected aliases**, representing **409 of 422** upstream methods; **13 remain**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,558/376 executable lines**, total **32,989**.
+
+All arithmetic is encoded from the UOp graph into `RKImage` at compile time and executes on FP16 DPU EW. There is no
+tensor-buffer inspection or host result calculation, LUT, CMAC, FP32 input, Tinygrad-core/runtime change, or tolerance
+relaxation.
