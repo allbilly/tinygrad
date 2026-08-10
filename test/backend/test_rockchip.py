@@ -486,6 +486,24 @@ class TestRockchipValidationOps(unittest.TestCase):
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipAttentionOps(unittest.TestCase):
+  """Scaled dot-product attention through tiled DPU MUL, balanced ADD, softmax, and value reduction plans."""
+
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_scaled_dot_product_attention = _test_ops.TestOps.test_scaled_dot_product_attention
+  test_scaled_dot_product_attention_causal = _test_ops.TestOps.test_scaled_dot_product_attention_causal
+  test_scaled_dot_product_attention_gqa = _test_ops.TestOps.test_scaled_dot_product_attention_gqa
+  test_scaled_dot_product_attention_mismatch_ls = _test_ops.TestOps.test_scaled_dot_product_attention_mismatch_ls
+
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBroadcastOps(unittest.TestCase):
   """FP16 broadcasting through static gather and DPU EW arithmetic."""
 

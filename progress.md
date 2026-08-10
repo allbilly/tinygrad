@@ -5537,3 +5537,41 @@ assumption rather than a Rockchip result failure.
 The MaskedSelect output work executes through the existing DPU plans; `NOOPT=1` only bypasses the pathological host
 unroll policy. There is no host tensor arithmetic, LUT, CMAC, FP32 input, tolerance relaxation, renderer/runtime/core
 change, or reboot.
+
+---
+
+## 2026-08-10 — complete the upstream census with DPU-only attention
+
+All four unchanged upstream scaled-dot-product-attention methods now pass under the existing FP16 tolerance. The
+renderer recognizes finalized unrolled vector dots, gathers their FP16 operands into a group-major scratch matrix,
+executes tiled DPU MUL, and performs a physically balanced DPU ADD reduction. The deterministic QK probe improved
+from max/mean absolute error **0.01171875/0.00114362** to **0.00390625/0.00057529**, with zero failures under
+`atol=rtol=5e-3`. Tensor and static causal masks are applied as a separate DPU ADD after the finite dot, avoiding
+TwoSum arithmetic on infinity. Centered logits are clamped before exponent scaling because RK3588 maps FP16
+`-inf * finite` to NaN.
+
+Large tiled stages are split at semantic operation boundaries derived from the 64,000-lane DPU tile and 64-byte FP16
+row alignment. Balanced reduction operations, final scaling, rowwise exponential stages, and weighted-value chunks
+are independently state-initialized, keeping every ioctl below the driver's 30-second timeout without a hardcoded
+task-count limit. The mapped-dot scratch plan has an explicit 256 MiB compile-time admission budget; the largest GQA
+QK image uses **160.5 MiB**.
+
+The first correct GQA run took **104.35 s**. A cold wall profile attributed **94.81 s** of **101.47 s** realization
+to renderer construction and only **2.76 s** to all four kernel calls. The final attention matcher was repeatedly
+expanding full million-lane offset vectors and alone consumed **74.14 s**. Proving the output index contiguous once
+and validating compile-time load expressions at range boundaries reduced that renderer to **0.51 s** and total cold
+rendering to **21.39 s**. The promoted GQA method then passed in **30.74 s**; the remaining cold renderer cost is the
+large QK matcher (**18.12 s**), while its NPU execution remains approximately **1.44 s**.
+
+- Individual promoted methods: mismatch-length **11.42 s**, ordinary plus tensor-mask **25.60 s**, causal **26.53 s**,
+  and GQA **30.74 s**.
+- Final attention class: **4 passed in 77.80 s** serially at `5e-3/5e-3`.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after final testing; no reboot was used.
+- `test_rockchip.py`: **445 collected aliases**, representing **all 422 of 422** upstream methods. Of the unique
+  methods, **417 physically pass** and **5 are explicit contract/oracle skips**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **8,016/376 executable lines**, total **33,447**.
+
+All offsets, masks, and plans are derived from static UOps at compile time. Runtime gathers only move opaque lanes;
+every attention arithmetic operation executes on DPU EW. There is no tensor-value host computation, CMAC, LUT, FP32
+input, Tinygrad-core/runtime change, or tolerance relaxation.
