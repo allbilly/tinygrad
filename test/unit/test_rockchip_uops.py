@@ -1,7 +1,7 @@
 import math, struct
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _NATIVE_SIGN,
-  _lower_uop_program, decode_image, encode_image)
+  _MAX_EW_ELEMS_FP16, _iter_range_env, _lower_uop_program, decode_image, encode_image)
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
@@ -185,6 +185,18 @@ def test_unrolled_math_reduction_vectorizes_periodic_indices():
   assert len(image.ew_ops) < 300
 
 
+def test_batched_unrolled_math_reduction_materializes_each_uop_result():
+  rows, groups = 8, 4
+  out, source = UOp.param(0, dtypes.half, (rows,)), UOp.param(1, dtypes.half, (rows*groups,))
+  normalizer, lane = UOp.param(2, dtypes.half, (rows,)), UOp.range(rows, 0)
+  terms = [(source.index(lane*groups+k).load() - normalizer.index(lane).load()).exp2() for k in range(groups)]
+  value = terms[0]
+  for term in terms[1:]: value = value + term
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and len(image.mid_gathers) == groups
+  assert image.gather_after > 1 and image.ew_ops[image.gather_after].dst.kind is RKBufferKind.SCRATCH
+
+
 def test_static_reduce_uops_are_structurally_executed():
   for op in (Ops.ADD, Ops.MAX, Ops.MUL):
     out, source = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,))
@@ -205,8 +217,8 @@ def test_static_dot_reduce_owns_accurate_physical_recipe():
 
 
 def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
-  groups = 256
-  rows = 8
+  groups = 64
+  rows = _MAX_EW_ELEMS_FP16+1
   out = UOp.param(0, dtypes.half, (rows,))
   lhs, rhs = UOp.param(1, dtypes.half, (rows*groups,)), UOp.param(2, dtypes.half, (rows*groups,))
   lane = UOp.range(rows, 0)
@@ -217,7 +229,7 @@ def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   value = (zero < value).where(value, zero)
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and image.constants == struct.pack("<eee", 1.0, 65.0, 0.0)
-  assert len(image.gathers) == groups*2 and image.gather_after == 17
+  assert len(image.gathers) == groups*2 and image.gather_after >= 17 and image.gather_after%17 == 0
   assert len(image.mid_gathers) == groups*2 and len(image.ew_ops) > image.gather_after
   assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MAX]
 
@@ -276,6 +288,13 @@ def test_static_structural_expansion_is_bounded():
   reduced = UOp(Ops.REDUCE, dtypes.half, src=(source.index(axis).load(), axis), arg=(Ops.ADD,))
   uops = list(out.index(lane).store(reduced).end(lane, axis).sink().toposort())
   assert _lower_uop_program(uops) is None
+
+
+def test_static_range_environment_allocation_is_bounded():
+  axes = [UOp.range(1024, 0), UOp.range(1024, 1)]
+  try: _iter_range_env(axes, max_envs=1024)
+  except RuntimeError as error: assert "static_index_budget" in str(error)
+  else: raise AssertionError("oversized static RANGE product was materialized")
 
 
 def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):

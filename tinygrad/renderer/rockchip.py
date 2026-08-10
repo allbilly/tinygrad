@@ -208,8 +208,9 @@ _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _MAX_MAPPED_DOT_SCRATCH_BYTES = 352 << 20
 _MAX_GENERIC_UNROLL = 512
-_MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 256
+_MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 64
 _MAX_GENERIC_EXPANDED_NODES = 16384
+_MAX_STATIC_RANGE_ENVS = 1 << 18
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
 _FP16_EXACT_INTEGER = 1 << 11
 _POOL_INDEX_DIGIT_BITS = 4
@@ -482,7 +483,7 @@ def _output_store(uops:list[UOp], dtype:DType|tuple[DType, ...], *, allow_local:
   if out_param.dtype.scalar() not in accepted or out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
   return store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
 
-def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
+def _iter_range_env(ranges:list[UOp], max_envs:int=_MAX_STATIC_RANGE_ENVS) -> list[dict[UOp, int]]:
   if not ranges: return [{}]
   order:list[UOp] = []
   seen:set[UOp] = set()
@@ -495,7 +496,9 @@ def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
   envs:list[dict[UOp, int]] = [{}]
   for r in order:
     if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
-    envs = [{**env, r: i} for env in envs for i in range(int(r.src[0].arg))]
+    bound = int(r.src[0].arg)
+    if bound < 0 or bound and len(envs) > max_envs//bound: raise RuntimeError("RKPLAN_REJECT:static_index_budget")
+    envs = [{**env, r: i} for env in envs for i in range(bound)]
   return envs
 
 def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
@@ -1473,7 +1476,7 @@ def _lower_rowwise_exp_reduction(uops:list[UOp]) -> RKImage|None:
       if gather.src_kind is RKBufferKind.ARG and gather.src_index == fake_slot else gather for gather in log_image.gathers))
   return _append_inplace_image(summed, log_image)
 
-def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
+def _lower_mapped_add_loop_reduction(uops:list[UOp], *, generic_only:bool=False) -> RKImage|None:
   """Evaluate one fused FP16 map over the whole reduction domain, then reduce its materialized lanes."""
   if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
   store, out, rows, out_index, root = output
@@ -1503,15 +1506,18 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   fake_out = out.replace(src=(out.src[0].const_like(lanes),))
   fake_index = store.src[0].replace(src=(fake_out, linear_index))
   fake_store = store.replace(src=(fake_index, term, *store.src[2:]))
-  try: mapped = lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(fake_store,)).toposort())))
-  except RuntimeError: return None
+  map_uops = _fp16_rewrite(list(UOp(Ops.SINK, src=(fake_store,)).toposort()))
+  if generic_only: mapped = _lower_uop_program(map_uops, vectorize_reductions=False, recipes_ready=True)
+  else:
+    try: mapped = lower_ew(map_uops)
+    except RuntimeError: return None
+  if mapped is None: return None
   return _finish_mapped_add_reduction(mapped, out_slot, rows, groups, post_scale)
 
 def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:bool=False) -> RKImage|None:
   """Execute repeated ADD terms once as vector UOps, then physically reduce their materialized lanes."""
   if (output:=_output_store(uops, dtypes.half)) is None: return None
-  store, out, count, _, root = output
-  if count != 1: return None
+  store, out, count, out_index, root = output
   legacy_shape = root.op is Ops.CAST and root.src[0].op is Ops.MUL
   summed, post_scale = root, 1.0
   while True:
@@ -1522,7 +1528,14 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
     post_scale *= float(scale.arg); summed = value
   if summed.op is not Ops.ADD or not math.isfinite(post_scale): return None
   terms = tuple(_strip_cast(term) for term in _flatten_binary(summed, Ops.ADD))
-  if len(terms) < 2: return None
+  if len(terms) < 2 or count*len(terms) > _MAX_STATIC_RANGE_ENVS: return None
+  mapped_math = any(u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) for u in terms[0].toposort())
+  if count > 1 and not mapped_math: return None
+  out_ranges = _index_ranges(out_index)
+  try: out_envs = _iter_range_env(out_ranges)
+  except RuntimeError: return None
+  if len(out_envs) != count or tuple(_eval_int(out_index, env) for env in out_envs) != tuple(range(count)): return None
+  vector_env = {r:np.fromiter((env[r] for env in out_envs), dtype=np.int64, count=count) for r in out_ranges}
   def input_leaf(u:UOp) -> tuple[UOp, UOp]|None:
     index = u if u.op is Ops.INDEX else u.src[0] if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX else None
     param = _root_param(index) if index is not None else None
@@ -1530,10 +1543,10 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
   input_slots = {parsed[1].arg.slot for term in terms for u in term.toposort()
                  for parsed in (input_leaf(u),) if parsed is not None}
   if not legacy_shape and len(input_slots) < 2: return None
-  if any(u.op not in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.RECIPROCAL, Ops.NEG,
-                      Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE,
-                      Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST)
-         for u in terms[0].toposort()): return None
+  supported_ops = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.RECIPROCAL, Ops.NEG,
+                   Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE,
+                   Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST, Ops.RANGE)
+  if any(u.op not in supported_ops for u in terms[0].toposort()): return None
   signature_cache:dict[UOp, tuple] = {}
   def signature(u:UOp) -> tuple:
     if u in signature_cache: return signature_cache[u]
@@ -1557,7 +1570,8 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
     for leaf in leaves: counterparts[leaf].append(found[leaf])
   first = input_leaf(leaves[0]); assert first is not None
   first_index = first[0]
-  lane = UOp(Ops.RANGE, first_index.src[1].dtype, src=(first_index.src[1].const_like(len(terms)),), arg=(0, AxisType.LOOP))
+  axis = max((r.arg[0] for r in _index_ranges(out_index) if isinstance(r.arg, tuple)), default=-1)+1
+  lane = UOp(Ops.RANGE, first_index.src[1].dtype, src=(first_index.src[1].const_like(len(terms)),), arg=(axis, AxisType.LOOP))
   substitutions:dict[UOp, UOp] = {}
   repeated_shapes:set[tuple[int, int]] = set()
   for leaf in leaves:
@@ -1567,8 +1581,16 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
     concrete = [item for item in parsed if item is not None]
     params = [item[1] for item in concrete]
     if len({param.key for param in params}) != 1: return None
-    try: offsets = tuple(_eval_int(item[0].src[1], {}) for item in concrete)
-    except RuntimeError: return None
+    try:
+      eval_cache:dict[UOp, np.ndarray] = {}
+      base_values = np.broadcast_to(_eval_vector(concrete[0][0].src[1], vector_env, eval_cache), count).astype(np.int64)
+      offsets_list:list[int] = []
+      for item in concrete:
+        delta = np.unique(np.broadcast_to(_eval_vector(item[0].src[1], vector_env, eval_cache), count).astype(np.int64)-base_values)
+        if len(delta) != 1: raise RuntimeError("nonuniform repeated index")
+        offsets_list.append(int(delta[0]))
+      offsets = tuple(offsets_list)
+    except (RuntimeError, ValueError): return None
     run = next((i for i,value in enumerate(offsets) if value != offsets[0]), len(offsets))
     period = next((size for size in range(2, len(offsets)) if len(offsets)%size == 0 and
                    offsets == offsets[:size]*(len(offsets)//size)), len(offsets))
@@ -1580,18 +1602,21 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
     else: blocks, index_lane = offsets, lane
     stride = blocks[1]-blocks[0]
     if blocks != tuple(blocks[0]+i*stride for i in range(len(blocks))): return None
-    index = concrete[0][0].replace(src=(params[0], index_lane.alu(Ops.MUL, lane.const_like(stride)).alu(Ops.ADD, lane.const_like(blocks[0])),
+    mapped_index = concrete[0][0].src[1].alu(Ops.ADD,
+      index_lane.alu(Ops.MUL, lane.const_like(stride)).alu(Ops.ADD, lane.const_like(blocks[0])))
+    index = concrete[0][0].replace(src=(params[0], mapped_index,
                                               *concrete[0][0].src[2:]))
     substitutions[leaf] = index if leaf.op is Ops.INDEX else leaf.replace(src=(index, *leaf.src[1:]))
   vector = template.substitute(substitutions)
   factorizations = [(len(terms)//factor, factor) for factor in range(2, math.isqrt(len(terms))+1) if len(terms)%factor == 0 and
                     (len(terms)//factor)%(_reduction_stride(1)//2) == 0]
-  group_shape = next(iter(repeated_shapes)) if len(repeated_shapes) == 1 else min(factorizations, key=lambda shape:sum(shape), default=())
+  group_shape = (next(iter(repeated_shapes)) if len(repeated_shapes) == 1 else
+                 min(factorizations, key=lambda shape:sum(shape), default=())) if count == 1 else ()
   matrix_lane = (lane.alu(Ops.FLOORMOD, lane.const_like(group_shape[1])).alu(Ops.MUL, lane.const_like(group_shape[0])).alu(
     Ops.ADD, lane.alu(Ops.FLOORDIV, lane.const_like(group_shape[1])))) if group_shape and \
     group_shape[0]%(_reduction_stride(1)//2) == 0 else lane
-  fake_out = out.replace(src=(out.src[0].const_like(len(terms)),))
-  fake_index = store.src[0].replace(src=(fake_out, matrix_lane))
+  fake_out = out.replace(src=(out.src[0].const_like(count*len(terms)),))
+  fake_index = store.src[0].replace(src=(fake_out, matrix_lane.alu(Ops.MUL, matrix_lane.const_like(count)).alu(Ops.ADD, out_index)))
   fake_store = store.replace(src=(fake_index, vector, *store.src[2:]))
   map_uops = list(UOp(Ops.SINK, src=(fake_store,)).toposort())
   if generic_only: mapped = _lower_uop_program(_fp16_rewrite(map_uops), vectorize_reductions=False, recipes_ready=True)
@@ -1599,8 +1624,12 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
     try: mapped = lower_ew(_fp16_rewrite(map_uops))
     except RuntimeError: return None
   if mapped is None: return None
-  return _finish_mapped_add_reduction(mapped, out.arg.slot, 1, len(terms), post_scale,
-                                      group_shape)
+  finished = _finish_mapped_add_reduction(mapped, out.arg.slot, count, len(terms), post_scale, group_shape)
+  if finished is not None and count > 1 and mapped_math and finished.gather_after < len(finished.ew_ops):
+    ops = list(finished.ew_ops)
+    ops[finished.gather_after] = replace(ops[finished.gather_after], stateful=True)
+    finished = replace(finished, ew_ops=tuple(ops))
+  return finished
 
 def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   """Execute repeated FP16 MUL UOps with product residuals, then compensate their physical ADD reduction."""
@@ -1629,7 +1658,7 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   terms = tuple(_strip_cast(term) for term in _flatten_binary(summed, Ops.ADD))
   groups, lanes = len(terms), rows*len(terms)
   chunk_lanes = _MAX_EW_ELEMS_FP16*(_reduction_stride(1)//2)
-  if groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or \
+  if groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or groups < 256 and rows <= _MAX_EW_ELEMS_FP16 or \
      8*_scratch_bytes(lanes)+_scratch_bytes(min(chunk_lanes, lanes)) > _MAX_MAPPED_DOT_SCRATCH_BYTES: return None
 
   parsed:list[tuple[tuple[UOp, RKGather], tuple[UOp, RKGather]]] = []
@@ -8121,6 +8150,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
   if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
   if vectorize_reductions and (mul_add:=_lower_vectorized_mul_add_reduction(uops)) is not None: return mul_add
+  mapped_loop = _lower_mapped_add_loop_reduction(uops, generic_only=True) if vectorize_reductions else None
+  if mapped_loop is not None: return mapped_loop
   if vectorize_reductions and (reduction:=_lower_vectorized_unrolled_add_reduction(uops, generic_only=True)) is not None:
     return reduction
   if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool), allow_local=True)) is None or len(output[0].src) != 2:

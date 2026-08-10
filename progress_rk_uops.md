@@ -253,3 +253,33 @@ Verification:
 - `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchip test/backend/test_rockchip.py::TestRockchipConvOps -x -q -n0`: 73 passed, 6 skipped, 37 subtests passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 18. Bounded semantic math reductions and submission groups — complete
+
+- Bounded static `RANGE` environment construction before allocation; oversized Cartesian products now decline with
+  `RKPLAN_REJECT:static_index_budget` instead of exhausting the Python process.
+- Generalized the repeated-ADD UOp rule from scalar output to batched output. Repeated EXP2/SQRT/LOG2/SIN results are
+  first materialized over their physical lane matrix, then reduced, preserving the semantic result boundary between a
+  math UOp recipe and its consumer.
+- Lowered generic mapped local ADD loops through the typed UOp executor rather than requiring the legacy EW walker.
+- Extended the residual-preserving generic `MUL+ADD` rule to 64-term reductions only when the result spans more than one
+  hardware FP16 tile. This covers large ordinary UOp dots without capturing small convolution programs or recognizing
+  attention/matmul graph dialects.
+- Partitioned stateful physical dependency groups in the runtime: large equal-lane groups are spatially tiled, while
+  small-lane groups longer than 48 stages are submitted sequentially with an explicit state initialization at each
+  boundary. One semantic UOp program still owns the complete image; submission boundaries are a physical runtime rule.
+- Restored all four scaled-dot-product-attention methods through the generic paths. The causal softmax denominator now
+  matches the independently materialized EXP2 sum, and its 64-term QK reduction retains product residuals.
+- Preserved the existing one-ioctl contract for ordinary core and convolution images.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 31 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipAttentionOps -q -n0`:
+  4 passed.
+- Attention plus complete transcendental class: 49 passed.
+- Core plus complete convolution class: 73 passed, 6 skipped, 37 subtests passed.
+- `TestRockchipReductionOps::test_std_mean`: passed without process abort.
+- Three consecutive isolated `TestRockchipTranscendentalOps::test_logsumexp` runs: passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

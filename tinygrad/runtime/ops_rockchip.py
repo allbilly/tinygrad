@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ctypes, mmap, os, time
+from dataclasses import replace
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
@@ -12,6 +13,7 @@ _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _PC_DATA_AMOUNT_MAX = (1 << 16) - 1
 _SUBMIT_TIMEOUT_MS = 30_000
+_MAX_EW_GROUP_OPS = 48
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
@@ -181,7 +183,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self.dev.reset_npu()
 
-  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None) -> None:
+  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None, *, tile_groups:bool=True) -> None:
     ops = self.image.ew_ops if ops is None else ops
     scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
       op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
@@ -198,6 +200,40 @@ class RockchipProgram(Program['RockchipDevice']):
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return
+    if tile_groups:
+      groups:list[tuple[RKEWOp, ...]] = []
+      start = 0
+      for i,op in enumerate(ops):
+        if i > start and op.submit_barrier:
+          groups.append(ops[start:i])
+          start = i
+      groups.append(ops[start:])
+      spatial = tuple(group[0].stateful and group[0].count > _MAX_EW_ELEMS_FP16 and
+        all(op.count == group[0].count and not (op.compare or op.int16_input or op.int16_output or op.int32_input or
+                                               op.int32_output or op.ew_cfg & _EW_STAGE_FP32_OUT) for op in group)
+        for group in groups)
+      sequential = tuple(group[0].stateful and len(group) > _MAX_EW_GROUP_OPS and max(op.count for op in group) <= _MAX_EW_ELEMS_FP16 and
+                         not any(op.int32_input or op.int32_output or op.ew_cfg & _EW_STAGE_FP32_OUT for op in group)
+                         for group in groups)
+      if any(tiled or split for tiled,split in zip(spatial, sequential)):
+        for group,tiled,split in zip(groups, spatial, sequential):
+          if split:
+            for chunk_start in range(0, len(group), _MAX_EW_GROUP_OPS):
+              chunk = list(group[chunk_start:chunk_start+_MAX_EW_GROUP_OPS])
+              chunk[0] = replace(chunk[0], submit_barrier=False, stateful=True)
+              self._run_ew_ops(address, buffer, tuple(chunk), tile_groups=False)
+          elif not tiled:
+            self._run_ew_ops(address, buffer, group, tile_groups=False)
+          else:
+            for tile_start in range(0, group[0].count, _MAX_EW_ELEMS_FP16):
+              count, offset = min(_MAX_EW_ELEMS_FP16, group[0].count-tile_start), tile_start*2
+              tile_bodies = [patch_stage(emit_ew_stage(
+                RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
+                RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
+                RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
+                stateful=op.stateful or i == 0), address) for i,op in enumerate(group)]
+              self._submit_pcchain(tile_bodies)
+        return
     bodies:list[tuple[int, ...]] = []
     body_precision = 0
     for i, op in enumerate(ops):
