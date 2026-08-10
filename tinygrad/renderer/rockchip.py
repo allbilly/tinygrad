@@ -982,13 +982,11 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   middle = middle.alu(Ops.ADD, low)
   root = high.alu(Ops.ADD, middle)
   cache:dict[UOp, UOp] = {}
-  def tag_adds(u:UOp) -> UOp:
-    if u in cache: return cache[u]
-    tagged = u.replace(src=tuple(tag_adds(src) for src in u.src))
+  for u in root.toposort():
+    tagged = u.replace(src=tuple(cache[src] for src in u.src))
     if tagged.op is Ops.ADD: tagged = tagged.replace(arg=_NATIVE_PRECISE_ADD)
     cache[u] = tagged
-    return tagged
-  return tag_adds(root)
+  return cache[root]
 
 def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
@@ -7492,6 +7490,9 @@ class RKContext:
     self.ew_ops:list[RKEWOp] = []
     self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort())
     self.use_counts:dict[UOp, int] = {}
+    self.static_nodes:set[UOp] = set()
+    for node in self.root.toposort():
+      if node.op in _STATIC_OPS and all(src in self.static_nodes for src in node.src): self.static_nodes.add(node)
     self._register_graph(self.root)
 
   def _register_graph(self, root:UOp) -> None:
@@ -7812,7 +7813,7 @@ class RKContext:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
-    elif (dtype in (dtypes.half, dtypes.int16, dtypes.bool) and _is_static_expr(u) and
+    elif (dtype in (dtypes.half, dtypes.int16, dtypes.bool) and u in self.static_nodes and
           not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
       value = self._static(u)
     elif u.op is Ops.LOAD: value = self._load(u)
@@ -7842,6 +7843,11 @@ class RKContext:
     return value
 
   def finish(self) -> RKImage:
+    nodes = self.root.toposort()
+    if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) for node in nodes):
+      for node in nodes:
+        if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
+          self.lower(node)
     result = self.lower(self.root)
     dtype = self.out_param.dtype.scalar()
     if dtype is dtypes.half and result.layout is RKLayout.FP16:
@@ -7889,6 +7895,16 @@ def _expand_math_uops(root:UOp) -> UOp:
     return tag_adds(rewritten[-1].src[0])
   def rewrite(u:UOp) -> UOp:
     if u in cache: return cache[u]
+    if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
+      mapped = _fp32_expr_to_half(u.src[0])
+      cache[u] = mapped
+      return mapped
+    if u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
+      try:
+        mapped = _accurate_add_recipe(u)
+        cache[u] = mapped
+        return mapped
+      except _RKGenericReject: pass
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
     if mapped.op is Ops.SQRT:
       if (recipe:=_dpu_sqrt(mapped.src[0])) is None: raise _RKGenericReject
@@ -7898,9 +7914,6 @@ def _expand_math_uops(root:UOp) -> UOp:
       if mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
       mapped = rewrite(physical_recipe(_dpu_log2(mapped.src[0])))
     elif mapped.op is Ops.SIN: mapped = rewrite(physical_recipe(_dpu_sin(mapped.src[0])))
-    elif mapped.op is Ops.ADD and mapped.dtype.scalar() is dtypes.half and mapped.arg is None:
-      try: mapped = rewrite(_accurate_add_recipe(mapped))
-      except _RKGenericReject: pass
     cache[u] = mapped
     return mapped
   return rewrite(root)
@@ -8005,6 +8018,7 @@ def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
     if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
     root = _expand_math_uops(_unroll_static_local(uops, output, reduced))
+    if len(root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
