@@ -5125,6 +5125,39 @@ Other branches contain earlier native no-LUT power work now already incorporated
 - `test_rockchip.py`: **421 collected aliases**, representing **398 unique upstream methods**. The authoritative
   remainder falls from 25 to **24 of 422**.
 - Repository-wide Tinygrad mypy (**216 files**), Ruff, collection, and `git diff --check`: pass.
+
+---
+
+## 2026-08-10 — compact DPU log-sum-exp and NLL reductions
+
+The rowwise log-sum-exp producer used by FP16 log-softmax previously expanded every unrolled class exponential before
+lowering. For a 32x10 input that produced **1,177 DPU EW tasks, 88 submit barriers, and 10 duplicate gathers**. A strict
+row/class matcher now materializes the centered exponentials once in class-major order, performs one balanced row
+reduction, and appends an in-place logarithm image. Known log-sum-exp bounds remove generic domain comparisons:
+centered exponents are nonpositive and the exponential sum is finite and at least one. The resulting producer is
+**148 EW tasks, 13 barriers, no compare/reset tasks, two initial gathers, and ten mid-reduction gathers**.
+
+The historical `rockchip-2607` log-softmax path was inspected and rejected because it executes a serialized FP32
+evaluator on the host. `~/npu` and `~/rk3588` document native Softmax and LUT-based approximations, but contain no
+standalone register-level Softmax example compatible with this backend's no-LUT contract. This implementation uses
+only existing native DPU EW arithmetic and compile-time address/gather planning.
+
+The final vector NLL path exposed a separate precision-transition failure: after a 39-task INT16 class selection, its
+four dependent FP16 tasks intermittently timed out. Scalar reductions already used a proven three-task preparation
+boundary. The vector output now follows the same structure—three FP16 preparation tasks followed by one stateful output
+task—without changing arithmetic.
+
+- Existing `test_log_softmax` and `test_log_softmax_other_axis`: **2 passed in 5.15 s**.
+- `test_nll_loss_reductions`: passed independently twice (**4.06 s**, **4.39 s**) and then passed from
+  `test_rockchip.py` together with both log-softmax methods: **3 passed in 6.37 s**.
+- Weighted NLL no longer timed out, but its signed near-zero mean denominator exceeded FP16 tolerance; class-probability
+  cross-entropy sum also remains outside tolerance. Both stay staging-only.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing; no reboot was used.
+- `test_rockchip.py`: **422 collected tests**, representing **399 of 422** upstream method names; **23 remain**.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,383/368 executable lines**, total **32,806**.
+
+No Tinygrad-core change, tensor-value host computation, LUT, CMAC, FP32 input, or tolerance relaxation was introduced.
 - `sz.py`: renderer/runtime **7,269/368 executable lines**, total **32,692**.
 
 The change is confined to compile-time UOp recognition and DPU FP16 masks/FDIV. It adds no host tensor reads or

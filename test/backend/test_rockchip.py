@@ -862,6 +862,8 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
 class TestRockchipLossOps(unittest.TestCase):
   """Cross-entropy composites evaluated by DPU EW and reduction stages."""
 
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
   @classmethod
   def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
 
@@ -873,6 +875,7 @@ class TestRockchipLossOps(unittest.TestCase):
   test_nll_loss = _test_ops.TestOps.test_nll_loss
   test_nll_loss_3d = _test_ops.TestOps.test_nll_loss_3d
   test_nll_loss_ignore_index = _test_ops.TestOps.test_nll_loss_ignore_index
+  test_nll_loss_reductions = _test_ops.TestOps.test_nll_loss_reductions
   test_sparse_categorical_crossentropy = _test_ops.TestOps.test_sparse_categorical_crossentropy
   test_sparse_categorical_crossentropy_ignore_index = _test_ops.TestOps.test_sparse_categorical_crossentropy_ignore_index
   test_sparse_categorical_crossentropy_label_smoothing = _test_ops.TestOps.test_sparse_categorical_crossentropy_label_smoothing

@@ -31,7 +31,6 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
 
   test_cross_entropy_reductions = _test_ops.TestOps.test_cross_entropy_reductions
   test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
-  test_nll_loss_reductions = _test_ops.TestOps.test_nll_loss_reductions
   test_nll_loss_weight = _test_ops.TestOps.test_nll_loss_weight
   test_nll_loss_3d_weight = _test_ops.TestOps.test_nll_loss_3d_weight
 
