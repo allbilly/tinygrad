@@ -5059,9 +5059,14 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
                    if load in target_loads and const.op is Ops.CONST and const.dtype.scalar() is dtypes.int}
   if len(ignore_values) > 1: return None
   ignore = next(iter(ignore_values), None)
-  smoothing_values = {float(const.arg) for const in nodes if const.op is Ops.CONST and
-    const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 < float(const.arg) <= 1.0 for parent in parents.get(const, ())
-    if parent.op is Ops.MUL and any(other is not const and other.op is Ops.MUL for other in parent.src)}
+  scalar_constants = {float(const.arg) for const in nodes if const.op is Ops.CONST and
+                      const.dtype.scalar() in (dtypes.half, dtypes.float)}
+  smoothing_values = {classes*float(const.arg) for const in nodes if const.op is Ops.CONST and
+    const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 < classes*float(const.arg) <= 1.0 and
+    any(parent.op is Ops.ADD and any(other is not const and other.op is Ops.MUL for other in parent.src)
+        for parent in parents.get(const, ())) and
+    (math.isclose(classes*float(const.arg), 1.0) or
+     any(math.isclose(scale+classes*float(const.arg), 1.0) for scale in scalar_constants))}
   if len(smoothing_values) > 1: return None
   smoothing = next(iter(smoothing_values), 0.0)
   mean = out_count == 1 and (any(u.op in (Ops.FDIV, Ops.RECIPROCAL) for u in nodes) or

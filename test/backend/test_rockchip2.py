@@ -30,7 +30,6 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_cross_entropy_reductions = _test_ops.TestOps.test_cross_entropy_reductions
-  test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

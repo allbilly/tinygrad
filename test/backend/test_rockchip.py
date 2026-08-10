@@ -879,6 +879,7 @@ class TestRockchipLossOps(unittest.TestCase):
 
   test_cross_entropy_class_indices = _test_ops.TestOps.test_cross_entropy_class_indices
   test_cross_entropy_class_probabilities = _test_ops.TestOps.test_cross_entropy_class_probabilities
+  test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
   test_nll_loss = _test_ops.TestOps.test_nll_loss
   test_nll_loss_3d = _test_ops.TestOps.test_nll_loss_3d
   test_nll_loss_3d_weight = _test_ops.TestOps.test_nll_loss_3d_weight

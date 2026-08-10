@@ -5356,3 +5356,22 @@ contract; only their canonical graph shapes informed the local matchers.
 All arithmetic is encoded from the UOp graph into `RKImage` at compile time and executes on FP16 DPU EW. There is no
 tensor-buffer inspection or host result calculation, LUT, CMAC, FP32 input, Tinygrad-core/runtime change, or tolerance
 relaxation.
+
+---
+
+## 2026-08-10 — promote sparse cross-entropy smoothing
+
+The indexed cross-entropy lowerer previously recognized label smoothing only through one obsolete nested-MUL shape.
+Finalized Tinygrad graphs instead carry a target scale and a per-class smoothing constant satisfying
+`target_scale + classes * per_class = 1`. The matcher now recovers smoothing from that invariant, while retaining the
+existing exact INT32 class selection and FP16 DPU-EW loss evaluation. This is loss-level graph recognition; the local
+compare/mask emission remains in the existing shared integer-mask helpers.
+
+- Unchanged upstream `test_cross_entropy_smoothing`: **passed in 14.85 s** while staged and **14.33 s** after promotion.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after promotion; no reboot was used.
+- `test_rockchip.py`: **433 collected aliases**, representing **410 of 422** upstream methods; **12 remain**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,563/376 executable lines**, total **32,994**.
+
+The dense `test_cross_entropy_reductions` scalar sum remains staged because its cancellation-sensitive FP16 result is
+outside the permitted tolerance. No tolerance, runtime, Tinygrad-core, LUT, CMAC, or CPU tensor computation changed.
