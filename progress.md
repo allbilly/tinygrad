@@ -5196,3 +5196,26 @@ tensor evaluation, FP32 input, Tinygrad-core change, or tolerance relaxation.
 
 The change is confined to compile-time UOp recognition and DPU FP16 masks/FDIV. It adds no host tensor reads or
 arithmetic, Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance relaxation.
+
+---
+
+## 2026-08-10 — re-screen the complete non-attention remainder
+
+The 14 staged non-attention forward methods were rerun serially on physical RKNPU before changing the success census.
+No new method passed: 13 failed and upstream `test_pow_int` skipped itself in **48.87 s**. Consequently nothing was
+promoted to `test_rockchip.py`, which remains the physical-success-only census at **402 of 422** upstream method names.
+
+The exact 20-method remainder is:
+
+- 13 current failures: `test_cross_entropy_reductions`, `test_cross_entropy_smoothing`, `test_acosh`, `test_asinh`,
+  `test_atan`, `test_cos`, `test_sigmoid_alt_extreme`, `test_tan`, `test_softmax_argmax`, `test_cast_relu`,
+  `test_masked_select`, `test_pow_const_direct`, and `test_scatter_reduce_prod_zeros`;
+- one upstream self-skip: `test_pow_int`;
+- four no-CMAC attention methods not run: `test_scaled_dot_product_attention`,
+  `test_scaled_dot_product_attention_causal`, `test_scaled_dot_product_attention_gqa`, and
+  `test_scaled_dot_product_attention_mismatch_ls`;
+- two backward-only methods excluded by the forward-only contract: `test_cmp_lt_backwards` and
+  `test_cmp_ne_backwards`.
+
+Vendor `~/rk3588/examples/elementwise.py` passed **60/60 probes** both before and after this batch. No reboot was used.
+This screening milestone changes no renderer, runtime, Tinygrad core, tolerance, or test placement.
