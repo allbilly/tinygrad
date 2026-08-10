@@ -4915,3 +4915,16 @@ the authoritative remainder falls from 38 to **34 of 421**.
 Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check` pass. `sz.py` reports renderer/runtime
 **7,144/368 executable lines**, total **32,567**. There is no Tinygrad-core change, host numerical computation, LUT,
 CMAC, FP32 input, or tolerance relaxation beyond the established FP16 contract.
+
+---
+
+## 2026-08-10 — first indexed-loss promotion
+
+The unchanged upstream `test_cross_entropy_class_indices` method passes physically in **1.80 s** through the shared
+native INT16 class-selection and FP16 loss plan, and is promoted to `test_rockchip.py`. The next candidate,
+`test_cross_entropy_reductions`, reached the runtime's 30-second blocking-submit limit. The serial `-x` batch stopped
+there; no later loss candidate is claimed or promoted on this boot.
+
+`test_rockchip.py` now collects **411 upstream-only cases**, representing **388 unique upstream method names**. The
+authoritative remainder falls from 34 to **33 of 421**. There is no Tinygrad-core change, host loss computation, LUT,
+CMAC, FP32 input, or tolerance relaxation.

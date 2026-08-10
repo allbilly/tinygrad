@@ -29,7 +29,6 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
-  test_cross_entropy_class_indices = _test_ops.TestOps.test_cross_entropy_class_indices
   test_cross_entropy_reductions = _test_ops.TestOps.test_cross_entropy_reductions
   test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
   test_sparse_categorical_crossentropy = _test_ops.TestOps.test_sparse_categorical_crossentropy

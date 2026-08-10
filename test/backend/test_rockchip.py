@@ -866,6 +866,7 @@ class TestRockchipLossOps(unittest.TestCase):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
+  test_cross_entropy_class_indices = _test_ops.TestOps.test_cross_entropy_class_indices
   test_cross_entropy_class_probabilities = _test_ops.TestOps.test_cross_entropy_class_probabilities
 
 
