@@ -5219,3 +5219,30 @@ The exact 20-method remainder is:
 
 Vendor `~/rk3588/examples/elementwise.py` passed **60/60 probes** both before and after this batch. No reboot was used.
 This screening milestone changes no renderer, runtime, Tinygrad core, tolerance, or test placement.
+
+---
+
+## 2026-08-10 — fail-closed odd-lane INT32 conversion arenas
+
+Dynamic masked-select first realizes a scalar predicate count. That count crashed in the Rockchip runtime before any
+submit: `_int32_tiles_bytes` used `cdiv`, whose current Tinygrad meaning is truncating C division, as if it were ceiling
+division. Counts 1–3 therefore received a zero-byte tile arena, and other nonmultiples of four were undersized. The
+runtime's raw conversion copy wrote past that view and segfaulted Python.
+
+Tile sizing now uses `ceildiv(count, 4) * 64`, matching the four-lane/64-byte DPU regrouping layout proven by
+`~/rk3588/examples/elementwise_int.py`. The runtime also validates source, tile, and destination extents before any
+`memmove`, turning malformed or stale images into a Python error instead of memory corruption. Prior Rockchip branches
+contained only host-subtask masked-select implementations; they do not provide a safe replacement under the no-CPU-
+cheat rule. Other Tinygrad hardware runtimes similarly keep explicit byte extents around host/device copies.
+
+- Odd INT16→INT32 writeback counts 1, 3, 5, and 7 were added to `test_rockchip2.py` and pass with the existing 8-lane
+  cases in **0.15 s**.
+- All five bounded/dynamic Rockchip masked-select regressions pass in **24.84 s**; the dynamic threshold case is
+  **8.68 s**, and the 32-element scalar-True case is **3.07 s**.
+- Existing upstream `test_masked_select_size`: **passed in 2.26 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after testing; no reboot was used.
+
+The unchanged upstream 320-element scalar-True `test_masked_select` is not promoted. Its count now executes correctly,
+but its output graph remains CPU-bound for minutes in Tinygrad core movement/devectorization before the Rockchip
+renderer is called. Changing that core rewrite is outside this backend milestone. No tensor values are inspected or
+computed on the host; the added runtime code only validates and moves raw conversion bytes.

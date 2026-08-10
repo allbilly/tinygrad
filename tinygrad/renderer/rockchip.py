@@ -7,7 +7,7 @@ from enum import IntEnum
 from typing import Callable, Iterable, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, Invalid, dtypes
-from tinygrad.helpers import Target, cdiv, cmod, floordiv, floormod, round_up
+from tinygrad.helpers import Target, cdiv, ceildiv, cmod, floordiv, floormod, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
@@ -229,7 +229,7 @@ _EW_CFG = {
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _reduction_stride(count:int) -> int: return round_up(count*2, 64)
-def _int32_tiles_bytes(count:int) -> int: return cdiv(count, 4) * 64
+def _int32_tiles_bytes(count:int) -> int: return ceildiv(count, 4) * 64
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
 def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
 def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKGather:

@@ -139,6 +139,14 @@ class RockchipProgram(Program['RockchipDevice']):
       raise RuntimeError("INT32 EW conversion requires scratch input and tile arena")
     source, tiles, dest = buffer(op.lhs.kind, op.lhs.index), buffer(op.rhs.kind, op.rhs.index), buffer(op.dst.kind, op.dst.index)
     src_itemsize, dst_itemsize = (2, 1 if op.bool_output else 4) if to_int32 else (4, 2)
+    source_need = op.lhs.addend+op.count*src_itemsize
+    tile_need = op.rhs.addend+(op.count+3)//4*64
+    dest_need = op.dst.addend+op.count*dst_itemsize
+    if source_need > source.size or tile_need > tiles.size or dest_need > dest.size:
+      raise RuntimeError(f"INT32 conversion exceeds buffer: source {source_need}/{source.size}, "
+                         f"tiles {tile_need}/{tiles.size}, destination {dest_need}/{dest.size}; "
+                         f"slots lhs={op.lhs.index} rhs={op.rhs.index} dst={op.dst.index}, "
+                         f"scratch={tuple(spec.size for spec in self.image.scratch)}")
     self.dev._sync_buffer(source, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     ctypes.memset(int(tiles.va_addr), 0, tiles.size)
     for tile,start in enumerate(range(0, op.count, 4)):

@@ -756,6 +756,9 @@ class TestRockchipInt16EWOps(_base.TestRockchipInt16EWOps):
     self._check([-29000,-1230,-5,-2,1,3,1170,31000], lambda x,y:(x+y).cast(dtypes.int32), a, b,
                 output_dtype=np.int32)
     self._check(a, lambda x:x.cast(dtypes.int32), a, output_dtype=np.int32)
+    for count in (1, 3, 5, 7):
+      values = np.arange(count, dtype=np.int16)-3
+      self._check(values.astype(np.int32), lambda x:x.cast(dtypes.int32), values, output_dtype=np.int32)
   def test_sum_unrolled(self):
     values = np.asarray([[-32768, 32767, 1], [30000, 2000, -1234]], dtype=np.int16)
     self._check(values.sum(1, dtype=np.int32), lambda x:x.sum(1), values, output_dtype=np.int32,
