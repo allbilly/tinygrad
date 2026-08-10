@@ -7722,6 +7722,100 @@ _pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_
 _pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])
 _pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
 
+def _unit_ratio_source(root:UOp) -> UOp|None:
+  """Match Tinygrad's x/sqrt(1+x*x) normalization."""
+  candidates = ((root.src[0], root.src[1]),) if root.op is Ops.FDIV else tuple((source, inverse.src[0])
+    for source,inverse in (root.src, root.src[::-1]) if inverse.op is Ops.RECIPROCAL and len(inverse.src) == 1)
+  for source, denominator in candidates:
+    if (denominator.op is not Ops.SQRT or len(denominator.src) != 1 or
+        (radicand:=denominator.src[0]).op is not Ops.ADD): continue
+    square = next((u for u in radicand.src if u.op is Ops.MUL and len(u.src) == 2 and
+                   u.src[0].key == source.key and u.src[1].key == source.key), None)
+    unit = next((u for u in radicand.src if u.op is Ops.CONST and float(u.arg) == 1.0), None)
+    if square is not None and unit is not None: return source
+  return None
+
+def _fold_atan(root:UOp) -> UOp|None:
+  """Replace Tinygrad's asin-based atan with a compact range-reduced DPU polynomial."""
+  nodes = root.toposort()
+  sources:dict[bytes, UOp] = {}
+  for u in nodes:
+    if u.op in (Ops.MUL, Ops.FDIV) and (source:=_unit_ratio_source(u)) is not None: sources[source.key] = source
+  constants = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float)}
+  if (len(sources) != 1 or not any(abs(v-math.pi/2) < 1e-12 for v in constants) or
+      not any(abs(v-1.570796305) < 1e-10 for v in constants) or
+      not any(abs(v+0.0012624911) < 1e-8 for v in constants)): return None
+  source = next(iter(sources.values())).cast(dtypes.half)
+  one = UOp.const(1.0, dtypes.half)
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS)
+  reduced = _native_min(magnitude, one.alu(Ops.FDIV, magnitude))
+  angle = reduced.alu(Ops.MUL, UOp.const(math.pi/4, dtypes.half).alu(Ops.ADD,
+    one.alu(Ops.SUB, reduced).alu(Ops.MUL, UOp.const(0.2447, dtypes.half).alu(
+      Ops.ADD, reduced.alu(Ops.MUL, UOp.const(0.0663, dtypes.half))))))
+  large = _finite_positive_mask(magnitude.alu(Ops.SUB, one))
+  reflected = UOp.const(math.pi/2, dtypes.half).alu(Ops.SUB, angle)
+  selected = angle.alu(Ops.ADD, large.alu(Ops.MUL, reflected.alu(Ops.SUB, angle)))
+  sign = source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)))
+  return selected.alu(Ops.MUL, sign)
+
+_pm_atan = PatternMatcher([(UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_atan)])
+
+def _hyperbolic_log_source(root:UOp) -> tuple[UOp, int]|None:
+  """Match log(x + sqrt(x*x +/- 1)) after natural log expands to LOG2 times ln(2)."""
+  if root.op is not Ops.MUL: return None
+  for logarithm, scale in (root.src, root.src[::-1]):
+    if (scale.op is not Ops.CONST or abs(float(scale.arg)-math.log(2)) > 1e-12 or logarithm.op is not Ops.LOG2 or
+        len(logarithm.src) != 1 or (argument:=logarithm.src[0]).op is not Ops.ADD): continue
+    for source, radical in (argument.src, argument.src[::-1]):
+      if radical.op is not Ops.SQRT or len(radical.src) != 1 or (radicand:=radical.src[0]).op is not Ops.ADD: continue
+      square = next((u for u in radicand.src if u.op is Ops.MUL and len(u.src) == 2 and
+                     u.src[0].key == source.key and u.src[1].key == source.key), None)
+      offset = next((u for u in radicand.src if u.op is Ops.CONST and float(u.arg) in (-1.0, 1.0)), None)
+      if square is not None and offset is not None: return source, int(float(offset.arg))
+  return None
+
+def _poly_horner(source:UOp, coefficients:tuple[float, ...]) -> UOp:
+  result = UOp.const(coefficients[-1], dtypes.half)
+  for coefficient in reversed(coefficients[:-1]):
+    result = result.alu(Ops.MUL, source).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
+  return result
+
+def _hyperbolic_tail(magnitude:UOp, coefficients:tuple[float, ...]) -> UOp:
+  """Approximate log(2*x) plus an inverse-even-power correction for large positive x."""
+  one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
+  inverse = one.alu(Ops.FDIV, magnitude); inverse_square = inverse.alu(Ops.MUL, inverse)
+  correction = inverse_square.alu(Ops.MUL, _poly_horner(inverse_square, coefficients))
+  return magnitude.alu(Ops.LOG2).alu(Ops.MUL, ln2).alu(Ops.ADD, ln2).alu(Ops.ADD, correction)
+
+def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
+  """Stabilize Tinygrad's FP16 asinh/acosh expansions without LUT or CMAC."""
+  if (matched:=_hyperbolic_log_source(root)) is None: return None
+  source, offset = matched; source = source.cast(dtypes.half)
+  one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
+  if offset == 1:
+    magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS)
+    bounded = _native_min(magnitude, UOp.const(1.5, dtypes.half))
+    square = bounded.alu(Ops.MUL, bounded)
+    small = bounded.alu(Ops.MUL, _poly_horner(square,
+      (0.99989513, -0.16376462, 0.06135906, -0.01879756, 0.00268578)))
+    safe = magnitude.alu(Ops.MAX, UOp.const(1.5, dtypes.half))
+    large = _hyperbolic_tail(safe, (0.25, -3/32, 5/96))
+    gate = _finite_positive_mask(magnitude.alu(Ops.SUB, UOp.const(1.5, dtypes.half)))
+    selected = small.alu(Ops.ADD, gate.alu(Ops.MUL, large.alu(Ops.SUB, small)))
+    sign = source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)))
+    return selected.alu(Ops.MUL, sign)
+  bounded = _native_min(source, UOp.const(2.0, dtypes.half)).alu(Ops.MAX, UOp.const(-2.0, dtypes.half))
+  square = bounded.alu(Ops.MUL, bounded)
+  small = bounded.alu(Ops.ADD, square.alu(Ops.SUB, one).sqrt()).alu(Ops.LOG2).alu(Ops.MUL, ln2)
+  safe = source.alu(Ops.MAX, UOp.const(2.0, dtypes.half))
+  large = _hyperbolic_tail(safe, (-0.25, -3/32, -5/96))
+  gate = _finite_positive_mask(source.alu(Ops.SUB, UOp.const(2.0, dtypes.half)))
+  return small.alu(Ops.ADD, gate.alu(Ops.MUL, large.alu(Ops.SUB, small)))
+
+_pm_inverse_hyperbolic = PatternMatcher([
+  (UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_inverse_hyperbolic),
+])
+
 def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
   """Approximate FP16 sqrt/rsqrt with range-independent Babylonian iterations on DPU EW."""
   if any(_local_load(u) is not None for u in source.toposort()): return None
@@ -8011,6 +8105,8 @@ def _fold_tan(x:UOp) -> UOp|None:
 _pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"), _fold_tan)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_inverse_hyperbolic, name="rockchip inverse hyperbolic")
+  sink = graph_rewrite(sink, _pm_atan, name="rockchip atan")
   sink = graph_rewrite(sink, _pm_tan, name="rockchip tan")
   sink = graph_rewrite(sink, _pm_sin, name="rockchip sin")
   sink = graph_rewrite(sink, _pm_masked_exp2, name="rockchip masked exp2")

@@ -821,6 +821,9 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
   test_exp2_log2_zero_times_negative = _test_ops.TestOps.test_exp2_log2_zero_times_negative
   test_asin = _test_ops.TestOps.test_asin
   test_acos = _test_ops.TestOps.test_acos
+  test_atan = _test_ops.TestOps.test_atan
+  test_asinh = _test_ops.TestOps.test_asinh
+  test_acosh = _test_ops.TestOps.test_acosh
   test_celu = _test_ops.TestOps.test_celu
   test_selu = _test_ops.TestOps.test_selu
   test_silu = _test_ops.TestOps.test_silu

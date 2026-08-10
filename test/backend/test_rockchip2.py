@@ -43,9 +43,6 @@ class TestRockchipTranscendentalCandidates(_test_ops.TestOps):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
-  test_acosh = _test_ops.TestOps.test_acosh
-  test_asinh = _test_ops.TestOps.test_asinh
-  test_atan = _test_ops.TestOps.test_atan
   test_cos = _test_ops.TestOps.test_cos
   test_sigmoid_alt_extreme = _test_ops.TestOps.test_sigmoid_alt_extreme
   test_tan = _test_ops.TestOps.test_tan

@@ -5296,3 +5296,32 @@ staging alias was promoted.
 
 The screen changed no renderer, runtime, Tinygrad core, tolerance, or test placement. The unfinished softmax-argmax
 matcher remains a separate uncommitted milestone.
+
+---
+
+## 2026-08-10 — stable no-LUT inverse functions
+
+The unchanged upstream `test_atan`, `test_asinh`, and `test_acosh` methods now pass on DPU EW across their ordinary
+45x65 inputs and the positive/negative FP16 extreme ranges near 300. Tinygrad's original formulas square the input:
+`atan` normalizes by `sqrt(1+x*x)`, while both inverse hyperbolic functions use `sqrt(x*x +/- 1)`. Those squares
+overflow FP16 and previously produced zero, infinity, or the wrong domain result.
+
+The renderer recognizes the complete canonical formulas before their SQRT/LOG2 expansions. `atan` range-reduces to
+`min(abs(x), 1/abs(x))`, evaluates a compact polynomial on [0,1], reflects around pi/2, and restores the sign.
+`asinh` uses a bounded odd polynomial through 1.5 and a corrected `log(2*abs(x))` tail. `acosh` retains the bounded
+sqrt/log domain behavior and uses the corresponding corrected `log(2*x)` tail above two. Shared Horner and
+inverse-even-power helpers keep these as local arithmetic recipes rather than new memory-specialized lowerers.
+
+The historical `rockchip-upstream-research` and `rockchip-2607` implementations were inspected. Both ultimately use
+DPU LUT payloads for these functions; `~/npu/include/rknnops.h` and `~/rk3588/experimental/rknnops.h` contain the same
+LUT approach, while the old RKNN support table marks the three operators unsupported. None was ported under the
+current no-LUT contract.
+
+- Promoted methods from `test_rockchip.py`: **3 passed in 3.72 s** after the final cleanup; each also passed alone.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after final physical testing; no reboot was used.
+- `test_rockchip.py`: **429 collected aliases**, representing **406 of 422** upstream methods; **16 remain**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,503/376 executable lines**, total **32,934**.
+
+All new math is encoded into `RKImage` at compile time and runs as FP16 DPU EW stages. There is no tensor-value host
+evaluation, LUT, CMAC, FP32 input, Tinygrad-core change, runtime change, or tolerance relaxation.
