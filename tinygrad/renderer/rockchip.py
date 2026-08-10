@@ -7203,6 +7203,52 @@ def _dpu_log2(source:UOp) -> UOp:
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
   return result.alu(Ops.ADD, zero_correction).alu(Ops.ADD, negative_correction).alu(Ops.ADD, inf_correction)
 
+def _lower_tensor_pow(uops:list[UOp]) -> RKImage|None:
+  """Replace Tinygrad's integer-parity POW expansion with an equivalent FP16 DPU graph."""
+  if (output:=_output_store(uops, dtypes.half)) is None: return None
+  store, _, _, _, root = output
+  nodes = root.toposort()
+  exponentials = [u for u in nodes if u.op is Ops.EXP2]
+  logarithms = [u for u in nodes if u.op is Ops.LOG2]
+  if len(exponentials) != 1 or len(logarithms) != 1 or not any(u.op is Ops.CMOD for u in nodes): return None
+  exponential, logarithm = exponentials[0], logarithms[0]
+  scaled = exponential.src[0]
+  if scaled.op is not Ops.MUL or logarithm not in scaled.src: return None
+  exponent = scaled.src[1 if scaled.src[0] is logarithm else 0]
+  base_loads = {u.key:u for u in logarithm.src[0].toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half}
+  if len(base_loads) != 1 or exponent.dtype.scalar() is not dtypes.half: return None
+  base = next(iter(base_loads.values()))
+  if any(u.op is Ops.REDUCE for u in nodes): return None
+
+  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+  absolute = UOp(Ops.MAX, dtypes.half, src=(base, base), arg=_NATIVE_ABS)
+  base_nonzero = _finite_positive_mask(absolute)
+  base_zero = one.alu(Ops.SUB, base_nonzero)
+  exponent_positive = _finite_positive_mask(exponent)
+  zero_positive = _mask_mul(base_zero, exponent_positive)
+  effective_exponent = exponent.alu(Ops.MUL, one.alu(Ops.SUB, zero_positive))
+  safe_base = _native_min(absolute.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)), UOp.const(65504.0, dtypes.half))
+  magnitude = _dpu_exp2(effective_exponent.alu(Ops.MUL, _dpu_log2(safe_base)))
+  magnitude = magnitude.alu(Ops.MUL, one.alu(Ops.SUB, zero_positive))
+
+  infinite_base = _finite_positive_mask(absolute.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
+  infinite_positive = _mask_mul(infinite_base, exponent_positive)
+  magnitude = magnitude.alu(Ops.ADD, infinite_positive.alu(Ops.FDIV, one.alu(Ops.SUB, infinite_positive)))
+
+  absolute_exponent = UOp(Ops.MAX, dtypes.half, src=(exponent, exponent), arg=_NATIVE_ABS)
+  integral = _native_floor(absolute_exponent)
+  fraction = absolute_exponent.alu(Ops.SUB, integral)
+  non_integral = _positive_mask(fraction)
+  odd = integral.alu(Ops.SUB, _native_floor(integral.alu(Ops.MUL, UOp.const(0.5, dtypes.half))).alu(
+    Ops.MUL, UOp.const(2.0, dtypes.half)))
+  negative_base = _finite_positive_mask(zero.alu(Ops.SUB, base))
+  sign = one.alu(Ops.SUB, _mask_mul(negative_base, odd).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  invalid = _mask_mul(_mask_mul(negative_base, non_integral), one.alu(Ops.SUB, infinite_base))
+  result = magnitude.alu(Ops.MUL, sign).alu(Ops.ADD, zero.alu(Ops.FDIV, one.alu(Ops.SUB, invalid)))
+  replacement = store.replace(src=(store.src[0], result, *store.src[2:]))
+  try: return lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(replacement,)).toposort())))
+  except RuntimeError: return None
+
 _pm_rsqrt = PatternMatcher([(UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float),
   src=(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)),)), lambda source:_dpu_sqrt(source, True))])
 _pm_sqrt = PatternMatcher([(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sqrt(source))])
@@ -7229,7 +7275,7 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = (_lower_bounded_exact_fp16_copysign(uops) or _lower_std_mean_pair(uops) or
+    image = (_lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or _lower_std_mean_pair(uops) or
              _lower_unrolled_mapped_add_reduction(uops) or _lower_mapped_add_loop_reduction(uops))
     return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()
 

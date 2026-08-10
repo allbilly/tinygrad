@@ -4839,3 +4839,29 @@ Tinygrad range-reduction graphs. Their provisional aliases were removed.
 - `test_rockchip.py`: **398 collected cases**, representing **375 unique upstream methods**.
 - Authoritative upstream-name remainder: **46 of 421**.
 - No Tinygrad-core change, host numerical computation, LUT, CMAC, tolerance change, or NPU timeout was involved.
+
+---
+
+## 2026-08-10 — runtime tensor-power and broadcast batch
+
+Tinygrad's canonical runtime POW expansion is now collapsed back into a compact FP16 DPU graph. Native ABS and FLOOR
+recover magnitude, integrality, and exponent parity; the existing no-LUT LOG2/EXP2 compositions evaluate the magnitude;
+and DPU masks preserve negative-base, zero-base, infinity, and zero-exponent semantics. An exact positive-mask stage is
+used for the fractional remainder so the smallest nonzero FP16 exponent cannot be mistaken for zero.
+
+Five unchanged upstream methods pass together in **7.24 s**, including all 30 broadcast subtests:
+`test_pow_full`, `test_pow_zero_exponent`, `test_pow_zero_tensor`, `test_broadcast_full`, and the slow
+`test_broadcast_partial`. The first broad run found only one IEEE mismatch among 2,925 tensor-power lanes: base
+`-0.2025` with exponent `-8.64e-6` was incorrectly finite. The exact subnormal predicate fixed that final mismatch.
+Constant-exponent `-inf` and integer-input/float-exponent graphs remain separate lowering shapes and were not promoted.
+
+- `test_rockchip.py`: **403 collected cases**, representing **380 unique upstream methods**.
+- Authoritative upstream-name remainder: **41 of 421**.
+- A diagnostic `ROCKCHIP_EW_REDUCE=twoproduct` cross-entropy run timed out after 30 seconds and logged one IOMMU read
+  fault at address zero. No more two-product submissions were made. The required vendor health check then passed all
+  **60/60** elementwise probes, and the new power batch subsequently passed without a timeout.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,712/367 executable lines**, total **32,134**.
+
+There is no Tinygrad-core change, host numerical computation, LUT, CMAC, FP32 input, or tolerance relaxation beyond the
+established `test_gemm_fp16` FP16 contract.

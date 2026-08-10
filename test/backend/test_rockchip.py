@@ -358,6 +358,20 @@ class TestRockchipIntegerPowerOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 5)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipTensorPowerOps(unittest.TestCase):
+  """Runtime FP16 exponents lowered to native ABS/FLOOR and no-LUT EXP2/LOG2 DPU stages."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_pow_full = _test_ops.TestOps.test_pow_full
+  test_pow_zero_exponent = _test_ops.TestOps.test_pow_zero_exponent
+  test_pow_zero_tensor = _test_ops.TestOps.test_pow_zero_tensor
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipOneHotOps(unittest.TestCase):
   """Exact INT32 one-hot equality through four raw bytes and DPU EW masks."""
 
@@ -468,6 +482,8 @@ class TestRockchipBroadcastOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_broadcast_simple = _test_ops.TestOps.test_broadcast_simple
+  test_broadcast_full = _test_ops.TestOps.test_broadcast_full
+  test_broadcast_partial = _test_ops.TestOps.test_broadcast_partial
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
