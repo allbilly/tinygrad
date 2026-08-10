@@ -401,6 +401,16 @@ class TestRockchipGatherOps(unittest.TestCase):
 class TestRockchipMaskedSelectOps(unittest.TestCase):
   """Forward-only bounded FP16 and integer selection through DPU masks and raw-byte gathers."""
 
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def test_masked_select(self):
+    # Preserve the compact three-prefix reduction graph consumed by the Rockchip matcher.
+    with Context(NOOPT=1): _test_ops.TestOps.test_masked_select(self)
+
   test_masked_select_size = _test_ops.TestOps.test_masked_select_size
 
 
@@ -961,6 +971,8 @@ class TestRockchipContractSkips(unittest.TestCase):
   test_cmp_ne_backwards = unittest.skip("Rockchip testing is forward-only")(_test_ops.TestOps.test_cmp_ne_backwards)
   test_pow_const_direct = unittest.skip("requires explicit FP32 inputs and backward execution")(_test_ops.TestOps.test_pow_const_direct)
   test_pow_int = unittest.skip("unsupported by the upstream test")(_test_ops.TestOps.test_pow_int)
+  test_scatter_reduce_prod_zeros = unittest.skip(
+    "Torch FP32 destination rejects the DEFAULT_FLOAT=HALF source before NPU execution")(_test_ops.TestOps.test_scatter_reduce_prod_zeros)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(unittest.TestCase):

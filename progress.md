@@ -5512,3 +5512,28 @@ main census.
 Attention is not intrinsically CMAC-only. The base `Q @ K.T` has 65,536 output lanes with a 64-term reduction and the
 final `softmax @ V` has 262,144 lanes with a 16-term reduction, both above the current 64,000-lane DPU-EW dot-lowering
 limit. They remain staged for tiled DPU MUL/ADD reduction work under the no-CMAC contract.
+
+---
+
+## 2026-08-10 — promote compact MaskedSelect and record scatter oracle skip
+
+The unchanged upstream `test_masked_select` method is now represented in the main Rockchip census under a narrowly
+scoped `Context(NOOPT=1)`. This preserves the compact three-prefix reduction graph consumed by the existing Rockchip
+matcher. The normal Rockchip heuristic unrolls each of the three 320-lane reductions by 32, causing a host codegen
+explosion before the renderer is reached; disabling that heuristic only for this method leaves the tensor semantics,
+FP16 tolerance, renderer, runtime, and NPU execution unchanged.
+
+`test_scatter_reduce_prod_zeros` is also represented as an explicit contract skip. The unchanged test forces its
+Torch and Tinygrad destinations to FP32 with `.float()`, while `helper_test_op` generates an FP16 source under
+`DEFAULT_FLOAT=HALF`. PyTorch rejects that dtype mismatch before Tinygrad or the NPU executes. The method passes on
+CPU with the normal FP32 default and fails identically on CPU with `DEFAULT_FLOAT=HALF`, confirming a test-oracle
+assumption rather than a Rockchip result failure.
+
+- Promoted upstream method: **1 passed in 8.62 s** serially, covering both its dynamic-predicate and scalar-True forms.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after promotion; no reboot was used.
+- `test_rockchip.py`: **441 collected aliases**, representing **418 of 422** upstream methods; **4 remain**.
+- Remaining methods: the four scaled-dot-product-attention variants.
+
+The MaskedSelect output work executes through the existing DPU plans; `NOOPT=1` only bypasses the pathological host
+unroll policy. There is no host tensor arithmetic, LUT, CMAC, FP32 input, tolerance relaxation, renderer/runtime/core
+change, or reboot.

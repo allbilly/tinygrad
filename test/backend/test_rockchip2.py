@@ -37,20 +37,6 @@ class TestRockchipCompositeCandidates(_test_ops.TestOps):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
-class TestRockchipEdgeCandidates(_test_ops.TestOps):
-  """Remaining forward power, masked-selection, and scatter edge candidates."""
-
-  @classmethod
-  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
-
-  @classmethod
-  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
-
-  test_masked_select = _test_ops.TestOps.test_masked_select
-  test_scatter_reduce_prod_zeros = _test_ops.TestOps.test_scatter_reduce_prod_zeros
-
-@_only_local_tests
-@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchip(_base.TestRockchip):
   def test_add_scalar_constfold(self):
     # Tensor(1)+0.5 folds on device=None — no NPU submit
