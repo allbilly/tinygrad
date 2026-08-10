@@ -7795,12 +7795,75 @@ class RKContext:
       constants = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot)+1))
     return RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops))
 
+def _unroll_static_reduces(root:UOp) -> UOp:
+  """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
+  cache:dict[UOp, UOp] = {}
+  def rewrite(u:UOp) -> UOp:
+    if u in cache: return cache[u]
+    mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
+    if mapped.op is Ops.REDUCE:
+      reduce_op = mapped.arg[0] if isinstance(mapped.arg, tuple) else mapped.arg
+      ranges = list(mapped.src[1:])
+      if reduce_op not in (Ops.ADD, Ops.MAX, Ops.MUL) or not ranges or any(
+        r.op is not Ops.RANGE or r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
+      envs = _iter_range_env(ranges)
+      if not envs: raise _RKGenericReject
+      terms = [mapped.src[0].substitute({r:r.const_like(env[r]) for r in ranges}) for env in envs]
+      mapped = terms[0]
+      for term in terms[1:]: mapped = UOp(reduce_op, u.dtype, src=(mapped, term))
+    cache[u] = mapped
+    return mapped
+  return rewrite(root)
+
+def _local_buffer(u:UOp) -> UOp|None:
+  u = _strip_cast(u)
+  if u.op in (Ops.LOAD, Ops.STORE): u = u.src[0]
+  if u.op is Ops.INDEX: u = u.src[0]
+  while u.op is Ops.AFTER: u = u.src[0]
+  return u if u.op is Ops.BUFFER else None
+
+def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
+  """Execute one static local accumulator for ADD/MAX/MUL without recovering a tensor operation."""
+  local_loads = [load for u in root.toposort() if (load:=_local_load(u)) is not None]
+  buffers = {_local_buffer(load) for load in local_loads}
+  if not local_loads: return root
+  if len(buffers) != 1 or (buffer:=next(iter(buffers))) is None: raise _RKGenericReject
+  stores = [u for u in uops if u.op is Ops.STORE and _local_buffer(u) is buffer]
+  out_ranges = set(_index_ranges(output[3]))
+  updates:list[tuple[UOp, UOp, list[UOp]]] = []
+  initializers:list[UOp] = []
+  for store in stores:
+    value = _strip_cast(store.src[1])
+    accumulator = next((src for src in value.src if _local_load(src) is not None and _local_buffer(src) is buffer), None) \
+      if value.op in (Ops.ADD, Ops.MAX, Ops.MUL) else None
+    if accumulator is None:
+      if not any(r not in out_ranges for r in _index_ranges(value)): initializers.append(store.src[1])
+      continue
+    term = value.src[1 if value.src[0] is accumulator else 0]
+    ranges = [r for r in _index_ranges(term) if r not in out_ranges]
+    updates.append((value, term, ranges))
+  if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
+  update, term, ranges = updates[0]
+  if not ranges or any(r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
+  reduced = initializers[0]
+  for env in _iter_range_env(ranges):
+    lane = term.substitute({r:r.const_like(env[r]) for r in ranges})
+    reduced = UOp(update.op, update.dtype, src=(reduced, lane))
+  substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
+  return root.substitute(substitutions)
+
 def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
-  if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.bool))) is None or len(output[0].src) != 2: return None
+  if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.bool), allow_local=True)) is None or len(output[0].src) != 2:
+    return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
   try:
     if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
+    root = _unroll_static_local(uops, output, _unroll_static_reduces(output[4]))
+    if root is not output[4]:
+      store = output[0].replace(src=(output[0].src[0], root))
+      uops = list(UOp(Ops.SINK, src=(store,)).toposort())
+      if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.bool))) is None: return None
     return RKContext(output).finish()
   except (_RKGenericReject, RuntimeError, ValueError, KeyError):
     return None

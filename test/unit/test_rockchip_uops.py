@@ -1,6 +1,6 @@
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import RKArg, RKBufferKind, RKLayout, RKValue, _lower_uop_program
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
 def _program(dtype, value, count:int=4):
@@ -59,3 +59,25 @@ def test_math_uops_own_multi_stage_recipes():
     image = _lower_uop_program(_program(dtypes.half, lambda i, op=op:UOp(op, dtypes.half, src=(source.index(i).load(),))))
     assert image is not None and len(image.ew_ops) > 1
     assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
+def test_static_reduce_uops_are_structurally_executed():
+  for op in (Ops.ADD, Ops.MAX, Ops.MUL):
+    out, source = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,))
+    row, axis = UOp.range(2, 0), UOp.range(3, 1, AxisType.REDUCE)
+    term = source.index(row*3+axis).load()
+    reduced = UOp(Ops.REDUCE, dtypes.half, src=(term, axis), arg=(op,))
+    image = _lower_uop_program(list(out.index(row).store(reduced).end(row, axis).sink().toposort()))
+    assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 2
+
+
+def test_static_local_accumulator_is_structurally_executed():
+  for op,initial in ((Ops.ADD, 0.0), (Ops.MAX, -100.0), (Ops.MUL, 1.0)):
+    out, source = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,))
+    row, axis = UOp.range(2, 0), UOp.range(3, 1, AxisType.REDUCE)
+    local = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG).index(0)
+    initialize = local.store(initial)
+    update = local.store(UOp(op, dtypes.half, src=(local.load(), source.index(row*3+axis).load())))
+    output = out.index(row).store(local.load())
+    image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
+    assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3

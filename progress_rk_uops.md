@@ -21,7 +21,7 @@
 
 Verification:
 
-- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 7 passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 9 passed.
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py`: pass.
 
@@ -31,9 +31,12 @@ Verification:
 - Each semantic math UOp now expands directly to its existing DPU arithmetic recipe and physical stages.
 - Added one generic recipe test covering all four math UOps.
 
-### 3. Structural RANGE/reduction execution — pending
+### 3. Structural RANGE/reduction execution — complete
 
-- Add one generic static-range/local-state executor for ADD, MAX, and MUL reductions.
+- Added one static structural interpreter for `REDUCE`/`RANGE` with ADD, MAX, and MUL.
+- Added the symmetric local LOAD/STORE accumulator interpreter for the same operators.
+- Structural execution produces ordinary semantic UOps and reuses `RKContext`; it does not recover a tensor operation name.
+- Added coverage for direct reductions and mutable local accumulators across all three operators.
 
 ### 4. Symmetric host address materialization — pending
 
