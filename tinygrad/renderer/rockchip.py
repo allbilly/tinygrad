@@ -1655,6 +1655,58 @@ def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
       root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
   return _typed_int_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)))
 
+def _lower_integer_fp16_cast(output:RKOutput) -> RKImage|None:
+  """Convert a direct or statically gathered INT32 input to FP16 through the DPU converter."""
+  _, out_param, count, out_index, root = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.half or len(root.src) != 1 or
+      (load:=root.src[0]).op is not Ops.LOAD or load.dtype.scalar() is not dtypes.int or len(load.src) != 1 or
+      load.src[0].op is not Ops.INDEX or (source:=_root_param(load.src[0])) is None or source.src[0].op is not Ops.CONST): return None
+  try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
+  except RuntimeError: return None
+  if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
+  tiles = 0
+  scratch = [RKScratch(_int32_tiles_bytes(count))]
+  gathers:tuple[RKGather, ...] = ()
+  value = RKArg(RKBufferKind.ARG, source.arg.slot)
+  if offsets != tuple(range(count)):
+    scratch.append(RKScratch(max(64, count*4)))
+    gathers = (RKGather(source.arg.slot, 1, count, offsets=offsets, itemsize=4),)
+    value = RKArg(RKBufferKind.SCRATCH, 1)
+  op = RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), value, RKArg(RKBufferKind.SCRATCH, tiles), count,
+              _EW_CFG[Ops.MAX], int32_input=True)
+  return RKImage(RKTarget.RK3588, tuple(scratch), gathers=gathers, ew_ops=(op,))
+
+def _lower_fused_integer_fp16_cast(uops:list[UOp], output:RKOutput) -> RKImage|None:
+  """Prepend one DPU INT32-to-FP16 conversion to an otherwise ordinary FP16 EW graph."""
+  store, _, count, out_index, root = output
+  casts = [u for u in root.toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and
+           u.src[0].op is Ops.LOAD and u.src[0].dtype.scalar() is dtypes.int and len(u.src[0].src) == 1 and
+           u.src[0].src[0].op is Ops.INDEX]
+  if len(casts) != 1: return None
+  cast, load = casts[0], casts[0].src[0]
+  source = _root_param(load.src[0])
+  if source is None or source.src[0].op is not Ops.CONST: return None
+  try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
+  except RuntimeError: return None
+  if offsets != tuple(range(count)): return None
+  fake_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=0)
+  fake = UOp.placeholder((count,), dtypes.half, fake_slot, device="ROCKCHIP").index(out_index).load()
+  replacement = store.replace(src=(store.src[0], root.substitute({cast:fake}), *store.src[2:]))
+  try: mapped = lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(replacement,)).toposort())))
+  except RuntimeError: return None
+  if mapped.fill is not None or mapped.mid_gathers or mapped.post_gathers: return None
+  converted, tiles = len(mapped.scratch), len(mapped.scratch)+1
+  def remap(arg:RKArg) -> RKArg:
+    return RKArg(RKBufferKind.SCRATCH, converted, arg.addend) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
+  ops = tuple(replace(op, dst=remap(op.dst), lhs=remap(op.lhs), rhs=remap(op.rhs)) for op in mapped.ew_ops)
+  gathers = tuple(replace(g, src_kind=RKBufferKind.SCRATCH, src_index=converted)
+                  if g.src_kind is RKBufferKind.ARG and g.src_index == fake_slot else g for g in mapped.gathers)
+  convert = RKEWOp(RKArg(RKBufferKind.SCRATCH, converted), RKArg(RKBufferKind.ARG, source.arg.slot),
+                   RKArg(RKBufferKind.SCRATCH, tiles), count, _EW_CFG[Ops.MAX], int32_input=True)
+  scratch = (*mapped.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_int32_tiles_bytes(count)))
+  return replace(mapped, scratch=scratch, gathers=gathers, ew_ops=(convert, *ops))
+
 def _lower_integer_fp32_cast(output:RKOutput) -> RKImage|None:
   """Compose the DPU INT32-to-FP16 and FP16-to-FP32 converters for integer and boolean inputs."""
   _, out_param, count, out_index, root = output
@@ -6529,6 +6581,8 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
     if (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
   if (half_output:=_output_store(uops, dtypes.half)) is not None:
+    if (integer_cast:=_lower_integer_fp16_cast(half_output)) is not None: return integer_cast
+    if (fused_integer_cast:=_lower_fused_integer_fp16_cast(uops, half_output)) is not None: return fused_integer_cast
     if (integer_division:=_lower_int32_true_division(half_output)) is not None: return integer_division
     if (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
     if (max_unpool:=_lower_unrolled_max_unpool(half_output)) is not None: return max_unpool
@@ -7251,6 +7305,34 @@ def _lower_tensor_pow(uops:list[UOp]) -> RKImage|None:
   try: return lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(replacement,)).toposort())))
   except RuntimeError: return None
 
+def _lower_negative_constant_base_pow(uops:list[UOp]) -> RKImage|None:
+  """Lower `negative_constant ** fp16` after Tinygrad has folded LOG2(abs(base))."""
+  if (output:=_output_store(uops, dtypes.half)) is None: return None
+  store, _, _, _, root = output
+  nodes = root.toposort()
+  exponentials = [u for u in nodes if u.op is Ops.EXP2]
+  if len(exponentials) != 1 or any(u.op is Ops.LOG2 for u in nodes) or not any(u.op is Ops.CMOD for u in nodes) or \
+     not any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.half and math.isnan(float(u.arg)) for u in nodes): return None
+  scaled = exponentials[0].src[0]
+  pair = next(((value, factor) for value,factor in (scaled.src, scaled.src[::-1])
+               if factor.op is Ops.CONST and factor.dtype.scalar() is dtypes.half and float(factor.arg) > 0), None) \
+         if scaled.op is Ops.MUL else (scaled, UOp.const(1.0, dtypes.half))
+  if pair is None or pair[0].dtype.scalar() is not dtypes.half: return None
+  exponent, logarithm = pair
+  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+  absolute_exponent = UOp(Ops.MAX, dtypes.half, src=(exponent, exponent), arg=_NATIVE_ABS)
+  integral = _native_floor(absolute_exponent)
+  non_integral = _positive_mask(absolute_exponent.alu(Ops.SUB, integral))
+  odd = integral.alu(Ops.SUB, _native_floor(integral.alu(Ops.MUL, UOp.const(0.5, dtypes.half))).alu(
+    Ops.MUL, UOp.const(2.0, dtypes.half)))
+  signed_odd = _mask_mul(odd, one.alu(Ops.SUB, non_integral))
+  sign = one.alu(Ops.SUB, signed_odd.alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  magnitude = _dpu_exp2(exponent.alu(Ops.MUL, logarithm))
+  result = magnitude.alu(Ops.MUL, sign).alu(Ops.ADD, zero.alu(Ops.FDIV, one.alu(Ops.SUB, non_integral)))
+  replacement = store.replace(src=(store.src[0], result, *store.src[2:]))
+  try: return lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(replacement,)).toposort())))
+  except RuntimeError: return None
+
 _pm_rsqrt = PatternMatcher([(UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float),
   src=(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)),)), lambda source:_dpu_sqrt(source, True))])
 _pm_sqrt = PatternMatcher([(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sqrt(source))])
@@ -7277,7 +7359,8 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = (_lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or _lower_std_mean_pair(uops) or
+    image = (_lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or _lower_negative_constant_base_pow(uops) or
+             _lower_std_mean_pair(uops) or
              _lower_unrolled_mapped_add_reduction(uops) or _lower_mapped_add_loop_reduction(uops))
     return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()
 

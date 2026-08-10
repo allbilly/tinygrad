@@ -4854,16 +4854,20 @@ Five runtime-exponent/broadcast methods pass together in **7.24 s**, including a
 `test_broadcast_partial`. The first broad run found only one IEEE mismatch among 2,925 tensor-power lanes: base
 `-0.2025` with exponent `-8.64e-6` was incorrectly finite. The exact subnormal predicate fixed that final mismatch.
 The same graph now also accepts compile-time FP16 exponents; `test_pow_neg_inf_frac_exponent` passes both `-inf**0.3`
-and `-inf**3.3`, bringing this milestone to **six unchanged upstream methods**. Constant-base and integer-input/
-float-exponent graphs remain separate lowering shapes and were not promoted.
+and `-inf**3.3`. Negative constant bases whose LOG2 magnitude has folded are handled by the same FP16 parity graph.
+A reusable DPU INT32-to-FP16 pre-conversion now feeds fused EW graphs, removing the last non-POW blocker from integer
+exponents. Consequently the complete 17-subcase `test_pow_const` and `test_pow_int_base_float_exponent` methods pass;
+the final six-method tensor-power class passes in **8.72 s**. This milestone now covers **eight unchanged upstream
+methods** including the two broadcast methods. Only the dedicated `0 ** negative_constant` infinity edge remains from
+the forward constant-power group.
 
-- `test_rockchip.py`: **404 collected cases**, representing **381 unique upstream methods**.
-- Authoritative upstream-name remainder: **40 of 421**.
+- `test_rockchip.py`: **406 collected cases**, representing **383 unique upstream methods**.
+- Authoritative upstream-name remainder: **38 of 421**.
 - A diagnostic `ROCKCHIP_EW_REDUCE=twoproduct` cross-entropy run timed out after 30 seconds and logged one IOMMU read
   fault at address zero. No more two-product submissions were made. The required vendor health check then passed all
   **60/60** elementwise probes, and the new power batch subsequently passed without a timeout.
 - Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
-- `sz.py`: renderer/runtime **6,712/367 executable lines**, total **32,134**.
+- `sz.py`: renderer/runtime **6,791/367 executable lines**, total **32,213**.
 
 There is no Tinygrad-core change, host numerical computation, LUT, CMAC, FP32 input, or tolerance relaxation beyond the
 established `test_gemm_fp16` FP16 contract.

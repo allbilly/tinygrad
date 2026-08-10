@@ -368,6 +368,8 @@ class TestRockchipTensorPowerOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_pow_full = _test_ops.TestOps.test_pow_full
+  test_pow_const = _test_ops.TestOps.test_pow_const
+  test_pow_int_base_float_exponent = _test_ops.TestOps.test_pow_int_base_float_exponent
   test_pow_neg_inf_frac_exponent = _test_ops.TestOps.test_pow_neg_inf_frac_exponent
   test_pow_zero_exponent = _test_ops.TestOps.test_pow_zero_exponent
   test_pow_zero_tensor = _test_ops.TestOps.test_pow_zero_tensor
