@@ -1,6 +1,6 @@
 from tinygrad.dtype import dtypes
 from tinygrad.renderer.rockchip import RKArg, RKBufferKind, RKLayout, RKValue, _lower_uop_program
-from tinygrad.uop.ops import UOp
+from tinygrad.uop.ops import Ops, UOp
 
 
 def _program(dtype, value, count:int=4):
@@ -51,3 +51,11 @@ def test_generic_int16_uses_canonical_native_layout():
   image = _lower_uop_program(_program(dtypes.int16, lambda i:source.index(i).load() + UOp.const(3, dtypes.int16)))
   assert image is not None and len(image.ew_ops) == 1
   assert image.ew_ops[0].int16_input and image.ew_ops[0].int16_output
+
+
+def test_math_uops_own_multi_stage_recipes():
+  source = UOp.param(1, dtypes.half, (4,))
+  for op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
+    image = _lower_uop_program(_program(dtypes.half, lambda i, op=op:UOp(op, dtypes.half, src=(source.index(i).load(),))))
+    assert image is not None and len(image.ew_ops) > 1
+    assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG

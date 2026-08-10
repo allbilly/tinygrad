@@ -21,13 +21,15 @@
 
 Verification:
 
-- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 6 passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 7 passed.
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py`: pass.
 
-### 2. Math UOp recipes — pending
+### 2. Math UOp recipes — complete
 
-- Move SQRT, EXP2, LOG2, and SIN recipe ownership into generic UOp handlers.
+- Moved SQRT, EXP2, LOG2, and SIN recipe ownership into the generic executor.
+- Each semantic math UOp now expands directly to its existing DPU arithmetic recipe and physical stages.
+- Added one generic recipe test covering all four math UOps.
 
 ### 3. Structural RANGE/reduction execution — pending
 

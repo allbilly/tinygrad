@@ -7742,6 +7742,20 @@ class RKContext:
     self._emit(selected, condition, delta, _EW_CFG[Ops.MUL])
     return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), no, selected, _EW_CFG[Ops.ADD])
 
+  def _math(self, u:UOp) -> RKValue:
+    if len(u.src) != 1 or u.dtype.scalar() is not dtypes.half: raise _RKGenericReject
+    if u.op is Ops.SQRT:
+      if (recipe:=_dpu_sqrt(u.src[0])) is None: raise _RKGenericReject
+    elif u.op is Ops.EXP2: recipe = _dpu_exp2(u.src[0])
+    elif u.op is Ops.LOG2: recipe = _dpu_log2(u.src[0])
+    elif u.op is Ops.SIN: recipe = _dpu_sin(u.src[0])
+    else: raise _RKGenericReject
+    value = self.lower(recipe)
+    if value.layout is not RKLayout.FP16: raise _RKGenericReject
+    if u is self.root and value.arg != self.out:
+      value = self._emit(RKValue(self.out, dtypes.half, self.count, RKLayout.FP16), value, value, _EW_CFG[Ops.MAX])
+    return value
+
   def lower(self, u:UOp) -> RKValue:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
@@ -7758,6 +7772,7 @@ class RKContext:
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op is Ops.WHERE: value = self._where(u)
+    elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)
     else: raise _RKGenericReject
     self.values[u] = value
     return value
