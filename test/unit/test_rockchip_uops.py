@@ -1,5 +1,6 @@
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import RKArg, RKBufferKind, RKLayout, RKValue, _lower_uop_program
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _lower_uop_program,
+  decode_image, encode_image)
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
@@ -81,3 +82,28 @@ def test_static_local_accumulator_is_structurally_executed():
     output = out.index(row).store(local.load())
     image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
+
+
+def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):
+  monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "1")
+  indices = UOp.param(2, dtypes.int, (4,))
+  axis = UOp.range(4, 0)
+
+  gather_out, gather_source = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (8,))
+  gather = gather_out.index(axis).store(gather_source.index(indices.index(axis).load()).load())
+  gather_uops = list(gather.end(axis).sink().toposort())
+  gather_image = _lower_uop_program(gather_uops)
+  assert gather_image is not None and gather_image.execution_class is RKExecutionClass.HOST_ADDRESS
+  assert len(gather_image.host_gathers) == 1 and not gather_image.host_scatters
+  assert decode_image(encode_image(gather_image)) == gather_image
+
+  scatter_out, scatter_source = UOp.param(0, dtypes.half, (8,)), UOp.param(1, dtypes.half, (4,))
+  scatter = scatter_out.index(indices.index(axis).load()).store(scatter_source.index(axis).load())
+  scatter_uops = list(scatter.end(axis).sink().toposort())
+  scatter_image = _lower_uop_program(scatter_uops)
+  assert scatter_image is not None and scatter_image.execution_class is RKExecutionClass.HOST_ADDRESS
+  assert len(scatter_image.host_scatters) == 1 and not scatter_image.host_gathers
+  assert decode_image(encode_image(scatter_image)) == scatter_image
+
+  monkeypatch.delenv("ROCKCHIP_HOST_GATHER")
+  assert _lower_uop_program(gather_uops) is None and _lower_uop_program(scatter_uops) is None

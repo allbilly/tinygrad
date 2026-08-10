@@ -21,7 +21,7 @@
 
 Verification:
 
-- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 9 passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 10 passed.
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py`: pass.
 
@@ -38,10 +38,13 @@ Verification:
 - Structural execution produces ordinary semantic UOps and reuses `RKContext`; it does not recover a tensor operation name.
 - Added coverage for direct reductions and mutable local accumulators across all three operators.
 
-### 4. Symmetric host address materialization — pending
+### 4. Symmetric host address materialization — complete
 
-- Add explicit `HOST_ADDRESS` image/runtime records for direct dynamic gather and scatter.
-- Keep numeric and reduction semantics forbidden on the host.
+- Added serialized `RKHostAddress` records and explicit `NATIVE`/`HOST_ADDRESS` image classification.
+- Added opt-in direct dynamic gather and last-writer scatter through `ROCKCHIP_HOST_GATHER=1`.
+- Dynamic gathers run before EW stages; dynamic scatters run after EW/post-gather stages.
+- The runtime only reads indices, bounds-checks addresses, and copies raw lanes. It performs no numeric or reduction semantics.
+- Scatter-reduce is intentionally not part of `RKHostAddress`.
 
 ### 5. Legacy deletion census — pending
 

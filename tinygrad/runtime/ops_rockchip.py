@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
-  RKArg, RKGather, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+  RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -305,6 +305,28 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
     cleared_scratch:set[int] = set()
+    def apply_host_addresses(ops:tuple[RKHostAddress, ...], scatter:bool) -> None:
+      for op in ops:
+        source, indices, dest = buffer(op.src.kind, op.src.index), buffer(op.index.kind, op.index.index), buffer(op.dst.kind, op.dst.index)
+        lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[op.itemsize]
+        index_dtype = {2:np.int16, 4:np.int32}[op.index_itemsize]
+        if op.src.addend % op.itemsize or op.dst.addend % op.itemsize or op.index.addend % op.index_itemsize:
+          raise RuntimeError("unaligned RKHostAddress")
+        src = np.frombuffer(to_mv(int(source.va_addr), source.size), dtype=lane_dtype)[op.src.addend//op.itemsize:]
+        idx = np.frombuffer(to_mv(int(indices.va_addr), indices.size), dtype=index_dtype)[
+          op.index.addend//op.index_itemsize:op.index.addend//op.index_itemsize+op.count].astype(np.intp)
+        dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)[op.dst.addend//op.itemsize:]
+        if len(idx) != op.count or len(src) < (op.count if scatter else op.src_count) or len(dst) < (op.dst_count if scatter else op.count):
+          raise RuntimeError("RKHostAddress exceeds buffer")
+        limit = op.dst_count if scatter else op.src_count
+        if op.normalize_negative: idx = np.where(idx < 0, idx+limit, idx)
+        valid = (idx >= 0) & (idx < limit)
+        if scatter:
+          for lane in range(op.count):
+            if valid[lane]: dst[idx[lane]] = src[lane]
+        else:
+          dst[:op.count] = op.fill_bits
+          dst[np.nonzero(valid)[0]] = src[idx[valid]]
     def apply_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
       for gather in gathers:
         dest = buffer(gather.dst_kind, gather.dst_index)
@@ -330,6 +352,7 @@ class RockchipProgram(Program['RockchipDevice']):
           for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
           dst[dst_index] = src[index]
     apply_gathers(self.image.gathers, True)
+    apply_host_addresses(self.image.host_gathers, False)
     self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
@@ -354,6 +377,13 @@ class RockchipProgram(Program['RockchipDevice']):
     else: self._run_ew_ops(address, buffer)
     if self.image.ew_ops: self.dev._native_int16 = native_int16
     if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
+    if self.image.host_scatters:
+      touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \
+                {(op.index.kind, op.index.index) for op in self.image.host_scatters} | \
+                {(op.dst.kind, op.dst.index) for op in self.image.host_scatters}
+      self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      apply_host_addresses(self.image.host_scatters, True)
+      self.dev._sync_buffers(tuple(buffer(op.dst.kind, op.dst.index) for op in self.image.host_scatters), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if (fill:=self.image.fill) is not None:
       bits = self.image.constants[:fill.itemsize] * fill.count
       dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]

@@ -13,9 +13,10 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 28
-_HEADER = struct.Struct("<4sHHHHIIIIII")  # magic/version/target, scratch/gather counts, ops/constants, phase split, flags
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 29
+_HEADER = struct.Struct("<4sHHHHHHIIIIII")  # magic/version/target, scratch/gather/host counts, ops/constants, phase split, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIi"), struct.Struct("<IIi")
+_HOST_ADDRESS = struct.Struct("<BBBBBHHHIIIIIiii")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
@@ -25,6 +26,7 @@ _RKIMAGE_U16_MAX = (1 << 16) - 1
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 class RKLayout(IntEnum): FP16 = 0; INT16 = 1; BOOL_MASK = 2; INT32 = 3
+class RKExecutionClass(IntEnum): NATIVE = 0; HOST_ADDRESS = 1
 
 @dataclass(frozen=True)
 class RKArg: kind: RKBufferKind; index: int; addend: int = 0
@@ -53,6 +55,12 @@ class RKGather:
   src_kind: RKBufferKind = RKBufferKind.ARG
 
 @dataclass(frozen=True)
+class RKHostAddress:
+  """Host-calculated raw-lane movement. It never owns numeric or reduction semantics."""
+  src: RKArg; index: RKArg; dst: RKArg; count: int; src_count: int; dst_count: int
+  itemsize: int = 2; index_itemsize: int = 4; fill_bits: int = 0; normalize_negative: bool = False
+
+@dataclass(frozen=True)
 class RKMultiGather: gathers: tuple[RKGather, ...]
 
 @dataclass(frozen=True)
@@ -79,6 +87,11 @@ class RKImage:
   gathers: tuple[RKGather, ...] = (); fill: RKFill|None = None; ew_ops: tuple[RKEWOp, ...] = ()
   mid_gathers: tuple[RKGather, ...] = (); gather_after: int = 0
   post_gathers: tuple[RKGather, ...] = ()
+  host_gathers: tuple[RKHostAddress, ...] = (); host_scatters: tuple[RKHostAddress, ...] = ()
+
+  @property
+  def execution_class(self) -> RKExecutionClass:
+    return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
 
 @dataclass(frozen=True)
 class RKReloc: word: int; arg: RKArg
@@ -90,6 +103,7 @@ def encode_image(image:RKImage) -> bytes:
   gathers = image.gathers + image.mid_gathers + image.post_gathers
   if image.mid_gathers and not 0 <= image.gather_after < len(image.ew_ops): raise ValueError("invalid mid-gather split")
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.scratch), len(gathers),
+                               len(image.host_gathers), len(image.host_scatters),
                                len(image.ew_ops), len(image.constants), len(image.mid_gathers), len(image.post_gathers),
                                image.gather_after, int(image.fill is not None)))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
@@ -101,6 +115,11 @@ def encode_image(image:RKImage) -> bytes:
     elif kind in (1, 3): out += struct.pack(f"<{g.count}i", *g.offsets)
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
+  for host in image.host_gathers + image.host_scatters:
+    if host.itemsize not in _ITEM_FORMAT or host.index_itemsize not in (2, 4): raise ValueError("invalid RKHostAddress item size")
+    out += _HOST_ADDRESS.pack(int(host.src.kind), int(host.index.kind), int(host.dst.kind), host.itemsize, host.index_itemsize,
+      host.src.index, host.index.index, host.dst.index, host.count, host.src_count, host.dst_count, host.fill_bits,
+      int(host.normalize_negative), host.src.addend, host.index.addend, host.dst.addend)
   for op in image.ew_ops:
     if op.bool_output and not op.int32_output: raise ValueError("bool output requires INT32 conversion")
     int16_to_int32 = op.int16_input and op.int32_output and not op.int16_output and not op.int32_input
@@ -115,7 +134,8 @@ def encode_image(image:RKImage) -> bytes:
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
-  magic, version, target, nscratch, ngather, nop, nconst, mid_count, post_count, gather_after, flags = _HEADER.unpack_from(blob)
+  magic, version, target, nscratch, ngather, nhost_gather, nhost_scatter, nop, nconst, mid_count, post_count, gather_after, flags = \
+    _HEADER.unpack_from(blob)
   if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags & ~1 or
       (mid_count and not 0 <= gather_after < nop) or (not mid_count and gather_after != 0)): raise ValueError("invalid RKImage header")
   off = _HEADER.size
@@ -141,6 +161,17 @@ def decode_image(blob:bytes) -> RKImage:
       gathers.append(RKGather(src_index, dst_index, count, base, axes, fill_bits=fill_bits,
                               dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
                               src_kind=RKBufferKind(src_kind)))
+  host_addresses:list[RKHostAddress] = []
+  for _ in range(nhost_gather+nhost_scatter):
+    src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \
+      fill_bits, host_flags, src_addend, index_addend, dst_addend = _HOST_ADDRESS.unpack_from(blob, off)
+    off += _HOST_ADDRESS.size
+    if (src_kind not in (0, 1) or index_kind not in (0, 1) or dst_kind not in (0, 1) or itemsize not in _ITEM_FORMAT or
+        index_itemsize not in (2, 4) or host_flags & ~1 or min(count, src_count, dst_count) < 0):
+      raise ValueError("invalid RKHostAddress")
+    host_addresses.append(RKHostAddress(RKArg(RKBufferKind(src_kind), src_index, src_addend),
+      RKArg(RKBufferKind(index_kind), index_index, index_addend), RKArg(RKBufferKind(dst_kind), dst_index, dst_addend),
+      count, src_count, dst_count, itemsize, index_itemsize, fill_bits, bool(host_flags & 1)))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
@@ -162,7 +193,8 @@ def decode_image(blob:bytes) -> RKImage:
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
   pre_count = ngather-mid_count-post_count
   return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:pre_count]), fill, tuple(ew_ops),
-                 tuple(gathers[pre_count:pre_count+mid_count]), gather_after, tuple(gathers[-post_count:] if post_count else ()))
+                 tuple(gathers[pre_count:pre_count+mid_count]), gather_after, tuple(gathers[-post_count:] if post_count else ()),
+                 tuple(host_addresses[:nhost_gather]), tuple(host_addresses[nhost_gather:]))
 
 def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tuple[int, ...]:
   commands = list(stage.commands)
@@ -7579,6 +7611,15 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
 
 class _RKGenericReject(Exception): pass
 
+def _runtime_index(u:UOp) -> tuple[UOp, UOp, UOp, int]|None:
+  """Return the index LOAD, its parameter, lane-address expression, and raw index width."""
+  u = _strip_cast(u)
+  if (u.op is not Ops.LOAD or len(u.src) != 1 or u.src[0].op is not Ops.INDEX or
+      (param:=_root_param(u.src[0])) is None or param.src[0].op is not Ops.CONST): return None
+  dtype = param.dtype.scalar()
+  if dtype not in (dtypes.int, dtypes.int16): return None
+  return u, param, u.src[0].src[1], dtype.itemsize
+
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
   def __init__(self, output:RKOutput):
@@ -7590,6 +7631,7 @@ class RKContext:
     self.static_slots:dict[tuple[RKLayout, tuple[int, ...]], RKValue] = {}
     self.gather_slots:dict[tuple, RKValue] = {}
     self.gathers:list[RKGather] = []
+    self.host_gathers:list[RKHostAddress] = []
     self.ew_ops:list[RKEWOp] = []
     self.mask_program = False
 
@@ -7643,9 +7685,18 @@ class RKContext:
     gate = u.src[2] if len(u.src) > 2 else None
     default = u.src[1] if len(u.src) > 1 else None
     if default is not None and default.op is not Ops.CONST: raise _RKGenericReject
-    if any(x.op is Ops.LOAD for x in index.toposort()) or gate is not None and any(x.op is Ops.LOAD for x in gate.toposort()):
-      raise _RKGenericReject
     layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16
+    if any(x.op is Ops.LOAD for x in index.toposort()) or gate is not None and any(x.op is Ops.LOAD for x in gate.toposort()):
+      runtime_index = _runtime_index(index)
+      if (os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or gate is not None or runtime_index is None or
+          runtime_index[2].key != self.out_index.key or int(runtime_index[1].src[0].arg) != self.count): raise _RKGenericReject
+      value = self._scratch(dtype, layout)
+      fill_bits = _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
+        _int16_bits(0 if default is None else default.arg)
+      self.host_gathers.append(RKHostAddress(RKArg(RKBufferKind.ARG, param.arg.slot),
+        RKArg(RKBufferKind.ARG, runtime_index[1].arg.slot), value.arg, self.count, int(param.src[0].arg), self.count,
+        itemsize=2, index_itemsize=runtime_index[3], fill_bits=fill_bits))
+      return value
     if gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
       return RKValue(RKArg(RKBufferKind.ARG, param.arg.slot), dtype, self.count, layout)
     fill_bits = _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
@@ -7793,7 +7844,8 @@ class RKContext:
     if self.constants:
       by_slot = {slot:bits for bits,slot in self.constants.items()}
       constants = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot)+1))
-    return RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops))
+    return RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops),
+                   host_gathers=tuple(self.host_gathers))
 
 def _unroll_static_reduces(root:UOp) -> UOp:
   """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
@@ -7852,8 +7904,27 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
   return root.substitute(substitutions)
 
+def _lower_host_scatter(uops:list[UOp]) -> RKImage|None:
+  """Lower a direct dynamic STORE as raw last-writer host address materialization."""
+  if os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or \
+     (output:=_output_store(uops, (dtypes.half, dtypes.int16))) is None or len(output[0].src) != 2: return None
+  store, out_param, out_count, dynamic_index, value = output
+  if (index_info:=_runtime_index(dynamic_index)) is None: return None
+  _, index_param, lane_index, index_itemsize = index_info
+  value = _strip_cast(value)
+  if (value.op is not Ops.LOAD or len(value.src) != 1 or value.src[0].op is not Ops.INDEX or
+      (source:=_root_param(value.src[0])) is None or source.src[0].op is not Ops.CONST or
+      value.src[0].src[1].key != lane_index.key or source.dtype.scalar() is not out_param.dtype.scalar()): return None
+  count = int(index_param.src[0].arg)
+  if int(source.src[0].arg) < count: return None
+  address = RKHostAddress(RKArg(RKBufferKind.ARG, source.arg.slot), RKArg(RKBufferKind.ARG, index_param.arg.slot),
+    RKArg(RKBufferKind.ARG, out_param.arg.slot), count, int(source.src[0].arg), out_count,
+    itemsize=out_param.dtype.scalar().itemsize, index_itemsize=index_itemsize)
+  return RKImage(RKTarget.RK3588, host_scatters=(address,))
+
 def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
+  if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
   if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.bool), allow_local=True)) is None or len(output[0].src) != 2:
     return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
