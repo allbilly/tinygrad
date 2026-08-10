@@ -257,9 +257,9 @@ _BN_CFG_COMPARE = 0x40082
 _BN_MUL_COMPARE = 0x7c000000
 _BN_RELUX_COMPARE = 0x3f800000
 (_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_COPYSIGN, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN,
- _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RELU6, _NATIVE_SIGN) = (
+ _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RAW_MIN, _NATIVE_RELU6, _NATIVE_SIGN) = (
    "rockchip_abs", "rockchip_ceil", "rockchip_copysign", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
-   "rockchip_min", "rockchip_positive_mask", "rockchip_precise_add", "rockchip_relu6", "rockchip_sign")
+   "rockchip_min", "rockchip_positive_mask", "rockchip_precise_add", "rockchip_raw_min", "rockchip_relu6", "rockchip_sign")
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
@@ -7643,6 +7643,9 @@ class RKContext:
       if expected is RKLayout.FP16: return self._native_min(u, lhs, rhs)
       dst = self._alu_dst(u, dtype, RKLayout.INT16, ((u.src[0], lhs), (u.src[1], rhs)))
       return self._emit(dst, lhs, rhs, _EW_CFG_MIN)
+    if u.op is Ops.MAX and u.arg == _NATIVE_RAW_MIN:
+      dst = self._alu_dst(u, dtype, expected, ((u.src[0], lhs), (u.src[1], rhs)))
+      return self._emit(dst, lhs, rhs, _EW_CFG_MIN)
     cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else \
       _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else \
       _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else \
@@ -7711,6 +7714,33 @@ class RKContext:
 
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
+    if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
+      dtype = u.dtype.scalar()
+      routes:dict[UOp, list[bool]] = {}
+      def route(node:UOp, active:tuple[bool, ...]) -> None:
+        if node.op is Ops.WHERE and _is_static_expr(node.src[0]):
+          selector = tuple(bool(x) for x in _static_values(self.out_index, node.src[0], self.count, lambda x:int(bool(x))))
+          route(node.src[1], tuple(live and take for live,take in zip(active, selector)))
+          route(node.src[2], tuple(live and not take for live,take in zip(active, selector)))
+          return
+        mask = routes.setdefault(node, [False]*self.count)
+        for i,live in enumerate(active): mask[i] |= live
+      route(u, (True,)*self.count)
+      def exact_operand(src:UOp) -> RKValue:
+        if (src.op is Ops.LOAD and dtype is dtypes.half and len(src.src) > 2 and src.src[1].op is Ops.CONST and
+            math.isinf(float(src.src[1].arg)) and float(src.src[1].arg) < 0.0 and
+            (param:=_root_param(src.src[0])) is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg) < self.count):
+          return self._load(src, _fp16_bits(-65504.0))
+        return self.lower(src)
+      expected = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16
+      itemsize = dtype.itemsize
+      for partial,(leaf,mask) in enumerate(routes.items()):
+        value = exact_operand(leaf)
+        if value.layout is not expected: raise _RKGenericReject
+        offsets = tuple(value.arg.addend//itemsize+i if take else -1 for i,take in enumerate(mask))
+        self.post_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count, offsets=offsets,
+          partial=bool(partial), dst_kind=RKBufferKind.ARG, src_kind=value.arg.kind, itemsize=itemsize))
+      return RKValue(self.out, dtype, self.count, expected)
     condition_uop = _strip_cast(u.src[0])
     if (condition_uop.op is Ops.CMPLT and condition_uop.src[1].op is Ops.CONST and float(condition_uop.src[1].arg) == 0.0 and
         u.src[2].key == condition_uop.src[0].key and (negative_match:=_const_operand(u.src[1], Ops.MUL, -1.0)) is not None and
@@ -7890,6 +7920,9 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
 def _expand_math_uops(root:UOp) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
   cache:dict[UOp, UOp] = {}
+  exact_static_selection = root.op is Ops.WHERE and _is_static_expr(root.src[0]) and not any(
+    node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and not math.isfinite(float(node.arg))
+    for node in root.toposort())
   def physical_recipe(recipe:UOp) -> UOp:
     rewritten = _fp16_rewrite(list(UOp(Ops.SINK, src=(recipe,)).toposort()))
     if not rewritten or rewritten[-1].op is not Ops.SINK or len(rewritten[-1].src) != 1: raise _RKGenericReject
@@ -7914,6 +7947,8 @@ def _expand_math_uops(root:UOp) -> UOp:
         return mapped
       except _RKGenericReject: pass
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
+    if exact_static_selection and mapped.op is Ops.MUL and (minimum:=_fold_minimum(mapped)) is not None:
+      mapped = minimum.replace(arg=_NATIVE_RAW_MIN)
     if mapped.op is Ops.SQRT:
       if (recipe:=_dpu_sqrt(mapped.src[0])) is None: raise _RKGenericReject
       mapped = rewrite(physical_recipe(recipe))
@@ -7929,14 +7964,13 @@ def _expand_math_uops(root:UOp) -> UOp:
 def _finite_max_neutral_selectors(root:UOp) -> UOp:
   """Use the canonical finite FP16 MAX neutral for selected negative-infinity padding."""
   if root.op is not Ops.MAX: return root
-  nodes = root.toposort()
-  uses:dict[UOp, list[UOp]] = {}
-  for node in nodes:
-    for src in node.src: uses.setdefault(src, []).append(node)
-  replacements = {node:node.const_like(-65504.0) for node in nodes if node.op is Ops.CONST and
-    node.dtype.scalar() in (dtypes.half, dtypes.float) and math.isinf(float(node.arg)) and float(node.arg) < 0.0 and
-    uses.get(node) and all(user.op in (Ops.LOAD, Ops.WHERE) and node in user.src[1:] for user in uses[node])}
-  return root.substitute(replacements) if replacements else root
+  cache:dict[UOp, UOp] = {}
+  for node in root.toposort():
+    src = tuple(cache[x] for x in node.src)
+    if (node.op is Ops.WHERE and src[1].op is Ops.CONST and src[1].dtype.scalar() in (dtypes.half, dtypes.float) and
+        math.isinf(float(src[1].arg)) and float(src[1].arg) < 0.0): src = (src[0], src[1].const_like(-65504.0), src[2])
+    cache[node] = node.replace(src=src)
+  return cache[root]
 
 def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
   cache:dict[UOp, UOp] = {}

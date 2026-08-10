@@ -38,14 +38,13 @@ def test_generic_where_selects_infinity_without_mask_multiplication():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(-math.inf, dtypes.half))))
-  assert image is not None and len(image.ew_ops) == 3
-  assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
 
 
 def test_max_uses_finite_neutral_for_selected_negative_infinity():
   source = UOp.param(1, dtypes.half, (4,))
   def maximum(i):
-    selected = (i < UOp.const(3, dtypes.int)).where(source.index(i).load(), UOp.const(-math.inf, dtypes.half))
+    selected = (i < UOp.const(3, dtypes.int)).where(UOp.const(-math.inf, dtypes.half), source.index(i).load())
     return selected.maximum(UOp.const(-2.0, dtypes.half))
   image = _lower_uop_program(_program(dtypes.half, maximum))
   assert image is not None and not any(op.submit_barrier for op in image.ew_ops)
@@ -92,6 +91,16 @@ def test_max_materializes_negative_infinity_fill_as_finite_neutral():
   assert image is not None and image.gathers[0].fill_bits == 0xfbff
 
 
+def test_static_root_where_uses_exact_gathers_and_finite_padding_neutral():
+  source = UOp.param(1, dtypes.half, (3,))
+  def selected(i):
+    padded = source.index(i).load(UOp.const(-math.inf, dtypes.half), i < UOp.const(3, dtypes.int))
+    return (i < UOp.const(4, dtypes.int)).where(padded, UOp.const(0.0, dtypes.half))
+  image = _lower_uop_program(_program(dtypes.half, selected))
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
+  assert any(gather.fill_bits == 0xfbff for gather in image.gathers)
+
+
 def test_generic_bool_store_has_explicit_boundary_conversion():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() < rhs.index(i).load()))
@@ -133,8 +142,8 @@ def test_static_bool_materializes_in_int16_consumer_layout():
   lhs, rhs = UOp.param(1, dtypes.int16, (4,)), UOp.param(2, dtypes.int16, (4,))
   image = _lower_uop_program(_program(dtypes.int16,
     lambda i:(i < UOp.const(2, dtypes.int)).where(lhs.index(i).load(), rhs.index(i).load())))
-  assert image is not None and len(image.gathers) == 1 and len(image.ew_ops) == 4
-  assert all(op.int16_input and op.int16_output for op in image.ew_ops)
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
+  assert all(gather.itemsize == 2 for gather in image.post_gathers)
 
 
 def test_int16_to_int32_is_an_explicit_output_boundary():
