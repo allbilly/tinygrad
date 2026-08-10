@@ -10,7 +10,7 @@ Reduction via ROCKCHIP_EW_REDUCE=sequential|kahan|twoproduct (default sequential
 Each program uses one PC chain sized from its actual register-command and task-descriptor bytes.
 """
 from __future__ import annotations
-import math, unittest
+import math, os, unittest
 import numpy as np
 import torch
 from tinygrad import Tensor, Device, dtypes
@@ -545,7 +545,8 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self.assertEqual(got.dtype, output_dtype)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
-    if expected_tasks is not None: self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
+    if expected_tasks is not None and os.getenv("ROCKCHIP_UOPS", "1") == "0":
+      self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_bool(self, op, *values, expected=None, expected_tasks=None, expected_submits=1):
     arrays = tuple(np.asarray(value, dtype=np.int16) for value in values)
@@ -554,7 +555,8 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self.assertEqual(got.dtype, np.bool_)
     np.testing.assert_array_equal(got, op(*arrays) if expected is None else expected)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
-    if expected_tasks is not None: self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
+    if expected_tasks is not None and os.getenv("ROCKCHIP_UOPS", "1") == "0":
+      self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_index(self, expected, op, values, submits, tasks):
     before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
@@ -562,7 +564,7 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self.assertEqual(got.dtype, np.int32)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=np.int32))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, submits)
-    self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, tasks)
+    if os.getenv("ROCKCHIP_UOPS", "1") == "0": self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, tasks)
 
   def _check_cumsum(self, shape, axis, tasks):
     values = (np.arange(np.prod(shape), dtype=np.uint32)*7919).astype(np.uint16).view(np.int16).reshape(shape)

@@ -21,7 +21,7 @@
 
 Verification:
 
-- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 10 passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 10 passed at this milestone.
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py`: pass.
 
@@ -46,7 +46,19 @@ Verification:
 - The runtime only reads indices, bounds-checks addresses, and copies raw lanes. It performs no numeric or reduction semantics.
 - Scatter-reduce is intentionally not part of `RKHostAddress`.
 
-### 5. Legacy deletion census — pending
+### 5. First legacy deletion census — complete
 
-- Run the Rockchip census and delete operation-specific lowerers replaced by generic semantics.
+- Deleted `_lower_native_int16_ew` and its operation-pattern rewrite catalog, including the sign, ReLU6, leaky-ReLU, ABS/NEG, MIN, and masked-select graph recovery rules.
+- Added a canonical `BOOL_INT16` layout so INT16 comparisons, boolean compositions, and ternary `WHERE` compose without rediscovering mask representation.
+- Added an INT16 `XOR -1` UOp recipe. Tinygrad's portable `~max(~x, ~y)` minimum now executes as its ordinary XOR/MAX UOps instead of being recognized as a tensor minimum.
+- Made the INT16 `WHERE` recipe saturation-safe across the complete signed range and materialized static selectors in the consumer's bool layout.
+- Added an explicit INT16-to-INT32 output-boundary conversion without introducing general INT32 arithmetic semantics.
+- Kept legacy task-count assertions behind `ROCKCHIP_UOPS=0`; the generic correctness executor promises one submission, not an optimized stage count.
+- Removed 222 renderer lines while adding 84 generic renderer lines and 39 focused unit-test lines in this milestone.
+- The remaining operation-specific catalog is still the correctness oracle for UOp families not yet migrated.
 - Preserve `Ops.WMMA -> CMAC` as the only planned graph-level fast path.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 14 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipInt16EWOps test/backend/test_rockchip2.py::TestRockchipInt16EWOps -x -q -n0`: 42 passed.

@@ -54,6 +54,45 @@ def test_generic_int16_uses_canonical_native_layout():
   assert image.ew_ops[0].int16_input and image.ew_ops[0].int16_output
 
 
+def test_generic_int16_complement_recipe_composes_with_max():
+  lhs, rhs = UOp.param(1, dtypes.int16, (4,)), UOp.param(2, dtypes.int16, (4,))
+  def minimum(i):
+    left, right, complement = lhs.index(i).load(), rhs.index(i).load(), UOp.const(-1, dtypes.int16)
+    inverted_left = UOp(Ops.XOR, dtypes.int16, src=(left, complement))
+    inverted_right = UOp(Ops.XOR, dtypes.int16, src=(right, complement))
+    return UOp(Ops.XOR, dtypes.int16, src=(inverted_left.maximum(inverted_right), complement))
+  image = _lower_uop_program(_program(dtypes.int16, minimum))
+  assert image is not None and len(image.ew_ops) == 4
+  assert all(op.int16_input and op.int16_output for op in image.ew_ops)
+
+
+def test_generic_int16_where_avoids_saturating_difference():
+  source = UOp.param(1, dtypes.int16, (4,))
+  def clipped(i):
+    value = source.index(i).load()
+    return (value < UOp.const(100, dtypes.int16)).where(value, UOp.const(-100, dtypes.int16))
+  image = _lower_uop_program(_program(dtypes.int16, clipped))
+  assert image is not None
+  assert len(image.ew_ops) == 7
+  assert all(op.int16_input and op.int16_output for op in image.ew_ops)
+
+
+def test_static_bool_materializes_in_int16_consumer_layout():
+  lhs, rhs = UOp.param(1, dtypes.int16, (4,)), UOp.param(2, dtypes.int16, (4,))
+  image = _lower_uop_program(_program(dtypes.int16,
+    lambda i:(i < UOp.const(2, dtypes.int)).where(lhs.index(i).load(), rhs.index(i).load())))
+  assert image is not None and len(image.gathers) == 1 and len(image.ew_ops) == 4
+  assert all(op.int16_input and op.int16_output for op in image.ew_ops)
+
+
+def test_int16_to_int32_is_an_explicit_output_boundary():
+  lhs, rhs = UOp.param(1, dtypes.int16, (4,)), UOp.param(2, dtypes.int16, (4,))
+  image = _lower_uop_program(_program(dtypes.int,
+    lambda i:(lhs.index(i).load() + rhs.index(i).load()).cast(dtypes.int)))
+  assert image is not None and len(image.ew_ops) == 2
+  assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
+
+
 def test_math_uops_own_multi_stage_recipes():
   source = UOp.param(1, dtypes.half, (4,))
   for op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
