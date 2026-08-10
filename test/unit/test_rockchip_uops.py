@@ -42,6 +42,15 @@ def test_generic_where_selects_infinity_without_mask_multiplication():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
+def test_max_uses_finite_neutral_for_selected_negative_infinity():
+  source = UOp.param(1, dtypes.half, (4,))
+  def maximum(i):
+    selected = (i < UOp.const(3, dtypes.int)).where(source.index(i).load(), UOp.const(-math.inf, dtypes.half))
+    return selected.maximum(UOp.const(-2.0, dtypes.half))
+  image = _lower_uop_program(_program(dtypes.half, maximum))
+  assert image is not None and not any(op.submit_barrier for op in image.ew_ops)
+
+
 def test_generic_where_predicates_nonfinite_exp2_input():
   source = UOp.param(1, dtypes.half, (4,))
   def power(i):

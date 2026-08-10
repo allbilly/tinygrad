@@ -7926,6 +7926,18 @@ def _expand_math_uops(root:UOp) -> UOp:
     return mapped
   return rewrite(root)
 
+def _finite_max_neutral_selectors(root:UOp) -> UOp:
+  """Use the canonical finite FP16 MAX neutral for selected negative-infinity padding."""
+  if root.op is not Ops.MAX: return root
+  nodes = root.toposort()
+  uses:dict[UOp, list[UOp]] = {}
+  for node in nodes:
+    for src in node.src: uses.setdefault(src, []).append(node)
+  replacements = {node:node.const_like(-65504.0) for node in nodes if node.op is Ops.CONST and
+    node.dtype.scalar() in (dtypes.half, dtypes.float) and math.isinf(float(node.arg)) and float(node.arg) < 0.0 and
+    uses.get(node) and all(user.op in (Ops.LOAD, Ops.WHERE) and node in user.src[1:] for user in uses[node])}
+  return root.substitute(replacements) if replacements else root
+
 def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
   cache:dict[UOp, UOp] = {}
   def rewrite(u:UOp) -> UOp:
@@ -8025,7 +8037,7 @@ def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
   try:
     if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
-    root = _expand_math_uops(_unroll_static_local(uops, output, reduced))
+    root = _expand_math_uops(_finite_max_neutral_selectors(_unroll_static_local(uops, output, reduced)))
     if len(root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
