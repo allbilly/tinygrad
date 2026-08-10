@@ -4998,3 +4998,29 @@ Historical branches, `~/npu`, and `~/rk3588` contain no native reusable normaliz
 normalization shortcut evaluates prefix reductions on the host and was rejected. This milestone changes only the
 Rockchip renderer and Rockchip test census: no tensor-buffer reads, NumPy result arithmetic, Tinygrad-core change, LUT,
 CMAC, FP32 input, or tolerance relaxation beyond `test_gemm_fp16` is present.
+
+---
+
+## 2026-08-10 — exact indexed-loss tail padding and sparse reductions promotion
+
+The indexed-loss scalar tail no longer assumes DPU preserves zeroed bytes outside a logical short vector. Complete
+32-lane segments are reduced together, the final segment is added with its actual lane count, and the CPU-side layout
+gather explicitly writes zero for unused vector lanes before the final one-lane DPU tree. This keeps the fast segmented
+path for large losses while eliminating the NaN caused by reading padded lanes for 12-row sparse CE. Final scalar
+MUL/FDIV stages now begin explicit stateful submit segments after their dependent reduction trees.
+
+FP16 mean recognition compares the magnitude of the actual binary16 scale against `1/rows`; sparse CE lowers its mean
+as `-fp16(1/12)`, so the old positive `1e-6` float comparison incorrectly treated it as a sum. The unchanged
+`test_sparse_categorical_crossentropy_reductions` method now passes mean/sum/none in **4.73 s**, and its promoted alias
+passes from `test_rockchip.py` in **4.62 s**. The default first part of the broader sparse-CE method also passes; its
+combined ignore-index plus smoothing case, the separate ignore-index method, and smoothing method are finite but still
+outside the established FP16 tolerance and remain staging-only.
+
+One combined NLL+sparse rerun encountered a transient 30-second log-softmax producer timeout after NLL passed. Vendor
+health immediately passed **60/60**, and the exact sparse method then passed alone; no reboot was used. Collection is
+now **415 upstream-only aliases**, representing **392 unique upstream methods**, with an authoritative remainder of
+**30 of 422**. Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and diff checks pass. `sz.py` reports
+renderer/runtime **7,266/368 executable lines**, total **32,689**.
+
+The change is confined to static Rockchip plan construction and the Rockchip test census. It adds no host tensor-value
+inspection or result arithmetic, Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance relaxation.

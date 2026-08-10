@@ -870,6 +870,7 @@ class TestRockchipLossOps(unittest.TestCase):
   test_cross_entropy_class_indices = _test_ops.TestOps.test_cross_entropy_class_indices
   test_cross_entropy_class_probabilities = _test_ops.TestOps.test_cross_entropy_class_probabilities
   test_nll_loss = _test_ops.TestOps.test_nll_loss
+  test_sparse_categorical_crossentropy_reductions = _test_ops.TestOps.test_sparse_categorical_crossentropy_reductions
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

@@ -4956,7 +4956,7 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
   smoothing = 1.0-next(iter(target_coefficients)) if target_coefficients else 0.0
   mean = out_count == 1 and (any(u.op in (Ops.FDIV, Ops.RECIPROCAL) for u in nodes) or
     any(u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
-        abs(float(u.arg)-1.0/rows) < 1e-6 for u in nodes))
+        _fp16_bits(abs(float(u.arg))) == _fp16_bits(1.0/rows) for u in nodes))
 
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(rows, classes)
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
@@ -5040,28 +5040,36 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
         gathers.append(RKGather(target.arg.slot, denominator_slot, reduction_lanes, values=(0,)*reduction_lanes))
       ops.append(RKEWOp(arg(denominator_slot), selected_weight, arg(fp16_valid), rows, _EW_CFG[Ops.MUL], stateful=True))
       denominator_values = arg(denominator_slot)
-    def segment_sum(value:RKArg) -> RKArg:
-      return _reduce_rows(ops, [RKArg(value.kind, value.index, value.addend+segment*64)
-        for segment in range(reduction_lanes//32)], 32, _EW_CFG[Ops.ADD])
-    numerator_partial = segment_sum(arg(masked_loss))
+    full_segments, tail = divmod(rows, 32)
+    def segment_sum(value:RKArg) -> tuple[RKArg, int]:
+      partial = (_reduce_rows(ops, [RKArg(value.kind, value.index, value.addend+segment*64)
+        for segment in range(full_segments)], 32, _EW_CFG[Ops.ADD]) if full_segments else None)
+      if tail:
+        tail_value = RKArg(value.kind, value.index, value.addend+full_segments*64)
+        if partial is None: return tail_value, tail
+        ops.append(RKEWOp(partial, partial, tail_value, tail, _EW_CFG[Ops.ADD]))
+      assert partial is not None
+      return partial, 32
+    numerator_partial, numerator_lanes = segment_sum(arg(masked_loss))
     numerator_arena = scratch(32*_reduction_stride(1))
     mid = [RKGather(numerator_partial.index, numerator_arena, 32,
-                    offsets=tuple(numerator_partial.addend//2+lane for lane in range(32)), dst_stride=_reduction_stride(1)//2,
+                    offsets=tuple(numerator_partial.addend//2+lane if lane < numerator_lanes else -1 for lane in range(32)),
+                    dst_stride=_reduction_stride(1)//2,
                     src_kind=RKBufferKind.SCRATCH)]
     denominator_arena:int|None = None
     if mean:
-      denominator_partial = segment_sum(denominator_values)
+      denominator_partial, denominator_lanes = segment_sum(denominator_values)
       denominator_arena = scratch(32*_reduction_stride(1))
       mid.append(RKGather(denominator_partial.index, denominator_arena, 32,
-                          offsets=tuple(denominator_partial.addend//2+lane for lane in range(32)),
+                          offsets=tuple(denominator_partial.addend//2+lane if lane < denominator_lanes else -1 for lane in range(32)),
                           dst_stride=_reduction_stride(1)//2, src_kind=RKBufferKind.SCRATCH))
     mid_gathers, gather_after = tuple(mid), len(ops)
     numerator = _reduce_rows(ops, [arg(numerator_arena, lane*_reduction_stride(1)) for lane in range(32)], 1, _EW_CFG[Ops.ADD])
     if mean:
       assert denominator_arena is not None
       denominator = _reduce_rows(ops, [arg(denominator_arena, lane*_reduction_stride(1)) for lane in range(32)], 1, _EW_CFG[Ops.ADD])
-      ops.append(RKEWOp(out, numerator, denominator, 1, _EW_CFG[Ops.FDIV], stateful=True))
-    else: ops.append(RKEWOp(out, numerator, arg(fp16_one), 1, _EW_CFG[Ops.MUL]))
+      ops.append(RKEWOp(out, numerator, denominator, 1, _EW_CFG[Ops.FDIV], submit_barrier=True, stateful=True))
+    else: ops.append(RKEWOp(out, numerator, arg(fp16_one), 1, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=mid_gathers, gather_after=gather_after)
 
