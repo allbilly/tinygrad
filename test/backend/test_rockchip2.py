@@ -7,6 +7,7 @@ import math, unittest
 import numpy as np
 import torch
 from tinygrad import Tensor, Device, dtypes
+from tinygrad.helpers import Context
 from test.backend.test_ops import slow_test
 from test.backend import test_ops as _test_ops
 from test.backend import test_rockchip as _base
@@ -254,6 +255,12 @@ class TestRockchipMaskedSelectOps(_base.TestRockchipMaskedSelectOps):
   def test_dynamic_scalar_true_small(self):
     _fp16_test_op([(32,)], lambda x:x.masked_select(torch.tensor(True)),
                   lambda x:x.masked_select(Tensor(True)), forward_only=True)
+  def test_dynamic_scalar_true_compact(self):
+    values = np.random.default_rng(7).uniform(-2, 2, 320).astype(np.float16)
+    before = Device["ROCKCHIP"].submit_count
+    with Context(NOOPT=1): got = Tensor(values, device="ROCKCHIP").masked_select(Tensor(True)).realize().numpy()
+    np.testing.assert_array_equal(got, values)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
   def test_fixed_masked_select_pad_and_truncate(self):
     values = np.array([-3., 2., -1., 4., 5., -2.], dtype=np.float16)
     source = Tensor(values, device="ROCKCHIP")

@@ -5466,3 +5466,29 @@ backend mutation was ported under the no-CPU-cheat and no-Tinygrad-core-change r
 This milestone changes documentation only. No renderer/runtime/core/test/tolerance behavior changed, and no host tensor
 value was inspected or computed. Finishing the last forward method requires authority to correct the Rockchip-specific
 multi-reduction unroll policy in Tinygrad core, after which the compact finalized graph can be lowered and promoted.
+
+---
+
+## 2026-08-10 — compact scalar-True MaskedSelect backend plan
+
+The backend side of the remaining scalar-True MaskedSelect is now complete without a Tinygrad-core change. A strict
+matcher admits only the finalized three-prefix graph: one same-sized FP16 source, three initialized INT32 ADD loops,
+the exact negative-index normalization and bounds gate, three equal reduction extents, and the complete expected UOp
+fingerprint/constants. Because a broadcast scalar-True mask preserves every flattened input lane, the resulting
+RKImage is one DPU MAX pass-through from source to output.
+
+The compact 320-element path was physically tested under `Context(NOOPT=1)`: **exact output, one submit, one DPU
+task**, and **4.00 s** under pytest. All six Rockchip MaskedSelect regressions passed serially in **25.31 s**. An
+in-process experiment replaced only the existing Rockchip heuristic for kernels with three reduction axes by returning
+the untouched scheduler copy; the unchanged upstream `test_masked_select` then passed both its data-dependent and
+scalar-True cases in **12.08 s**. The monkeypatch was test-process-only and is not present in the worktree.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing; no reboot was used.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **7,803/376 executable lines**, total **33,234**.
+- The success census remains **412 of 422** until the normal upstream command passes without `NOOPT` or monkeypatching.
+
+The matcher reads only finalized UOp structure, dtypes, static sizes, constants, and bounds; it never reads an input
+buffer. The single output operation executes on DPU EW. There is no runtime arithmetic, CPU tensor computation, LUT,
+CMAC, FP32 input, tolerance change, or Tinygrad-core modification. The only remaining step for promotion is the narrow
+Rockchip multi-reduction optimizer-policy correction described above.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 # ruff: noqa: E702
 import base64, math, os, struct
+from collections import Counter
 import numpy as np
 from dataclasses import dataclass, replace
 from enum import IntEnum
@@ -5638,6 +5639,39 @@ def _lower_fixed_integer_nonzero(output:RKOutput, dtype:DType=dtypes.int) -> RKI
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=mid, gather_after=gather_after)
 
+def _lower_constant_true_masked_select(uops:list[UOp]) -> RKImage|None:
+  """Recognize the exact three-prefix scalar-True MaskedSelect graph as a DPU copy."""
+  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
+  _, out_param, count, out_index, root = output
+  if not 65 <= count <= _FP16_EXACT_INTEGER or root.op is not Ops.LOAD or len(root.src) != 3 or root.src[0].op is not Ops.INDEX:
+    return None
+  source = _root_param(root.src[0])
+  normalized = _negative_normalized_index(root.src[0].src[1])
+  if (source is None or source is out_param or source.dtype.scalar() is not dtypes.half or source.src[0].op is not Ops.CONST or
+      int(source.src[0].arg) != count or root.src[1].op is not Ops.CONST or float(root.src[1].arg) != 0.0 or
+      normalized is None or normalized[1] != count or not _bounded_index_gate(root.src[2], root.src[0].src[1], count)):
+    return None
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  if (len(ranges) != 4 or sum(r.arg[1] is AxisType.WEAK for r in ranges) != 1 or
+      sum(r.arg[1] is AxisType.REDUCE for r in ranges) != 3 or
+      any(r.src[0].op is not Ops.CONST or int(r.src[0].arg) != count for r in ranges)):
+    return None
+  try:
+    if _gather_offsets(out_index, out_index, None, count) != tuple(range(count)): return None
+  except RuntimeError: return None
+  local_buffers = [u for u in uops if u.op is Ops.BUFFER]
+  local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
+  if (len(local_buffers) != 3 or any(u.dtype.scalar() is not dtypes.int or u.src[0].op is not Ops.CONST or
+      int(u.src[0].arg) != 1 for u in local_buffers) or len(local_stores) != 6 or
+      sum(u.src[1].op is Ops.CONST and int(u.src[1].arg) == 0 for u in local_stores) != 3 or
+      sum(u.src[1].op is Ops.ADD for u in local_stores) != 3): return None
+  expected_ops = {Ops.AFTER:9, Ops.INDEX:11, Ops.STORE:7, Ops.ADD:7, Ops.LOAD:7, Ops.CONST:7, Ops.CMPLT:5,
+                  Ops.RANGE:4, Ops.END:4, Ops.BUFFER:3, Ops.CMPNE:3, Ops.WHERE:3, Ops.PARAM:2, Ops.CAST:1, Ops.AND:1, Ops.SINK:1}
+  if Counter(u.op for u in uops) != expected_ops or sorted(int(u.arg) for u in uops if u.op is Ops.CONST and
+      u.dtype.scalar() is dtypes.int) != sorted((1-count, 0, 1, count-1, count)): return None
+  out, inp = RKArg(RKBufferKind.ARG, out_param.arg.slot), RKArg(RKBufferKind.ARG, source.arg.slot)
+  return RKImage(RKTarget.RK3588, ew_ops=(RKEWOp(out, inp, inp, count, _EW_CFG[Ops.MAX], stateful=True),))
+
 def _lower_fixed_fp16_masked_select(output:RKOutput) -> RKImage|None:
   """Lower a bounded fixed-size `x.masked_select(x > 0)` gather/fill without host value inspection."""
   _, out_param, count, out_index, root = output
@@ -8413,7 +8447,8 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = (_lower_softmax_argmax(uops) or _lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or
+    image = (_lower_constant_true_masked_select(uops) or _lower_softmax_argmax(uops) or
+             _lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or
              _lower_negative_constant_base_pow(uops) or
              _lower_std_mean_pair(uops) or _lower_unrolled_lp_cuberoot(uops) or _lower_rowwise_logsumexp(uops) or
              _lower_unrolled_mapped_add_reduction(uops) or _lower_mapped_add_loop_reduction(uops))
