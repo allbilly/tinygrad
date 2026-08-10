@@ -1120,7 +1120,8 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   return _reduction_image(out_param.arg.slot, rows, in_param.arg.slot, blocks, const_values,
                           _EW_CFG[reduce_op], fp32_out, post_scale, prepare if negate_inputs else None)
 
-def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float) -> RKImage|None:
+def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float,
+                                 group_shape:tuple[int, ...]=()) -> RKImage|None:
   """Retarget a vector map image into scratch, then append a row-wise ADD reduction."""
   if mapped.fill is not None or mapped.mid_gathers or mapped.post_gathers or not mapped.ew_ops: return None
   lanes = rows*groups
@@ -1134,20 +1135,40 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
     return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
   pre_ops = tuple(replace(op, dst=remap_arg(op.dst), lhs=remap_arg(op.lhs), rhs=remap_arg(op.rhs)) for op in mapped.ew_ops)
   gathers = tuple(remap_gather(gather) for gather in mapped.gathers)
-  stride, arena_slot = _reduction_stride(rows), value_slot+1
-  mid = tuple(RKGather(value_slot, arena_slot, rows, base=group*rows, axes=((1, rows, 1),),
-                       dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
   ops = list(pre_ops)
+  matrix = (rows == 1 and len(group_shape) == 2 and math.prod(group_shape) == groups and
+            group_shape[0]%(_reduction_stride(1)//2) == 0)
+  outer, inner = group_shape if matrix else (rows, groups)
+  stride, arena_slot = _reduction_stride(1 if matrix else outer), value_slot+1
   def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, arena_slot, offset)
   scaled_slot = arena_slot+1
-  reduced = _reduce_arena(ops, [group*stride for group in range(groups)], rows, _EW_CFG[Ops.ADD], arena,
-                          RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, scaled_slot))
+  mid:tuple[RKGather, ...]
+  if matrix:
+    def value(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, offset)
+    vector_stride = _reduction_stride(outer)
+    def vector_temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, arena_slot, index*vector_stride)
+    _compensated_add(ops, [group*outer*2 for group in range(inner)], outer, value, vector_temporary, value())
+    mid = (RKGather(value_slot, arena_slot, outer, offsets=tuple(range(outer)), dst_stride=stride//2,
+                    src_kind=RKBufferKind.SCRATCH),)
+    gather_after = len(ops)
+    reduced = _reduce_arena(ops, [row*stride for row in range(outer)], 1, _EW_CFG[Ops.ADD], arena,
+                            RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, scaled_slot))
+  else:
+    mid = tuple(RKGather(value_slot, arena_slot, rows, base=group*rows, axes=((1, rows, 1),),
+                         dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
+    gather_after = len(pre_ops)
+    destination = RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, scaled_slot)
+    if 2 <= inner <= _reduction_stride(1)//2:
+      def temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, index*stride)
+      reduced = _compensated_add(ops, [group*stride for group in range(inner)], outer, arena, temporary, destination)
+    else: reduced = _reduce_arena(ops, [group*stride for group in range(inner)], outer, _EW_CFG[Ops.ADD], arena, destination)
   if post_scale != 1.0:
     ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), reduced, RKArg(RKBufferKind.SCRATCH, 0), rows, _EW_CFG[Ops.MUL]))
-  scratch = (RKScratch(_scratch_bytes(lanes)), *mapped.scratch, RKScratch(_scratch_bytes(lanes)), RKScratch(groups*stride))
+  scratch = (RKScratch(_scratch_bytes(lanes)), *mapped.scratch, RKScratch(_scratch_bytes(lanes)),
+             RKScratch((outer if matrix else inner)*stride))
   if post_scale != 1.0: scratch += (RKScratch(_scratch_bytes(rows)),)
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<e", post_scale)+mapped.constants,
-                 gathers=gathers, ew_ops=tuple(ops), mid_gathers=mid, gather_after=len(pre_ops))
+                 gathers=gathers, ew_ops=tuple(ops), mid_gathers=mid, gather_after=gather_after)
 
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append a gather-free in-place EW image while retaining contiguous constant scratch slots."""
@@ -1281,19 +1302,33 @@ def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
   """Factor a scalar unrolled FP32 sum of identical FP16 lane expressions back into one vector map."""
   if (output:=_output_store(uops, dtypes.half)) is None: return None
   store, out, count, _, root = output
-  if count != 1 or root.op is not Ops.CAST or root.src[0].op is not Ops.MUL: return None
-  product = root.src[0]
-  summed, scale = next(((a, b) for a,b in (product.src, product.src[::-1]) if b.op is Ops.CONST), (None, None))
-  if summed is None or scale is None or not math.isfinite(post_scale:=float(scale.arg)): return None
+  if count != 1: return None
+  legacy_shape = root.op is Ops.CAST and root.src[0].op is Ops.MUL
+  summed, post_scale = root, 1.0
+  while True:
+    if summed.op is Ops.CAST: summed = summed.src[0]; continue
+    value, scale = next(((a, b) for a,b in (summed.src, summed.src[::-1]) if b.op is Ops.CONST), (None, None)) \
+      if summed.op is Ops.MUL else (None, None)
+    if value is None or scale is None: break
+    post_scale *= float(scale.arg); summed = value
+  if summed.op is not Ops.ADD or not math.isfinite(post_scale): return None
   terms = tuple(_strip_cast(term) for term in _flatten_binary(summed, Ops.ADD))
   if len(terms) < 2: return None
   def input_leaf(u:UOp) -> tuple[UOp, UOp]|None:
     index = u if u.op is Ops.INDEX else u.src[0] if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX else None
     param = _root_param(index) if index is not None else None
     return (index, param) if index is not None and param is not None and param.dtype.scalar() is dtypes.half else None
+  input_slots = {parsed[1].arg.slot for term in terms for u in term.toposort()
+                 for parsed in (input_leaf(u),) if parsed is not None}
+  if not legacy_shape and len(input_slots) < 2: return None
+  if any(u.op not in (Ops.ADD, Ops.MUL, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST)
+         for u in terms[0].toposort()): return None
+  signature_cache:dict[UOp, tuple] = {}
   def signature(u:UOp) -> tuple:
+    if u in signature_cache: return signature_cache[u]
     if (leaf:=input_leaf(u)) is not None: return ("input", leaf[1].arg.slot, u.op, u.dtype.scalar())
-    return (u.op, u.dtype.scalar(), u.arg, tuple(signature(src) for src in u.src))
+    signature_cache[u] = ret = (u.op, u.dtype.scalar(), u.arg, tuple(signature(src) for src in u.src))
+    return ret
   template, template_signature = terms[0], signature(terms[0])
   if any(signature(term) != template_signature for term in terms[1:]): return None
   loaded_indices = {u.src[0] for u in template.toposort() if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX}
@@ -1313,6 +1348,7 @@ def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
   first_index = first[0]
   lane = UOp(Ops.RANGE, first_index.src[1].dtype, src=(first_index.src[1].const_like(len(terms)),), arg=(0, AxisType.LOOP))
   substitutions:dict[UOp, UOp] = {}
+  repeated_shapes:set[tuple[int, int]] = set()
   for leaf in leaves:
     paired = counterparts[leaf]
     parsed = [input_leaf(node) for node in paired]
@@ -1322,18 +1358,30 @@ def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
     if len({param.key for param in params}) != 1: return None
     try: offsets = tuple(_eval_int(item[0].src[1], {}) for item in concrete)
     except RuntimeError: return None
-    stride = offsets[1]-offsets[0]
-    if offsets != tuple(offsets[0]+i*stride for i in range(len(offsets))): return None
-    index = concrete[0][0].replace(src=(params[0], lane.alu(Ops.MUL, lane.const_like(stride)).alu(Ops.ADD, lane.const_like(offsets[0])),
+    run = next((i for i,value in enumerate(offsets) if value != offsets[0]), len(offsets))
+    if 1 < run < len(offsets) and len(offsets)%run == 0 and all(len(set(offsets[i:i+run])) == 1 for i in range(0, len(offsets), run)):
+      repeated_shapes.add((len(offsets)//run, run))
+      blocks, index_lane = offsets[::run], lane.alu(Ops.FLOORDIV, lane.const_like(run))
+    else: blocks, index_lane = offsets, lane
+    stride = blocks[1]-blocks[0]
+    if blocks != tuple(blocks[0]+i*stride for i in range(len(blocks))): return None
+    index = concrete[0][0].replace(src=(params[0], index_lane.alu(Ops.MUL, lane.const_like(stride)).alu(Ops.ADD, lane.const_like(blocks[0])),
                                               *concrete[0][0].src[2:]))
     substitutions[leaf] = index if leaf.op is Ops.INDEX else leaf.replace(src=(index, *leaf.src[1:]))
   vector = template.substitute(substitutions)
+  factorizations = [(len(terms)//factor, factor) for factor in range(2, math.isqrt(len(terms))+1) if len(terms)%factor == 0 and
+                    (len(terms)//factor)%(_reduction_stride(1)//2) == 0]
+  group_shape = next(iter(repeated_shapes)) if len(repeated_shapes) == 1 else min(factorizations, key=lambda shape:sum(shape), default=())
+  matrix_lane = (lane.alu(Ops.FLOORMOD, lane.const_like(group_shape[1])).alu(Ops.MUL, lane.const_like(group_shape[0])).alu(
+    Ops.ADD, lane.alu(Ops.FLOORDIV, lane.const_like(group_shape[1])))) if group_shape and \
+    group_shape[0]%(_reduction_stride(1)//2) == 0 else lane
   fake_out = out.replace(src=(out.src[0].const_like(len(terms)),))
-  fake_index = store.src[0].replace(src=(fake_out, lane))
+  fake_index = store.src[0].replace(src=(fake_out, matrix_lane))
   fake_store = store.replace(src=(fake_index, vector, *store.src[2:]))
   try: mapped = lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(fake_store,)).toposort())))
   except RuntimeError: return None
-  return _finish_mapped_add_reduction(mapped, out.arg.slot, 1, len(terms), post_scale)
+  return _finish_mapped_add_reduction(mapped, out.arg.slot, 1, len(terms), post_scale,
+                                      group_shape)
 
 def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
   return _flatten_binary(root.src[0], op)+_flatten_binary(root.src[1], op) if root.op is op else [root]
@@ -1562,6 +1610,28 @@ def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:
     if len(active) & 1: reduced.append(active[-1])
     active = reduced
   return out if out is not None else arena(active[0])
+
+def _compensated_add(ops:list[RKEWOp], active:list[int], count:int, arena:Callable[[int], RKArg],
+                     temporary:Callable[[int], RKArg], out:RKArg) -> RKArg:
+  """Reduce aligned FP16 vectors with TwoSum residuals retained in consumed arena lanes."""
+  errors:list[int] = []
+  while len(active) > 1:
+    reduced:list[int] = []
+    for lhs,rhs in zip(active[::2], active[1::2]):
+      total, delta = temporary(0), temporary(1)
+      ops.extend((RKEWOp(total, arena(lhs), arena(rhs), count, _EW_CFG[Ops.ADD]),
+                  RKEWOp(delta, total, arena(lhs), count, _EW_CFG[Ops.SUB]),
+                  RKEWOp(arena(rhs), arena(rhs), delta, count, _EW_CFG[Ops.SUB]),
+                  RKEWOp(delta, total, delta, count, _EW_CFG[Ops.SUB]),
+                  RKEWOp(arena(lhs), arena(lhs), delta, count, _EW_CFG[Ops.SUB]),
+                  RKEWOp(arena(rhs), arena(lhs), arena(rhs), count, _EW_CFG[Ops.ADD]),
+                  RKEWOp(arena(lhs), total, total, count, _EW_CFG[Ops.MAX])))
+      reduced.append(lhs); errors.append(rhs)
+    if len(active)&1: reduced.append(active[-1])
+    active = reduced
+  residual = _reduce_arena(ops, errors, count, _EW_CFG[Ops.ADD], arena)
+  ops.append(RKEWOp(out, arena(active[0]), residual, count, _EW_CFG[Ops.ADD]))
+  return out
 
 def _append_dpu_sqrt_ops(ops:list[RKEWOp], source:RKArg, out:RKArg, count:int, slots:dict[float, int],
                          scratch:Callable[[], RKArg]) -> None:
@@ -5061,12 +5131,16 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
   ignore = next(iter(ignore_values), None)
   scalar_constants = {float(const.arg) for const in nodes if const.op is Ops.CONST and
                       const.dtype.scalar() in (dtypes.half, dtypes.float)}
-  smoothing_values = {classes*float(const.arg) for const in nodes if const.op is Ops.CONST and
+  direct_smoothing = {float(const.arg) for const in nodes if const.op is Ops.CONST and
+    const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 < float(const.arg) <= 1.0 for parent in parents.get(const, ())
+    if parent.op is Ops.MUL and any(other is not const and other.op is Ops.MUL for other in parent.src)}
+  per_class_smoothing = {classes*float(const.arg) for const in nodes if const.op is Ops.CONST and
     const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 < classes*float(const.arg) <= 1.0 and
     any(parent.op is Ops.ADD and any(other is not const and other.op is Ops.MUL for other in parent.src)
         for parent in parents.get(const, ())) and
     (math.isclose(classes*float(const.arg), 1.0) or
      any(math.isclose(scale+classes*float(const.arg), 1.0) for scale in scalar_constants))}
+  smoothing_values = direct_smoothing | per_class_smoothing
   if len(smoothing_values) > 1: return None
   smoothing = next(iter(smoothing_values), 0.0)
   mean = out_count == 1 and (any(u.op in (Ops.FDIV, Ops.RECIPROCAL) for u in nodes) or

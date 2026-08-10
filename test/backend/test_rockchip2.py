@@ -20,19 +20,6 @@ def _only_local_tests(cls):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
-class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
-  """Upstream indexed-loss candidates; passing methods move unchanged to test_rockchip.py."""
-
-  @classmethod
-  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
-
-  @classmethod
-  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
-
-  test_cross_entropy_reductions = _test_ops.TestOps.test_cross_entropy_reductions
-
-@_only_local_tests
-@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCompositeCandidates(_test_ops.TestOps):
   """Remaining cumulative, normalization, and attention candidates."""
 

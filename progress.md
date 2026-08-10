@@ -5375,3 +5375,35 @@ compare/mask emission remains in the existing shared integer-mask helpers.
 
 The dense `test_cross_entropy_reductions` scalar sum remains staged because its cancellation-sensitive FP16 result is
 outside the permitted tolerance. No tolerance, runtime, Tinygrad-core, LUT, CMAC, or CPU tensor computation changed.
+
+---
+
+## 2026-08-10 — compact compensated mapped reductions
+
+The unchanged upstream `test_cross_entropy_reductions` now passes its mean, sum, and vector-output variants. Its
+final dense loss graph contained 320 repeated local ADD/MUL terms, but the old scalar lowering emitted one DPU task
+per tree edge and accumulated cancellation error. The unrolled matcher now peels canonical cast/scale wrappers,
+memoizes local expression signatures, recognizes repeated source rows, and vectorizes a shape recovered from the UOp
+offsets. It transposes the mapped terms into 64-byte-aligned class vectors, performs a TwoSum-style compensated class
+reduction, then gathers aligned row totals for the final scalar reduction.
+
+The scalar loss kernel fell from approximately **44 ms** to **4.3 ms**; its vector-output form is approximately
+**1.5 ms**. The full unchanged upstream method passed in **5.16 s**. The broadened matcher initially exposed two
+regressions during verification: transcendental log-softmax DAGs caused a 198-second host fingerprinting runaway, and
+100-row temporary vectors overlapped when spaced by a fixed 64 bytes. Restricting the matcher to local ADD/MUL graphs,
+memoizing signatures, and deriving temporary spacing from `_reduction_stride(count)` fixed both. Plain one-buffer
+reductions remain on their established loop lowerer.
+
+- Promoted `test_cross_entropy_reductions`; the related log-softmax, cross-entropy, NLL, and sparse-smoothing batch
+  passed as **8 tests in 33.32 s**.
+- Representative scalar/vector reduction regressions, including `test_sum_twice`, `test_sum_full`, sum, and mean-axis,
+  passed after narrowing. Both direct sparse smoothing and per-class one-hot smoothing feed the same indexed-loss
+  emitter and pass together.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after final testing; no reboot was used.
+- `test_rockchip.py`: **434 collected aliases**, representing **411 of 422** upstream methods; **11 remain**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check`: pass. `sz.py` reports
+  renderer/runtime **7,635/376 executable lines**, total **33,066**.
+
+All matching, offset recovery, and transposition are compile-time UOp/RKImage construction. All arithmetic executes as
+FP16 DPU EW; there is no tensor-value host evaluation, LUT, CMAC, FP32 input, Tinygrad-core/runtime change, or tolerance
+relaxation.
