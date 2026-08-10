@@ -1255,6 +1255,7 @@ class TestRockchipReductionOps(unittest.TestCase):
   test_std_mean = _test_ops.TestOps.test_std_mean
   test_std_mean_loaded_nan = _test_ops.TestOps.test_std_mean_loaded_nan
   test_std_zero_in_axis = _test_ops.TestOps.test_std_zero_in_axis
+  test_normalize = _test_ops.TestOps.test_normalize
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):

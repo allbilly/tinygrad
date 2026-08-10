@@ -71,7 +71,6 @@ class TestRockchipCompositeCandidates(_test_ops.TestOps):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_logcumsumexp_numerical = _test_ops.TestOps.test_logcumsumexp_numerical
-  test_normalize = _test_ops.TestOps.test_normalize
   test_scaled_dot_product_attention = _test_ops.TestOps.test_scaled_dot_product_attention
   test_scaled_dot_product_attention_causal = _test_ops.TestOps.test_scaled_dot_product_attention_causal
   test_scaled_dot_product_attention_gqa = _test_ops.TestOps.test_scaled_dot_product_attention_gqa

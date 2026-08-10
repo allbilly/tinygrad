@@ -4965,3 +4965,36 @@ CMPLT/CAST/WHERE graph rejects during Rockchip compilation and is not counted as
 authoritative remainder is **32 of 422**. No failed, compiler-only, or partially passing method was promoted. This
 promotion changes only the test census and documentation; it introduces no Tinygrad-core change, host numerical
 computation, LUT, CMAC, FP32 input, or tolerance relaxation.
+
+---
+
+## 2026-08-10 — native DPU Lp normalization family
+
+The former square-only loop reducer is generalized into one Lp reduction image for p=0, p=1, p=2, p=3, and p=-1.
+Native ABS plus MUL handles powers 1/2/3, native compare handles the zero norm, and FDIV handles reciprocal terms and
+the final reciprocal. A no-LUT FP16 Newton cube root runs entirely as stateful DPU MUL/FDIV/ADD stages. Tinygrad's
+unrolled p=3 graph is recognized structurally and feeds the same emitter; all gather offsets and coverage checks are
+compile-time UOp/index proofs.
+
+The bring-up exposed two hardware details without introducing arbitrary task caps. Mixed cube-root stages stalled at
+task 43 in one 53-task chain and then at task 4 in a five-task iteration. Submit boundaries are now derived from
+balanced-reduction levels and Newton iteration dependencies, and every mixed cube-root stage emits full DPU state, as
+the established sqrt path does. Reciprocal terms are prepared block-by-block so they never evaluate zero-filled arena
+padding; zero-safe p=0/1/2/3 terms retain the compact whole-arena map.
+
+- Exact p=3 and p=-1 focused probes pass in **4.21 s** and **4.15 s** respectively.
+- The complete unchanged upstream `test_normalize` method passes all seven variants in **4.18 s**, then passes from
+  `test_rockchip.py` in **4.22 s**. It covers multiple axes/shapes and p=0, p=1, p=2, p=3, and p=-1.
+- The broader reduction class reached 16 passes before one transient existing std timeout. Vendor health passed
+  **60/60**, the exact std method then passed in **3.72 s**, and the remaining 19 methods passed in **18.79 s**.
+- Vendor `~/rk3588/examples/elementwise.py` passed **60/60** after every timeout and after final promotion; no reboot
+  was used.
+- `test_rockchip.py` collects **414 upstream-only aliases**, representing **391 unique upstream methods**. The
+  authoritative remainder is **31 of 422**.
+- Repository-wide Ruff, Tinygrad mypy (**216 files**), collection, and `git diff --check` pass. `sz.py` reports
+  renderer/runtime **7,258/368 executable lines**, total **32,681**.
+
+Historical branches, `~/npu`, and `~/rk3588` contain no native reusable normalization primitive. The only old local
+normalization shortcut evaluates prefix reductions on the host and was rejected. This milestone changes only the
+Rockchip renderer and Rockchip test census: no tensor-buffer reads, NumPy result arithmetic, Tinygrad-core change, LUT,
+CMAC, FP32 input, or tolerance relaxation beyond `test_gemm_fp16` is present.
