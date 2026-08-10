@@ -4928,3 +4928,16 @@ there; no later loss candidate is claimed or promoted on this boot.
 `test_rockchip.py` now collects **411 upstream-only cases**, representing **388 unique upstream method names**. The
 authoritative remainder falls from 34 to **33 of 421**. There is no Tinygrad-core change, host loss computation, LUT,
 CMAC, FP32 input, or tolerance relaxation.
+
+---
+
+## 2026-08-10 — cumulative log-exp promotion
+
+The complete unchanged upstream `test_logcumsumexp` method passes physically in **12.18 s**, covering its nine scalar,
+vector, multidimensional, and axis variants, and is promoted to `test_rockchip.py`. The vendor elementwise health check
+passed **60/60** immediately before the serial batch. The separate numerical `[0,100]` edge compiled but returned
+`[NaN,100]` instead of `[0,100]`, so `test_logcumsumexp_numerical` remains staged in `test_rockchip2.py`.
+
+The upstream census now contains **422** unique method names because `test_cast_relu` was added after the earlier
+421-method baseline. `test_rockchip.py` selects **389** of them and collects **412** aliases; the corrected authoritative
+remainder is **33 of 422**. No compiler-only or numerically failing candidate was promoted.
