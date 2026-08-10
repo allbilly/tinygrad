@@ -255,9 +255,9 @@ _BN_CFG_COMPARE = 0x40082
 _BN_MUL_COMPARE = 0x7c000000
 _BN_RELUX_COMPARE = 0x3f800000
 (_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_COPYSIGN, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN,
- _NATIVE_POSITIVE_MASK, _NATIVE_RELU6, _NATIVE_SIGN) = (
+ _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RELU6, _NATIVE_SIGN) = (
    "rockchip_abs", "rockchip_ceil", "rockchip_copysign", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
-   "rockchip_min", "rockchip_positive_mask", "rockchip_relu6", "rockchip_sign")
+   "rockchip_min", "rockchip_positive_mask", "rockchip_precise_add", "rockchip_relu6", "rockchip_sign")
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
@@ -978,7 +978,15 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
     middle, error = _two_sum(middle, error, neg_one)
     low = low.alu(Ops.ADD, error)
   middle = middle.alu(Ops.ADD, low)
-  return high.alu(Ops.ADD, middle)
+  root = high.alu(Ops.ADD, middle)
+  cache:dict[UOp, UOp] = {}
+  def tag_adds(u:UOp) -> UOp:
+    if u in cache: return cache[u]
+    tagged = u.replace(src=tuple(tag_adds(src) for src in u.src))
+    if tagged.op is Ops.ADD: tagged = tagged.replace(arg=_NATIVE_PRECISE_ADD)
+    cache[u] = tagged
+    return tagged
+  return tag_adds(root)
 
 def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
@@ -7428,6 +7436,31 @@ def _runtime_index(u:UOp) -> tuple[UOp, UOp, UOp, int]|None:
   if dtype not in (dtypes.int, dtypes.int16): return None
   return u, param, u.src[0].src[1], dtype.itemsize
 
+def _fp32_expr_to_half(u:UOp) -> UOp:
+  """Represent a float ADD/MUL expression with a three-half expansion at its FP16 storage boundary."""
+  if u.dtype.scalar() is dtypes.half: return u
+  if u.dtype.scalar() is not dtypes.float: raise _RKGenericReject
+  if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.half: return u.src[0]
+  if u.op is Ops.CONST: return UOp.const(float(u.arg), dtypes.half)
+  if u.op is Ops.MUL and len(u.src) == 2:
+    return UOp(Ops.MUL, dtypes.half, src=tuple(_fp32_expr_to_half(src) for src in u.src))
+  if u.op in (Ops.SUB, Ops.MAX) and len(u.src) == 2:
+    return UOp(u.op, dtypes.half, src=tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg)
+  if u.op is Ops.NEG and len(u.src) == 1:
+    return UOp(Ops.NEG, dtypes.half, src=(_fp32_expr_to_half(u.src[0]),))
+  if u.op is Ops.ADD:
+    return _precise_mul_sum(_fp32_add_terms(u))
+  raise _RKGenericReject
+
+def _fp32_add_terms(u:UOp) -> list[UOp]:
+  terms:list[UOp] = []
+  def flatten(x:UOp) -> None:
+    if x.op is Ops.ADD and x.dtype.scalar() is dtypes.float:
+      flatten(x.src[0]); flatten(x.src[1])
+    else: terms.append(_fp32_expr_to_half(x))
+  flatten(u)
+  return terms
+
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
   def __init__(self, output:RKOutput):
@@ -7442,8 +7475,15 @@ class RKContext:
     self.host_gathers:list[RKHostAddress] = []
     self.post_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
-    self.mask_program = any(u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN)
-                            for u in self.root.toposort())
+    self.mask_program = False
+    self.use_counts:dict[UOp, int] = {}
+    self._register_graph(self.root)
+
+  def _register_graph(self, root:UOp) -> None:
+    local:dict[UOp, int] = {}
+    for node in root.toposort():
+      for src in node.src: local[src] = local.get(src, 0) + 1
+    for node,count in local.items(): self.use_counts[node] = max(self.use_counts.get(node, 0), count)
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
@@ -7453,6 +7493,15 @@ class RKContext:
   def _dst(self, u:UOp, dtype:DType, layout:RKLayout) -> RKValue:
     if u is self.root and self.out_param.dtype.scalar() is dtype and layout in (RKLayout.FP16, RKLayout.INT16):
       return RKValue(self.out, dtype, self.count, layout)
+    return self._scratch(dtype, layout)
+
+  def _alu_dst(self, u:UOp, dtype:DType, layout:RKLayout, operands:tuple[tuple[UOp, RKValue], ...]) -> RKValue:
+    if u is self.root and self.out_param.dtype.scalar() is dtype and layout in (RKLayout.FP16, RKLayout.INT16):
+      return RKValue(self.out, dtype, self.count, layout)
+    for src,value in operands:
+      if (self.use_counts.get(src) == 1 and src in self.values and src.op in GroupOp.ALU and
+          value.arg.kind is RKBufferKind.SCRATCH and value.layout is layout):
+        return RKValue(value.arg, dtype, self.count, layout)
     return self._scratch(dtype, layout)
 
   def _constant(self, u:UOp, dtype_hint:DType|None=None) -> RKValue:
@@ -7548,7 +7597,8 @@ class RKContext:
       return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), one, src, _EW_CFG[Ops.FDIV])
     if u.op is Ops.NEG:
       src = self.lower(u.src[0])
-      return self._emit(self._dst(u, u.dtype.scalar(), src.layout), src, src, _EW_CFG_NEG)
+      dst = self._alu_dst(u, u.dtype.scalar(), src.layout, ((u.src[0], src),))
+      return self._emit(dst, src, src, _EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
     dtype = u.dtype.scalar()
     expected = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else None
@@ -7558,7 +7608,8 @@ class RKContext:
     if lhs.layout not in compatible or rhs.layout not in compatible: raise _RKGenericReject
     if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
       if expected is RKLayout.FP16: return self._native_min(u, lhs, rhs)
-      return self._emit(self._dst(u, dtype, RKLayout.INT16), lhs, rhs, _EW_CFG_MIN)
+      dst = self._alu_dst(u, dtype, RKLayout.INT16, ((u.src[0], lhs), (u.src[1], rhs)))
+      return self._emit(dst, lhs, rhs, _EW_CFG_MIN)
     cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else \
       _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else \
       _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else \
@@ -7567,7 +7618,23 @@ class RKContext:
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
     layout = RKLayout.BOOL_MASK if compare else expected
     out_dtype = dtypes.bool if compare else dtype
-    return self._emit(self._dst(u, out_dtype, layout), lhs, rhs, cfg, compare=compare)
+    dst = self._alu_dst(u, out_dtype, layout, ((u.src[0], lhs), (u.src[1], rhs)))
+    return self._emit(dst, lhs, rhs, cfg, compare=compare)
+
+  def _accurate_add(self, u:UOp) -> RKValue:
+    terms:list[UOp] = []
+    def flatten(x:UOp) -> None:
+      if x.op is Ops.ADD and x.dtype.scalar() is dtypes.half and x.arg is None:
+        flatten(x.src[0]); flatten(x.src[1])
+      elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half and len(x.src) == 1 and x.src[0].dtype.scalar() is dtypes.float and \
+           x.src[0].op is Ops.ADD:
+        terms.extend(_fp32_add_terms(x.src[0]))
+      else: terms.append(x)
+    flatten(u)
+    if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
+    recipe = _precise_mul_sum(terms)
+    self._register_graph(recipe)
+    return self.lower(recipe)
 
   def _bool_binary(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
@@ -7670,13 +7737,20 @@ class RKContext:
       value = self._static(u)
     elif u.op is Ops.LOAD: value = self._load(u)
     elif u.op is Ops.CAST and len(u.src) == 1:
-      source = self.lower(u.src[0])
+      if dtype is dtypes.half and u.src[0].dtype.scalar() is dtypes.float:
+        recipe = _fp32_expr_to_half(u.src[0])
+        self._register_graph(recipe)
+        source = self.lower(recipe)
+      else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
       elif dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16):
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject
+    elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None:
+      try: value = self._accurate_add(u)
+      except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
@@ -7709,6 +7783,16 @@ class RKContext:
     return RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops),
                    post_gathers=tuple(self.post_gathers), host_gathers=tuple(self.host_gathers))
 
+def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
+  if reduce_op is Ops.ADD and dtype.scalar() is dtypes.half:
+    nonzero = [term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)]
+    if nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero):
+      return _precise_mul_sum(nonzero)
+  while len(terms) > 1:
+    terms = [UOp(reduce_op, dtype, src=(terms[i], terms[i+1])) for i in range(0, len(terms)-1, 2)] + \
+      (terms[-1:] if len(terms) & 1 else [])
+  return terms[0]
+
 def _unroll_static_reduces(root:UOp) -> UOp:
   """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
   cache:dict[UOp, UOp] = {}
@@ -7723,8 +7807,7 @@ def _unroll_static_reduces(root:UOp) -> UOp:
       envs = _iter_range_env(ranges)
       if not envs: raise _RKGenericReject
       terms = [mapped.src[0].substitute({r:r.const_like(env[r]) for r in ranges}) for env in envs]
-      mapped = terms[0]
-      for term in terms[1:]: mapped = UOp(reduce_op, u.dtype, src=(mapped, term))
+      mapped = _structural_reduce(reduce_op, u.dtype, terms)
     cache[u] = mapped
     return mapped
   return rewrite(root)
@@ -7759,10 +7842,10 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
   update, term, ranges = updates[0]
   if not ranges or any(r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
-  reduced = initializers[0]
+  terms = [initializers[0]]
   for env in _iter_range_env(ranges):
-    lane = term.substitute({r:r.const_like(env[r]) for r in ranges})
-    reduced = UOp(update.op, update.dtype, src=(reduced, lane))
+    terms.append(term.substitute({r:r.const_like(env[r]) for r in ranges}))
+  reduced = _structural_reduce(update.op, update.dtype, terms)
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
   return root.substitute(substitutions)
 

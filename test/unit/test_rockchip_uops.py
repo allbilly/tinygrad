@@ -111,6 +111,33 @@ def test_static_reduce_uops_are_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 2
 
 
+def test_static_dot_reduce_owns_accurate_physical_recipe():
+  out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,)), UOp.param(2, dtypes.half, (6,))
+  row, axis = UOp.range(2, 0), UOp.range(3, 1, AxisType.REDUCE)
+  term = lhs.index(row*3+axis).load() * rhs.index(row*3+axis).load()
+  reduced = UOp(Ops.REDUCE, dtypes.half, src=(term, axis), arg=(Ops.ADD,))
+  image = _lower_uop_program(list(out.index(row).store(reduced).end(row, axis).sink().toposort()))
+  assert image is not None and len(image.gathers) >= 6 and len(image.ew_ops) > 20
+
+
+def test_fp32_add_mul_tree_uses_half_expansion_at_output_boundary():
+  out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  lane = UOp.range(2, 0)
+  products = [lhs.index(lane*2+k).load().cast(dtypes.float) * rhs.index(lane*2+k).load().cast(dtypes.float) for k in range(2)]
+  value = products[0].alu(Ops.ADD, products[1]).cast(dtypes.half)
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and len(image.ew_ops) > 10
+
+
+def test_fp32_boundary_activation_preserves_accurate_reduction():
+  out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  lane = UOp.range(2, 0)
+  products = [lhs.index(lane*2+k).load().cast(dtypes.float) * rhs.index(lane*2+k).load().cast(dtypes.float) for k in range(2)]
+  value = products[0].alu(Ops.ADD, products[1]).maximum(UOp.const(0.0, dtypes.float)).cast(dtypes.half)
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and len(image.ew_ops) > 10 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_static_local_accumulator_is_structurally_executed():
   for op,initial in ((Ops.ADD, 0.0), (Ops.MAX, -100.0), (Ops.MUL, 1.0)):
     out, source = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,))
