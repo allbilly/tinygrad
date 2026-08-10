@@ -7210,11 +7210,12 @@ def _lower_tensor_pow(uops:list[UOp]) -> RKImage|None:
   nodes = root.toposort()
   exponentials = [u for u in nodes if u.op is Ops.EXP2]
   logarithms = [u for u in nodes if u.op is Ops.LOG2]
-  if len(exponentials) != 1 or len(logarithms) != 1 or not any(u.op is Ops.CMOD for u in nodes): return None
+  if len(exponentials) != 1 or len(logarithms) != 1: return None
   exponential, logarithm = exponentials[0], logarithms[0]
   scaled = exponential.src[0]
   if scaled.op is not Ops.MUL or logarithm not in scaled.src: return None
   exponent = scaled.src[1 if scaled.src[0] is logarithm else 0]
+  if exponent.op is not Ops.CONST and not any(u.op is Ops.CMOD for u in nodes): return None
   base_loads = {u.key:u for u in logarithm.src[0].toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half}
   if len(base_loads) != 1 or exponent.dtype.scalar() is not dtypes.half: return None
   base = next(iter(base_loads.values()))
@@ -7242,7 +7243,8 @@ def _lower_tensor_pow(uops:list[UOp]) -> RKImage|None:
   odd = integral.alu(Ops.SUB, _native_floor(integral.alu(Ops.MUL, UOp.const(0.5, dtypes.half))).alu(
     Ops.MUL, UOp.const(2.0, dtypes.half)))
   negative_base = _finite_positive_mask(zero.alu(Ops.SUB, base))
-  sign = one.alu(Ops.SUB, _mask_mul(negative_base, odd).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  signed_odd = _mask_mul(odd, one.alu(Ops.SUB, non_integral))
+  sign = one.alu(Ops.SUB, _mask_mul(negative_base, signed_odd).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
   invalid = _mask_mul(_mask_mul(negative_base, non_integral), one.alu(Ops.SUB, infinite_base))
   result = magnitude.alu(Ops.MUL, sign).alu(Ops.ADD, zero.alu(Ops.FDIV, one.alu(Ops.SUB, invalid)))
   replacement = store.replace(src=(store.src[0], result, *store.src[2:]))

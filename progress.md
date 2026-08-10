@@ -4849,14 +4849,16 @@ recover magnitude, integrality, and exponent parity; the existing no-LUT LOG2/EX
 and DPU masks preserve negative-base, zero-base, infinity, and zero-exponent semantics. An exact positive-mask stage is
 used for the fractional remainder so the smallest nonzero FP16 exponent cannot be mistaken for zero.
 
-Five unchanged upstream methods pass together in **7.24 s**, including all 30 broadcast subtests:
+Five runtime-exponent/broadcast methods pass together in **7.24 s**, including all 30 broadcast subtests:
 `test_pow_full`, `test_pow_zero_exponent`, `test_pow_zero_tensor`, `test_broadcast_full`, and the slow
 `test_broadcast_partial`. The first broad run found only one IEEE mismatch among 2,925 tensor-power lanes: base
 `-0.2025` with exponent `-8.64e-6` was incorrectly finite. The exact subnormal predicate fixed that final mismatch.
-Constant-exponent `-inf` and integer-input/float-exponent graphs remain separate lowering shapes and were not promoted.
+The same graph now also accepts compile-time FP16 exponents; `test_pow_neg_inf_frac_exponent` passes both `-inf**0.3`
+and `-inf**3.3`, bringing this milestone to **six unchanged upstream methods**. Constant-base and integer-input/
+float-exponent graphs remain separate lowering shapes and were not promoted.
 
-- `test_rockchip.py`: **403 collected cases**, representing **380 unique upstream methods**.
-- Authoritative upstream-name remainder: **41 of 421**.
+- `test_rockchip.py`: **404 collected cases**, representing **381 unique upstream methods**.
+- Authoritative upstream-name remainder: **40 of 421**.
 - A diagnostic `ROCKCHIP_EW_REDUCE=twoproduct` cross-entropy run timed out after 30 seconds and logged one IOMMU read
   fault at address zero. No more two-product submissions were made. The required vendor health check then passed all
   **60/60** elementwise probes, and the new power batch subsequently passed without a timeout.
