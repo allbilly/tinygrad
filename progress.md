@@ -4896,3 +4896,22 @@ same vector passed within the established FP16 tolerance after the reset.
   but it does not validate multi-stage PC chains. Physical promotion is deferred until a clean boot.
 - Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. No Tinygrad-core change, host
   numerical computation, LUT, CMAC, FP32 input, or tolerance relaxation was introduced.
+
+---
+
+## 2026-08-10 — first no-LUT trig/log promotion
+
+The remaining no-LUT transcendental family was screened on physical hardware before any compiler-only candidate was
+admitted to the upstream-success suite. Four unchanged upstream methods now pass on DPU EW: `test_log`, `test_log10`,
+`test_log2`, and `test_sin`. Their promoted aliases pass together from `test_rockchip.py` in **13.36 s**; the slowest is
+`test_sin` at **6.01 s**. The vendor elementwise health check passed **60/60** immediately before the batch, and the
+kernel logged no new RKNPU timeout or IOMMU fault during these runs.
+
+ACOSH, ASINH, ATAN, COS, alternate extreme sigmoid, and TAN remain only in `test_rockchip2.py`: their graphs compile,
+but physical comparison exposed domain, large-magnitude, backward-only, or approximation errors. They were not
+promoted. `test_rockchip.py` now collects **410 upstream-only cases**, representing **387 unique upstream method names**;
+the authoritative remainder falls from 38 to **34 of 421**.
+
+Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check` pass. `sz.py` reports renderer/runtime
+**7,144/368 executable lines**, total **32,567**. There is no Tinygrad-core change, host numerical computation, LUT,
+CMAC, FP32 input, or tolerance relaxation beyond the established FP16 contract.

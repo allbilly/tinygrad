@@ -506,13 +506,40 @@ def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
   rows, envs, reduce_range, groups = shape
   updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
   if len(updates) != 1: return None
-  post_sqrt = root.op is Ops.SQRT and len(root.src) == 1
-  value = root.src[0] if post_sqrt else root
+  value_root = root
+  if root.op is Ops.MAX:
+    unclamped, epsilon = next(((value, const) for value,const in (root.src, root.src[::-1]) if const.op is Ops.CONST), (None, None))
+    if unclamped is None or epsilon is None or _fp16_bits(float(epsilon.arg)) != 0: return None
+    value_root = unclamped
+  post_sqrt = value_root.op is Ops.SQRT and len(value_root.src) == 1
+  value = value_root.src[0] if post_sqrt else value_root
   if _local_load(value) is not None: post_scale = 1.0
   elif value.op is Ops.MUL and (load:=next((x for x in value.src if _local_load(x) is not None), None)) is not None and \
        (scale:=value.src[1 if value.src[0] is load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
   else: return None
   return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale, post_sqrt)
+
+def _lower_square_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
+  """Lower SUM(x*x), optionally followed by SQRT, as one mapped FP16 reduction."""
+  if loop.groups < 2 or loop.update.op is not Ops.ADD: return None
+  accumulator = next((x for x in loop.update.src if _local_load(x) is not None), None)
+  if accumulator is None: return None
+  square = _strip_cast(loop.update.src[1 if loop.update.src[0] is accumulator else 0])
+  if square.op is not Ops.MUL or square.src[0] is not square.src[1]: return None
+  value = _strip_cast(square.src[0])
+  if value.op is Ops.MUL and (absolute:=_fold_abs(value)) is not None and absolute.arg == _NATIVE_ABS: value = absolute.src[0]
+  load = _strip_cast(value)
+  source = _root_param(load.src[0]) if load.op is Ops.LOAD and load.src and load.src[0].op is Ops.INDEX else None
+  if source is None or source.src[0].op is not Ops.CONST or load.dtype.scalar() is not dtypes.half: return None
+  try: blocks = tuple(tuple(_eval_int(load.src[0].src[1], {**env, loop.reduce_range:r}) for env in loop.envs)
+                      for r in range(loop.groups))
+  except RuntimeError: return None
+  if (int(source.src[0].arg) != loop.rows*loop.groups or
+      sorted(offset for block in blocks for offset in block) != list(range(loop.rows*loop.groups))): return None
+  def prepare(ops:list[RKEWOp], value:RKArg, _:dict[float, int]) -> None:
+    ops.append(RKEWOp(value, value, value, loop.rows, _EW_CFG[Ops.MUL], stateful=not ops))
+  return _reduction_image(loop.out.arg.slot, loop.rows, source.arg.slot, blocks, (), _EW_CFG[Ops.ADD],
+                          loop.out.dtype.scalar() is dtypes.float, loop.post_scale, prepare, loop.post_sqrt)
 
 def _spaced_reduction_gathers(src_slot:int, dst_slot:int, rows:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...],
                                stride:int|None=None, fill_bits:int=0) -> tuple[RKGather, ...]:
@@ -1371,12 +1398,13 @@ def _append_dpu_sqrt_ops(ops:list[RKEWOp], source:RKArg, out:RKArg, count:int, s
 
 def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...],
                      constants:tuple[float, ...], cfg:int, fp32_out:bool, post_scale:float,
-                     prepare:Callable[[list[RKEWOp], RKArg, dict[float, int]], None]|None=None, post_sqrt:bool=False) -> RKImage:
+                     prepare:Callable[[list[RKEWOp], RKArg, dict[float, int]], None]|None=None, post_sqrt:bool=False,
+                     fill_bits:int=0) -> RKImage:
   """Materialize row blocks, apply an optional lane transform, reduce them, and write the typed result."""
   if post_sqrt: constants = tuple(dict.fromkeys((*constants, 0.0, 1.0, 65504.0, 2**-24, 0.5)))
   const_slots, data_slot = {value:i for i,value in enumerate(constants)}, len(constants)
   stride = _reduction_stride(rows)
-  gathers = _spaced_reduction_gathers(source_slot, data_slot, rows, blocks, stride)
+  gathers = _spaced_reduction_gathers(source_slot, data_slot, rows, blocks, stride, fill_bits)
   def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, data_slot, offset)
   extra:list[RKScratch] = []
   def scratch() -> RKArg:
@@ -1397,6 +1425,63 @@ def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[
   scratch_buffers = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(len(blocks)*stride), *extra)
   return RKImage(RKTarget.RK3588, scratch_buffers, b"".join(struct.pack("<e", value) for value in constants),
                  gathers=gathers, ew_ops=tuple(ops))
+
+def _lower_fp16_cumulative_max_loop(uops:list[UOp]) -> RKImage|None:
+  """Collapse Tinygrad's output-recursive FP16 CumMax loop into one aligned prefix matrix reduction."""
+  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
+  store, out, count, out_index, root = output
+  if count < 2 or root.op is not Ops.MAX: return None
+  ranges = _index_ranges(out_index)
+  if len(ranges) != 1 or ranges[0].src[0].op is not Ops.CONST or int(ranges[0].src[0].arg) != count: return None
+  lane = ranges[0]
+  loads = [u for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
+           u.src and u.src[0].op is Ops.INDEX and _root_param(u.src[0]) is not None]
+  source_loads = [u for u in loads if _root_param(u.src[0]) is not out]
+  prior_loads = [u for u in loads if _root_param(u.src[0]) is out]
+  if len(source_loads) != 1 or len(prior_loads) != 1: return None
+  source_load, prior_load = source_loads[0], prior_loads[0]
+  source = _root_param(source_load.src[0])
+  if source is None or source.src[0].op is not Ops.CONST or int(source.src[0].arg) != count or len(prior_load.src) != 3: return None
+  try:
+    for i in range(count):
+      env = {lane:i}
+      if _eval_int(out_index, env) != i or _eval_int(source_load.src[0].src[1], env) != i: return None
+      valid = bool(_eval_expr(prior_load.src[2], env, {}))
+      if valid != (i != 0) or valid and _eval_int(prior_load.src[0].src[1], env) != i-1: return None
+  except RuntimeError: return None
+  blocks = tuple(tuple(candidate if candidate <= row else -1 for row in range(count)) for candidate in range(count))
+  return _reduction_image(out.arg.slot, count, source.arg.slot, blocks, (), _EW_CFG[Ops.MAX], False, 1.0,
+                          fill_bits=_fp16_bits(-math.inf))
+
+def _lower_fp16_local_cumulative_max(uops:list[UOp]) -> RKImage|None:
+  """Collapse Tinygrad's register-local FP16 CumMax loop into the same aligned prefix matrix reduction."""
+  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
+  store, out, _, _, root = output
+  if (shape:=_loop_reduction_shape(store, out, uops)) is None or _local_load(root) is None: return None
+  rows, envs, reduce_range, groups = shape
+  local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
+  updates = [u for u in local_stores if reduce_range in u.toposort()]
+  initializers = [u for u in local_stores if reduce_range not in u.toposort()]
+  if (len(updates) != 1 or len(initializers) != 1 or groups < 2 or initializers[0].src[1].op is not Ops.CONST or
+      float(initializers[0].src[1].arg) != -math.inf): return None
+  update = updates[0].src[1]
+  if update.op is not Ops.MAX: return None
+  accumulator = next((x for x in update.src if _local_load(x) is not None), None)
+  term = next((x for x in update.src if x is not accumulator), None)
+  if accumulator is None or term is None: return None
+  loads = [u for u in term.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
+           u.src and u.src[0].op is Ops.INDEX and _root_param(u.src[0]) is not None]
+  if len(loads) != 1: return None
+  load, source = loads[0], _root_param(loads[0].src[0])
+  if source is None or source is out or source.src[0].op is not Ops.CONST or int(source.src[0].arg) != rows: return None
+  def candidate_offset(env:dict[UOp, int], lane:int) -> int:
+    values = {**env, reduce_range:lane}
+    return _eval_int(load.src[0].src[1], values) if len(load.src) < 3 or bool(_eval_expr(load.src[2], values, {})) else -1
+  try: blocks = tuple(tuple(candidate_offset(env, lane) for env in envs) for lane in range(groups))
+  except RuntimeError: return None
+  if not _cumulative_prefix_blocks(blocks, rows): return None
+  return _reduction_image(out.arg.slot, rows, source.arg.slot, blocks, (), _EW_CFG[Ops.MAX], False, 1.0,
+                          fill_bits=_fp16_bits(-math.inf))
 
 def _std_mean_image(out_slot:int, rows:int, source_slot:int, blocks:tuple[tuple[int, ...], ...], variance_scale:float) -> RKImage:
   """Compute a stacked FP16 `(std, mean)` without reading Tinygrad's internal FP32 mean buffer."""
@@ -6793,6 +6878,8 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (tensor_scatter_reduce:=_lower_dynamic_tensor_scatter_reduce(half_output)) is not None: return tensor_scatter_reduce
     if (scatter_reduce:=_lower_dynamic_scalar_scatter_reduce(half_output)) is not None: return scatter_reduce
     if (scatter:=_lower_dynamic_16bit_scatter(half_output)) is not None: return scatter
+  if (cumulative_max:=_lower_fp16_cumulative_max_loop(uops)) is not None: return cumulative_max
+  if (local_cumulative_max:=_lower_fp16_local_cumulative_max(uops)) is not None: return local_cumulative_max
   if (half_loop_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
      (loop_max_unpool:=_lower_loop_max_unpool(uops, half_loop_output)) is not None: return loop_max_unpool
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
@@ -6854,6 +6941,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (unrolled_map_reduce:=_lower_unrolled_mapped_add_reduction(uops)) is not None: return unrolled_map_reduce
   if (loop:=_loop_reduction_match(uops)) is not None:
     if (dot_reduction:=_lower_dot_loop_reduction(loop)) is not None: return dot_reduction
+    if (square_reduction:=_lower_square_loop_reduction(loop)) is not None: return square_reduction
     if (variance:=_lower_centered_square_loop_reduction(loop)) is not None: return variance
     if (loop_reduction:=_lower_scalar_loop_reduction(loop)) is not None: return loop_reduction
   if (mapped_reduction:=_lower_mapped_add_loop_reduction(uops)) is not None: return mapped_reduction
@@ -7392,6 +7480,69 @@ def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
 def _native_floor(source:UOp) -> UOp:
   return UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_FLOOR)
 
+def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float, ...], half_period:float) -> tuple[UOp, UOp, UOp]:
+  """Reduce a finite FP16 angle with split constants so large products do not erase the residual."""
+  one = UOp.const(1.0, dtypes.half)
+  bounded = _native_min(source.cast(dtypes.half).alu(Ops.MAX, UOp.const(-10000.0, dtypes.half)),
+                        UOp.const(10000.0, dtypes.half))
+  quotient = bounded.alu(Ops.MUL, UOp.const(reciprocal_period, dtypes.half))
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(quotient, quotient), arg=_NATIVE_ABS)
+  multiple = _native_floor(magnitude.alu(Ops.ADD, UOp.const(0.5, dtypes.half))).alu(
+    Ops.MUL, _positive_mask(quotient).alu(Ops.MUL, UOp.const(2.0, dtypes.half)).alu(Ops.SUB, one))
+  reduced = bounded
+  for coefficient in split: reduced = reduced.alu(Ops.SUB, multiple.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
+  # The rounded FP16 quotient can be a few periods off at large magnitudes. Normalize the small residual instead.
+  for _ in range(3):
+    correction = _positive_mask(reduced.alu(Ops.SUB, UOp.const(half_period, dtypes.half))).alu(
+      Ops.SUB, _positive_mask(UOp.const(-half_period, dtypes.half).alu(Ops.SUB, reduced)))
+    multiple = multiple.alu(Ops.ADD, correction)
+    for coefficient in split: reduced = reduced.alu(Ops.SUB, correction.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
+  return bounded, multiple, reduced
+
+def _dpu_sin(source:UOp) -> UOp:
+  """Approximate FP16 SIN without LUTs using Cody-Waite reduction and an odd polynomial."""
+  source = source.cast(dtypes.half)
+  one = UOp.const(1.0, dtypes.half)
+  _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
+  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
+  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
+    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
+  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
+  square = angle.alu(Ops.MUL, angle)
+  polynomial = UOp.const(1/362880, dtypes.half)
+  for coefficient in (-1/5040, 1/120, -1/6, 1.0):
+    polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
+  sign = one.alu(Ops.SUB, _positive_mask(UOp.const(0.0, dtypes.half).alu(Ops.SUB, reduced)).alu(
+    Ops.MUL, UOp.const(2.0, dtypes.half)))
+  return angle.alu(Ops.MUL, polynomial).alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
+
+def _dpu_tan(source:UOp) -> UOp:
+  """Approximate FP16 TAN directly, retaining a split pole distance near odd multiples of pi/2."""
+  source = source.cast(dtypes.half)
+  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+  bounded, multiple, reduced = _dpu_periodic_reduce(
+    source, 1/math.pi, (2.0, 1.0, 0.125, 0.015625, math.pi-3.140625), math.pi/2)
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
+  near_pole = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(0.75, dtypes.half)))
+  reduced_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  distance = bounded
+  for factor,coefficient in ((multiple, 3.0), (reduced_sign, 1.5), (multiple, 0.140625), (reduced_sign, 0.0703125),
+                             (multiple, math.pi-3.140625), (reduced_sign, math.pi/2-1.5703125)):
+    distance = distance.alu(Ops.SUB, factor.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
+  pole_magnitude = UOp(Ops.MAX, dtypes.half, src=(distance, distance), arg=_NATIVE_ABS)
+  angle = _mask_mul(magnitude, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, _mask_mul(pole_magnitude, near_pole))
+  square = angle.alu(Ops.MUL, angle)
+  polynomial = UOp.const(1382/155925, dtypes.half)
+  for coefficient in (62/2835, 17/315, 2/15, 1/3, 1.0):
+    polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
+  tangent = angle.alu(Ops.MUL, polynomial)
+  safe_tangent = tangent.alu(Ops.ADD, one.alu(Ops.SUB, near_pole))
+  magnitude_result = _mask_mul(tangent, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, near_pole.alu(Ops.FDIV, safe_tangent))
+  distance_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, distance)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
+  sign = _mask_mul(reduced_sign, one.alu(Ops.SUB, near_pole)).alu(Ops.SUB, _mask_mul(distance_sign, near_pole))
+  return magnitude_result.alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, zero))
+
 def _dpu_pow2_integer(exponent:UOp) -> UOp:
   """Build `2**exponent` for the FP16 exponent range with exact native DPU arithmetic."""
   zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
@@ -7421,6 +7572,18 @@ def _dpu_exp2(source:UOp) -> UOp:
   above = mask_fn(source.alu(Ops.SUB, UOp.const(15.9921875, dtypes.half)))
   finite = _mask_mul(result, one.alu(Ops.SUB, below))
   return finite.alu(Ops.ADD, one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one))
+
+def _fold_masked_exp2(x:UOp) -> UOp|None:
+  """Move a static `-inf` padding mask outside EXP2 so cumulative exponentials remain compact."""
+  exponent = x.src[0]
+  scaled, factor = next(((value, const) for value,const in (exponent.src, exponent.src[::-1]) if const.op is Ops.CONST), (None, None)) \
+    if exponent.op is Ops.MUL else (exponent, UOp.const(1.0, exponent.dtype))
+  if scaled is None or factor is None or scaled.op is not Ops.WHERE: return None
+  gate, yes, no = scaled.src
+  padded = tuple(arm.op is Ops.CONST and math.isinf(float(arm.arg)) and float(arm.arg) < 0 for arm in (yes, no))
+  if padded.count(True) != 1 or not _is_static_expr(gate): return None
+  value, mask = (no, UOp.const(1.0, dtypes.half).alu(Ops.SUB, gate.cast(dtypes.half))) if padded[0] else (yes, gate.cast(dtypes.half))
+  return _mask_mul(_dpu_exp2(value.cast(dtypes.half).alu(Ops.MUL, factor.cast(dtypes.half))), mask)
 
 def _fp16_predecessor(value:float) -> float:
   """Return the previous positive binary16 value for inclusive threshold masks."""
@@ -7537,9 +7700,24 @@ _pm_rsqrt = PatternMatcher([(UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float),
   src=(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)),)), lambda source:_dpu_sqrt(source, True))])
 _pm_sqrt = PatternMatcher([(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sqrt(source))])
 _pm_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_exp2(source))])
+_pm_masked_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), name="x"), _fold_masked_exp2)])
 _pm_log2 = PatternMatcher([(UPat(Ops.LOG2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_log2(source))])
+_pm_sin = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sin(source))])
+def _fold_tan(x:UOp) -> UOp|None:
+  """Recognize Tensor.tan's SIN(x)/SIN(pi/2-x) expansion before either sine is rewritten."""
+  if x.op is not Ops.FDIV or len(x.src) != 2 or any(u.op is not Ops.SIN for u in x.src): return None
+  numerator, denominator = x.src
+  source_loads = {u.key for u in numerator.src[0].toposort() if u.op is Ops.LOAD}
+  denominator_loads = {u.key for u in denominator.src[0].toposort() if u.op is Ops.LOAD}
+  has_half_pi = any(u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
+                    abs(float(u.arg)-math.pi/2) < 1e-5 for u in denominator.src[0].toposort())
+  return _dpu_tan(numerator.src[0]) if len(source_loads) == 1 and source_loads == denominator_loads and has_half_pi else None
+_pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"), _fold_tan)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_tan, name="rockchip tan")
+  sink = graph_rewrite(sink, _pm_sin, name="rockchip sin")
+  sink = graph_rewrite(sink, _pm_masked_exp2, name="rockchip masked exp2")
   sink = graph_rewrite(sink, _pm_exp2, name="rockchip exp2")
   sink = graph_rewrite(sink, _pm_log2, name="rockchip log2")
   sink = graph_rewrite(sink, _pm_rsqrt, name="rockchip rsqrt")
@@ -7554,7 +7732,7 @@ def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None,
-                 Ops.FDIV: lambda: None, Ops.SQRT: lambda: None, Ops.EXP2: lambda: None, Ops.LOG2: lambda: None}
+                 Ops.FDIV: lambda: None, Ops.SQRT: lambda: None, Ops.EXP2: lambda: None, Ops.LOG2: lambda: None, Ops.SIN: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}

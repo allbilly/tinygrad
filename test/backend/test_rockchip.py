@@ -824,6 +824,9 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
   test_swish = _test_ops.TestOps.test_swish
   test_exp = _test_ops.TestOps.test_exp
   test_exp2 = _test_ops.TestOps.test_exp2
+  test_log = _test_ops.TestOps.test_log
+  test_log10 = _test_ops.TestOps.test_log10
+  test_log2 = _test_ops.TestOps.test_log2
   test_logaddexp = _test_ops.TestOps.test_logaddexp
   test_sigmoid = _test_ops.TestOps.test_sigmoid
   test_sigmoid_extreme = _test_ops.TestOps.test_sigmoid_extreme
@@ -847,6 +850,7 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
   test_atanh = _test_ops.TestOps.test_atanh
   test_sinh = _test_ops.TestOps.test_sinh
   test_cosh = _test_ops.TestOps.test_cosh
+  test_sin = _test_ops.TestOps.test_sin
   test_binary_crossentropy = _test_ops.TestOps.test_binary_crossentropy
   test_binary_crossentropy_reductions = _test_ops.TestOps.test_binary_crossentropy_reductions
   test_binary_crossentropy_logits_pos_weights = _test_ops.TestOps.test_binary_crossentropy_logits_pos_weights

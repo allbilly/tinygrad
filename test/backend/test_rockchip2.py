@@ -30,6 +30,7 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_cross_entropy_class_indices = _test_ops.TestOps.test_cross_entropy_class_indices
+  test_cross_entropy_reductions = _test_ops.TestOps.test_cross_entropy_reductions
   test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
   test_sparse_categorical_crossentropy = _test_ops.TestOps.test_sparse_categorical_crossentropy
   test_sparse_categorical_crossentropy_reductions = _test_ops.TestOps.test_sparse_categorical_crossentropy_reductions
@@ -41,6 +42,61 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
   test_nll_loss_weight = _test_ops.TestOps.test_nll_loss_weight
   test_nll_loss_3d_weight = _test_ops.TestOps.test_nll_loss_3d_weight
   test_nll_loss_ignore_index = _test_ops.TestOps.test_nll_loss_ignore_index
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipTranscendentalCandidates(_test_ops.TestOps):
+  """Remaining no-LUT transcendental candidates; passing methods move unchanged to test_rockchip.py."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_acosh = _test_ops.TestOps.test_acosh
+  test_asinh = _test_ops.TestOps.test_asinh
+  test_atan = _test_ops.TestOps.test_atan
+  test_cos = _test_ops.TestOps.test_cos
+  test_sigmoid_alt_extreme = _test_ops.TestOps.test_sigmoid_alt_extreme
+  test_tan = _test_ops.TestOps.test_tan
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipCompositeCandidates(_test_ops.TestOps):
+  """Remaining cumulative, normalization, and attention candidates."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_logcumsumexp = _test_ops.TestOps.test_logcumsumexp
+  test_logcumsumexp_numerical = _test_ops.TestOps.test_logcumsumexp_numerical
+  test_normalize = _test_ops.TestOps.test_normalize
+  test_scaled_dot_product_attention = _test_ops.TestOps.test_scaled_dot_product_attention
+  test_scaled_dot_product_attention_causal = _test_ops.TestOps.test_scaled_dot_product_attention_causal
+  test_scaled_dot_product_attention_gqa = _test_ops.TestOps.test_scaled_dot_product_attention_gqa
+  test_scaled_dot_product_attention_mismatch_ls = _test_ops.TestOps.test_scaled_dot_product_attention_mismatch_ls
+  test_softmax_argmax = _test_ops.TestOps.test_softmax_argmax
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipEdgeCandidates(_test_ops.TestOps):
+  """Remaining forward power, masked-selection, and scatter edge candidates."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_masked_select = _test_ops.TestOps.test_masked_select
+  test_pow_const_direct = _test_ops.TestOps.test_pow_const_direct
+  test_pow_int = _test_ops.TestOps.test_pow_int
+  test_pow_zero_const = _test_ops.TestOps.test_pow_zero_const
+  test_scatter_reduce_prod_zeros = _test_ops.TestOps.test_scatter_reduce_prod_zeros
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
