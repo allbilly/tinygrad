@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, mmap, os, time
+import collections, ctypes, mmap, os, time, weakref
 from dataclasses import replace
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
@@ -42,15 +42,14 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
-    scratch_offsets:list[int] = []
-    scratch_size = 0
+    self._scratch_offsets:list[int] = []
+    self._scratch_size = 0
     for spec in self.image.scratch:
-      scratch_size = _align_up(scratch_size, spec.alignment)
-      scratch_offsets.append(scratch_size)
-      scratch_size += spec.size
-    self._scratch_arena = dev._gpu_alloc(scratch_size) if scratch_size else None
-    self.scratch = (() if self._scratch_arena is None else
-                    tuple(self._scratch_arena.offset(offset, spec.size) for offset, spec in zip(scratch_offsets, self.image.scratch)))
+      self._scratch_size = _align_up(self._scratch_size, spec.alignment)
+      self._scratch_offsets.append(self._scratch_size)
+      self._scratch_size += spec.size
+    self._scratch_arena:HCQBuffer|None = None
+    self.scratch:tuple[HCQBuffer, ...] = ()
     self.submit_count = 0
     self._cmd_buf:HCQBuffer|None = None
     self._task_buf:HCQBuffer|None = None
@@ -58,14 +57,28 @@ class RockchipProgram(Program['RockchipDevice']):
     self._standalone_task_buf:HCQBuffer|None = None
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
+    dev._touch_program(self)
+    self._ensure_scratch()
+
+  def _ensure_scratch(self) -> None:
+    if self._scratch_arena is not None or not self._scratch_size: return
+    self._scratch_arena = self.dev._gpu_alloc(self._scratch_size)
+    self.scratch = tuple(self._scratch_arena.offset(offset, spec.size)
+      for offset,spec in zip(self._scratch_offsets, self.image.scratch))
+
+  def _release_resources(self) -> None:
+    self.scratch = ()
+    for attr in ("_scratch_arena", "_cmd_buf", "_task_buf", "_standalone_cmd_buf", "_standalone_task_buf"):
+      if (buf:=getattr(self, attr, None)) is not None:
+        setattr(self, attr, None)
+        self.dev._gpu_free(buf)
+    self._pcchain_bodies = None
+    getattr(self, "_scratch_ew_bodies", {}).clear()
 
   @suppress_finalizing
   def __del__(self):
-    if (scratch:=getattr(self, "_scratch_arena", None)) is not None: self.dev._gpu_free(scratch)
-    if (cmd:=getattr(self, "_cmd_buf", None)) is not None: self.dev._gpu_free(cmd)
-    if (task:=getattr(self, "_task_buf", None)) is not None: self.dev._gpu_free(task)
-    if (cmd:=getattr(self, "_standalone_cmd_buf", None)) is not None: self.dev._gpu_free(cmd)
-    if (task:=getattr(self, "_standalone_task_buf", None)) is not None: self.dev._gpu_free(task)
+    self._release_resources()
+    self.dev._forget_program(self)
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
 
@@ -328,6 +341,8 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
+    self.dev._touch_program(self)
+    self._ensure_scratch()
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
@@ -337,8 +352,8 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     for i in range(len(self.image.constants)//2):
       if i >= len(self.scratch): break
-      count = max((op.count for op in self.image.ew_ops), default=0)
-      bits = self.image.constants[i*2:i*2+2] * count
+      lane = self.image.constants[i*2:i*2+2]
+      bits = lane * (self.scratch[i].size//len(lane))
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
     cleared_scratch:set[int] = set()
@@ -433,7 +448,16 @@ class RockchipDevice(Compiled):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count = self.task_count = 0
     self._native_int16 = False
+    self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
+    self._program_resources:collections.OrderedDict[int, weakref.ReferenceType[RockchipProgram]] = collections.OrderedDict()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
+  def _touch_program(self, program:RockchipProgram) -> None:
+    self._program_resources.pop(id(program), None)
+    self._program_resources[id(program)] = weakref.ref(program)
+    while len(self._program_resources) > self._program_resource_limit:
+      _, reference = self._program_resources.popitem(last=False)
+      if (old:=reference()) is not None: old._release_resources()
+  def _forget_program(self, program:RockchipProgram) -> None: self._program_resources.pop(id(program), None)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
     try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=alloc, flags=flags|_BO_FLAGS)

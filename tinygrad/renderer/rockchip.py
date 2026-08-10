@@ -7243,7 +7243,7 @@ def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
               any(x in self_nan for x in root.src)
   finite_constants = [abs(float(u.arg)) for u in nodes if u.op is Ops.CONST and
                       u.dtype.scalar() in (dtypes.half, dtypes.float) and math.isfinite(float(u.arg))]
-  exact = any(math.isclose(value, 1e-5, rel_tol=0.0, abs_tol=1e-9) for value in finite_constants) and \
+  exact = any(_fp16_bits(value) == _fp16_bits(1e-5) for value in finite_constants) and \
           not any(1e-4 < value < .1 for value in finite_constants)
   return operands[0], operands[1], equal_nan, exact
 
@@ -7322,7 +7322,8 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
     return value if value.dtype.scalar() is dtypes.half else value.cast(dtypes.half)
   def classes(value:UOp) -> tuple[UOp, UOp, UOp, UOp]:
     high = _positive_mask(value.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
-    low = _positive_mask(UOp.const(-65504.0, dtypes.half).alu(Ops.SUB, value))
+    negated = UOp(Ops.NEG, dtypes.half, src=(value,))
+    low = _positive_mask(negated.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
     nan = _mask_mul(high, low)
     return nan, high.alu(Ops.SUB, nan), low.alu(Ops.SUB, nan), inverse(high.alu(Ops.MAX, low))
   def atom(op:Ops, lhs:UOp, rhs:UOp, invert:bool=False) -> UOp|None:
@@ -7367,6 +7368,7 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
   # graph always carries its original lhs!=rhs test beside two self-NaN tests and the explicit infinity constants.
   # OR exact IEEE equality back into that graph; NaN remains unequal unless the original equal_nan branch accepts it.
   if (isclose:=_isclose_match(root)) is not None and (unequal:=atom(Ops.CMPNE, isclose[0], isclose[1])) is not None:
+    result = _mask_mul(result, _mask_mul(classes(isclose[0])[3], classes(isclose[1])[3]))
     exact = inverse(unequal)
     if isclose[2]:
       lhs_nan, rhs_nan = classes(isclose[0])[0], classes(isclose[1])[0]
@@ -7698,6 +7700,12 @@ class RKContext:
       dst = self._alu_dst(u, u.dtype.scalar(), src.layout, ((u.src[0], src),))
       return self._emit(dst, src, src, _EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
+    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None:
+      self._register_graph(recipe)
+      return self.lower(recipe)
+    if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
+      self._register_graph(recipe)
+      return self.lower(recipe)
     dtype = u.dtype.scalar()
     expected = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else None
     if expected is None: raise _RKGenericReject
@@ -7793,6 +7801,12 @@ class RKContext:
     if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
     return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
 
+  def _ieee_bool(self, recipe:UOp) -> RKValue:
+    self._register_graph(recipe)
+    value = self.lower(recipe)
+    if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
+    return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
+
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
     if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
@@ -7824,6 +7838,12 @@ class RKContext:
       return RKValue(self.out, dtype, self.count, expected)
     condition_uop = _strip_cast(u.src[0])
     if (recipe:=_fold_where_abs(u)) is not None:
+      self._register_graph(recipe)
+      return self.lower(recipe)
+    if (recipe:=_fold_ordered_where(u)) is not None:
+      self._register_graph(recipe)
+      return self.lower(recipe)
+    if (recipe:=_fold_threshold_where(u)) is not None:
       self._register_graph(recipe)
       return self.lower(recipe)
     if (u.src[1].op is Ops.EXP2 and u.src[2].op is Ops.CONST and float(u.src[2].arg) == 1.0 and
@@ -7949,6 +7969,8 @@ class RKContext:
       try: value = self._accurate_add(u)
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
+    elif (dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ) and
+          (ieee_recipe:=_ieee_comparison_mask(u)) is not None): value = self._ieee_bool(ieee_recipe)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.int16: value = self._int16_bitwise(u)
@@ -8569,24 +8591,30 @@ def _mask_expr(u:UOp) -> UOp|None:
     return mask_lhs.alu(Ops.MAX, mask_rhs) if u.op is Ops.OR else _mask_mul(mask_lhs, mask_rhs)
   return None
 
+def _fold_threshold_where(x:UOp) -> UOp|None:
+  """Select a compared value or finite constant without multiplying an inactive nonfinite value."""
+  gate = _unwrap_condition(x.src[0])
+  if gate.op is not Ops.CMPLT or gate.src[1].op is not Ops.CONST or not math.isfinite(float(gate.src[1].arg)): return None
+  lhs, threshold = gate.src[0], float(gate.src[1].arg)
+  yes, no = (_unwrap_condition(u) for u in x.src[1:])
+  if (mask:=_mask_expr(x.src[0])) is None: return None
+  inverse = UOp.const(1.0, dtypes.half).alu(Ops.SUB, mask)
+  if yes.key == lhs.key and no.op is Ops.CONST and math.isfinite(float(no.arg)) and float(no.arg) != threshold:
+    return _native_min(lhs.cast(dtypes.half), UOp.const(threshold, dtypes.half)).alu(
+      Ops.ADD, _mask_mul(inverse, UOp.const(float(no.arg)-threshold, dtypes.half)))
+  if no.key == lhs.key and yes.op is Ops.CONST and math.isfinite(float(yes.arg)) and float(yes.arg) != threshold:
+    return lhs.cast(dtypes.half).alu(Ops.MAX, UOp.const(threshold, dtypes.half)).alu(
+      Ops.ADD, _mask_mul(mask, UOp.const(float(yes.arg)-threshold, dtypes.half)))
+  return None
+
 def _fold_general_where(x:UOp) -> UOp|None:
   """Select FP16 arms with DPU masks, avoiding multiplication by nonfinite constants."""
+  if (threshold:=_fold_threshold_where(x)) is not None: return threshold
   mask = _mask_expr(x.src[0])
   if mask is None: return None
   yes, no = (arm.cast(dtypes.half) for arm in x.src[1:])
   one = UOp.const(1.0, dtypes.half)
   inverse = one.alu(Ops.SUB, mask)
-  gate = _unwrap_condition(x.src[0])
-  if gate.op is Ops.CMPLT:
-    lhs, rhs, yes_u, no_u = (_unwrap_condition(u) for u in (*gate.src, *x.src[1:]))
-    if rhs.op is Ops.CONST and math.isfinite(float(rhs.arg)):
-      threshold = float(rhs.arg)
-      if yes_u.key == lhs.key and no_u.op is Ops.CONST and math.isfinite(float(no_u.arg)) and float(no_u.arg) != threshold:
-        return _native_min(lhs.cast(dtypes.half), UOp.const(threshold, dtypes.half)).alu(
-          Ops.ADD, _mask_mul(inverse, UOp.const(float(no_u.arg)-threshold, dtypes.half)))
-      if no_u.key == lhs.key and yes_u.op is Ops.CONST and math.isfinite(float(yes_u.arg)) and float(yes_u.arg) != threshold:
-        return lhs.cast(dtypes.half).alu(Ops.MAX, UOp.const(threshold, dtypes.half)).alu(
-          Ops.ADD, _mask_mul(mask, UOp.const(float(yes_u.arg)-threshold, dtypes.half)))
   nonfinite = tuple(arm.op is Ops.CONST and not math.isfinite(float(arm.arg)) for arm in x.src[1:])
   if any(nonfinite):
     if any(arm.op is Ops.CONST and math.isnan(float(arm.arg)) for arm in x.src[1:]): return None
@@ -8600,11 +8628,14 @@ def _fold_general_where(x:UOp) -> UOp|None:
 
 def _fold_relu_cap(x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
+  def relu(u:UOp) -> UOp|None:
+    if (source:=_relu_operand(u)) is not None: return source
+    return _relu_operand(folded) if u.op is Ops.WHERE and (folded:=_fold_ordered_where(u)) is not None else None
   def shifted(u:UOp) -> tuple[UOp, float]:
     return (term[0], float(term[1].arg)) if (term:=_const_operand(u, Ops.ADD)) is not None else (u, 0.0)
   for positive, negative in (x.src, x.src[::-1]):
-    source, scaled = _relu_operand(positive), _const_operand(negative, Ops.MUL, -1.0)
-    if source is None or scaled is None or (upper:=_relu_operand(scaled[0])) is None: continue
+    source, scaled = relu(positive), _const_operand(negative, Ops.MUL, -1.0)
+    if source is None or scaled is None or (upper:=relu(scaled[0])) is None: continue
     source_base, source_shift = shifted(source)
     upper_base, upper_shift = shifted(upper)
     if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: continue

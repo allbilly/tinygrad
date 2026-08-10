@@ -23,6 +23,15 @@ def test_generic_fp16_uops_lower_in_dependency_order():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
 
 
+def test_infinite_numerator_fdiv_preserves_dynamic_denominator_sign():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:
+    UOp(Ops.FDIV, dtypes.half, src=(UOp.const(math.inf, dtypes.half), source.index(i).load()))))
+  assert image is not None and len(image.ew_ops) == 3
+  assert all(op.ew_cfg == _EW_CFG[Ops.FDIV] for op in image.ew_ops[:2])
+  assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_generic_where_owns_ternary_arity():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   def select(i):
@@ -30,8 +39,18 @@ def test_generic_where_owns_ternary_arity():
     return (left < right).where(left, right)
   image = _lower_uop_program(_program(dtypes.half, select))
   assert image is not None
-  assert any(op.compare for op in image.ew_ops)
+  assert any(op.compare or op.ew_cfg == _EW_CFG[Ops.MAX] for op in image.ew_ops)
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
+
+
+def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
+  lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  def greater_equal(i):
+    less = UOp(Ops.CMPLT, dtypes.bool, src=(lhs.index(i).load(), rhs.index(i).load()))
+    return UOp(Ops.CMPNE, dtypes.bool, src=(less, UOp.const(True, dtypes.bool)))
+  image = _lower_uop_program(_program(dtypes.bool, greater_equal))
+  assert image is not None and len(image.ew_ops) > 10
+  assert image.ew_ops[-1].int32_output and image.ew_ops[-1].bool_output
 
 
 def test_generic_where_selects_infinity_without_mask_multiplication():
@@ -73,6 +92,26 @@ def test_generic_where_abs_recipe_avoids_infinite_arm_blend():
     return (value < UOp.const(0.0, dtypes.half)).where(value * UOp.const(-1.0, dtypes.half), value)
   image = _lower_uop_program(_program(dtypes.half, absolute))
   assert image is not None and len(image.ew_ops) == 2 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
+def test_threshold_where_uses_bounded_selection_for_dynamic_infinity():
+  source = UOp.param(1, dtypes.half, (4,))
+  def selected(i):
+    value = source.index(i).load()
+    return (value < UOp.const(0.0, dtypes.half)).where(value, UOp.const(1.0, dtypes.half))
+  image = _lower_uop_program(_program(dtypes.half, selected))
+  assert image is not None and any(op.ew_cfg == _EW_CFG[Ops.MAX] for op in image.ew_ops)
+
+
+def test_shifted_relu_difference_becomes_bounded_cap():
+  source = UOp.param(1, dtypes.half, (4,))
+  def bounded(i):
+    scaled = source.index(i).load() * UOp.const(1/6, dtypes.half)
+    lower, upper, zero = scaled + UOp.const(0.5, dtypes.half), scaled + UOp.const(-0.5, dtypes.half), UOp.const(0.0, dtypes.half)
+    return (zero < lower).where(lower, zero) + (zero < upper).where(upper, zero) * UOp.const(-1.0, dtypes.half)
+  image = _lower_uop_program(_program(dtypes.half, bounded))
+  assert image is not None and len(image.ew_ops) < 10
+  assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
 def test_where_abs_remains_native_inside_math_recipe():
@@ -121,6 +160,14 @@ def test_static_root_where_uses_exact_gathers_and_finite_padding_neutral():
   image = _lower_uop_program(_program(dtypes.half, selected))
   assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
   assert any(gather.fill_bits == 0xfbff for gather in image.gathers)
+
+
+def test_static_root_where_preserves_nonzero_constant_route():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half,
+    lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(3.5, dtypes.half))))
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
+  assert struct.pack("<e", 3.5) in image.constants
 
 
 def test_generic_bool_store_has_explicit_boundary_conversion():

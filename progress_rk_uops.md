@@ -304,3 +304,28 @@ Verification:
   4 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 20. IEEE predicate composition and bounded program resources — complete
+
+- Lowered inverted and composed FP16 comparisons through one IEEE boolean recipe, preserving unordered NaN semantics for
+  `>=`, `<=`, equality, inequality, and `isclose` instead of treating hardware masks as ordinary finite arithmetic.
+- Added generic nonfinite-safe physical recipes for threshold `WHERE`, infinite-numerator FDIV, and shifted ReLU caps.
+  These rules fix infinity selection, signed division, and extreme hard-sigmoid inputs without recognizing tensor methods.
+- Initialized constant scratch from the declared physical slot size, so gather-only static `WHERE` routes preserve every
+  nonzero constant lane through padding and slicing.
+- Added a bounded LRU for persistent Rockchip program resources. Evicted programs release GEM scratch, command/task
+  buffers, and cached PC-chain bodies, then rehydrate them transparently if the global compiler cache invokes them again.
+- Reduced the authoritative full-census failures from 52 to 4 while increasing passes from 381 to 429. The old dense
+  timeout/bad-address/memory-error cascade is gone; the four remaining failures are two submission timeouts and two
+  unsupported `NEG` graphs.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 38 passed.
+- Complete comparison class plus `isclose`, infinity-WHERE, and padding regressions: 11 passed.
+- Fresh `test_div_naninf`, `test_hardsigmoid_extreme`, and `test_cross_entropy_smoothing` runs: passed.
+- Forced `ROCKCHIP_PROGRAM_CACHE=1` mixed semantic and attention regressions: 8 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -q -n0`:
+  429 passed, 4 failed, 12 skipped, 154 subtests passed in 19m28s.
+- `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py test/unit/test_rockchip_uops.py`: pass.
+- `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py`: pass.
