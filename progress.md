@@ -5073,3 +5073,32 @@ combined ignore+smoothing cases, but its separate 3x12x10 batch variant timed ou
 
 The change remains static Rockchip plan construction. It reads no tensor values on the host and introduces no CPU
 result computation, Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance relaxation.
+
+---
+
+## 2026-08-10 — exact segmented indexed-loss reduction
+
+Indexed scalar reduction now packs the 32-lane sum across complete input segments and the exact `<32` tail into one
+spaced arena, then reduces only those live lanes. This replaces the unreliable in-place tail addition and keeps the
+post-gather tree bounded to at most 63 lanes for every input size. The 36-row batched sparse case first stopped timing
+out but exposed NaN under an in-place tail fold; with exact packing its deterministic result matches PyTorch exactly.
+
+The complete unchanged upstream `test_sparse_categorical_crossentropy` method passes all default, combined
+ignore+smoothing, and 3x12x10 batch variants in **6.65 s**. `test_nll_loss_3d` passes independently in **25.42 s**;
+the two promoted aliases pass together from `test_rockchip.py` in **29.15 s**. Isolated NLL reductions and weighted
+NLL passed, but a later combined success-suite run timed out, so both remain staged. Weighted 3D NLL also timed out
+and remains staged.
+
+Historical Rockchip branches, `~/npu`, and `~/rk3588` contain no native indexed-loss primitive to reuse. The old loss
+milestones evaluate graphs with host NumPy and were rejected. The new path uses existing DPU ADD/FDIV plus static
+opaque-byte gather packing.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after each timeout and before the final promotion
+  batch. No reboot was used.
+- `test_rockchip.py`: **420 collected aliases**, representing **397 unique upstream methods**. The authoritative
+  remainder falls from 27 to **25 of 422**.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, collection, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **7,263/368 executable lines**, total **32,686**; the reduction rewrite is line-neutral.
+
+The CPU-cheat audit found only compile-time UOp/layout inspection in the renderer. Runtime gather code copies opaque
+lanes and performs no tensor arithmetic. There is no Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance change.
