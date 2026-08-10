@@ -7477,20 +7477,39 @@ class RKContext:
     self.host_gathers:list[RKHostAddress] = []
     self.post_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
-    self.mask_program = False
+    self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort())
     self.use_counts:dict[UOp, int] = {}
+    self.remaining_uses:dict[UOp, int] = {}
+    self.recyclable:set[int] = set()
+    self.free_scratch:list[int] = []
     self._register_graph(self.root)
 
   def _register_graph(self, root:UOp) -> None:
     local:dict[UOp, int] = {}
     for node in root.toposort():
       for src in node.src: local[src] = local.get(src, 0) + 1
-    for node,count in local.items(): self.use_counts[node] = max(self.use_counts.get(node, 0), count)
+    for node,count in local.items():
+      merged = max(self.use_counts.get(node, 0), count)
+      self.use_counts[node] = merged
+      self.remaining_uses[node] = max(self.remaining_uses.get(node, 0), merged)
 
-  def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
+  def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None, *, reuse:bool=True) -> RKValue:
+    if reuse and size is None and self.free_scratch:
+      slot = self.free_scratch.pop()
+      self.recyclable.discard(slot)
+      return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
     slot = len(self.scratch)
     self.scratch.append(RKScratch(_scratch_bytes(self.count) if size is None else size))
     return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
+
+  def _release_sources(self, u:UOp, value:RKValue) -> None:
+    for src in u.src:
+      if src not in self.remaining_uses: continue
+      self.remaining_uses[src] -= 1
+      source = self.values.get(src)
+      if (self.remaining_uses[src] == 0 and source is not None and source.arg.kind is RKBufferKind.SCRATCH and
+          source.arg.index in self.recyclable and source.arg != value.arg and source.arg.index not in self.free_scratch):
+        self.free_scratch.append(source.arg.index)
 
   def _dst(self, u:UOp, dtype:DType, layout:RKLayout) -> RKValue:
     if u is self.root and self.out_param.dtype.scalar() is dtype and layout in (RKLayout.FP16, RKLayout.INT16):
@@ -7515,7 +7534,7 @@ class RKContext:
     if bits in self.constants:
       slot = self.constants[bits]
       return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
-    value = self._scratch(dtype, layout)
+    value = self._scratch(dtype, layout, reuse=False)
     self.constants[bits] = value.arg.index
     return value
 
@@ -7532,7 +7551,7 @@ class RKContext:
     else: raise _RKGenericReject
     key = (layout, vector)
     if key not in self.static_slots:
-      value = self._scratch(dtype, layout)
+      value = self._scratch(dtype, layout, reuse=False)
       self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector))
       self.static_slots[key] = value
     cached = self.static_slots[key]
@@ -7552,7 +7571,7 @@ class RKContext:
       runtime_index = _runtime_index(index)
       if (os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or gate is not None or runtime_index is None or
           runtime_index[2].key != self.out_index.key or int(runtime_index[1].src[0].arg) != self.count): raise _RKGenericReject
-      value = self._scratch(dtype, layout)
+      value = self._scratch(dtype, layout, reuse=False)
       fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
         _int16_bits(0 if default is None else default.arg)
       self.host_gathers.append(RKHostAddress(RKArg(RKBufferKind.ARG, param.arg.slot),
@@ -7567,7 +7586,7 @@ class RKContext:
     _validate_gather_bounds(plan, int(param.src[0].arg))
     key = (layout, _gather_cache_key((plan,)))
     if key not in self.gather_slots:
-      value = self._scratch(dtype, layout)
+      value = self._scratch(dtype, layout, reuse=False)
       self.gathers.append(replace(plan, dst_index=value.arg.index, itemsize=2))
       self.gather_slots[key] = value
     return self.gather_slots[key]
@@ -7587,11 +7606,12 @@ class RKContext:
 
   def _native_min(self, u:UOp, lhs:RKValue, rhs:RKValue) -> RKValue:
     zero = self.lower(UOp.const(0.0, dtypes.half))
-    neg_lhs, neg_rhs, neg_max = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(3))
+    neg_lhs, neg_rhs = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
     self._emit(neg_lhs, zero, lhs, _EW_CFG[Ops.SUB])
     self._emit(neg_rhs, zero, rhs, _EW_CFG[Ops.SUB])
-    self._emit(neg_max, neg_lhs, neg_rhs, _EW_CFG[Ops.MAX])
-    return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), zero, neg_max, _EW_CFG[Ops.SUB])
+    self._emit(neg_lhs, neg_lhs, neg_rhs, _EW_CFG[Ops.MAX])
+    dst = self._dst(u, dtypes.half, RKLayout.FP16) if u is self.root else neg_lhs
+    return self._emit(dst, zero, neg_lhs, _EW_CFG[Ops.SUB])
 
   def _alu(self, u:UOp) -> RKValue:
     if u.op is Ops.RECIPROCAL:
@@ -7697,20 +7717,68 @@ class RKContext:
 
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
+    condition_uop = _strip_cast(u.src[0])
+    if (condition_uop.op is Ops.CMPLT and condition_uop.src[1].op is Ops.CONST and float(condition_uop.src[1].arg) == 0.0 and
+        u.src[2].key == condition_uop.src[0].key and (negative_match:=_const_operand(u.src[1], Ops.MUL, -1.0)) is not None and
+        negative_match[0].key == condition_uop.src[0].key):
+      recipe = UOp(Ops.MAX, dtypes.half, src=(condition_uop.src[0], condition_uop.src[0]), arg=_NATIVE_ABS)
+      self._register_graph(recipe)
+      return self.lower(recipe)
+    if (u.src[1].op is Ops.EXP2 and u.src[2].op is Ops.CONST and float(u.src[2].arg) == 1.0 and
+        len(u.src[1].src) == 1 and (scaled:=u.src[1].src[0]).op is Ops.MUL):
+      infinite = next((factor for factor in scaled.src if factor.op is Ops.CONST and
+                       math.isinf(float(factor.arg))), None)
+      source = next((factor for factor in scaled.src if factor is not infinite), None)
+      if (infinite is not None and source is not None and condition_uop.op is Ops.CMPNE and
+          any(term.key == source.key for term in condition_uop.src) and
+          any(term.op is Ops.CONST and float(term.arg) == 0.0 for term in condition_uop.src)):
+        zero_u, one_u = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+        condition_value = self.lower(u.src[0])
+        positive = self.lower(UOp(Ops.CMPLT, dtypes.bool, src=(zero_u, source)))
+        negative_mask = self.lower(UOp(Ops.CMPLT, dtypes.bool, src=(source, zero_u)))
+        if any(value.layout is not RKLayout.BOOL_MASK for value in (condition_value, positive, negative_mask)): raise _RKGenericReject
+        one, zero = self._constant(one_u), self._constant(zero_u)
+        signed = self._scratch(dtypes.bool, RKLayout.BOOL_MASK)
+        self._emit(signed, positive, negative_mask, _EW_CFG[Ops.MAX])
+        unordered = self._scratch(dtypes.half, RKLayout.FP16)
+        self._emit(unordered, condition_value, signed, _EW_CFG[Ops.SUB])
+        finite_zero = self._scratch(dtypes.half, RKLayout.FP16)
+        self._emit(finite_zero, one, condition_value, _EW_CFG[Ops.SUB])
+        overflow = negative_mask if float(infinite.arg) < 0.0 else positive
+        overflow_denominator, overflow_quotient, overflow_correction = \
+          (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(3))
+        self._emit(overflow_denominator, one, overflow, _EW_CFG[Ops.SUB])
+        self._emit(overflow_quotient, one, overflow_denominator, _EW_CFG[Ops.FDIV])
+        self._emit(overflow_correction, overflow_quotient, one, _EW_CFG[Ops.SUB])
+        unordered_denominator, unordered_correction = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
+        self._emit(unordered_denominator, one, unordered, _EW_CFG[Ops.SUB])
+        self._emit(unordered_correction, zero, unordered_denominator, _EW_CFG[Ops.FDIV])
+        finite = self._scratch(dtypes.half, RKLayout.FP16)
+        self._emit(finite, finite_zero, overflow_correction, _EW_CFG[Ops.ADD])
+        return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), finite, unordered_correction, _EW_CFG[Ops.ADD])
     nonfinite = [i for i,arm in enumerate(u.src[1:]) if arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.half and
                  not math.isfinite(float(arm.arg))]
-    if len(nonfinite) == 1 and not math.isnan(float(u.src[1+nonfinite[0]].arg)):
+    if len(nonfinite) == 1:
       inf_index, finite_u = nonfinite[0], u.src[2-nonfinite[0]]
       finite = self.lower(finite_u)
       if finite.layout is not RKLayout.FP16: raise _RKGenericReject
-      condition = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
-      if condition.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
+      selector = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+      if selector.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
+      if math.isnan(float(u.src[1+inf_index].arg)):
+        zero, one = self._constant(UOp.const(0.0, dtypes.half)), self._constant(UOp.const(1.0, dtypes.half))
+        if inf_index == 0:
+          denominator = self._scratch(dtypes.half, RKLayout.FP16)
+          self._emit(denominator, one, selector, _EW_CFG[Ops.SUB])
+        else: denominator = selector
+        correction = self._scratch(dtypes.half, RKLayout.FP16)
+        self._emit(correction, zero, denominator, _EW_CFG[Ops.FDIV])
+        return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), finite, correction, _EW_CFG[Ops.ADD])
       one, sign = self._constant(UOp.const(1.0, dtypes.half)), self._constant(
         UOp.const(math.copysign(1.0, float(u.src[1+inf_index].arg)), dtypes.half))
       if inf_index == 0:
         denominator = self._scratch(dtypes.half, RKLayout.FP16)
-        self._emit(denominator, one, condition, _EW_CFG[Ops.SUB])
-      else: denominator = condition
+        self._emit(denominator, one, selector, _EW_CFG[Ops.SUB])
+      else: denominator = selector
       quotient, correction = self._scratch(dtypes.half, RKLayout.FP16), self._scratch(dtypes.half, RKLayout.FP16)
       self._emit(quotient, sign, denominator, _EW_CFG[Ops.FDIV])
       self._emit(correction, quotient, sign, _EW_CFG[Ops.SUB])
@@ -7718,19 +7786,19 @@ class RKContext:
     yes, no = (self.lower(src) for src in u.src[1:])
     if yes.layout is not no.layout or yes.layout not in (RKLayout.FP16, RKLayout.INT16): raise _RKGenericReject
     mask_layout = RKLayout.BOOL_MASK if yes.layout is RKLayout.FP16 else RKLayout.BOOL_INT16
-    condition = self._static(u.src[0], mask_layout) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
-    if condition.layout is not mask_layout: raise _RKGenericReject
+    selector = self._static(u.src[0], mask_layout) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+    if selector.layout is not mask_layout: raise _RKGenericReject
     dtype = dtypes.half if yes.layout is RKLayout.FP16 else dtypes.int16
     if dtype is dtypes.int16:
       one = self._constant(UOp.const(1, dtypes.int16))
       selected_yes, inverse, selected_no = (self._scratch(dtype, yes.layout) for _ in range(3))
-      self._emit(selected_yes, condition, yes, _EW_CFG[Ops.MUL])
-      self._emit(inverse, one, condition, _EW_CFG[Ops.SUB])
+      self._emit(selected_yes, selector, yes, _EW_CFG[Ops.MUL])
+      self._emit(inverse, one, selector, _EW_CFG[Ops.SUB])
       self._emit(selected_no, inverse, no, _EW_CFG[Ops.MUL])
       return self._emit(self._dst(u, dtype, yes.layout), selected_yes, selected_no, _EW_CFG[Ops.ADD])
     delta, selected = self._scratch(dtype, yes.layout), self._scratch(dtype, yes.layout)
     self._emit(delta, yes, no, _EW_CFG[Ops.SUB])
-    self._emit(selected, condition, delta, _EW_CFG[Ops.MUL])
+    self._emit(selected, selector, delta, _EW_CFG[Ops.MUL])
     return self._emit(self._dst(u, dtype, yes.layout), no, selected, _EW_CFG[Ops.ADD])
 
   def _widen_int16(self, u:UOp, source:RKValue) -> RKValue:
@@ -7758,6 +7826,7 @@ class RKContext:
   def lower(self, u:UOp) -> RKValue:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
+    consume_sources = True
     if u.op is Ops.CONST: value = self._constant(u)
     elif (dtype in (dtypes.half, dtypes.int16, dtypes.bool) and _is_static_expr(u) and
           not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
@@ -7768,6 +7837,7 @@ class RKContext:
         recipe = _fp32_expr_to_half(u.src[0])
         self._register_graph(recipe)
         source = self.lower(recipe)
+        consume_sources = False
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
@@ -7776,16 +7846,20 @@ class RKContext:
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject
     elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None:
-      try: value = self._accurate_add(u)
+      try: value, consume_sources = self._accurate_add(u), False
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
-    elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
+    elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value, consume_sources = self._compare(u), False
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.int16: value = self._int16_bitwise(u)
     elif u.op is Ops.WHERE: value = self._where(u)
-    elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)
+    elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value, consume_sources = self._math(u), False
     else: raise _RKGenericReject
     self.values[u] = value
+    if u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
+                Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) and \
+       value.arg.kind is RKBufferKind.SCRATCH: self.recyclable.add(value.arg.index)
+    if consume_sources: self._release_sources(u, value)
     return value
 
   def finish(self) -> RKImage:
@@ -7819,6 +7893,35 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
     terms = [UOp(reduce_op, dtype, src=(terms[i], terms[i+1])) for i in range(0, len(terms)-1, 2)] + \
       (terms[-1:] if len(terms) & 1 else [])
   return terms[0]
+
+def _expand_math_uops(root:UOp) -> UOp:
+  """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
+  cache:dict[UOp, UOp] = {}
+  def physical_recipe(recipe:UOp) -> UOp:
+    rewritten = _fp16_rewrite(list(UOp(Ops.SINK, src=(recipe,)).toposort()))
+    if not rewritten or rewritten[-1].op is not Ops.SINK or len(rewritten[-1].src) != 1: raise _RKGenericReject
+    tagged:dict[UOp, UOp] = {}
+    def tag_adds(u:UOp) -> UOp:
+      if u in tagged: return tagged[u]
+      mapped = u.replace(src=tuple(tag_adds(src) for src in u.src),
+                         arg=_NATIVE_PRECISE_ADD if u.op is Ops.ADD and u.arg is None else u.arg)
+      tagged[u] = mapped
+      return mapped
+    return tag_adds(rewritten[-1].src[0])
+  def rewrite(u:UOp) -> UOp:
+    if u in cache: return cache[u]
+    mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
+    if mapped.op is Ops.SQRT:
+      if (recipe:=_dpu_sqrt(mapped.src[0])) is None: raise _RKGenericReject
+      mapped = rewrite(physical_recipe(recipe))
+    elif mapped.op is Ops.EXP2: mapped = rewrite(physical_recipe(_dpu_exp2(mapped.src[0])))
+    elif mapped.op is Ops.LOG2:
+      if mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
+      mapped = rewrite(physical_recipe(_dpu_log2(mapped.src[0])))
+    elif mapped.op is Ops.SIN: mapped = rewrite(physical_recipe(_dpu_sin(mapped.src[0])))
+    cache[u] = mapped
+    return mapped
+  return rewrite(root)
 
 def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
   cache:dict[UOp, UOp] = {}
@@ -7919,7 +8022,7 @@ def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
   try:
     if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
-    root = _unroll_static_local(uops, output, reduced)
+    root = _expand_math_uops(_unroll_static_local(uops, output, reduced))
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
@@ -7929,7 +8032,6 @@ def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
     return None
 
 def lower_ew(uops:list[UOp]) -> RKImage:
-  if os.getenv("ROCKCHIP_UOPS", "1") != "0" and (generic:=_lower_uop_program(uops)) is not None: return generic
   if (int16_cumulative:=_lower_unrolled_int16_cumulative_extrema(uops)) is not None: return int16_cumulative
   if (int16_extrema:=_lower_int16_loop_extrema(uops)) is not None: return int16_extrema
   if (int16_product:=_lower_int16_product_loop(uops)) is not None: return int16_product

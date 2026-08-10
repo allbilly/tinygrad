@@ -42,6 +42,31 @@ def test_generic_where_selects_infinity_without_mask_multiplication():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
+def test_generic_where_predicates_nonfinite_exp2_input():
+  source = UOp.param(1, dtypes.half, (4,))
+  def power(i):
+    exponent = UOp.const(-math.inf, dtypes.half) * source.index(i).load()
+    return (source.index(i).load() != UOp.const(0.0, dtypes.half)).where(exponent.exp2(), UOp.const(1.0, dtypes.half))
+  image = _lower_uop_program(_program(dtypes.half, power))
+  assert image is not None and len(image.ew_ops) > 10
+
+
+def test_generic_where_materializes_nan_only_on_selected_lanes():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:
+    (source.index(i).load() < UOp.const(0.0, dtypes.half)).where(UOp.const(math.nan, dtypes.half), source.index(i).load())))
+  assert image is not None and any(op.submit_barrier for op in image.ew_ops)
+
+
+def test_generic_where_abs_recipe_avoids_infinite_arm_blend():
+  source = UOp.param(1, dtypes.half, (4,))
+  def absolute(i):
+    value = source.index(i).load()
+    return (value < UOp.const(0.0, dtypes.half)).where(value * UOp.const(-1.0, dtypes.half), value)
+  image = _lower_uop_program(_program(dtypes.half, absolute))
+  assert image is not None and len(image.ew_ops) == 2 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_generic_static_index_becomes_gather():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:source.index(3-i).load()))

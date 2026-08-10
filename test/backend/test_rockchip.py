@@ -355,7 +355,7 @@ class TestRockchipIntegerPowerOps(unittest.TestCase):
       _fp16_test_op([()], lambda x,exponent=exponent:x**exponent, forward_only=True)
     _fp16_test_op([(45,65)], lambda x:x**3, forward_only=True, low=-30, high=-27)
     _fp16_test_op([()], lambda x:x**3, forward_only=True, low=-30, high=-27)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 5)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 5 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 7)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipTensorPowerOps(unittest.TestCase):

@@ -106,3 +106,20 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 20 passed.
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py`: pass.
+
+### 9. Whole-recipe physical liveness and nonfinite selection — complete
+
+- Expanded SQRT, EXP2, LOG2, and SIN handler recipes before physical allocation so their complete UOp liveness graph is visible to `RKContext`.
+- Added dead-ALU scratch recycling while keeping constants, static vectors, and gathered inputs in persistent pre-chain slots. This prevents both oversized math images and accidental overwrites of materialized values.
+- Tagged arithmetic internal to math recipes so the accurate reduction ADD recipe is not recursively applied to polynomial evaluation.
+- Made positive-mask state visible before emitting a mixed math chain, matching the DPU's stateful execution requirement.
+- Added safe `WHERE` recipes for selected NaN, expanded absolute value, and `EXP2(infinity * x)` domains; `0**x` now preserves infinity, zero, one, and NaN lanes without an operation-level power lowerer.
+- Generic lowering is attempted exactly once on the original Tinygrad program. The legacy oracle no longer re-enters the generic executor with an already rewritten physical recipe.
+- Composite nonfinite LOG2 selectors are explicitly declined until their value-class ABI is represented generically.
+- Updated the integer-power submission assertion to distinguish the generic one-image correctness contract from the legacy fusion count.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 23 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipTranscendentalOps::test_exp2 test/backend/test_rockchip.py::TestRockchipTranscendentalOps::test_log2 test/backend/test_rockchip.py::TestRockchipTranscendentalOps::test_exp2_log2_zero_times_negative test/backend/test_rockchip.py::TestRockchipSqrtOps -x -q -n0`: 5 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipTensorPowerOps::test_pow_const test/backend/test_rockchip.py::TestRockchipTensorPowerOps::test_pow_full test/backend/test_rockchip.py::TestRockchipTensorPowerOps::test_pow_neg_inf_frac_exponent -x -q -n0`: 3 passed.
