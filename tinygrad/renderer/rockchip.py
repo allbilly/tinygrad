@@ -7823,10 +7823,7 @@ class RKContext:
           partial=bool(partial), dst_kind=RKBufferKind.ARG, src_kind=value.arg.kind, itemsize=itemsize))
       return RKValue(self.out, dtype, self.count, expected)
     condition_uop = _strip_cast(u.src[0])
-    if (condition_uop.op is Ops.CMPLT and condition_uop.src[1].op is Ops.CONST and float(condition_uop.src[1].arg) == 0.0 and
-        u.src[2].key == condition_uop.src[0].key and (negative_match:=_const_operand(u.src[1], Ops.MUL, -1.0)) is not None and
-        negative_match[0].key == condition_uop.src[0].key):
-      recipe = UOp(Ops.MAX, dtypes.half, src=(condition_uop.src[0], condition_uop.src[0]), arg=_NATIVE_ABS)
+    if (recipe:=_fold_where_abs(u)) is not None:
       self._register_graph(recipe)
       return self.lower(recipe)
     if (u.src[1].op is Ops.EXP2 and u.src[2].op is Ops.CONST and float(u.src[2].arg) == 1.0 and
@@ -8629,6 +8626,22 @@ def _fold_abs(x:UOp) -> UOp|None:
       return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
   return None
 
+def _fold_where_abs(x:UOp) -> UOp|None:
+  """Recognize `WHERE(x < 0, -x, x)` before an unselected infinity can contaminate a mask blend."""
+  if x.op is not Ops.WHERE or len(x.src) != 3 or x.dtype.scalar() is not dtypes.half: return None
+  condition = _strip_cast(x.src[0])
+  negative = _strip_cast(x.src[1])
+  source = condition.src[0] if condition.op is Ops.CMPLT else None
+  negated = source is not None and negative.op is Ops.NEG and len(negative.src) == 1 and negative.src[0].key == source.key
+  if source is not None and (scaled:=_const_operand(negative, Ops.MUL, -1.0)) is not None:
+    negated |= scaled[0].key == source.key
+  if (source is not None and source.op is Ops.FDIV and negative.op is Ops.FDIV and
+      source.src[1].key == negative.src[1].key and source.src[0].op is Ops.CONST and negative.src[0].op is Ops.CONST):
+    negated |= float(source.src[0].arg) == -float(negative.src[0].arg)
+  if (condition.op is not Ops.CMPLT or condition.src[1].op is not Ops.CONST or float(condition.src[1].arg) != 0.0 or
+      x.src[2].key != condition.src[0].key or not negated): return None
+  return UOp(Ops.MAX, x.dtype, src=(condition.src[0], condition.src[0]), arg=_NATIVE_ABS)
+
 def _fold_copysign(x:UOp) -> UOp|None:
   """Recognize Tinygrad's signed-zero-aware copysign graph before numeric sign folding."""
   if x.op is not Ops.WHERE or len(x.src) != 3: return None
@@ -8805,7 +8818,8 @@ _pm_fp32_to_fp16 = PatternMatcher([
       x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
-_pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs)])
+_pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
+                          (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_where_abs)])
 _pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round)])
 _pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_floor_ceil)])
 _pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])

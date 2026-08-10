@@ -283,3 +283,24 @@ Verification:
 - Three consecutive isolated `TestRockchipTranscendentalOps::test_logsumexp` runs: passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 19. Nonfinite-safe absolute UOp composition — complete
+
+- Folded the ordinary `WHERE(x < 0, -x, x)` UOp spelling to native physical ABS before a consuming LOG2/EXP2 recipe
+  expands it into arithmetic. This prevents an inactive `0 * inf` arm from contaminating the selected value with NaN.
+- Accepted equivalent negation spellings owned by ordinary UOps: unary NEG, multiplication by `-1`, and matched FDIV
+  numerators such as `WHERE((1/x) < 0, -1/x, 1/x)`.
+- Fixed both remaining FP16 power boundary cases through composable WHERE/ABS/LOG2/MUL/EXP2 semantics. No POW handler or
+  tensor-power graph lowerer was added to the generic executor.
+- Made execution of an empty physical EW sequence an explicit runtime no-op. Zero-stage constant/size images no longer
+  enter submission grouping with an empty operation tuple.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 33 passed.
+- Complete Rockchip integer and tensor power families: 9 passed.
+- Complete transcendental and power families plus masked-select/nonzero size regressions: 56 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchipAttentionOps -q -n0`:
+  4 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

@@ -1,6 +1,6 @@
 import math, struct
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _NATIVE_SIGN,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _EW_CFG_ABS, _NATIVE_SIGN,
   _MAX_EW_ELEMS_FP16, _iter_range_env, _lower_uop_program, decode_image, encode_image)
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -73,6 +73,28 @@ def test_generic_where_abs_recipe_avoids_infinite_arm_blend():
     return (value < UOp.const(0.0, dtypes.half)).where(value * UOp.const(-1.0, dtypes.half), value)
   image = _lower_uop_program(_program(dtypes.half, absolute))
   assert image is not None and len(image.ew_ops) == 2 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
+def test_where_abs_remains_native_inside_math_recipe():
+  source = UOp.param(1, dtypes.half, (4,))
+  def logarithm(i):
+    value = source.index(i).load()
+    absolute = (value < UOp.const(0.0, dtypes.half)).where(value * UOp.const(-1.0, dtypes.half), value)
+    return absolute.log2()
+  image = _lower_uop_program(_program(dtypes.half, logarithm))
+  assert image is not None and any(op.ew_cfg == _EW_CFG_ABS for op in image.ew_ops)
+
+
+def test_where_abs_recognizes_negated_reciprocal_arms():
+  source = UOp.param(1, dtypes.half, (4,))
+  def power_magnitude(i):
+    value = source.index(i).load()
+    reciprocal = UOp(Ops.FDIV, dtypes.half, src=(UOp.const(1.0, dtypes.half), value))
+    negative = UOp(Ops.FDIV, dtypes.half, src=(UOp.const(-1.0, dtypes.half), value))
+    absolute = (reciprocal < UOp.const(0.0, dtypes.half)).where(negative, reciprocal)
+    return (absolute.log2() * UOp.const(0.3, dtypes.half)).exp2()
+  image = _lower_uop_program(_program(dtypes.half, power_magnitude))
+  assert image is not None and any(op.ew_cfg == _EW_CFG_ABS for op in image.ew_ops)
 
 
 def test_generic_static_index_becomes_gather():

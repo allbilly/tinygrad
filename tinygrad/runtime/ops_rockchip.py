@@ -185,6 +185,7 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None, *, tile_groups:bool=True) -> None:
     ops = self.image.ew_ops if ops is None else ops
+    if not ops: return
     scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
       op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
     if scratch_int16:
