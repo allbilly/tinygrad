@@ -5434,3 +5434,35 @@ two-dimensional axis-0 loops and the flattened axis-1 global loops over precompu
 All tensor topology, offsets, and constants are recovered at compile time. Runtime only performs the existing raw
 gathers and submits the generated DPU plan; there is no tensor-value host computation, tolerance change, LUT, CMAC,
 FP32 input, Tinygrad-core change, or Rockchip-runtime change.
+
+---
+
+## 2026-08-10 — forward census boundary and MaskedSelect compiler profile
+
+The post-softmax census has one remaining forward, FP16-input, no-CMAC target: the scalar-True half of unchanged
+upstream `test_masked_select`. Its data-dependent `x > 0.5` half already executes correctly through the existing DPU
+count/prefix/selection plans. The other nine absent method names are outside the active contract or cannot reach the
+backend: four attention methods require CMAC, `test_pow_const_direct` explicitly constructs FP32 tensors and computes
+gradients, two comparison methods are backward-only, `test_pow_int` self-skips, and `test_scatter_reduce_prod_zeros`
+fails in the upstream Torch oracle because its FP32 destination receives a default-FP16 source.
+
+The scalar-True MaskedSelect blocker is entirely before the renderer. Its scheduled output kernel is only **40 UOps**,
+but the Rockchip-specific optimizer unrolls each of three nested 320-lane reductions by 32. A 20-second isolated
+codegen profile (started only after the dynamic count submit had completed) recorded **26.4 million Python calls**;
+`devectorize2` consumed **15.0 seconds**, constructed over 300,000 indexed operands, and still had not reached the
+renderer. With `NOOPT=1`, or with the generic non-Rockchip heuristic, the same AST reaches the renderer as **75 UOps
+in 0.11 seconds**. This proves the remaining issue is the existing Rockchip policy in
+`tinygrad/codegen/opt/heuristic.py`, not missing DPU MaskedSelect arithmetic.
+
+The only historical passing implementation, `797611d18` on `rockchip-2607`, intercepts the pre-codegen graph and
+replaces it with a host-subtask copy. `~/npu` and `~/rk3588` contain no native MaskedSelect/NonZero instruction; they
+provide only the EW primitives already used here. Neither the host shortcut, a test-only `NOOPT`, nor a process-global
+backend mutation was ported under the no-CPU-cheat and no-Tinygrad-core-change rules.
+
+- Upstream census remains **412 of 422** unique methods, with no false promotion.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after profiling; no reboot was used.
+- `sz.py`: renderer/runtime **7,770/376 executable lines**, total **33,201**.
+
+This milestone changes documentation only. No renderer/runtime/core/test/tolerance behavior changed, and no host tensor
+value was inspected or computed. Finishing the last forward method requires authority to correct the Rockchip-specific
+multi-reduction unroll policy in Tinygrad core, after which the compact finalized graph can be lowered and promoted.
