@@ -168,6 +168,14 @@ def test_static_local_accumulator_is_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
 
 
+def test_static_structural_expansion_is_bounded():
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (513,))
+  lane, axis = UOp.range(1, 0), UOp.range(513, 1, AxisType.REDUCE)
+  reduced = UOp(Ops.REDUCE, dtypes.half, src=(source.index(axis).load(), axis), arg=(Ops.ADD,))
+  uops = list(out.index(lane).store(reduced).end(lane, axis).sink().toposort())
+  assert _lower_uop_program(uops) is None
+
+
 def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):
   monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "1")
   indices = UOp.param(2, dtypes.int, (4,))

@@ -207,6 +207,8 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _MAX_MAPPED_DOT_SCRATCH_BYTES = 256 << 20
+_MAX_GENERIC_UNROLL = 512
+_MAX_GENERIC_EXPANDED_NODES = 8192
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
 _FP16_EXACT_INTEGER = 1 << 11
 _POOL_INDEX_DIGIT_BITS = 4
@@ -7818,6 +7820,16 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
       (terms[-1:] if len(terms) & 1 else [])
   return terms[0]
 
+def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
+  cache:dict[UOp, UOp] = {}
+  def rewrite(u:UOp) -> UOp:
+    if u in replacements: return replacements[u]
+    if u in cache: return cache[u]
+    mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
+    cache[u] = mapped
+    return mapped
+  return rewrite(root)
+
 def _unroll_static_reduces(root:UOp) -> UOp:
   """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
   cache:dict[UOp, UOp] = {}
@@ -7829,9 +7841,12 @@ def _unroll_static_reduces(root:UOp) -> UOp:
       ranges = list(mapped.src[1:])
       if reduce_op not in (Ops.ADD, Ops.MAX, Ops.MUL) or not ranges or any(
         r.op is not Ops.RANGE or r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
+      iterations = math.prod(int(r.src[0].arg) for r in ranges)
+      if iterations > _MAX_GENERIC_UNROLL or iterations*len(mapped.src[0].toposort()) > _MAX_GENERIC_EXPANDED_NODES:
+        raise _RKGenericReject
       envs = _iter_range_env(ranges)
       if not envs: raise _RKGenericReject
-      terms = [mapped.src[0].substitute({r:r.const_like(env[r]) for r in ranges}) for env in envs]
+      terms = [_substitute_static_ranges(mapped.src[0], {r:r.const_like(env[r]) for r in ranges}) for env in envs]
       mapped = _structural_reduce(reduce_op, u.dtype, terms)
     cache[u] = mapped
     return mapped
@@ -7867,9 +7882,12 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
   update, term, ranges = updates[0]
   if not ranges or any(r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
+  if any(node.op is Ops.WHERE and node.dtype.scalar() is dtypes.float for node in term.toposort()): raise _RKGenericReject
+  iterations = math.prod(int(r.src[0].arg) for r in ranges)
+  if iterations > _MAX_GENERIC_UNROLL or iterations*len(term.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
   terms = [initializers[0]]
   for env in _iter_range_env(ranges):
-    terms.append(term.substitute({r:r.const_like(env[r]) for r in ranges}))
+    terms.append(_substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges}))
   reduced = _structural_reduce(update.op, update.dtype, terms)
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
   return root.substitute(substitutions)
@@ -7900,7 +7918,8 @@ def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
   try:
     if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
-    root = _unroll_static_local(uops, output, _unroll_static_reduces(output[4]))
+    reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
+    root = _unroll_static_local(uops, output, reduced)
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
