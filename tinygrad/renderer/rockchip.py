@@ -7536,7 +7536,7 @@ class RKContext:
     cached = self.static_slots[key]
     return RKValue(cached.arg, dtype, self.count, layout)
 
-  def _load(self, u:UOp) -> RKValue:
+  def _load(self, u:UOp, fill_override:int|None=None) -> RKValue:
     dtype = u.dtype.scalar()
     if dtype not in (dtypes.half, dtypes.int16) or not u.src or u.src[0].op is not Ops.INDEX or \
        (param:=_root_param(u.src[0])) is None or param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST:
@@ -7551,7 +7551,7 @@ class RKContext:
       if (os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or gate is not None or runtime_index is None or
           runtime_index[2].key != self.out_index.key or int(runtime_index[1].src[0].arg) != self.count): raise _RKGenericReject
       value = self._scratch(dtype, layout)
-      fill_bits = _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
+      fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
         _int16_bits(0 if default is None else default.arg)
       self.host_gathers.append(RKHostAddress(RKArg(RKBufferKind.ARG, param.arg.slot),
         RKArg(RKBufferKind.ARG, runtime_index[1].arg.slot), value.arg, self.count, int(param.src[0].arg), self.count,
@@ -7559,7 +7559,7 @@ class RKContext:
       return value
     if gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
       return RKValue(RKArg(RKBufferKind.ARG, param.arg.slot), dtype, self.count, layout)
-    fill_bits = _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
+    fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
       _int16_bits(0 if default is None else default.arg)
     plan = _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
     _validate_gather_bounds(plan, int(param.src[0].arg))
@@ -7603,7 +7603,14 @@ class RKContext:
     dtype = u.dtype.scalar()
     expected = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else None
     if expected is None: raise _RKGenericReject
-    lhs, rhs = self._operand(u.src[0], dtype), self._operand(u.src[1], dtype)
+    def operand(src:UOp) -> RKValue:
+      if (u.op is Ops.MAX and dtype is dtypes.half and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg) < 0):
+        return self._constant(UOp.const(-65504.0, dtypes.half))
+      if (u.op is Ops.MAX and dtype is dtypes.half and src.op is Ops.LOAD and len(src.src) > 2 and src.src[1].op is Ops.CONST and
+          math.isinf(float(src.src[1].arg)) and float(src.src[1].arg) < 0 and _is_static_expr(src.src[2])):
+        return self._load(src, _fp16_bits(-65504.0))
+      return self._operand(src, dtype)
+    lhs, rhs = operand(u.src[0]), operand(u.src[1])
     compatible = (RKLayout.FP16, RKLayout.BOOL_MASK) if expected is RKLayout.FP16 else (expected,)
     if lhs.layout not in compatible or rhs.layout not in compatible: raise _RKGenericReject
     if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
@@ -7688,6 +7695,24 @@ class RKContext:
 
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
+    nonfinite = [i for i,arm in enumerate(u.src[1:]) if arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.half and
+                 not math.isfinite(float(arm.arg))]
+    if len(nonfinite) == 1 and not math.isnan(float(u.src[1+nonfinite[0]].arg)):
+      inf_index, finite_u = nonfinite[0], u.src[2-nonfinite[0]]
+      finite = self.lower(finite_u)
+      if finite.layout is not RKLayout.FP16: raise _RKGenericReject
+      condition = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+      if condition.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
+      one, sign = self._constant(UOp.const(1.0, dtypes.half)), self._constant(
+        UOp.const(math.copysign(1.0, float(u.src[1+inf_index].arg)), dtypes.half))
+      if inf_index == 0:
+        denominator = self._scratch(dtypes.half, RKLayout.FP16)
+        self._emit(denominator, one, condition, _EW_CFG[Ops.SUB])
+      else: denominator = condition
+      quotient, correction = self._scratch(dtypes.half, RKLayout.FP16), self._scratch(dtypes.half, RKLayout.FP16)
+      self._emit(quotient, sign, denominator, _EW_CFG[Ops.FDIV])
+      self._emit(correction, quotient, sign, _EW_CFG[Ops.SUB])
+      return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), finite, correction, _EW_CFG[Ops.ADD])
     yes, no = (self.lower(src) for src in u.src[1:])
     if yes.layout is not no.layout or yes.layout not in (RKLayout.FP16, RKLayout.INT16): raise _RKGenericReject
     mask_layout = RKLayout.BOOL_MASK if yes.layout is RKLayout.FP16 else RKLayout.BOOL_INT16

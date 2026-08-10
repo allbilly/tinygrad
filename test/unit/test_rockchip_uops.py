@@ -1,3 +1,4 @@
+import math
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _lower_uop_program,
   decode_image, encode_image)
@@ -33,11 +34,28 @@ def test_generic_where_owns_ternary_arity():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
 
 
+def test_generic_where_selects_infinity_without_mask_multiplication():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half,
+    lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(-math.inf, dtypes.half))))
+  assert image is not None and len(image.ew_ops) == 3
+  assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_generic_static_index_becomes_gather():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:source.index(3-i).load()))
   assert image is not None and len(image.gathers) == 1
   assert image.gathers[0].base == 3 and image.gathers[0].axes == ((1, 4, -1),)
+
+
+def test_max_materializes_negative_infinity_fill_as_finite_neutral():
+  source = UOp.param(1, dtypes.half, (4,))
+  def padded(i):
+    value = source.index(i).load(UOp.const(-math.inf, dtypes.half), i < UOp.const(3, dtypes.int))
+    return value.maximum(UOp.const(0.0, dtypes.half))
+  image = _lower_uop_program(_program(dtypes.half, padded))
+  assert image is not None and image.gathers[0].fill_bits == 0xfbff
 
 
 def test_generic_bool_store_has_explicit_boundary_conversion():
