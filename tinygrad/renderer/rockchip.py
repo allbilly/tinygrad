@@ -1505,8 +1505,8 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   except RuntimeError: return None
   return _finish_mapped_add_reduction(mapped, out_slot, rows, groups, post_scale)
 
-def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
-  """Factor a scalar unrolled FP32 sum of identical FP16 lane expressions back into one vector map."""
+def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:bool=False) -> RKImage|None:
+  """Execute repeated ADD terms once as vector UOps, then physically reduce their materialized lanes."""
   if (output:=_output_store(uops, dtypes.half)) is None: return None
   store, out, count, _, root = output
   if count != 1: return None
@@ -1528,7 +1528,9 @@ def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
   input_slots = {parsed[1].arg.slot for term in terms for u in term.toposort()
                  for parsed in (input_leaf(u),) if parsed is not None}
   if not legacy_shape and len(input_slots) < 2: return None
-  if any(u.op not in (Ops.ADD, Ops.MUL, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST)
+  if any(u.op not in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.RECIPROCAL, Ops.NEG,
+                      Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE,
+                      Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST)
          for u in terms[0].toposort()): return None
   signature_cache:dict[UOp, tuple] = {}
   def signature(u:UOp) -> tuple:
@@ -1566,7 +1568,11 @@ def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
     try: offsets = tuple(_eval_int(item[0].src[1], {}) for item in concrete)
     except RuntimeError: return None
     run = next((i for i,value in enumerate(offsets) if value != offsets[0]), len(offsets))
-    if 1 < run < len(offsets) and len(offsets)%run == 0 and all(len(set(offsets[i:i+run])) == 1 for i in range(0, len(offsets), run)):
+    period = next((size for size in range(2, len(offsets)) if len(offsets)%size == 0 and
+                   offsets == offsets[:size]*(len(offsets)//size)), len(offsets))
+    if period < len(offsets):
+      blocks, index_lane = offsets[:period], lane.alu(Ops.FLOORMOD, lane.const_like(period))
+    elif 1 < run < len(offsets) and len(offsets)%run == 0 and all(len(set(offsets[i:i+run])) == 1 for i in range(0, len(offsets), run)):
       repeated_shapes.add((len(offsets)//run, run))
       blocks, index_lane = offsets[::run], lane.alu(Ops.FLOORDIV, lane.const_like(run))
     else: blocks, index_lane = offsets, lane
@@ -1585,8 +1591,12 @@ def _lower_unrolled_mapped_add_reduction(uops:list[UOp]) -> RKImage|None:
   fake_out = out.replace(src=(out.src[0].const_like(len(terms)),))
   fake_index = store.src[0].replace(src=(fake_out, matrix_lane))
   fake_store = store.replace(src=(fake_index, vector, *store.src[2:]))
-  try: mapped = lower_ew(_fp16_rewrite(list(UOp(Ops.SINK, src=(fake_store,)).toposort())))
-  except RuntimeError: return None
+  map_uops = list(UOp(Ops.SINK, src=(fake_store,)).toposort())
+  if generic_only: mapped = _lower_uop_program(_fp16_rewrite(map_uops), vectorize_reductions=False, recipes_ready=True)
+  else:
+    try: mapped = lower_ew(_fp16_rewrite(map_uops))
+    except RuntimeError: return None
+  if mapped is None: return None
   return _finish_mapped_add_reduction(mapped, out.arg.slot, 1, len(terms), post_scale,
                                       group_shape)
 
@@ -7484,7 +7494,7 @@ def _accurate_add_recipe(u:UOp) -> UOp:
 
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
-  def __init__(self, output:RKOutput):
+  def __init__(self, output:RKOutput, *, accurate_adds:bool=True):
     self.store, self.out_param, self.count, self.out_index, self.root = output
     self.out = RKArg(RKBufferKind.ARG, self.out_param.arg.slot)
     self.values:dict[UOp, RKValue] = {}
@@ -7497,6 +7507,7 @@ class RKContext:
     self.post_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
     self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort())
+    self.accurate_adds = accurate_adds
     self.use_counts:dict[UOp, int] = {}
     self.static_nodes:set[UOp] = set()
     for node in self.root.toposort():
@@ -7639,6 +7650,15 @@ class RKContext:
     lhs, rhs = operand(u.src[0]), operand(u.src[1])
     compatible = (RKLayout.FP16, RKLayout.BOOL_MASK) if expected is RKLayout.FP16 else (expected,)
     if lhs.layout not in compatible or rhs.layout not in compatible: raise _RKGenericReject
+    if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:
+      if expected is not RKLayout.FP16 or lhs.layout is not RKLayout.FP16: raise _RKGenericReject
+      zero = self._constant(UOp.const(0.0, dtypes.half))
+      negative = self._scratch(dtypes.half, RKLayout.FP16)
+      negative_mask, positive_mask = (self._scratch(dtypes.bool, RKLayout.BOOL_MASK) for _ in range(2))
+      self._emit(negative, zero, lhs, _EW_CFG[Ops.SUB])
+      self._emit(negative_mask, negative, negative, _EW_CFG[Ops.MAX], compare=True)
+      self._emit(positive_mask, lhs, lhs, _EW_CFG[Ops.MAX], compare=True)
+      return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), positive_mask, negative_mask, _EW_CFG[Ops.SUB])
     if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
       if expected is RKLayout.FP16: return self._native_min(u, lhs, rhs)
       dst = self._alu_dst(u, dtype, RKLayout.INT16, ((u.src[0], lhs), (u.src[1], rhs)))
@@ -7867,7 +7887,7 @@ class RKContext:
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject
-    elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None:
+    elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None and self.accurate_adds:
       try: value = self._accurate_add(u)
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
@@ -7919,6 +7939,8 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
 
 def _expand_math_uops(root:UOp) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
+  composite_math = _fold_inverse_hyperbolic(root)
+  if composite_math is None: composite_math = _fold_atan(root)
   cache:dict[UOp, UOp] = {}
   exact_static_selection = root.op is Ops.WHERE and _is_static_expr(root.src[0]) and not any(
     node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and not math.isfinite(float(node.arg))
@@ -7934,6 +7956,7 @@ def _expand_math_uops(root:UOp) -> UOp:
       tagged[u] = mapped
       return mapped
     return tag_adds(rewritten[-1].src[0])
+  if composite_math is not None: root = physical_recipe(composite_math)
   def rewrite(u:UOp) -> UOp:
     if u in cache: return cache[u]
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
@@ -8062,22 +8085,35 @@ def _lower_host_scatter(uops:list[UOp]) -> RKImage|None:
     itemsize=out_param.dtype.scalar().itemsize, index_itemsize=index_itemsize)
   return RKImage(RKTarget.RK3588, host_scatters=(address,))
 
-def _lower_uop_program(uops:list[UOp]) -> RKImage|None:
+def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
   if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
+  if vectorize_reductions and (reduction:=_lower_vectorized_unrolled_add_reduction(uops, generic_only=True)) is not None:
+    return reduction
   if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool), allow_local=True)) is None or len(output[0].src) != 2:
     return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
+  if _fold_copysign(output[4]) is not None: return None
   try:
+    if (_fold_inverse_hyperbolic(output[4]) is None and _fold_atan(output[4]) is None and
+        any(u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) for u in uops)):
+      uops = _fp16_rewrite(uops)
+      if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool), allow_local=True)) is None: return None
+      recipes_ready = True
     if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
-    root = _expand_math_uops(_finite_max_neutral_selectors(_unroll_static_local(uops, output, reduced)))
+    root = _finite_max_neutral_selectors(_unroll_static_local(uops, output, reduced))
+    if not recipes_ready: root = _expand_math_uops(root)
     if len(root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
       if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool))) is None: return None
-    return RKContext(output).finish()
+    image = RKContext(output, accurate_adds=not recipes_ready).finish()
+    if any(len(items) > _RKIMAGE_U16_MAX for items in
+           (image.scratch, image.gathers, image.host_gathers, image.host_scatters, image.ew_ops, image.mid_gathers, image.post_gathers)):
+      return None
+    return image
   except (_RKGenericReject, RuntimeError, ValueError, KeyError):
     return None
 
@@ -8187,7 +8223,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (int16_loop_max_unpool:=_lower_loop_max_unpool(uops, int_loop_output, native_int16=True)) is not None: return int16_loop_max_unpool
   if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32
   if (unrolled_vector_dot:=_lower_unrolled_vector_dot_reduction(uops)) is not None: return unrolled_vector_dot
-  if (unrolled_map_reduce:=_lower_unrolled_mapped_add_reduction(uops)) is not None: return unrolled_map_reduce
+  if (unrolled_map_reduce:=_lower_vectorized_unrolled_add_reduction(uops)) is not None: return unrolled_map_reduce
   if (loop:=_loop_reduction_match(uops)) is not None:
     if (dot_reduction:=_lower_dot_loop_reduction(loop)) is not None: return dot_reduction
     if (lp_reduction:=_lower_lp_loop_reduction(loop)) is not None: return lp_reduction
@@ -9188,7 +9224,7 @@ class RockchipRenderer(Renderer):
              _lower_bounded_exact_fp16_copysign(uops) or _lower_tensor_pow(uops) or
              _lower_negative_constant_base_pow(uops) or
              _lower_std_mean_pair(uops) or _lower_unrolled_lp_cuberoot(uops) or _lower_rowwise_exp_reduction(uops) or
-             _lower_unrolled_mapped_add_reduction(uops) or _lower_mapped_add_loop_reduction(uops))
+             _lower_vectorized_unrolled_add_reduction(uops) or _lower_mapped_add_loop_reduction(uops))
     return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):

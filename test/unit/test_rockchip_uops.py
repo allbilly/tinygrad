@@ -1,7 +1,7 @@
 import math
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _lower_uop_program,
-  decode_image, encode_image)
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _NATIVE_SIGN,
+  _lower_uop_program, decode_image, encode_image)
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
@@ -160,6 +160,29 @@ def test_math_uops_own_multi_stage_recipes():
     image = _lower_uop_program(_program(dtypes.half, lambda i, op=op:UOp(op, dtypes.half, src=(source.index(i).load(),))))
     assert image is not None and len(image.ew_ops) > 1
     assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
+def test_generic_sign_recipe_owns_tagged_semantics():
+  source = UOp.param(1, dtypes.half, (4,))
+  def sign(i):
+    value = source.index(i).load()
+    return UOp(Ops.SUB, dtypes.half, src=(value, value), arg=_NATIVE_SIGN)
+  image = _lower_uop_program(_program(dtypes.half, sign))
+  assert image is not None and len(image.ew_ops) == 4
+  assert sum(op.compare for op in image.ew_ops) == 2
+
+
+def test_unrolled_math_reduction_vectorizes_periodic_indices():
+  out = UOp.param(0, dtypes.half, (1,))
+  lhs, rhs, weights = (UOp.param(1, dtypes.half, (8,)), UOp.param(2, dtypes.half, (8,)),
+                       UOp.param(3, dtypes.half, (2,)))
+  terms = [lhs.index(i).load().exp2() * rhs.index(i).load() * weights.index(i%2).load() for i in range(8)]
+  value = terms[0]
+  for term in terms[1:]: value = value + term
+  image = _lower_uop_program(list(out.index(0).store(value).sink().toposort()))
+  assert image is not None and image.mid_gathers
+  assert any(gather.src_index == 3 and gather.offsets == (0, 1, 0, 1, 0, 1, 0, 1) for gather in image.gathers)
+  assert len(image.ew_ops) < 300
 
 
 def test_static_reduce_uops_are_structurally_executed():
