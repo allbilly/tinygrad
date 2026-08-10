@@ -4941,3 +4941,27 @@ passed **60/60** immediately before the serial batch. The separate numerical `[0
 The upstream census now contains **422** unique method names because `test_cast_relu` was added after the earlier
 421-method baseline. `test_rockchip.py` selects **389** of them and collects **412** aliases; the corrected authoritative
 remainder is **33 of 422**. No compiler-only or numerically failing candidate was promoted.
+
+---
+
+## 2026-08-10 — promote the verified NLL case before further lowering
+
+The unresolved upstream candidates were screened as separate serial pytest processes so a failing or 30-second submit
+could not hide an independent pass. The unchanged `test_nll_loss` method passed physically in **3.40 s**, then passed
+again from the success-only `test_rockchip.py` suite in **3.46 s**. It is promoted to `TestRockchipLossOps`; the staging
+alias was removed from `test_rockchip2.py`.
+
+Four sparse-categorical-cross-entropy methods compiled but returned NaN at their first scalar reduction. NLL reduction
+timed out at the 30-second blocking-submit limit, weighted NLL exceeded the established FP16 tolerance, ignore-index NLL
+returned NaN, softmax-argmax still rejected an unsupported graph, and the scatter-prod fixture failed on the PyTorch
+FP16/FP32 dtype mismatch before NPU execution. Dynamic `masked_select` crashed its isolated Python process in the
+existing INT32 conversion path and remains staging-only. The vendor elementwise health check passed **60/60** after
+every failed process and after the promoted rerun; no reboot was used.
+
+The newly added upstream `test_cast_relu` census entry is tracked only in `test_rockchip2.py`; its current
+CMPLT/CAST/WHERE graph rejects during Rockchip compilation and is not counted as a pass.
+
+`test_rockchip.py` now collects **413 upstream-only aliases**, representing **390 unique upstream methods**. The
+authoritative remainder is **32 of 422**. No failed, compiler-only, or partially passing method was promoted. This
+promotion changes only the test census and documentation; it introduces no Tinygrad-core change, host numerical
+computation, LUT, CMAC, FP32 input, or tolerance relaxation.

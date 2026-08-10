@@ -35,7 +35,6 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
   test_sparse_categorical_crossentropy_reductions = _test_ops.TestOps.test_sparse_categorical_crossentropy_reductions
   test_sparse_categorical_crossentropy_ignore_index = _test_ops.TestOps.test_sparse_categorical_crossentropy_ignore_index
   test_sparse_categorical_crossentropy_label_smoothing = _test_ops.TestOps.test_sparse_categorical_crossentropy_label_smoothing
-  test_nll_loss = _test_ops.TestOps.test_nll_loss
   test_nll_loss_3d = _test_ops.TestOps.test_nll_loss_3d
   test_nll_loss_reductions = _test_ops.TestOps.test_nll_loss_reductions
   test_nll_loss_weight = _test_ops.TestOps.test_nll_loss_weight
@@ -90,6 +89,7 @@ class TestRockchipEdgeCandidates(_test_ops.TestOps):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
+  test_cast_relu = _test_ops.TestOpsUint8.test_cast_relu
   test_masked_select = _test_ops.TestOps.test_masked_select
   test_pow_const_direct = _test_ops.TestOps.test_pow_const_direct
   test_pow_int = _test_ops.TestOps.test_pow_int
