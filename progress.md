@@ -5048,3 +5048,28 @@ milestone after its earlier submit timeout.
 The implementation only inspects compile-time UOp topology and constants while constructing a DPU plan. It does not
 read tensor buffers or compute tensor values on the CPU, and adds no Tinygrad-core change, LUT, CMAC, FP32 input, or
 tolerance relaxation.
+
+---
+
+## 2026-08-10 — promote sparse label smoothing
+
+Sparse label smoothing is recognized from its lowered multiply-of-multiply coefficient rather than the obsolete
+one-hot CAST shape. Compile-only chain inspection explained the earlier timeout exactly: a nine-task mean-logit
+reduction and six dependent smoothing/masking stages occupied one ioctl, and the kernel stalled on task counter 14,
+the final stage. The first smoothing multiply now starts a stateful submit segment, matching the mathematical
+reduction-to-consumer boundary instead of imposing an arbitrary task limit.
+
+The unchanged upstream `test_sparse_categorical_crossentropy_label_smoothing` method passes physically in **4.96 s**
+and again from `test_rockchip.py` in **4.63 s**. `test_cross_entropy_smoothing` remains staged because one class-index
+variant differs by 0.0391, outside the established FP16 tolerance. The broader sparse method completed its default and
+combined ignore+smoothing cases, but its separate 3x12x10 batch variant timed out and therefore remains staged.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the failed sibling and broad-method runs,
+  and after final promotion. No reboot was used.
+- `test_rockchip.py`: **418 collected aliases**, representing **395 unique upstream methods**. The authoritative
+  remainder falls from 28 to **27 of 422**.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, collection, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **7,263/368 executable lines**, total **32,686**.
+
+The change remains static Rockchip plan construction. It reads no tensor values on the host and introduces no CPU
+result computation, Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance relaxation.

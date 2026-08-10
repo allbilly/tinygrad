@@ -4946,13 +4946,11 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
                    if load in target_loads and const.op is Ops.CONST and const.dtype.scalar() is dtypes.int}
   if len(ignore_values) > 1: return None
   ignore = next(iter(ignore_values), None)
-  target_coefficients = {float(const.arg) for const in nodes if const.op is Ops.CONST and
-    const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 <= float(const.arg) <= 1.0 for parent in parents.get(const, ())
-    if parent.op is Ops.MUL for other in parent.src if other is not const and other.op is Ops.CAST and
-    set(range(classes)).issubset({int(value.arg) for value in other.toposort() if value.op is Ops.CONST and
-                                 value.dtype.scalar() is dtypes.int})}
-  if len(target_coefficients) > 1: return None
-  smoothing = 1.0-next(iter(target_coefficients)) if target_coefficients else 0.0
+  smoothing_values = {float(const.arg) for const in nodes if const.op is Ops.CONST and
+    const.dtype.scalar() in (dtypes.half, dtypes.float) and 0.0 < float(const.arg) <= 1.0 for parent in parents.get(const, ())
+    if parent.op is Ops.MUL and any(other is not const and other.op is Ops.MUL for other in parent.src)}
+  if len(smoothing_values) > 1: return None
+  smoothing = next(iter(smoothing_values), 0.0)
   mean = out_count == 1 and (any(u.op in (Ops.FDIV, Ops.RECIPROCAL) for u in nodes) or
     any(u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
         _fp16_bits(abs(float(u.arg))) == _fp16_bits(1.0/rows) for u in nodes))
@@ -5012,7 +5010,7 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
                     RKGather(target.arg.slot, target_scale, rows, values=(_fp16_bits(1.0-smoothing),)*rows),
                     RKGather(target.arg.slot, smooth_scale, rows, values=(_fp16_bits(smoothing),)*rows)))
     scaled_logits, average_loss, target_loss, smooth_loss, combined = (scratch(rows*2) for _ in range(5))
-    ops.extend((RKEWOp(arg(scaled_logits), mean_logits, arg(inv_classes), rows, _EW_CFG[Ops.MUL], stateful=True),
+    ops.extend((RKEWOp(arg(scaled_logits), mean_logits, arg(inv_classes), rows, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
                 RKEWOp(arg(average_loss), arg(normalized), arg(scaled_logits), rows, _EW_CFG[Ops.SUB]),
                 RKEWOp(arg(target_loss), arg(loss), arg(target_scale), rows, _EW_CFG[Ops.MUL]),
                 RKEWOp(arg(smooth_loss), arg(average_loss), arg(smooth_scale), rows, _EW_CFG[Ops.MUL]),
