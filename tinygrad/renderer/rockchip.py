@@ -7764,15 +7764,21 @@ def _lower_tensor_pow(uops:list[UOp]) -> RKImage|None:
   if any(u.op is Ops.REDUCE for u in nodes): return None
 
   zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
+  reciprocal_base = any(u.op is Ops.FDIV and u.src[1].key == base.key and u.src[0].op is Ops.CONST and
+                        abs(float(u.src[0].arg)) == 1.0 for u in logarithm.src[0].toposort())
+  if reciprocal_base: exponent = zero.alu(Ops.SUB, exponent)
   absolute = UOp(Ops.MAX, dtypes.half, src=(base, base), arg=_NATIVE_ABS)
   base_nonzero = _finite_positive_mask(absolute)
   base_zero = one.alu(Ops.SUB, base_nonzero)
   exponent_positive = _finite_positive_mask(exponent)
+  exponent_negative = _finite_positive_mask(zero.alu(Ops.SUB, exponent))
   zero_positive = _mask_mul(base_zero, exponent_positive)
+  zero_negative = _mask_mul(base_zero, exponent_negative)
   effective_exponent = exponent.alu(Ops.MUL, one.alu(Ops.SUB, zero_positive))
   safe_base = _native_min(absolute.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)), UOp.const(65504.0, dtypes.half))
   magnitude = _dpu_exp2(effective_exponent.alu(Ops.MUL, _dpu_log2(safe_base)))
   magnitude = magnitude.alu(Ops.MUL, one.alu(Ops.SUB, zero_positive))
+  magnitude = magnitude.alu(Ops.ADD, zero_negative.alu(Ops.FDIV, one.alu(Ops.SUB, zero_negative)))
 
   infinite_base = _finite_positive_mask(absolute.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
   infinite_positive = _mask_mul(infinite_base, exponent_positive)

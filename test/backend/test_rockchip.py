@@ -371,6 +371,7 @@ class TestRockchipTensorPowerOps(unittest.TestCase):
   test_pow_const = _test_ops.TestOps.test_pow_const
   test_pow_int_base_float_exponent = _test_ops.TestOps.test_pow_int_base_float_exponent
   test_pow_neg_inf_frac_exponent = _test_ops.TestOps.test_pow_neg_inf_frac_exponent
+  test_pow_zero_const = _test_ops.TestOps.test_pow_zero_const
   test_pow_zero_exponent = _test_ops.TestOps.test_pow_zero_exponent
   test_pow_zero_tensor = _test_ops.TestOps.test_pow_zero_tensor
 

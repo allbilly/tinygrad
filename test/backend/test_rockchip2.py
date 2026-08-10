@@ -86,7 +86,6 @@ class TestRockchipEdgeCandidates(_test_ops.TestOps):
   test_masked_select = _test_ops.TestOps.test_masked_select
   test_pow_const_direct = _test_ops.TestOps.test_pow_const_direct
   test_pow_int = _test_ops.TestOps.test_pow_int
-  test_pow_zero_const = _test_ops.TestOps.test_pow_zero_const
   test_scatter_reduce_prod_zeros = _test_ops.TestOps.test_scatter_reduce_prod_zeros
 
 @_only_local_tests

@@ -5102,3 +5102,30 @@ opaque-byte gather packing.
 
 The CPU-cheat audit found only compile-time UOp/layout inspection in the renderer. Runtime gather code copies opaque
 lanes and performs no tensor arithmetic. There is no Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance change.
+
+---
+
+## 2026-08-10 — zero-base negative constant power
+
+Tinygrad lowers a negative constant exponent such as `x ** -0.3` as `(1/x) ** 0.3`. The Rockchip tensor-power matcher
+previously recovered the original base load but kept the positive exponent, so `0 ** -0.3` incorrectly became zero.
+It now recognizes the reciprocal-base form structurally and restores the negative exponent. A native DPU mask for
+`base == 0 && exponent < 0` adds `mask / (1-mask)`, yielding positive infinity without a LUT or host special case.
+
+The unchanged upstream `test_pow_zero_const` method passes all four zero-base cases and is promoted to
+`test_rockchip.py`; it passes there in **3.35 s**. The existing runtime-exponent `test_pow_zero_tensor` regression also
+passes, and the focused pair passes **2/2 in 4.86 s**. `test_pow_const_direct` remains staging-only because it is a
+gradient-only method under the forward-only contract; upstream itself skips `test_pow_int` as unsupported.
+
+Other branches contain earlier native no-LUT power work now already incorporated in this renderer. `~/npu` and
+`~/rk3588` prove EXP2 register operation but contain no additional power primitive or zero-base implementation to port.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after final physical testing; no
+  reboot was used.
+- `test_rockchip.py`: **421 collected aliases**, representing **398 unique upstream methods**. The authoritative
+  remainder falls from 25 to **24 of 422**.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, collection, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **7,269/368 executable lines**, total **32,692**.
+
+The change is confined to compile-time UOp recognition and DPU FP16 masks/FDIV. It adds no host tensor reads or
+arithmetic, Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance relaxation.
