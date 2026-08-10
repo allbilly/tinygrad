@@ -5275,3 +5275,24 @@ value; the DPU modulo path matches Tinygrad's low-byte cast semantics.
 The runtime change is zero: all arithmetic is encoded in `RKImage` at compile time and runs on DPU. Post-processing is
 the existing raw-byte gather only; there are no tensor-buffer reads, NumPy result calculations, LUTs, CMAC, FP32
 inputs, Tinygrad-core changes, or tolerance changes.
+
+---
+
+## 2026-08-10 — re-screen the post-uint8 upstream remainder
+
+The physical-success census remains **403 of 422** unique upstream `test_ops` methods, with **19 still absent** from
+`test_rockchip.py`. A serial no-CMAC screen of the current forward candidates produced no newly passing method, so no
+staging alias was promoted.
+
+- Eleven completed methods failed: both cross-entropy variants, all six staged transcendental variants,
+  `test_softmax_argmax`, `test_pow_const_direct`, and `test_scatter_reduce_prod_zeros`.
+- `test_masked_select` again spent over a minute in Tinygrad host rewrite/code generation before completing its first
+  staged method, so it was interrupted and remains a compiler-side runaway rather than a passing compiled case.
+- Upstream `test_pow_int` self-skipped. Four attention methods remain outside this screen under the no-CMAC contract,
+  and two backward-comparison methods remain outside the forward-only contract.
+- `test_scatter_reduce_prod_zeros` fails in the upstream Torch oracle before Tinygrad or the NPU because its FP32
+  destination and default-float source dtypes differ; it is not a Rockchip execution result.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the screen; no reboot was used.
+
+The screen changed no renderer, runtime, Tinygrad core, tolerance, or test placement. The unfinished softmax-argmax
+matcher remains a separate uncommitted milestone.
