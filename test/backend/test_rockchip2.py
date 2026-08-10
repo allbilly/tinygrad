@@ -32,13 +32,11 @@ class TestRockchipIndexedLossCandidates(_test_ops.TestOps):
   test_cross_entropy_reductions = _test_ops.TestOps.test_cross_entropy_reductions
   test_cross_entropy_smoothing = _test_ops.TestOps.test_cross_entropy_smoothing
   test_sparse_categorical_crossentropy = _test_ops.TestOps.test_sparse_categorical_crossentropy
-  test_sparse_categorical_crossentropy_ignore_index = _test_ops.TestOps.test_sparse_categorical_crossentropy_ignore_index
   test_sparse_categorical_crossentropy_label_smoothing = _test_ops.TestOps.test_sparse_categorical_crossentropy_label_smoothing
   test_nll_loss_3d = _test_ops.TestOps.test_nll_loss_3d
   test_nll_loss_reductions = _test_ops.TestOps.test_nll_loss_reductions
   test_nll_loss_weight = _test_ops.TestOps.test_nll_loss_weight
   test_nll_loss_3d_weight = _test_ops.TestOps.test_nll_loss_3d_weight
-  test_nll_loss_ignore_index = _test_ops.TestOps.test_nll_loss_ignore_index
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

@@ -4941,8 +4941,7 @@ def _lower_indexed_nll(uops:list[UOp]) -> RKImage|None:
       any(not 0 <= offset < int(source.src[0].arg) for offsets in candidate_offsets for offset in offsets)): return None
 
   ignore_values = {int(const.arg) for comparison in nodes if comparison.op is Ops.CMPNE and
-                   not any(parent.op is Ops.CMPNE and any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg)
-                                                          for x in parent.src) for parent in parents.get(comparison, ()))
+                   any(parent.op is Ops.CAST and parent.dtype.scalar() is dtypes.int for parent in parents.get(comparison, ()))
                    for load,const in (comparison.src, comparison.src[::-1])
                    if load in target_loads and const.op is Ops.CONST and const.dtype.scalar() is dtypes.int}
   if len(ignore_values) > 1: return None

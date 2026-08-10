@@ -5024,3 +5024,27 @@ renderer/runtime **7,266/368 executable lines**, total **32,689**.
 
 The change is confined to static Rockchip plan construction and the Rockchip test census. It adds no host tensor-value
 inspection or result arithmetic, Tinygrad-core change, LUT, CMAC, FP32 input, or tolerance relaxation.
+
+---
+
+## 2026-08-10 — promote native ignore-index losses
+
+Ignore-index recognition now follows the lowered graph's integer valid-count reduction: the ignored target comparison
+is the unique target/class predicate cast directly to INT32. This structural marker replaces the earlier nested-boolean
+heuristic and feeds the existing native INT16 class mask and FP16 DPU loss plan.
+
+The unchanged upstream `test_sparse_categorical_crossentropy_ignore_index` and `test_nll_loss_ignore_index` methods
+passed independently in **5.16 s** and **3.24 s**, then passed together from the success-only `test_rockchip.py` suite
+in **6.10 s**. Only these complete physical passes moved from `test_rockchip2.py`; the partially tested sparse method
+and the smoothing candidates remain staged. The experimental smoothing matcher was explicitly excluded from this
+milestone after its earlier submit timeout.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after promotion; no reboot was used.
+- `test_rockchip.py`: **417 collected aliases**, representing **394 unique upstream methods**. The authoritative
+  remainder falls from 30 to **28 of 422**.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, collection, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **7,265/368 executable lines**, total **32,688**.
+
+The implementation only inspects compile-time UOp topology and constants while constructing a DPU plan. It does not
+read tensor buffers or compute tensor values on the CPU, and adds no Tinygrad-core change, LUT, CMAC, FP32 input, or
+tolerance relaxation.
