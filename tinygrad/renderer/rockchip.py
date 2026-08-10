@@ -206,8 +206,9 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 
 _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
-_MAX_MAPPED_DOT_SCRATCH_BYTES = 256 << 20
+_MAX_MAPPED_DOT_SCRATCH_BYTES = 352 << 20
 _MAX_GENERIC_UNROLL = 512
+_MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 256
 _MAX_GENERIC_EXPANDED_NODES = 16384
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
 _FP16_EXACT_INTEGER = 1 << 11
@@ -1206,7 +1207,8 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
                           _EW_CFG[reduce_op], fp32_out, post_scale, prepare if negate_inputs else None)
 
 def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float,
-                                 group_shape:tuple[int, ...]=(), op_barriers:bool=False) -> RKImage|None:
+                                 group_shape:tuple[int, ...]=(), op_barriers:bool=False,
+                                 compensated_limit:int=_reduction_stride(1)//2) -> RKImage|None:
   """Retarget a vector map image into scratch, then append a row-wise ADD reduction."""
   if mapped.fill is not None or mapped.mid_gathers or mapped.post_gathers or not mapped.ew_ops: return None
   lanes = rows*groups
@@ -1243,7 +1245,7 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
                          dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
     gather_after = len(pre_ops)
     destination = RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, scaled_slot)
-    if 2 <= inner <= _reduction_stride(1)//2:
+    if 2 <= inner <= compensated_limit:
       def temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, index*stride)
       reduced = _compensated_add(ops, [group*stride for group in range(inner)], outer, arena, temporary, destination,
                                  op_barriers=op_barriers)
@@ -1600,15 +1602,19 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
   return _finish_mapped_add_reduction(mapped, out.arg.slot, 1, len(terms), post_scale,
                                       group_shape)
 
-def _lower_unrolled_vector_dot_reduction(uops:list[UOp]) -> RKImage|None:
-  """Materialize a bounded unrolled vector dot and preserve its balanced FP16 reduction order."""
+def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
+  """Execute repeated FP16 MUL UOps with product residuals, then compensate their physical ADD reduction."""
   if (output:=_output_store(uops, dtypes.half)) is None: return None
   store, out, rows, out_index, root = output
   if rows <= 1: return None
   bias:UOp|None = None
-  summed, post_scale = root, 1.0
-  if root.op is Ops.ADD:
-    for dot,candidate in (root.src, root.src[::-1]):
+  summed, post_scale, relu = root, 1.0, False
+  if root.op is Ops.WHERE and len(root.src) == 3 and root.src[0].op is Ops.CMPLT and \
+     len(root.src[0].src) == 2 and root.src[0].src[0].op is Ops.CONST and float(root.src[0].src[0].arg) == 0.0 and \
+     root.src[0].src[1].key == root.src[1].key and root.src[2].op is Ops.CONST and float(root.src[2].arg) == 0.0:
+    summed, relu = root.src[1], True
+  if summed.op is Ops.ADD:
+    for dot,candidate in (summed.src, summed.src[::-1]):
       candidate = _strip_cast(candidate)
       if (candidate.op is Ops.LOAD and candidate.dtype.scalar() is dtypes.half) or \
          (candidate.dtype.scalar() in (dtypes.half, dtypes.float) and _is_static_expr(candidate)):
@@ -1622,7 +1628,9 @@ def _lower_unrolled_vector_dot_reduction(uops:list[UOp]) -> RKImage|None:
   if summed.op is not Ops.ADD or not math.isfinite(post_scale): return None
   terms = tuple(_strip_cast(term) for term in _flatten_binary(summed, Ops.ADD))
   groups, lanes = len(terms), rows*len(terms)
-  if groups < 2 or 4*_scratch_bytes(lanes)+groups*_reduction_stride(rows) > _MAX_MAPPED_DOT_SCRATCH_BYTES: return None
+  chunk_lanes = _MAX_EW_ELEMS_FP16*(_reduction_stride(1)//2)
+  if groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or \
+     8*_scratch_bytes(lanes)+_scratch_bytes(min(chunk_lanes, lanes)) > _MAX_MAPPED_DOT_SCRATCH_BYTES: return None
 
   parsed:list[tuple[tuple[UOp, RKGather], tuple[UOp, RKGather]]] = []
   for term in terms:
@@ -1648,32 +1656,56 @@ def _lower_unrolled_vector_dot_reduction(uops:list[UOp]) -> RKImage|None:
     if pair_slots == slots: normalized.append(pair)
     elif pair_slots[::-1] == slots: normalized.append((pair[1], pair[0]))
     else: return None
-  gathers = tuple(replace(operand[1], dst_index=side, dst_addend=group*rows)
+  gathers = tuple(replace(operand[1], dst_index=side+1, dst_addend=group*rows)
                   for group,pair in enumerate(normalized) for side,operand in enumerate(pair))
-  chunk_lanes = _MAX_EW_ELEMS_FP16*(_reduction_stride(1)//2)
-  mapped_ops = tuple(RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot, start*2), RKArg(RKBufferKind.SCRATCH, 0, start*2),
-                            RKArg(RKBufferKind.SCRATCH, 1, start*2), min(chunk_lanes, lanes-start), _EW_CFG[Ops.MUL],
-                            submit_barrier=bool(start), stateful=True) for start in range(0, lanes, chunk_lanes))
-  mapped = RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(lanes)), RKScratch(_scratch_bytes(lanes))),
-                   gathers=gathers, ew_ops=mapped_ops)
-  finished = _finish_mapped_add_reduction(mapped, out.arg.slot, rows, groups, post_scale, op_barriers=True)
-  if finished is None or bias is None: return finished
-  if bias.op is Ops.LOAD:
-    bias_param = _root_param(bias.src[0]) if bias.src and bias.src[0].op is Ops.INDEX else None
-    if bias_param is None or bias_param.src[0].op is not Ops.CONST or int(bias_param.src[0].arg) != rows: return None
-    try: bias_offsets = _gather_offsets(out_index, bias.src[0].src[1], bias.src[2] if len(bias.src) > 2 else None, rows)
-    except RuntimeError: return None
-    if bias_offsets != tuple(range(rows)): return None
-    bias_arg = RKArg(RKBufferKind.ARG, bias_param.arg.slot)
-  else:
-    try: values = _static_values(out_index, bias, rows, _fp16_bits)
-    except RuntimeError: return None
-    bias_arg = RKArg(RKBufferKind.SCRATCH, len(finished.scratch))
-    finished = replace(finished, scratch=(*finished.scratch, RKScratch(_scratch_bytes(rows))),
-                       gathers=(*finished.gathers, RKGather(0, bias_arg.index, rows, values=values)))
-  add_bias = RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.ARG, out.arg.slot),
-                    bias_arg, rows, _EW_CFG[Ops.ADD], submit_barrier=True, stateful=True)
-  return replace(finished, ew_ops=(*finished.ew_ops, add_bias))
+  mapped_ops:list[RKEWOp] = []
+  splitter = RKArg(RKBufferKind.SCRATCH, 0)
+  for start in range(0, lanes, chunk_lanes):
+    count, offset = min(chunk_lanes, lanes-start), start*2
+    lhs, rhs = RKArg(RKBufferKind.SCRATCH, 1, offset), RKArg(RKBufferKind.SCRATCH, 2, offset)
+    lhs_high, rhs_high = RKArg(RKBufferKind.SCRATCH, 3, offset), RKArg(RKBufferKind.SCRATCH, 4, offset)
+    product = RKArg(RKBufferKind.ARG, out.arg.slot, offset)
+    error = RKArg(RKBufferKind.ARG, out.arg.slot, lanes*2+offset)
+    stages = ((product, lhs, rhs, Ops.MUL),
+              (lhs_high, lhs, splitter, Ops.MUL), (rhs_high, lhs_high, lhs, Ops.SUB),
+              (lhs_high, lhs_high, rhs_high, Ops.SUB), (lhs, lhs, lhs_high, Ops.SUB),
+              (rhs_high, rhs, splitter, Ops.MUL), (error, rhs_high, rhs, Ops.SUB),
+              (rhs_high, rhs_high, error, Ops.SUB), (rhs, rhs, rhs_high, Ops.SUB),
+              (error, lhs_high, rhs_high, Ops.MUL), (error, error, product, Ops.SUB),
+              (lhs_high, lhs_high, rhs, Ops.MUL), (error, error, lhs_high, Ops.ADD),
+              (rhs_high, lhs, rhs_high, Ops.MUL), (error, error, rhs_high, Ops.ADD),
+              (lhs, lhs, rhs, Ops.MUL), (error, error, lhs, Ops.ADD))
+    mapped_ops.extend(RKEWOp(dst, left, right, count, _EW_CFG[op], submit_barrier=i == 0 and bool(start), stateful=True)
+                      for i,(dst,left,right,op) in enumerate(stages))
+  mapped = RKImage(RKTarget.RK3588,
+    (RKScratch(_scratch_bytes(min(chunk_lanes, lanes))), *(RKScratch(_scratch_bytes(lanes)) for _ in range(4))),
+    struct.pack("<e", 65.0), gathers=gathers, ew_ops=tuple(mapped_ops))
+  finished = _finish_mapped_add_reduction(mapped, out.arg.slot, rows, groups*2, post_scale,
+                                           op_barriers=True, compensated_limit=groups*2)
+  if finished is None: return None
+  if bias is not None:
+    if bias.op is Ops.LOAD:
+      bias_param = _root_param(bias.src[0]) if bias.src and bias.src[0].op is Ops.INDEX else None
+      if bias_param is None or bias_param.src[0].op is not Ops.CONST or int(bias_param.src[0].arg) != rows: return None
+      try: bias_offsets = _gather_offsets(out_index, bias.src[0].src[1], bias.src[2] if len(bias.src) > 2 else None, rows)
+      except RuntimeError: return None
+      if bias_offsets != tuple(range(rows)): return None
+      bias_arg = RKArg(RKBufferKind.ARG, bias_param.arg.slot)
+    else:
+      try: values = _static_values(out_index, bias, rows, _fp16_bits)
+      except RuntimeError: return None
+      bias_arg = RKArg(RKBufferKind.SCRATCH, len(finished.scratch))
+      finished = replace(finished, scratch=(*finished.scratch, RKScratch(_scratch_bytes(rows))),
+                         gathers=(*finished.gathers, RKGather(0, bias_arg.index, rows, values=values)))
+    add_bias = RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.ARG, out.arg.slot),
+                      bias_arg, rows, _EW_CFG[Ops.ADD], submit_barrier=True, stateful=True)
+    finished = replace(finished, ew_ops=(*finished.ew_ops, add_bias))
+  if relu:
+    relu_image = RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(rows)),), struct.pack("<e", 0.0), ew_ops=(
+      RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.SCRATCH, 0),
+             rows, _EW_CFG[Ops.MAX]),))
+    if (finished:=_append_inplace_image(finished, relu_image)) is None: return None
+  return finished
 
 def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
   return _flatten_binary(root.src[0], op)+_flatten_binary(root.src[1], op) if root.op is op else [root]
@@ -8088,6 +8120,7 @@ def _lower_host_scatter(uops:list[UOp]) -> RKImage|None:
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
   if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
+  if vectorize_reductions and (mul_add:=_lower_vectorized_mul_add_reduction(uops)) is not None: return mul_add
   if vectorize_reductions and (reduction:=_lower_vectorized_unrolled_add_reduction(uops, generic_only=True)) is not None:
     return reduction
   if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool), allow_local=True)) is None or len(output[0].src) != 2:
@@ -8222,7 +8255,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (loop_pool_index:=_lower_loop_pool_index(uops, int_loop_output)) is not None: return loop_pool_index
     if (int16_loop_max_unpool:=_lower_loop_max_unpool(uops, int_loop_output, native_int16=True)) is not None: return int16_loop_max_unpool
   if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32
-  if (unrolled_vector_dot:=_lower_unrolled_vector_dot_reduction(uops)) is not None: return unrolled_vector_dot
+  if (unrolled_vector_dot:=_lower_vectorized_mul_add_reduction(uops)) is not None: return unrolled_vector_dot
   if (unrolled_map_reduce:=_lower_vectorized_unrolled_add_reduction(uops)) is not None: return unrolled_map_reduce
   if (loop:=_loop_reduction_match(uops)) is not None:
     if (dot_reduction:=_lower_dot_loop_reduction(loop)) is not None: return dot_reduction

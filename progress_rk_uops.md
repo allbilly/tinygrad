@@ -232,3 +232,24 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 28 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 17. Bounded product-residual reductions — complete
+
+- Added one generic physical path for 256-or-more repeated FP16 `MUL` terms followed by `ADD`, retaining each rounded
+  product's residual and compensating the final physical reduction.
+- Kept the rule semantic and composable: the path parses `MUL`, `ADD`, optional scalar/buffer bias, and the ordinary
+  `WHERE(CMPLT(0, x), x, 0)` UOps emitted for ReLU. It does not recognize GEMM or convolution shapes.
+- Materialized both operand streams through ordinary static gathers and bounded the complete scratch request before
+  accepting a program.
+- Restored the nested-convolution accuracy lost when milestone 11 capped the full expanded recipe. The old accurate path
+  required about 17,800 EW stages per kernel; the bounded path uses about 4,600 stages for each 288-term nested-convolution
+  reduction.
+- Retained enough product precision for the 256-by-256 GEMM tolerance without converting one semantic UOp into one ioctl.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 29 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchip::test_big_gemm test/backend/test_rockchip.py::TestRockchipConvOps::test_nested_conv2d -x -q -n0`: 2 passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py::TestRockchip test/backend/test_rockchip.py::TestRockchipConvOps -x -q -n0`: 73 passed, 6 skipped, 37 subtests passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

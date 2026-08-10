@@ -1,6 +1,6 @@
-import math
+import math, struct
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _NATIVE_SIGN,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _NATIVE_SIGN,
   _lower_uop_program, decode_image, encode_image)
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -202,6 +202,24 @@ def test_static_dot_reduce_owns_accurate_physical_recipe():
   reduced = UOp(Ops.REDUCE, dtypes.half, src=(term, axis), arg=(Ops.ADD,))
   image = _lower_uop_program(list(out.index(row).store(reduced).end(row, axis).sink().toposort()))
   assert image is not None and len(image.gathers) >= 6 and len(image.ew_ops) > 20
+
+
+def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
+  groups = 256
+  rows = 8
+  out = UOp.param(0, dtypes.half, (rows,))
+  lhs, rhs = UOp.param(1, dtypes.half, (rows*groups,)), UOp.param(2, dtypes.half, (rows*groups,))
+  lane = UOp.range(rows, 0)
+  terms = [lhs.index(lane*groups+k).load() * rhs.index(lane*groups+k).load() for k in range(groups)]
+  value = terms[0]
+  for term in terms[1:]: value = value + term
+  zero = UOp.const(0.0, dtypes.half)
+  value = (zero < value).where(value, zero)
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and image.constants == struct.pack("<eee", 1.0, 65.0, 0.0)
+  assert len(image.gathers) == groups*2 and image.gather_after == 17
+  assert len(image.mid_gathers) == groups*2 and len(image.ew_ops) > image.gather_after
+  assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MAX]
 
 
 def test_fp32_add_mul_tree_uses_half_expansion_at_output_boundary():
