@@ -2289,3 +2289,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 105. Slot immutable physical ABI records — complete
+
+- Reprofiled the dependent reduction after milestone 104. The hot path creates about 19k immutable `RKArg`,
+  `RKScratch`, `RKEWOp`, and related physical records, and generic frozen dataclass initialization alone cost 93 ms.
+- Made the renderer's frozen physical ABI and structural definition dataclasses slotted. No renderer/runtime code uses
+  dynamic attributes or `__dict__`; serialization remains explicitly field-based through `encode_image()`.
+- Frozen dataclass initialization fell from 93.4 to 8.4 ms (91.0%), scratch coloring fell from 306.9 to 279.5 ms
+  (8.9%), and total direct cProfile time fell from 1.149 to 1.118 seconds (2.7%). A warmed alternating benchmark of the
+  largest case improved from a 0.340-second median to 0.334 seconds (1.8%).
+- Scalar/vector/large dependent reductions, host-address gathering, and pinned raw-bit schedules produced image bytes
+  identical to milestone 104. Renderer size remains 4,677 executable lines, 5,556 lines or 54.3% below baseline;
+  runtime remains 480 lines. This changes Python record storage only and adds no CPU numeric semantics.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 5/5 physical record families byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.02 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

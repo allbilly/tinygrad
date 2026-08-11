@@ -27,18 +27,18 @@ class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 class RKLayout(IntEnum): FP16 = 0; INT16 = 1; BOOL_MASK = 2; INT32 = 3; BOOL_INT16 = 4; INT_FP16 = 5
 class RKExecutionClass(IntEnum): NATIVE = 0; HOST_ADDRESS = 1
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKArg: kind: RKBufferKind; index: int; addend: int = 0
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKValue:
   """Physical ABI. BOOL_MASK and bounded exact INT_FP16 values occupy FP16 scratch lanes."""
   arg: RKArg; dtype: DType; count: int; layout: RKLayout
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKScratch: size: int
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKGather:
   """Materialize an affine or fallback raw-lane index map."""
   src_index: int; dst_index: int; count: int; base: int = 0
@@ -54,14 +54,14 @@ class RKGather:
   src_kind: RKBufferKind = RKBufferKind.ARG
   after: int = -1  # EW-op split; -1 schedules the gather after the final stage
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKHostAddress:
   """Host-calculated raw-lane movement. It never owns numeric or reduction semantics."""
   src: RKArg; index: RKArg; dst: RKArg; count: int; src_count: int; dst_count: int
   itemsize: int = 2; index_itemsize: int = 4; fill_bits: int = 0
   index_limit: int = 0; base: int = 0; index_scale: int = 1; lane_stride: int = 0
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKEWOp:
   """One contiguous DPU elementwise operation."""
   dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int
@@ -69,7 +69,7 @@ class RKEWOp:
   int32_output: bool = False; int32_input: bool = False; bool_output: bool = False
   int16_output: bool = False; int16_input: bool = False
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKImage:
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""
   gathers: tuple[RKGather, ...] = (); ew_ops: tuple[RKEWOp, ...] = ()
@@ -180,10 +180,10 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
     host_gathers=tuple(remap_host(host) for host in image.host_gathers),
     host_scatters=tuple(remap_host(host) for host in image.host_scatters))
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKReloc: word: int; arg: RKArg
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RKStage: commands: tuple[int, ...]; relocs: tuple[RKReloc, ...]
 
 def encode_image(image:RKImage) -> bytes:
@@ -3819,7 +3819,7 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
   return _substitute_static_ranges(root, substitutions)
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _RKStaticLocalDef:
   initial:UOp; update_op:Ops; term:UOp; loops:tuple[UOp, ...]
 
