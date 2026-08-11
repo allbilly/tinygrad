@@ -467,3 +467,25 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 53 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 26. Large strict attention through bounded address plans and scratch lifetimes — complete
+
+- Extended the FP32-to-FP16 storage boundary to preserve semantic `EXP2`, `LOG2`, `SQRT`, and `SIN` UOps. Their
+  physical recipes remain owned by the corresponding UOp handler after the conversion boundary.
+- Added a compact divided-affine memory rule for addresses containing `RANGE // constant`. The GQA key/value broadcast
+  is represented by two gather axes instead of enumerating 1,048,576 static offsets.
+- Proved large contiguous output indices symbolically before attempting fallback enumeration, and materialized static
+  expressions that contain no `RANGE` exactly once. A million-lane constant expression no longer allocates a million
+  compile-time environments.
+- Added physical scratch lifetime coloring for the linear pre-gather plus EW schedule. UOps and all 2,494 physical GQA
+  stages remain unchanged, but dead intermediates reuse storage: the GQA image fell from 2,421 virtual scratch slots and
+  5,077,204,992 bytes to 89 physical slots and 186,646,528 bytes.
+- Added host-independent regressions for FP32 semantic math at a half storage boundary, compact divided-range address
+  plans, range-independent million-lane static values, and a 128-stage chain reusing dead `RKValue` storage.
+
+Verification:
+
+- Strict `TestRockchipAttentionOps`: 4 passed in 20.99s; strict GQA alone passed in 9.85s with the compacted image.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 57 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

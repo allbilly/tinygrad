@@ -94,6 +94,52 @@ class RKImage:
   def execution_class(self) -> RKExecutionClass:
     return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
 
+def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKImage:
+  """Color scratch lifetimes for the common pre-materialization followed by EW execution schedule."""
+  if image.mid_gathers or image.post_gathers or image.host_gathers or image.host_scatters or image.fill is not None: return image
+  events:dict[int, list[int]] = {}
+  def touch(arg:RKArg, event:int) -> None:
+    if arg.kind is RKBufferKind.SCRATCH: events.setdefault(arg.index, []).append(event)
+  for slot in constant_slots.values(): touch(RKArg(RKBufferKind.SCRATCH, slot), 0)
+  event = 1
+  for gather in image.gathers:
+    if not gather.values: touch(RKArg(gather.src_kind, gather.src_index), event)
+    touch(RKArg(gather.dst_kind, gather.dst_index), event)
+    event += 1
+  for op in image.ew_ops:
+    touch(op.lhs, event); touch(op.rhs, event); touch(op.dst, event)
+    event += 1
+  if not events: return replace(image, scratch=(), constants=b"")
+  if any(not 0 <= slot < len(image.scratch) for slot in events): raise ValueError("invalid virtual scratch slot")
+  intervals = sorted(((min(points), max(points), slot) for slot,points in events.items()), key=lambda item:(item[0], item[2]))
+  remap:dict[int, int] = {}
+  physical:list[RKScratch] = []
+  physical_end:list[int] = []
+  for start,end,slot in intervals:
+    spec = image.scratch[slot]
+    available = [index for index,last in enumerate(physical_end) if last < start]
+    if available:
+      target = min(available, key=lambda index:(max(physical[index].size, spec.size), index))
+      physical[target] = RKScratch(max(physical[target].size, spec.size), max(physical[target].alignment, spec.alignment))
+      physical_end[target] = end
+    else:
+      target = len(physical)
+      physical.append(spec); physical_end.append(end)
+    remap[slot] = target
+  def remap_arg(arg:RKArg) -> RKArg:
+    return replace(arg, index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg
+  gathers = tuple(replace(gather,
+    src_index=remap[gather.src_index] if not gather.values and gather.src_kind is RKBufferKind.SCRATCH else gather.src_index,
+    dst_index=remap[gather.dst_index] if gather.dst_kind is RKBufferKind.SCRATCH else gather.dst_index) for gather in image.gathers)
+  ew_ops = tuple(replace(op, dst=remap_arg(op.dst), lhs=remap_arg(op.lhs), rhs=remap_arg(op.rhs)) for op in image.ew_ops)
+  by_slot:dict[int, bytes] = {}
+  for bits,slot in constant_slots.items():
+    target = remap[slot]
+    if target in by_slot and by_slot[target] != bits: raise ValueError("overlapping scratch constants")
+    by_slot[target] = bits
+  constants = b"" if not by_slot else b"".join(by_slot.get(slot, b"\0\0") for slot in range(max(by_slot)+1))
+  return replace(image, scratch=tuple(physical), constants=constants, gathers=gathers, ew_ops=ew_ops)
+
 @dataclass(frozen=True)
 class RKReloc: word: int; arg: RKArg
 
@@ -753,6 +799,29 @@ def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
     elif r in coeffs: del coeffs[r]
   return lhs[0] + sign*rhs[0], coeffs
 
+def _divided_affine_index(u:UOp) -> tuple[int, dict[tuple[UOp, int], int]]|None:
+  """Represent static address arithmetic as a sum of scaled `range//divisor` terms."""
+  if u.op is Ops.CONST: return int(u.arg), {}
+  if u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int, dtypes.uint):
+    return _divided_affine_index(u.src[0])
+  if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {(u, 1):1}
+  if (u.op is Ops.CDIV and len(u.src) == 2 and u.src[0].op in (Ops.RANGE, Ops.SPECIAL) and
+      u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0):
+    return 0, {(u.src[0], int(u.src[1].arg)):1}
+  if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
+  lhs, rhs = _divided_affine_index(u.src[0]), _divided_affine_index(u.src[1])
+  if lhs is None or rhs is None: return None
+  if u.op is Ops.MUL:
+    if lhs[1] and rhs[1]: return None
+    scale, divided = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
+    return divided[0]*scale, {term:coefficient*scale for term,coefficient in divided[1].items()}
+  sign = -1 if u.op is Ops.SUB else 1
+  terms = lhs[1].copy()
+  for term,coefficient in rhs[1].items():
+    if (merged:=terms.get(term, 0)+sign*coefficient): terms[term] = merged
+    elif term in terms: del terms[term]
+  return lhs[0]+sign*rhs[0], terms
+
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
   if any(r not in ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
@@ -813,6 +882,18 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
     else:
       if expected == count and all(r in out_affine[1] for r in load_affine[1]):
         return RKGather(src_index, dst_index, count, load_affine[0], tuple(axes))
+  if gate is None and out_affine is not None and out_affine[0] == 0 and \
+     (load_divided:=_divided_affine_index(load_index)) is not None:
+    expected = 1
+    for r,dst_stride in sorted(out_affine[1].items(), key=lambda item:item[1]):
+      if dst_stride != expected or r.src[0].op is not Ops.CONST or (limit:=int(r.src[0].arg)) <= 0: break
+      expected *= limit
+    else:
+      if expected == count and all(r in out_affine[1] and divisor <= int(r.src[0].arg)
+                                   for r,divisor in load_divided[1]):
+        divided_axes = tuple((out_affine[1][r]*divisor, (int(r.src[0].arg)+divisor-1)//divisor, stride)
+                             for (r,divisor),stride in load_divided[1].items() if stride)
+        return RKGather(src_index, dst_index, count, load_divided[0], divided_axes)
   return RKGather(src_index, dst_index, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
 def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
@@ -7584,6 +7665,8 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
   if u.dtype.scalar() is not dtypes.float: raise _RKGenericReject
   if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.half: return u.src[0]
   if u.op is Ops.CONST: return UOp.const(float(u.arg), dtypes.half)
+  if u.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) and len(u.src) == 1:
+    return UOp(u.op, dtypes.half, src=(_fp32_expr_to_half(u.src[0]),), arg=u.arg)
   if u.op is Ops.MUL and len(u.src) == 2:
     return UOp(Ops.MUL, dtypes.half, src=tuple(_fp32_expr_to_half(src) for src in u.src))
   if u.op in (Ops.SUB, Ops.MAX) and len(u.src) == 2:
@@ -7715,6 +7798,12 @@ class RKContext:
 
   def _static(self, u:UOp, bool_layout:RKLayout=RKLayout.BOOL_MASK) -> RKValue:
     dtype = u.dtype.scalar()
+    if not _index_ranges(u):
+      scalar = _eval_expr(u, {}, {})
+      if dtype is dtypes.bool and bool_layout is RKLayout.BOOL_INT16:
+        value = self._constant(UOp.const(int(bool(scalar)), dtypes.int16))
+        return RKValue(value.arg, dtype, self.count, bool_layout)
+      return self._constant(UOp.const(scalar, dtype))
     if dtype is dtypes.half: vector, layout = _static_vector(self.out_index, u, self.count), RKLayout.FP16
     elif dtype is dtypes.int16: vector, layout = _static_values(self.out_index, u, self.count, _int16_bits), RKLayout.INT16
     elif dtype is dtypes.int:
@@ -8315,9 +8404,10 @@ class RKContext:
       by_slot = {slot:bits for bits,slot in self.constants.items()}
       constants = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot)+1))
     gather_after = min((g.after for g in self.mid_gathers if g.after >= 0), default=0)
-    return RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops),
-                   mid_gathers=tuple(self.mid_gathers), gather_after=gather_after, post_gathers=tuple(self.post_gathers),
-                   host_gathers=tuple(self.host_gathers))
+    image = RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops),
+                    mid_gathers=tuple(self.mid_gathers), gather_after=gather_after, post_gathers=tuple(self.post_gathers),
+                    host_gathers=tuple(self.host_gathers))
+    return _reuse_linear_scratch(image, self.constants)
 
 def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
   if reduce_op is Ops.ADD and dtype.scalar() is dtypes.half:
@@ -8705,7 +8795,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (prefix_add:=_lower_loop_int32_prefix_add(uops, output)) is not None: return prefix_add
   if _fold_copysign(output[4]) is not None: return None
   try:
-    if _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2])): return None
+    if (_contiguous_output_samples(output[3], output[2]) is None and
+        _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)

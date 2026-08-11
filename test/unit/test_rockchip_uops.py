@@ -2,7 +2,7 @@ import math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _EW_CFG_ABS, _NATIVE_SIGN,
-  _MAX_EW_ELEMS_FP16, _iter_range_env, _lower_uop_program, decode_image, encode_image)
+  _MAX_EW_ELEMS_FP16, _gather_plan, _iter_range_env, _lower_uop_program, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -391,6 +391,13 @@ def test_fp32_add_mul_tree_uses_half_expansion_at_output_boundary():
   assert image is not None and len(image.ew_ops) > 10
 
 
+def test_fp32_math_uop_converts_at_half_storage_boundary():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half,
+    lambda i:source.index(i).load().cast(dtypes.float).exp2().cast(dtypes.half)))
+  assert image is not None and len(image.ew_ops) > 10
+
+
 def test_fp32_boundary_activation_preserves_accurate_reduction():
   out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   lane = UOp.range(2, 0)
@@ -547,6 +554,32 @@ def test_static_range_environment_allocation_is_bounded():
   try: _iter_range_env(axes, max_envs=1024)
   except RuntimeError as error: assert "static_index_budget" in str(error)
   else: raise AssertionError("oversized static RANGE product was materialized")
+
+
+def test_large_range_independent_static_value_is_materialized_once():
+  image = _lower_uop_program(_program(dtypes.half,
+    lambda _i:UOp.const(0.0, dtypes.half) * UOp.const(-1.0, dtypes.half), count=1 << 20))
+  assert image is not None and not image.gathers and image.constants == struct.pack("<e", -0.0)
+
+
+def test_generic_ew_chain_reuses_dead_scratch_values():
+  source = UOp.param(1, dtypes.half, (1024,))
+  def chain(i):
+    value = source.index(i).load()
+    for _ in range(128): value = value * UOp.const(1.001, dtypes.half)
+    return value
+  image = _lower_uop_program(_program(dtypes.half, chain, count=1024))
+  assert image is not None and len(image.ew_ops) == 128 and len(image.scratch) <= 4
+
+
+def test_large_divided_range_address_uses_compact_gather_axes():
+  outer = UOp.range(16384, 1)
+  inner = UOp.range(64, 4, src=(outer,))
+  out_index = outer*64+inner
+  grouped = UOp(Ops.CDIV, dtypes.int, src=(outer, UOp.const(64, dtypes.int)))*1024+inner
+  plan = _gather_plan(1, 0, out_index, grouped, None, 1 << 20)
+  assert not plan.offsets and plan.base == 0
+  assert set(plan.axes) == {(1, 64, 1), (4096, 256, 1024)}
 
 
 def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):
