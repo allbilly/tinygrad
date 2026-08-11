@@ -8758,7 +8758,13 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if any(u.dtype.scalar() is dtypes.float for u in uops):
     sink = next((u for u in uops if u.op is Ops.SINK), None)
     if sink is not None:
-      storage_uops = list(graph_rewrite(sink, _pm_generic_storage_precision, name="rockchip generic storage precision").toposort())
+      storage_sink = sink
+      if (storage_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
+         storage_output[4].op is Ops.CAST and len(storage_output[4].src) == 1 and storage_output[4].src[0].dtype.scalar() is dtypes.float:
+        try: storage_sink = sink.substitute({storage_output[4]:_fp32_expr_to_half(storage_output[4].src[0])})
+        except _RKGenericReject: pass
+      storage_uops = list(graph_rewrite(storage_sink, _pm_generic_storage_precision,
+                                        name="rockchip generic storage precision").toposort())
       if (indexed:=dynamic_index_accumulation(storage_uops)) is not None: return indexed
   if vectorize_reductions and (mul_add:=_lower_vectorized_mul_add_reduction(uops)) is not None: return mul_add
   mapped_loop = _lower_mapped_add_loop_reduction(uops, generic_only=True) if vectorize_reductions else None

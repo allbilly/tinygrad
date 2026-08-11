@@ -489,3 +489,24 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 57 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 27. FP32 reduction semantics at the FP16 storage boundary — complete
+
+- Preserved the complete FP32 expression when a half output store consumes an FP32 accumulator. The generic storage
+  rule now lowers that semantic expression as one compensated multi-half recipe instead of independently narrowing
+  every `ADD` to a naive FP16 chain.
+- This is a typed storage-boundary rule shared by reductions and cumulative programs; it does not recognize einsum,
+  cumsum, or another tensor operation.
+- Fixed scalar einsum accumulation and both cumulative-sum precision cases. Together with the attention GQA fix in
+  milestone 26, all 26 failures from the latest measured prefix now have focused passing evidence; a new full census is
+  still required for the 252 tests that were not reached by that run.
+- Added a host-independent 64-term pure FP32 addition regression proving the half storage boundary emits a compensated
+  physical expansion rather than one EW stage per naive addition.
+
+Verification:
+
+- Strict `TestRockchipEinsumOps` plus `TestRockchipCumulativeOps`: 12 passed in 99.42s.
+- Strict `test_simple_cumsum`: 1 passed in 77.92s; strict `test_cumsum`: 1 passed in 5.97s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 58 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
