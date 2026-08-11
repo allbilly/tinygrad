@@ -626,45 +626,35 @@ def _static_int_vectors(out_index:UOp, exprs:tuple[UOp, ...], count:int) -> tupl
   order = np.argsort(dst)
   return tuple(tuple(int(x) for x in np.broadcast_to(_eval_vector(expr, vector_env, cache), len(envs))[order]) for expr in exprs)
 
-def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
+_LinearTerm = UOp|tuple[UOp, int]
+def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[_LinearTerm, int]]|None:
+  """Represent static address arithmetic as a sum of scaled RANGE or RANGE//constant terms."""
   if u.op is Ops.CONST: return int(u.arg), {}
-  if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {u: 1}
+  if divided and u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int, dtypes.uint):
+    return _linear_index(u.src[0], divided)
+  term:_LinearTerm|None = (u, 1) if divided and u.op in (Ops.RANGE, Ops.SPECIAL) else u if u.op in (Ops.RANGE, Ops.SPECIAL) else None
+  if divided and u.op is Ops.CDIV and len(u.src) == 2 and u.src[0].op in (Ops.RANGE, Ops.SPECIAL) and \
+     u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0: term = (u.src[0], int(u.src[1].arg))
+  if term is not None: return 0, {term:1}
   if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
-  lhs, rhs = _affine_index(u.src[0]), _affine_index(u.src[1])
+  lhs, rhs = _linear_index(u.src[0], divided), _linear_index(u.src[1], divided)
   if lhs is None or rhs is None: return None
   if u.op is Ops.MUL:
     if lhs[1] and rhs[1]: return None
     scale, affine = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
-    return affine[0]*scale, {r: coeff*scale for r, coeff in affine[1].items()}
-  sign = -1 if u.op is Ops.SUB else 1
-  coeffs = lhs[1].copy()
-  for r, coeff in rhs[1].items():
-    if (merged:=coeffs.get(r, 0) + sign*coeff): coeffs[r] = merged
-    elif r in coeffs: del coeffs[r]
-  return lhs[0] + sign*rhs[0], coeffs
-
-def _divided_affine_index(u:UOp) -> tuple[int, dict[tuple[UOp, int], int]]|None:
-  """Represent static address arithmetic as a sum of scaled `range//divisor` terms."""
-  if u.op is Ops.CONST: return int(u.arg), {}
-  if u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int, dtypes.uint):
-    return _divided_affine_index(u.src[0])
-  if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {(u, 1):1}
-  if (u.op is Ops.CDIV and len(u.src) == 2 and u.src[0].op in (Ops.RANGE, Ops.SPECIAL) and
-      u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0):
-    return 0, {(u.src[0], int(u.src[1].arg)):1}
-  if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
-  lhs, rhs = _divided_affine_index(u.src[0]), _divided_affine_index(u.src[1])
-  if lhs is None or rhs is None: return None
-  if u.op is Ops.MUL:
-    if lhs[1] and rhs[1]: return None
-    scale, divided = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
-    return divided[0]*scale, {term:coefficient*scale for term,coefficient in divided[1].items()}
+    return affine[0]*scale, {key:coefficient*scale for key,coefficient in affine[1].items()}
   sign = -1 if u.op is Ops.SUB else 1
   terms = lhs[1].copy()
-  for term,coefficient in rhs[1].items():
-    if (merged:=terms.get(term, 0)+sign*coefficient): terms[term] = merged
-    elif term in terms: del terms[term]
+  for key,coefficient in rhs[1].items():
+    if (merged:=terms.get(key, 0)+sign*coefficient): terms[key] = merged
+    elif key in terms: del terms[key]
   return lhs[0]+sign*rhs[0], terms
+
+def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
+  return typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(u))
+
+def _divided_affine_index(u:UOp) -> tuple[int, dict[tuple[UOp, int], int]]|None:
+  return typing_cast(tuple[int, dict[tuple[UOp, int], int]]|None, _linear_index(u, True))
 
 class RKStaticIndexEvaluator:
   """Share one compile-time output RANGE materialization across related static gather plans."""

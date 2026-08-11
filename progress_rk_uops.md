@@ -2772,3 +2772,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 130. Unify affine static-index analysis — complete
+
+- Replaced the separate affine and divided-affine recursive analyzers with one linear static-address analyzer. A typed
+  wrapper selects whether ordinary RANGE atoms or `RANGE//constant` atoms are admitted; CONST/ADD/SUB/MUL coefficient
+  propagation and cancellation now have one implementation.
+- This changes no runtime address behavior and introduces no host numeric evaluation. Eight ordinary, divided,
+  cancelled, casted, and deliberately non-affine expressions matched the old analyzers exactly; the compact
+  million-lane divided gather plan was also identical.
+- Renderer executable size fell from 4,575 to 4,564 lines. From the 10,233-line baseline, 5,669 lines are gone (55.4%);
+  runtime remains 480 lines.
+
+Verification:
+
+- Old/current analyzer comparison: 8/8 expressions and 1/1 divided gather plan identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.66 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
