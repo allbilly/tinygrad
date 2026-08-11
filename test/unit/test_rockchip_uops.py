@@ -5,7 +5,7 @@ from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, R
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
+  _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -844,6 +844,20 @@ def test_generic_ew_chain_reuses_dead_scratch_values():
     return value
   image = _lower_uop_program(_program(dtypes.half, chain, count=1024))
   assert image is not None and len(image.ew_ops) == 128 and len(image.scratch) <= 4
+
+
+def test_leading_vector_materialization_is_composed_into_initial_lane_gathers():
+  arg, vector, copied, arena = RKArg(RKBufferKind.ARG, 1), *(RKArg(RKBufferKind.SCRATCH, i) for i in range(3))
+  image = RKImage(RKTarget.RK3588, tuple(RKScratch(128) for _ in range(3)),
+    gathers=(RKGather(arg.index, vector.index, 4, axes=((1, 4, 1),)),),
+    ew_ops=(RKEWOp(copied, vector, vector, 4, _EW_CFG[Ops.MAX]),
+            RKEWOp(copied, arena, RKArg(arena.kind, arena.index, 32), 1, _EW_CFG[Ops.ADD]),
+            RKEWOp(RKArg(RKBufferKind.ARG, 0), copied, RKArg(arena.kind, arena.index, 64), 1, _EW_CFG[Ops.ADD])),
+    mid_gathers=tuple(RKGather(copied.index, arena.index, 1, base=lane, dst_addend=lane*32,
+                               src_kind=RKBufferKind.SCRATCH, after=1) for lane in range(4)), gather_after=1)
+  folded = _hoist_leading_vector_materialization(image)
+  assert len(folded.ew_ops) == 2 and not folded.mid_gathers and len(folded.gathers) == 5
+  assert tuple(gather.offsets for gather in folded.gathers[1:]) == ((0,), (1,), (2,), (3,))
 
 
 def test_scratch_reuse_spans_mid_gathers_without_aliasing_their_state():

@@ -1187,3 +1187,37 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 87 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 53. Delete scalar loop reduction recovery — complete
+
+- Disconnected the multi-scalar-local reduction recognizer first. `std_mean` then expanded a 13,125-iteration local
+  expression and hit Python recursion depth, so that bounded multi-accumulator structural executor remains required.
+- Also trialed deletion of the exact INT32 bounds-mask executor. Thirteen gather/fancy-index/validation cases passed,
+  but the extended gate stopped at cold `masked_select(size=4)`, so it was restored conservatively. Later diagnosis
+  showed that rejection was the independent masked-LOAD rewrite issue below; bounds-mask deletion remains a candidate.
+- Disconnected the ordinary scalar ADD/MUL/MAX loop recognizer. The generic mapped/local UOp paths passed the complete
+  reduction census numerically. The sole initial regression was `test_sum_full` using two submit segments instead of
+  the required one for its 16,384-lane NOOPT sum.
+- Added a physical scheduling peephole that composes a leading idempotent vector materialization with its dependent
+  lane gathers. It proves the removed vector is dead before redirecting those gathers to the original operand, so the
+  scalar EW chain starts without a synchronization split. This is a physical RKImage rule, not a tensor-op recognizer.
+- Deleted the scalar loop parser/executor's 40-line lowering body, its private 42-line reduction-image builder, and the
+  now-unreferenced spaced-gather and post-reduction sqrt/cuberoot helpers. SQRT/cuberoot semantics remain owned by the
+  generic UOp math recipes.
+- A cold-cache masked-select replay exposed a pre-existing rewrite issue hidden by cached images: an outer predicate
+  total was being merged into a dynamic LOAD gate. Generic masked-LOAD folding now declines when the outer predicate
+  has additional runtime LOAD dependencies, preserving that total as ordinary NPU WHERE/comparison execution.
+- No CPU numeric semantics were introduced. The new peephole changes only static gather scheduling, and runtime host
+  address work remains limited to reading indices, calculating bounded addresses, and copying raw typed lanes.
+- Reduced the renderer from 5,156 to 5,062 executable lines, another 94 lines. From the 10,233-line pre-deletion
+  baseline, 5,171 executable lines are gone (50.5%). The physical renderer diff is 32 insertions and 134 deletions;
+  runtime remains 488 executable lines.
+
+Verification:
+
+- Cold full `TestRockchipReductionOps`: 36 passed in 121.55s.
+- Cold one-hot/masked-select/nonzero gate: 5 passed in 73.60s.
+- Cold `test_sum_full`: one NPU submit contract restored; passed in 2.54s call time.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 88 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
