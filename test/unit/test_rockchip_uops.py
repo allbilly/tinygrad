@@ -851,7 +851,7 @@ def test_static_structural_expansion_is_bounded():
 def test_deep_generic_graph_canonicalization_is_iterative():
   value = UOp.const(0, dtypes.int)
   for _ in range(4096): value = value + UOp.const(1, dtypes.int)
-  rewritten = _finite_int_max_neutrals(value)
+  rewritten, _ = _finite_int_max_neutrals(value, value.toposort())
   assert rewritten.key == value.key
 
 

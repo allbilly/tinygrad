@@ -2161,3 +2161,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 99. Carry one dependency order through final canonicalization — complete
+
+- Reprofiled `test_dependent_reduction_range_preserves_vector_output_axis`. Its expanded 17.5k-node physical recipe
+  was still traversed separately by INT32-neutral detection, math no-op detection, final node sizing, and a synthetic
+  STORE/SINK rebuild used only to recreate the already-known `RKOutput` tuple.
+- Made the neutral and math passes consume the dependency order already owned by `_lower_uop_program()`, refreshing it
+  only when a pass actually returns a different root. Replaced the synthetic STORE/SINK plus `_output_store()` replay
+  with direct replacement of `RKOutput`'s value field; `RKContext` never consumed that temporary store or sink.
+- The direct cProfile workload fell from 2,059,999 to 1,647,957 calls (20.0%) and from 1.546 to 1.203 seconds (22.2%).
+  A warmed alternating AB/BA benchmark of the largest 128x128 case improved from a 0.389-second median to 0.366
+  seconds (5.7%).
+- Compared milestone-98/current images for scalar/vector/large dependent reductions plus SIN, BOOL `WHERE`, and INT32
+  MAX roots; all six were byte-identical. Renderer executable size fell from 4,689 to 4,688 lines. From the 10,233-line
+  baseline, 5,545 lines are gone (54.2%); runtime remains 480 lines. This only reuses compiler graph metadata and adds
+  no CPU numeric semantics.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 6/6 representative generic programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

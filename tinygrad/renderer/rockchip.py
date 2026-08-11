@@ -3651,9 +3651,8 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
       (terms[-1:] if len(terms) & 1 else [])
   return terms[0]
 
-def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
+def _expand_math_uops(root:UOp, nodes:dict[UOp, None], *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  nodes = root.toposort()
   bounded_recipes = len(nodes) <= _MAX_OPTIONAL_RECIPE_NODES
   if not bounded_recipes and not any(u.op in (Ops.WHERE, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.TRUNC) or
     u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and u.src[0].dtype.scalar() is dtypes.float for u in nodes): return root
@@ -3703,7 +3702,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
 
 _pm_fp32_sin_storage = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat(Ops.SIN, dtypes.float),)),
-   lambda root:_expand_math_uops(root)),
+   lambda root:_expand_math_uops(root, root.toposort())),
 ])
 
 def _finite_max_neutral_selectors(root:UOp) -> UOp:
@@ -3717,9 +3716,9 @@ def _finite_max_neutral_selectors(root:UOp) -> UOp:
     cache[node] = node.replace(src=src)
   return cache[root]
 
-def _finite_int_max_neutrals(root:UOp) -> UOp:
+def _finite_int_max_neutrals(root:UOp, nodes:dict[UOp, None]) -> tuple[UOp, dict[UOp, None]]:
   """Canonicalize INT32_MIN only while it acts as a structural MAX neutral in exact scratch arithmetic."""
-  if not any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min for u in root.toposort()): return root
+  if not any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min for u in nodes): return root,nodes
   cache:dict[tuple[UOp, bool], UOp] = {}
   stack:list[tuple[UOp, bool, bool]] = [(root, False, False)]
   while stack:
@@ -3734,7 +3733,7 @@ def _finite_int_max_neutrals(root:UOp) -> UOp:
     else:
       stack.append((u, under_max, True))
       stack.extend((src, active, False) for src in reversed(u.src))
-  return cache[(root, False)]
+  return cache[(root, False)], cache[(root, False)].toposort()
 
 def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
   cache:dict[UOp, UOp] = {}
@@ -4276,7 +4275,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
           try:
             source = storage_root.src[0]
             if not _has_runtime_address(source):
-              converted = _expand_math_uops(storage_root) if source.op is Ops.SIN else _canonical_half_storage(source)
+              converted = _expand_math_uops(storage_root, storage_root.toposort()) if source.op is Ops.SIN else _canonical_half_storage(source)
               storage_sink = sink.substitute({storage_root:converted})
           except _RKGenericReject: pass
       storage_sink = graph_rewrite(storage_sink, _pm_fp32_sin_storage, name="rockchip fp32 sin storage")
@@ -4306,20 +4305,20 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
     root = graph_rewrite(local_root, _pm_masked_loads, name="rockchip masked load materialization")
-    root = _finite_int_max_neutrals(_finite_max_neutral_selectors(root))
+    root = _finite_max_neutral_selectors(root)
     root_nodes = root.toposort()
+    root,root_nodes = _finite_int_max_neutrals(root, root_nodes)
     defer_nodes = storage_uops if storage_uops is not None else root_nodes
     defer_math = len(defer_nodes) > 256
-    if not recipes_ready and not defer_math:
-      root = _expand_math_uops(root, accurate_adds=storage_uops is None or storage_product_adds)
-    expanded_nodes = root.toposort()
+    if not recipes_ready and not defer_math and \
+       (expanded:=_expand_math_uops(root, root_nodes, accurate_adds=storage_uops is None or storage_product_adds)) is not root:
+      root,root_nodes = expanded,expanded.toposort()
+    expanded_nodes = root_nodes
     if len(expanded_nodes) > _MAX_GENERIC_EXPANDED_NODES:
       if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject(f"expanded nodes {len(expanded_nodes)}")
       return None
     if root is not output[4]:
-      store = output[0].replace(src=(output[0].src[0], root))
-      uops = list(UOp(Ops.SINK, src=(store,)).toposort())
-      if (output:=_output_store(uops, (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool))) is None: return None
+      output = (*output[:4], root)
     image = RKContext(output, expanded_nodes, accurate_adds=(not recipes_ready and (storage_uops is None or storage_product_adds) and
                                              len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
                                              not _has_runtime_address(output[4])),
