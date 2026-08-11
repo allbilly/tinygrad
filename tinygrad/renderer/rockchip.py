@@ -255,9 +255,9 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _MAX_MAPPED_DOT_SCRATCH_BYTES = 352 << 20
-_MAX_GENERIC_UNROLL = 512
+_MAX_GENERIC_UNROLL = 1024
 _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 64
-_MAX_GENERIC_EXPANDED_NODES = 16384
+_MAX_GENERIC_EXPANDED_NODES = 65535
 _MAX_STATIC_LOCAL_STEPS = 1 << 20
 _MAX_STATIC_RANGE_ENVS = 1 << 18
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
@@ -7711,6 +7711,8 @@ class RKContext:
     self.gather_slots:dict[tuple, RKValue] = {}
     self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
     self.int32_components:dict[RKArg, tuple[RKValue, ...]] = {}
+    self.fp16_components:dict[RKArg, tuple[RKValue, RKArg, RKArg]] = {}
+    self.fp16_ordered:dict[RKArg, tuple[RKArg, RKArg]] = {}
     self.gathers:list[RKGather] = []
     self.host_gathers:list[RKHostAddress] = []
     self.mid_gathers:list[RKGather] = []
@@ -8025,6 +8027,8 @@ class RKContext:
 
   def _compare(self, u:UOp) -> RKValue:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
+    if u.op in (Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_equality(u)
+    if u.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_less(u)
     if all(src.dtype.scalar() is dtypes.int for src in u.src):
       bounds = tuple(_exact_int_range(src) for src in u.src)
       if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(
@@ -8033,7 +8037,7 @@ class RKContext:
         recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in u.src), arg=u.arg)
         self._register_graph(recipe)
         value = self.lower(recipe)
-        if value.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
+        if value.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
         return value
       return self._int32_compare(u)
     if all(src.dtype.scalar() is dtypes.int16 for src in u.src):
@@ -8093,6 +8097,106 @@ class RKContext:
         self.ew_ops.append(RKEWOp(mask, constants[1], equal, self.count, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True))
       else: raise _RKGenericReject
     return RKValue(mask, dtypes.bool, self.count, RKLayout.BOOL_INT16)
+
+  def _fp16_equality(self, u:UOp) -> RKValue:
+    """Evaluate IEEE FP16 equality through raw bytes and native INT16 arithmetic, without reset-heavy compare stages."""
+    if u.op not in (Ops.CMPNE, Ops.CMPEQ) or len(u.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in u.src):
+      raise _RKGenericReject
+    values = tuple(self._operand(src, dtypes.half) for src in u.src)
+    if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
+    constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
+    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
+    lhs_low,lhs_high,lhs_nan = self._fp16_component_values(values[0])
+    rhs_low,rhs_high,rhs_nan = self._fp16_component_values(values[1])
+    low_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_low.arg, rhs_low.arg, constants[1].arg, self.count)
+    high_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_high, rhs_high, constants[1].arg, self.count)
+    either_nan, numeric, bits_equal, equal = (allocate() for _ in range(4))
+    integer = dict(int16_input=True, int16_output=True)
+    self.ew_ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, self.count, _EW_CFG[Ops.MAX], **integer),
+                        RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **integer),
+                        RKEWOp(bits_equal, low_equal, high_equal, self.count, _EW_CFG[Ops.MUL], **integer),
+                        RKEWOp(equal, bits_equal, numeric, self.count, _EW_CFG[Ops.MUL], **integer)))
+    if u.op is Ops.CMPNE:
+      unequal = allocate()
+      self.ew_ops.append(RKEWOp(unequal, constants[1].arg, equal, self.count, _EW_CFG[Ops.SUB], **integer))
+      equal = unequal
+    return RKValue(equal, dtypes.bool, self.count, RKLayout.BOOL_INT16)
+
+  def _fp16_component_values(self, value:RKValue) -> tuple[RKValue, RKArg, RKArg]:
+    """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
+    if value.layout is not RKLayout.FP16: raise _RKGenericReject
+    if value.arg in self.fp16_components: return self.fp16_components[value.arg]
+    low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
+    split_after = len(self.ew_ops)
+    for byte,part in enumerate((low, high)):
+      self.mid_gathers.append(RKGather(value.arg.index, part.arg.index, self.count,
+        base=value.arg.addend+byte, axes=((1, self.count, 2),), dst_stride=2,
+        src_kind=value.arg.kind, itemsize=1, after=split_after))
+    constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 123, 124, 127, 128)}
+    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
+    clean_high,nan = _fp16_high_and_nan(self.ew_ops, allocate, high.arg, low.arg,
+      constants[0].arg, constants[1].arg, constants[123].arg, constants[124].arg,
+      constants[127].arg, constants[128].arg, self.count)
+    self.fp16_components[value.arg] = low, clean_high, nan
+    return self.fp16_components[value.arg]
+
+  def _fp16_ordered_values(self, value:RKValue) -> tuple[RKArg, RKArg]:
+    """Map a classified FP16 lane to two unsigned bytes whose lexical order is IEEE numeric order."""
+    if value.arg in self.fp16_ordered: return self.fp16_ordered[value.arg]
+    low, clean_high, _ = self._fp16_component_values(value)
+    constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 127, 128, 255)}
+    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
+    integer = dict(int16_input=True, int16_output=True)
+    sign_delta, sign_positive, sign = (allocate() for _ in range(3))
+    positive_high, negative_high, high_delta, high_selected, ordered_high = (allocate() for _ in range(5))
+    negative_low, low_delta, low_selected, ordered_low = (allocate() for _ in range(4))
+    self.ew_ops.extend((
+      RKEWOp(sign_delta, clean_high, constants[127].arg, self.count, _EW_CFG[Ops.SUB], **integer),
+      RKEWOp(sign_positive, sign_delta, constants[0].arg, self.count, _EW_CFG[Ops.MAX], **integer),
+      RKEWOp(sign, sign_positive, constants[1].arg, self.count, _EW_CFG_MIN, **integer),
+      RKEWOp(positive_high, clean_high, constants[128].arg, self.count, _EW_CFG[Ops.ADD], **integer),
+      RKEWOp(negative_high, constants[255].arg, clean_high, self.count, _EW_CFG[Ops.SUB], **integer),
+      RKEWOp(high_delta, negative_high, positive_high, self.count, _EW_CFG[Ops.SUB], **integer),
+      RKEWOp(high_selected, sign, high_delta, self.count, _EW_CFG[Ops.MUL], **integer),
+      RKEWOp(ordered_high, positive_high, high_selected, self.count, _EW_CFG[Ops.ADD], **integer),
+      RKEWOp(negative_low, constants[255].arg, low.arg, self.count, _EW_CFG[Ops.SUB], **integer),
+      RKEWOp(low_delta, negative_low, low.arg, self.count, _EW_CFG[Ops.SUB], **integer),
+      RKEWOp(low_selected, sign, low_delta, self.count, _EW_CFG[Ops.MUL], **integer),
+      RKEWOp(ordered_low, low.arg, low_selected, self.count, _EW_CFG[Ops.ADD], **integer)))
+    self.fp16_ordered[value.arg] = ordered_high, ordered_low
+    return self.fp16_ordered[value.arg]
+
+  def _fp16_less(self, u:UOp) -> RKValue:
+    """Evaluate IEEE FP16 less-than as an ordered raw-byte comparison without reset-heavy compare stages."""
+    if u.op is not Ops.CMPLT or len(u.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in u.src):
+      raise _RKGenericReject
+    values = tuple(self._operand(src, dtypes.half) for src in u.src)
+    if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
+    constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
+    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
+    integer = dict(int16_input=True, int16_output=True)
+    ordered = tuple(self._fp16_ordered_values(value) for value in values)
+    nan = tuple(self._fp16_component_values(value)[2] for value in values)
+    less, equal = constants[0].arg, constants[1].arg
+    for lhs,rhs in zip(ordered[0], ordered[1]):
+      maximum, lhs_delta, rhs_delta, lhs_less, rhs_less, unequal, same, selected, next_less, next_equal = \
+        (allocate() for _ in range(10))
+      self.ew_ops.extend((RKEWOp(maximum, lhs, rhs, self.count, _EW_CFG[Ops.MAX], **integer),
+        RKEWOp(lhs_delta, maximum, lhs, self.count, _EW_CFG[Ops.SUB], **integer),
+        RKEWOp(rhs_delta, maximum, rhs, self.count, _EW_CFG[Ops.SUB], **integer),
+        RKEWOp(lhs_less, lhs_delta, constants[1].arg, self.count, _EW_CFG_MIN, **integer),
+        RKEWOp(rhs_less, rhs_delta, constants[1].arg, self.count, _EW_CFG_MIN, **integer),
+        RKEWOp(unequal, lhs_less, rhs_less, self.count, _EW_CFG[Ops.MAX], **integer),
+        RKEWOp(same, constants[1].arg, unequal, self.count, _EW_CFG[Ops.SUB], **integer),
+        RKEWOp(selected, equal, lhs_less, self.count, _EW_CFG[Ops.MUL], **integer),
+        RKEWOp(next_less, less, selected, self.count, _EW_CFG[Ops.MAX], **integer),
+        RKEWOp(next_equal, equal, same, self.count, _EW_CFG[Ops.MUL], **integer)))
+      less, equal = next_less, next_equal
+    either_nan, numeric, result = (allocate() for _ in range(3))
+    self.ew_ops.extend((RKEWOp(either_nan, nan[0], nan[1], self.count, _EW_CFG[Ops.MAX], **integer),
+                       RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **integer),
+                       RKEWOp(result, less, numeric, self.count, _EW_CFG[Ops.MUL], **integer)))
+    return RKValue(result, dtypes.bool, self.count, RKLayout.BOOL_INT16)
 
   def _raw_where(self, u:UOp, selector:RKValue, yes:RKValue, no:RKValue) -> RKValue:
     """Select arbitrary FP16 bit patterns with DPU INT16 byte arithmetic and raw layout gathers."""
@@ -8334,12 +8438,22 @@ class RKContext:
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
+      elif dtype is dtypes.half and source.layout is RKLayout.BOOL_INT16:
+        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
+        self._register_graph(recipe)
+        value = self.lower(recipe)
       elif dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
       elif dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16):
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
       elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT16:
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
+      elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT_FP16:
+        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
+        self._register_graph(recipe)
+        converted = self.lower(recipe)
+        if converted.layout is not RKLayout.FP16: raise _RKGenericReject
+        value = RKValue(converted.arg, dtype, self.count, RKLayout.INT_FP16)
       elif dtype is dtypes.int and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         if self.int_layout is RKLayout.INT_FP16:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
@@ -8358,6 +8472,9 @@ class RKContext:
       try: value = self._accurate_add(u)
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
+    elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): value = self._compare(u)
+    elif dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ) and \
+         all(src.dtype.scalar() is dtypes.bool for src in u.src): value = self._bool_binary(u)
     elif (dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ) and
           (ieee_recipe:=_ieee_comparison_mask(u)) is not None): value = self._ieee_bool(ieee_recipe)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
@@ -9482,7 +9599,6 @@ _pm_generic_storage_precision = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"),
    lambda x:x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
   (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)), _fold_bool_to_half),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),

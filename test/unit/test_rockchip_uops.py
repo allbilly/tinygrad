@@ -83,7 +83,15 @@ def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
     return UOp(Ops.CMPNE, dtypes.bool, src=(less, UOp.const(True, dtypes.bool)))
   image = _lower_uop_program(_program(dtypes.bool, greater_equal))
   assert image is not None and len(image.ew_ops) > 10
-  assert image.ew_ops[-1].int32_output and image.ew_ops[-1].bool_output
+  assert image.post_gathers and image.post_gathers[-1].itemsize == 1
+  assert not any(op.compare for op in image.ew_ops)
+
+
+def test_fp16_equality_uses_exact_raw_bytes_without_compare_resets():
+  lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() != rhs.index(i).load()))
+  assert image is not None and image.mid_gathers and image.post_gathers
+  assert not any(op.compare for op in image.ew_ops) and all(op.int16_input and op.int16_output for op in image.ew_ops)
 
 
 def test_generic_where_selects_infinity_without_mask_multiplication():
@@ -116,7 +124,7 @@ def test_generic_where_materializes_nan_only_on_selected_lanes():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:
     (source.index(i).load() < UOp.const(0.0, dtypes.half)).where(UOp.const(math.nan, dtypes.half), source.index(i).load())))
-  assert image is not None and any(op.submit_barrier for op in image.ew_ops)
+  assert image is not None and image.mid_gathers and not any(op.compare or op.submit_barrier for op in image.ew_ops)
 
 
 def test_nested_where_around_math_preserves_raw_uop_selection():
@@ -223,7 +231,8 @@ def test_generic_bool_store_has_explicit_boundary_conversion():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() < rhs.index(i).load()))
   assert image is not None
-  assert image.ew_ops[-1].int32_output and image.ew_ops[-1].bool_output
+  assert image.post_gathers and image.post_gathers[-1].itemsize == 1
+  assert not any(op.compare for op in image.ew_ops)
 
 
 def test_generic_int16_uses_canonical_native_layout():
@@ -309,7 +318,7 @@ def test_int32_where_constants_convert_at_the_output_boundary():
   image = _lower_uop_program(_program(dtypes.int, lambda i:
     (UOp.const(0.5, dtypes.half) < source.index(i).load()).where(UOp.const(4, dtypes.int), UOp.const(2, dtypes.int))))
   assert image is not None and len(image.ew_ops) > 3
-  assert image.ew_ops[-1].int32_output and not image.ew_ops[-1].int16_input
+  assert image.ew_ops[-1].int32_output and image.ew_ops[-1].int16_input
 
 
 def test_math_uops_own_multi_stage_recipes():

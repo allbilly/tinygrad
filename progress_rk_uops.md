@@ -530,3 +530,28 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 59 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 29. Exact composable FP16 comparison and larger structural RANGE execution — complete
+
+- Replaced reset-heavy FP16 `CMPEQ`/`CMPNE` and `CMPLT` stages with exact raw-byte UOp recipes. Equality canonicalizes
+  signed zero and rejects NaNs; ordering maps canonical FP16 bytes to an unsigned lexical key and masks unordered NaNs.
+- Cached each physical FP16 value's byte split, NaN classification, and sortable representation in `RKContext`, so
+  adjacent comparison and boolean UOps reuse the same physical `RKValue` components instead of rediscovering layout.
+- Kept boolean composition as boolean UOps and made `CAST(bool -> half/int)` an explicit BOOL_INT16 boundary recipe.
+  This prevents the generic storage path from recovering the former FP16 positive-mask graph dialect.
+- Raised the generic static RANGE budget to 1,024 iterations and the expanded-node budget to the RKImage 16-bit limit.
+  The 1,022-lane cumulative-index loop is now interpreted by the same local LOAD/STORE/MAX structural executor.
+- The 512-lane cumulative index image fell from 13,834 stages with 2,050 standalone compare stages to 25,624 native
+  INT16-composable stages with zero compare resets. The 1,022-lane image has 51,128 stages, also with zero compare
+  resets and below the RKImage limit.
+- Added/updated host-independent comparison, boolean-store, typed-`WHERE`, and nonfinite-selection regressions for the
+  canonical BOOL_INT16 ABI.
+
+Verification:
+
+- Strict `TestRockchipComparisonOps`: 5 passed in 30.16s.
+- Strict `TestRockchipCumulativeExtremaOps::test_simple_cummax`: 1 passed in 94.81s.
+- Strict `TestRockchipCumulativeExtremaOps`: 8 passed in 205.35s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 60 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
