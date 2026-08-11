@@ -1266,3 +1266,31 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 88 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 56. Keep comparison-derived integer sums in native INT16 — complete
+
+- Profiled the slowest current cold test, `TestRockchipNonzeroOps::test_nonzero`. Its instrumented 80.06s call made
+  69.39 million function calls: compilation consumed 38.68s, Rockchip rendering 20.46s, and runtime 35.04s. The
+  generated programs contained 9,070 synchronized gather points, 46,213 ioctls, and 36,784 buffer synchronizations.
+- Split all nine fixtures and inspected every serialized image. The 32x10 and 10x5x3 cases dominated at 34.24s and
+  21.41s in the instrumented diagnostic. Their unrolled prefix images repeatedly converted native `BOOL_INT16`
+  comparison results into `INT_FP16` through raw-byte WHERE recipes before adding them.
+- Made the physical ABI compositional at the program boundary: when a bounded integer result contains native FP16
+  comparisons, choose canonical INT16 scratch instead of INT_FP16. Boolean casts then remain their existing exact
+  0/1 INT16 lanes, ADD stays native INT16 DPU execution, and only the terminal output widens to INT32.
+- The first two prefix images fell from 158 total synchronization points to 42 and from 438 mid-gathers to 84.
+  Cold `test_nonzero` fell from 47.93s to 35.00s, about 27% faster.
+- Trialed a more aggressive per-UOp INT16 choice inside mixed INT32 programs. A large coordinate ADD correctly exposed
+  that its bounded WHERE operands had already materialized as INT32, so the over-broad experiment was removed rather
+  than inserting implicit reinterpretation or host arithmetic.
+- No CPU numeric semantics were introduced. Comparison, cast, prefix ADD, coordinate selection, and terminal widening
+  all execute on DPU. This performance milestone adds one executable renderer line, taking it from 5,042 to 5,043;
+  runtime remains 488 executable lines.
+
+Verification:
+
+- Cold full `TestRockchipNonzeroOps::test_nonzero`: 1 passed in 35.00s call time.
+- Cold nonzero-size/masked-select/one-hot gate: 4 passed in 22.16s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 89 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

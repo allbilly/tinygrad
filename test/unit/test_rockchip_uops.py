@@ -531,6 +531,14 @@ def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():
   assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
 
 
+def test_bounded_sums_of_native_half_comparisons_stay_int16_until_output():
+  out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (4,))
+  terms = [(source.index(i).load() < UOp.const(0.5, dtypes.half)).cast(dtypes.int) for i in range(4)]
+  image = _lower_uop_program(list(out.index(0).store(terms[0]+terms[1]+terms[2]+terms[3]).sink().toposort()))
+  assert image is not None and len(image.mid_gathers) == 10 and len({g.after for g in image.mid_gathers}) == 5
+  assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
+
+
 def test_fp32_pure_add_tree_uses_compensated_half_expansion_at_output_boundary():
   source = UOp.param(1, dtypes.half, (64,))
   terms = [source.index(i).load().cast(dtypes.float) for i in range(64)]

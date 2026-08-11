@@ -2914,12 +2914,13 @@ class RKContext:
     nodes = self.root.toposort()
     int_range = _exact_int_range(self.root) if self.root.dtype.scalar() is dtypes.int else None
     packed_bool_load = any(node.op is Ops.LOAD and node.dtype.scalar() is dtypes.bool and _root_param(node.src[0]) is not None for node in nodes)
+    native_bool = any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in node.src) for node in nodes)
     embedded_half_int = any(node.op is Ops.CAST and node.dtype.scalar() is dtypes.int and len(node.src) == 1 and
                             node.src[0].dtype.scalar() in (dtypes.half, dtypes.bool) for node in nodes)
     dynamic_int_load = any(node.op is Ops.LOAD and node.dtype.scalar() is dtypes.int and node.src and
                            _root_param(node.src[0]) is not None for node in nodes)
     self.int_layout = (RKLayout.INT32 if self.root.dtype.scalar() is dtypes.int and dynamic_int_load else
-                       RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and packed_bool_load and int_range is not None and
+                       RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and (packed_bool_load or native_bool) and int_range is not None and
                        -32768 <= int_range[0] <= int_range[1] <= 32767 else
                        RKLayout.INT_FP16 if self.root.dtype.scalar() is dtypes.int and int_range is not None and
                        -2048 <= int_range[0] <= int_range[1] <= 2048 else
