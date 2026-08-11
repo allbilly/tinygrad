@@ -2654,3 +2654,20 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 124. Delete final one-read INT_FP16 locals — complete
+
+- Removed the remaining one-read UOp/value locals in bounded integer comparison, FP16-backed integer CAST, and
+  INT_FP16 CMOD. Each recipe is lowered exactly once and its physical argument is consumed directly where required.
+- Bounded integer comparison, half→INT_FP16, and INT_FP16 remainder programs produced RKImages byte-identical to
+  milestone 123.
+- Renderer executable size fell from 4,618 to 4,615 lines. From the 10,233-line baseline, 5,618 lines are gone (54.9%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 affected RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.74 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

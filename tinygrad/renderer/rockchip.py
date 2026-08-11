@@ -3098,8 +3098,7 @@ class RKContext:
       if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(
         bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds
       ):
-        recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg)
-        value = self.lower(recipe)
+        value = self.lower(UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg))
         if value.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
         return value
       return self._int32_compare(u.replace(src=sources))
@@ -3502,8 +3501,7 @@ class RKContext:
         if self.int_layout is RKLayout.INT_FP16:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
           else:
-            converted = self.lower(_int_fp16_expr(u))
-            value = RKValue(converted.arg, dtype, self.count, self.int_layout)
+            value = RKValue(self.lower(_int_fp16_expr(u)).arg, dtype, self.count, self.int_layout)
         elif self.int_layout is RKLayout.INT16:
           value = self._scratch(dtype, self.int_layout)
           self.ew_ops.append(RKEWOp(value.arg, source.arg, source.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int16_output=True))
@@ -3523,8 +3521,7 @@ class RKContext:
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
-      converted = self.lower(_int_fp16_expr(u))
-      value = RKValue(converted.arg, dtype, self.count, self.int_layout)
+      value = RKValue(self.lower(_int_fp16_expr(u)).arg, dtype, self.count, self.int_layout)
     elif u.op is Ops.WHERE: value = self._where(u)
     elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)
     else: raise _RKGenericReject(f"uop {u.op.name} {dtype}")
