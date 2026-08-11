@@ -4896,6 +4896,14 @@ def _dpu_periodic_reduce_parts(source:UOp, reciprocal_period:float, split:tuple[
   bounded, multiple, _ = _dpu_periodic_reduce(source, reciprocal_period, split, half_period)
   return _precise_add_parts([bounded, *(multiple.alu(Ops.MUL, UOp.const(-coefficient, dtypes.half)) for coefficient in split)])
 
+def _dpu_reflected_angle(reduced:UOp, one:UOp) -> tuple[UOp, UOp, UOp]:
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
+  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
+  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
+    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
+  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
+  return angle, angle.alu(Ops.MUL, angle), reflected
+
 def _dpu_sin(source:UOp) -> UOp:
   """Approximate FP16 SIN without LUTs using Cody-Waite reduction and an odd polynomial."""
   one = UOp.const(1.0, dtypes.half)
@@ -4928,12 +4936,7 @@ def _dpu_sin(source:UOp) -> UOp:
     source = source.cast(dtypes.half)
     _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), period_split, math.pi)
     invalid = source.alu(Ops.MUL, UOp.const(0.0, dtypes.half))
-  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
-  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
-    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
-  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
-  square = angle.alu(Ops.MUL, angle)
+  angle, square, reflected = _dpu_reflected_angle(reduced, one)
   polynomial = UOp.const(1/362880, dtypes.half)
   for coefficient in (-1/5040, 1/120, -1/6, 1.0):
     polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
@@ -4953,12 +4956,7 @@ def _dpu_cos(source:UOp) -> UOp:
   source = source.cast(dtypes.half)
   one = UOp.const(1.0, dtypes.half)
   _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
-  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
-  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
-    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
-  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
-  square = angle.alu(Ops.MUL, angle)
+  _, square, reflected = _dpu_reflected_angle(reduced, one)
   polynomial = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320))
   sign = one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
   return polynomial.alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
@@ -4993,11 +4991,7 @@ def _dpu_tan(source:UOp) -> UOp:
 
   _, _, broad = _dpu_periodic_reduce(source, 1/(2*math.pi),
     (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
-  broad_magnitude = UOp(Ops.MAX, dtypes.half, src=(broad, broad), arg=_NATIVE_ABS)
-  reflected = _positive_mask(broad_magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
-  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, broad_magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
-    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
-  angle = _mask_mul(broad_magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
+  angle, _, reflected = _dpu_reflected_angle(broad, one)
   broad_pole = UOp.const(1.5703125, dtypes.half).alu(Ops.SUB, angle).alu(
     Ops.ADD, UOp.const(math.pi/2-1.5703125, dtypes.half))
   broad_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, broad)).alu(Ops.MUL, UOp.const(2.0, dtypes.half))).alu(
@@ -5021,18 +5015,21 @@ def _dpu_pow2_integer(exponent:UOp) -> UOp:
     quotient = half
   return scale
 
+def _dpu_exp2_bounded(bounded:UOp) -> UOp:
+  integer = _native_floor(bounded)
+  fraction = bounded.alu(Ops.SUB, integer)
+  polynomial = UOp.const(0.0013333558, dtypes.half)
+  for coefficient in (0.0096181291, 0.0555041087, 0.2402265069, 0.6931471806, 1.0):
+    polynomial = polynomial.alu(Ops.MUL, fraction).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
+  return polynomial.alu(Ops.MUL, _dpu_pow2_integer(integer))
+
 def _dpu_exp2(source:UOp) -> UOp:
   """Approximate FP16 EXP2 without LUTs using native FLOOR, Horner arithmetic, and exact exponent scaling."""
   source = source.cast(dtypes.half)
   mask_fn = _positive_mask if source.op in (Ops.INDEX, Ops.LOAD) else _finite_positive_mask
   one = UOp.const(1.0, dtypes.half)
   bounded = _native_min(source.alu(Ops.MAX, UOp.const(-24.0, dtypes.half)), UOp.const(15.9921875, dtypes.half))
-  integer = _native_floor(bounded)
-  fraction = bounded.alu(Ops.SUB, integer)
-  polynomial = UOp.const(0.0013333558, dtypes.half)
-  for coefficient in (0.0096181291, 0.0555041087, 0.2402265069, 0.6931471806, 1.0):
-    polynomial = polynomial.alu(Ops.MUL, fraction).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
-  result = polynomial.alu(Ops.MUL, _dpu_pow2_integer(integer))
+  result = _dpu_exp2_bounded(bounded)
   below = mask_fn(UOp.const(-24.0, dtypes.half).alu(Ops.SUB, source))
   above = mask_fn(source.alu(Ops.SUB, UOp.const(15.9921875, dtypes.half)))
   finite = _mask_mul(result, one.alu(Ops.SUB, below))
@@ -5042,12 +5039,7 @@ def _dpu_exp2_nonpositive(source:UOp) -> UOp:
   """Approximate EXP2 for a known nonpositive finite-or-negative-infinite input without domain comparisons."""
   source = source.cast(dtypes.half)
   bounded = _native_min(source.alu(Ops.MAX, UOp.const(-24.0, dtypes.half)), UOp.const(0.0, dtypes.half))
-  integer = _native_floor(bounded)
-  fraction = bounded.alu(Ops.SUB, integer)
-  polynomial = UOp.const(0.0013333558, dtypes.half)
-  for coefficient in (0.0096181291, 0.0555041087, 0.2402265069, 0.6931471806, 1.0):
-    polynomial = polynomial.alu(Ops.MUL, fraction).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
-  return polynomial.alu(Ops.MUL, _dpu_pow2_integer(integer))
+  return _dpu_exp2_bounded(bounded)
 
 def _fold_masked_exp2(x:UOp) -> UOp|None:
   """Move a static `-inf` padding mask outside EXP2 so cumulative exponentials remain compact."""

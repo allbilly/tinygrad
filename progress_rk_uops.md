@@ -1943,3 +1943,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 88. Share repeated math UOp recipe fragments — complete
+
+- SIN, COS, and TAN each rebuilt the same absolute-angle reflection around pi/2. Added one
+  `_dpu_reflected_angle()` UOp recipe fragment and reused it in all three handlers.
+- Normal and statically masked EXP2 each rebuilt the same bounded fractional polynomial and exact integer-power
+  scaling. Added one `_dpu_exp2_bounded()` recipe fragment and retained domain masking in the owning EXP2 handlers.
+- Compared milestone-87/current graph keys for half SIN, FP32 additive SIN, COS, TAN, EXP2, and nonpositive EXP2.
+  Every generated semantic UOp graph was identical, including 735 nodes in the largest FP32 SIN recipe.
+- Renderer executable size fell from 4,736 to 4,726 lines. From the 10,233-line baseline, 5,507 executable renderer
+  lines are gone (53.8%); runtime remains 480 lines. These helpers only construct UOps and introduce no CPU numeric
+  semantics.
+
+Verification:
+
+- Old/current UOp graph-key comparison: 6/6 math recipes identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.24 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
