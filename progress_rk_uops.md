@@ -1617,3 +1617,22 @@ Verification:
   bitcasts, INT16 masks, byte logic, serialization, and scratch scheduling.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 73. Delete unused UOp use-count registration — complete
+
+- Audited every `RKContext.use_counts` read and write. `_register_graph` walked each root and every generated recipe,
+  merged source-use counts into the context, and no allocator, cache, lowering handler, or scheduler ever read them.
+- Deleted the counter, registration method, initial root walk, and all 19 recipe-registration calls. Recipe UOps are
+  still lowered through the same memoized `values` map; scratch lifetime reuse remains an RKImage scheduling pass and
+  never depended on semantic graph use counts.
+- Renderer executable size fell from 4,848 to 4,822 lines. From the 10,233-line baseline, 5,411 executable lines are
+  gone (52.9%); runtime remains 484 lines. The physical diff is exactly 27 deletions with no replacement code.
+- No CPU numeric semantics or generated DPU task changed. The required standalone NPU health check still times out,
+  so hardware-sensitive recognizer replay remains pending reboot while static dead-code work continues.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `.venv/bin/python ~/rk3588/examples/elementwise.py`: timed out in `DRM_IOCTL_RKNPU_SUBMIT` (device still needs reboot).
