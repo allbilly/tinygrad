@@ -2704,6 +2704,8 @@ class RKContext:
                                   _scratch_bytes(self.count) if size is None else size))
     return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
 
+  def _int16_arg(self) -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
+
   def _dst(self, u:UOp, dtype:DType, layout:RKLayout) -> RKValue:
     if (u is self.root and self.out_param.dtype.scalar() is dtype and
         (dtype is dtypes.half and layout is RKLayout.FP16 or dtype is dtypes.int16 and layout is RKLayout.INT16 or
@@ -3176,21 +3178,20 @@ class RKContext:
       return value
     lhs, rhs = (operand(src) for src in u.src)
     lhs_bytes, rhs_bytes = self._int32_bytes(lhs), self._int32_bytes(rhs)
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
     constants = {value:self._constant(UOp.const(value, dtypes.int16)).arg for value in (0, 1, 127, 128, 256)}
     if u.op is Ops.CMPLT:
-      mask = _int32_less_mask(self.ew_ops, allocate, constants, [value.arg for value in lhs_bytes[::-1]],
+      mask = _int32_less_mask(self.ew_ops, self._int16_arg, constants, [value.arg for value in lhs_bytes[::-1]],
                               [value.arg for value in rhs_bytes[::-1]], self.count)
     else:
       equal = constants[1]
       for left,right in zip(lhs_bytes, rhs_bytes):
-        byte_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, left.arg, right.arg, constants[1], self.count)
-        selected = allocate()
+        byte_equal = _ew_native_int16_eq_mask(self.ew_ops, self._int16_arg, left.arg, right.arg, constants[1], self.count)
+        selected = self._int16_arg()
         self.ew_ops.append(RKEWOp(selected, equal, byte_equal, self.count, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
         equal = selected
       if u.op is Ops.CMPEQ: mask = equal
       elif u.op is Ops.CMPNE:
-        mask = allocate()
+        mask = self._int16_arg()
         self.ew_ops.append(RKEWOp(mask, constants[1], equal, self.count, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True))
       else: raise _RKGenericReject
     return RKValue(mask, dtypes.bool, self.count, RKLayout.BOOL_INT16)
@@ -3202,18 +3203,17 @@ class RKContext:
     values = tuple(self._operand(src, dtypes.half) for src in u.src)
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
     lhs_low,lhs_high,lhs_nan = self._fp16_component_values(values[0])
     rhs_low,rhs_high,rhs_nan = self._fp16_component_values(values[1])
-    low_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_low.arg, rhs_low.arg, constants[1].arg, self.count)
-    high_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_high, rhs_high, constants[1].arg, self.count)
-    either_nan, numeric, bits_equal, equal = (allocate() for _ in range(4))
+    low_equal = _ew_native_int16_eq_mask(self.ew_ops, self._int16_arg, lhs_low.arg, rhs_low.arg, constants[1].arg, self.count)
+    high_equal = _ew_native_int16_eq_mask(self.ew_ops, self._int16_arg, lhs_high, rhs_high, constants[1].arg, self.count)
+    either_nan, numeric, bits_equal, equal = (self._int16_arg() for _ in range(4))
     self.ew_ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
                         RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
                         RKEWOp(bits_equal, low_equal, high_equal, self.count, _EW_CFG[Ops.MUL], **_INT16_EW),
                         RKEWOp(equal, bits_equal, numeric, self.count, _EW_CFG[Ops.MUL], **_INT16_EW)))
     if u.op is Ops.CMPNE:
-      unequal = allocate()
+      unequal = self._int16_arg()
       self.ew_ops.append(RKEWOp(unequal, constants[1].arg, equal, self.count, _EW_CFG[Ops.SUB], **_INT16_EW))
       equal = unequal
     return RKValue(equal, dtypes.bool, self.count, RKLayout.BOOL_INT16)
@@ -3224,8 +3224,7 @@ class RKContext:
     if value.arg in self.fp16_components: return self.fp16_components[value.arg]
     low, high = self._raw_bytes(value)
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 123, 124, 127, 128)}
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-    clean_high,nan = _fp16_high_and_nan(self.ew_ops, allocate, high.arg, low.arg,
+    clean_high,nan = _fp16_high_and_nan(self.ew_ops, self._int16_arg, high.arg, low.arg,
       constants[0].arg, constants[1].arg, constants[123].arg, constants[124].arg,
       constants[127].arg, constants[128].arg, self.count)
     self.fp16_components[value.arg] = low, clean_high, nan
@@ -3236,10 +3235,9 @@ class RKContext:
     if value.arg in self.fp16_ordered: return self.fp16_ordered[value.arg]
     low, clean_high, _ = self._fp16_component_values(value)
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 127, 128, 255)}
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-    sign_delta, sign_positive, sign = (allocate() for _ in range(3))
-    positive_high, negative_high, high_delta, high_selected, ordered_high = (allocate() for _ in range(5))
-    negative_low, low_delta, low_selected, ordered_low = (allocate() for _ in range(4))
+    sign_delta, sign_positive, sign = (self._int16_arg() for _ in range(3))
+    positive_high, negative_high, high_delta, high_selected, ordered_high = (self._int16_arg() for _ in range(5))
+    negative_low, low_delta, low_selected, ordered_low = (self._int16_arg() for _ in range(4))
     self.ew_ops.extend((
       RKEWOp(sign_delta, clean_high, constants[127].arg, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
       RKEWOp(sign_positive, sign_delta, constants[0].arg, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
@@ -3263,13 +3261,12 @@ class RKContext:
     values = tuple(self._operand(src, dtypes.half) for src in u.src)
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
     ordered = tuple(self._fp16_ordered_values(value) for value in values)
     nan = tuple(self._fp16_component_values(value)[2] for value in values)
     less, equal = constants[0].arg, constants[1].arg
     for lhs,rhs in zip(ordered[0], ordered[1]):
       maximum, lhs_delta, rhs_delta, lhs_less, rhs_less, unequal, same, selected, next_less, next_equal = \
-        (allocate() for _ in range(10))
+        (self._int16_arg() for _ in range(10))
       self.ew_ops.extend((RKEWOp(maximum, lhs, rhs, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
         RKEWOp(lhs_delta, maximum, lhs, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
         RKEWOp(rhs_delta, maximum, rhs, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
@@ -3281,7 +3278,7 @@ class RKContext:
         RKEWOp(next_less, less, selected, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
         RKEWOp(next_equal, equal, same, self.count, _EW_CFG[Ops.MUL], **_INT16_EW)))
       less, equal = next_less, next_equal
-    either_nan, numeric, result = (allocate() for _ in range(3))
+    either_nan, numeric, result = (self._int16_arg() for _ in range(3))
     self.ew_ops.extend((RKEWOp(either_nan, nan[0], nan[1], self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
                        RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
                        RKEWOp(result, less, numeric, self.count, _EW_CFG[Ops.MUL], **_INT16_EW)))

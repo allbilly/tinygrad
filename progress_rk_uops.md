@@ -1963,3 +1963,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 89. Canonicalize RKContext INT16 scratch allocation — complete
+
+- Five FP16/INT32 comparison methods each declared the same local callback for allocating a canonical INT16 scratch
+  argument. Added one `_int16_arg()` physical ABI method on `RKContext` and passed it directly to raw-byte equality,
+  ordering, and classification recipes.
+- Compared milestone-88/current serialized images for FP16 inequality, FP16 less-than, and INT32 less-than; all three
+  were byte-identical.
+- Renderer executable size fell from 4,726 to 4,722 lines. From the 10,233-line baseline, 5,511 executable renderer
+  lines are gone (53.9%); runtime remains 480 lines. No CPU numeric semantics or DPU schedule changed.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 comparison programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.39 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
