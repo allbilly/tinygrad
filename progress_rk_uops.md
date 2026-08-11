@@ -1738,3 +1738,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 79. Remove residual recognizer and terminal-copy scaffolding — complete
+
+- A scoped parameter/use audit found that grouped boolean reduction no longer consumed its `uops` argument after its
+  structural proof moved entirely onto `RKOutput`. Removed the dead parameter and avoided copying the root's existing
+  topological order. Also removed unused output-store and loop-position unpack targets in the vectorized reduction,
+  multi-local reduction, and host-scatter paths.
+- Three one-item terminal byte-copy tuples survived the gather-timeline migration. Each was created only to run a
+  generator that set `after=len(ops)`. Scheduled those byte copies directly at the final EW point and deleted the
+  temporary phase-shaped scaffolding.
+- Renderer executable size fell from 4,785 to 4,782 lines. From the 10,233-line baseline, 5,451 executable renderer
+  lines are gone (53.3%); runtime remains 480 lines. No numeric semantics, memory policy, or hardware schedule changed.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.55 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

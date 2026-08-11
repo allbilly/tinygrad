@@ -980,7 +980,7 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
 def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   """Execute repeated FP16 MUL UOps with product residuals, then compensate their physical ADD reduction."""
   if (output:=_output_store(uops, dtypes.half)) is None: return None
-  store, out, rows, out_index, root = output
+  _, out, rows, out_index, root = output
   bias:UOp|None = None
   summed, post_scale, relu = root, 1.0, False
   if root.op is Ops.WHERE and len(root.src) == 3 and root.src[0].op is Ops.CMPLT and \
@@ -1988,9 +1988,8 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
   for valid in valid_axes[1:]:
     dst = scratch(count*2); ops.append(RKEWOp(arg(dst), result, valid, count, _EW_CFG[Ops.MUL],
       int16_input=True, int16_output=True)); result = arg(dst)
-  post = (_int16_low_bytes(result, out_param.arg.slot, count),)
   return RKImage(tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
-                 mid_gathers=tuple(replace(gather, after=len(ops)) for gather in post))
+                 mid_gathers=(replace(_int16_low_bytes(result, out_param.arg.slot, count), after=len(ops)),))
 
 def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predicate:Callable[[UOp], UOp|None],
                           max_scale:int=1) -> tuple[UOp, int]|None:
@@ -2267,9 +2266,8 @@ def _stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, offse
   ops:list[RKEWOp] = []
   selected = _reduce_rows(ops, [RKArg(RKBufferKind.SCRATCH, 0, i*vector_bytes) for i in range(len(offsets))], count,
                           _EW_CFG[Ops.MAX if op is Ops.OR else Ops.MUL], int16=True)
-  post = (_int16_low_bytes(selected, out_slot, count),)
   return RKImage((RKScratch(_scratch_bytes(matrix_lanes)),), gathers=gathers, ew_ops=tuple(ops),
-                 mid_gathers=tuple(replace(gather, after=len(ops)) for gather in post))
+                 mid_gathers=(replace(_int16_low_bytes(selected, out_slot, count), after=len(ops)),))
 
 
 def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, groups:int, op:Ops) -> RKImage:
@@ -2277,9 +2275,8 @@ def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot
   source_count = count*groups
   ops = _block_bool_reduction_ops(RKArg(RKBufferKind.SCRATCH, 0), count, groups, op, int16=True)
   gathers = (RKGather(source_slot, 0, source_count, dst_stride=2, itemsize=1),)
-  post = (_int16_low_bytes(RKArg(RKBufferKind.SCRATCH, 0), out_slot, count, groups*2),)
   return RKImage((RKScratch(_scratch_bytes(source_count)),), gathers=gathers, ew_ops=tuple(ops),
-                 mid_gathers=tuple(replace(gather, after=len(ops)) for gather in post))
+                 mid_gathers=(replace(_int16_low_bytes(RKArg(RKBufferKind.SCRATCH, 0), out_slot, count, groups*2), after=len(ops)),))
 
 def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
   term = _unwrap_condition(term)
@@ -2289,11 +2286,11 @@ def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
   return candidates[0] if len(candidates) == 1 else None
 
 
-def _lower_grouped_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
+def _lower_grouped_bool_reduction(output:RKOutput) -> RKImage|None:
   """Lower grouped FP16 or stored-bool any/all after proving launch coordinates and full source coverage."""
   store, out_param, count, out_index, root = output
   if _local_load(root) is None or len(store.src) not in (2, 3) or count <= 0: return None
-  nodes = list(root.toposort())
+  nodes = root.toposort()
   local_stores = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None]
   updates = [(u, _strip_cast(u.src[1])) for u in local_stores if _strip_cast(u.src[1]).op in (Ops.OR, Ops.AND)]
   if len(local_stores) != 5 or len(updates) != 2 or len({value.op for _,value in updates}) != 1: return None
@@ -3944,7 +3941,7 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
   staged:RKImage|None = None
   sources:dict[UOp, UOp] = {}
 
-  for position,buffer in enumerate(buffers):
+  for buffer in buffers:
     definition, groups = definitions[buffer], math.prod(int(loop.src[0].arg) for loop in definitions[buffer].loops)
     if groups > _MAX_STATIC_RANGE_ENVS: return None
     flat = UOp.const(0, dtypes.int)
@@ -4265,7 +4262,7 @@ def _lower_host_scatter(uops:list[UOp]) -> RKImage|None:
   """Lower a direct dynamic STORE as raw last-writer host address materialization."""
   if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1" or \
      (output:=_output_store(uops, (dtypes.half, dtypes.int16))) is None or len(output[0].src) != 2: return None
-  store, out_param, out_count, dynamic_index, value = output
+  _, out_param, out_count, dynamic_index, value = output
   if (index_info:=_runtime_index(dynamic_index)) is None: return None
   _, index_param, lane_index, index_itemsize = index_info
   value = _strip_cast(value)
@@ -4297,7 +4294,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
     if (division:=_lower_int32_division(int_output)) is not None: return division
   if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
-     (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
+     (grouped_bool_reduction:=_lower_grouped_bool_reduction(bool_loop_output)) is not None: return grouped_bool_reduction
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):
     if (direct_load:=_output_store(uops, dtype)) is None: continue
     if (image:=_lower_direct_dynamic_typed_load(direct_load, dtype)) is not None: return image
