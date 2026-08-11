@@ -2,7 +2,8 @@ import math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
-  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _canonical_half_storage, _gather_plan, _iter_range_env,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
+  _canonical_half_storage, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -45,6 +46,17 @@ def test_generic_fp16_uops_lower_in_dependency_order():
   assert image is not None
   assert len(image.ew_ops) == 2
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
+
+
+def test_fp32_load_materializes_through_canonical_fp16_physical_abi():
+  source = UOp.param(1, dtypes.float, (9,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:source.index(i).load().cast(dtypes.half), count=9))
+  assert image is not None and len(image.gathers) == 2
+  assert any(gather.itemsize == 4 and gather.count == 9 and not gather.values for gather in image.gathers)
+  converters = [op for op in image.ew_ops if op.ew_cfg & _EW_STAGE_FP32_IN]
+  assert [op.count for op in converters] == [4, 4, 1]
+  assert any(gather.count == 9 and gather.itemsize == 2 for gather in image.mid_gathers)
+  assert decode_image(encode_image(image)) == image
 
 
 def test_infinite_numerator_fdiv_preserves_dynamic_denominator_sign():
@@ -429,6 +441,41 @@ def test_fp32_add_mul_tree_uses_half_expansion_at_output_boundary():
   assert image is not None and len(image.ew_ops) > 10
 
 
+def test_static_fp32_subgraph_rounds_only_after_coordinate_cancellation():
+  lane = UOp.range(31, 0)
+  coordinate = (lane.cast(dtypes.float)+UOp.const(0.5, dtypes.float))*UOp.const(20/31, dtypes.float) - \
+    UOp.const(0.5, dtypes.float)
+  fraction = coordinate - UOp(Ops.TRUNC, dtypes.float, src=(coordinate,))
+  lowered = _fp32_expr_to_half(fraction)
+  assert lowered.op is Ops.CAST and lowered.dtype.scalar() is dtypes.half and lowered.src == (fraction,)
+
+
+def test_terminal_half_to_float_cast_uses_chunked_dpu_output_conversion():
+  source = UOp.param(1, dtypes.half, (9,))
+  image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
+  assert image is not None and len(image.ew_ops) == len(image.mid_gathers) == 3
+  assert tuple(gather.dst_addend for gather in image.mid_gathers) == (0, 8, 16)
+  assert all(op.ew_cfg & _EW_STAGE_FP32_OUT and op.dst.kind is RKBufferKind.ARG for op in image.ew_ops)
+  assert decode_image(encode_image(image)) == image
+
+
+def test_terminal_int_to_float_cast_composes_integer_and_fp32_converters():
+  source = UOp.param(1, dtypes.int, (9,))
+  image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
+  assert image is not None and len(image.ew_ops) == 6
+  assert sum(bool(op.ew_cfg & _EW_STAGE_FP32_OUT) for op in image.ew_ops) == 3
+  assert decode_image(encode_image(image)) == image
+
+
+def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():
+  source = UOp.param(1, dtypes.half, (9,))
+  integer = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load().cast(dtypes.int), count=9))
+  boolean = _lower_uop_program(_program(dtypes.bool, lambda i:source.index(i).load().cast(dtypes.bool), count=9))
+  assert integer is not None and integer.ew_ops[-1].int32_output
+  assert boolean is not None and boolean.ew_ops[-1].bool_output
+  assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
+
+
 def test_fp32_pure_add_tree_uses_compensated_half_expansion_at_output_boundary():
   source = UOp.param(1, dtypes.half, (64,))
   terms = [source.index(i).load().cast(dtypes.float) for i in range(64)]
@@ -448,11 +495,29 @@ def test_nested_fp32_product_sum_is_committed_before_outer_half_add():
   assert image is not None and len(image.ew_ops) > 20 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
+def test_independent_fp32_reductions_are_committed_before_outer_half_division():
+  lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  products = [(lhs.index(i).load() * rhs.index(i).load()).cast(dtypes.float) for i in range(4)]
+  weights = [rhs.index(i).load().cast(dtypes.float) for i in range(4)]
+  numerator, denominator = products[0], weights[0]
+  for product,weight in zip(products[1:], weights[1:]): numerator, denominator = numerator+product, denominator+weight
+  ratio = UOp(Ops.FDIV, dtypes.half, src=(numerator.cast(dtypes.half), denominator.cast(dtypes.half)))
+  image = _lower_uop_program(_program(dtypes.half, lambda _i:ratio, count=1))
+  assert image is not None and len(image.ew_ops) > 40 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_fp32_math_uop_converts_at_half_storage_boundary():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:source.index(i).load().cast(dtypes.float).exp2().cast(dtypes.half)))
   assert image is not None and len(image.ew_ops) > 10
+
+
+def test_trunc_uop_expands_to_native_floor_and_ceil_stages():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half,
+    lambda i:UOp(Ops.TRUNC, dtypes.half, src=(source.index(i).load(),))))
+  assert image is not None and any(op.ew_cfg == _EW_CFG_FLOOR for op in image.ew_ops)
 
 
 def test_fp32_sin_additive_phase_reduces_terms_before_half_storage_boundary():
@@ -750,6 +815,23 @@ def test_dynamic_host_gather_carries_affine_lane_address_abi(monkeypatch):
   assert image is not None and len(image.host_gathers) == 1
   address = image.host_gathers[0]
   assert (address.base, address.index_scale, address.lane_stride, address.index_limit) == (0, 1, 10, count*10)
+  assert decode_image(encode_image(image)) == image
+
+
+def test_dynamic_host_gather_materializes_nonaffine_static_lane_bases(monkeypatch):
+  monkeypatch.delenv("ROCKCHIP_HOST_GATHER", raising=False)
+  out, source = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (8,))
+  indices, lane = UOp.param(2, dtypes.int, (4,)), UOp.range(4, 0)
+  runtime = indices.index(lane).load()
+  batch, spatial = lane.alu(Ops.CDIV, lane.const_like(2)), lane.alu(Ops.CMOD, lane.const_like(2))
+  address = batch*4 + spatial + runtime*2
+  gate = ((runtime < UOp.const(0, dtypes.int)) != UOp.const(True, dtypes.bool)) & (runtime < UOp.const(2, dtypes.int))
+  value = source.index(address).load(UOp.const(0.0, dtypes.half), gate) * UOp.const(2.0, dtypes.half)
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and len(image.host_gathers) == 1
+  host = image.host_gathers[0]
+  assert host.src.kind is RKBufferKind.SCRATCH and (host.src_count, host.index_scale, host.lane_stride, host.index_limit) == (8, 1, 2, 2)
+  assert any(gather.offsets == (0, 2, 1, 3, 4, 6, 5, 7) for gather in image.gathers)
   assert decode_image(encode_image(image)) == image
 
 

@@ -15,6 +15,7 @@ _PC_DATA_AMOUNT_MAX = (1 << 16) - 1
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
 _SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
+_MAX_FP32_EW_GROUP_OPS = 16
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
@@ -273,8 +274,9 @@ class RockchipProgram(Program['RockchipDevice']):
         if bodies: self._submit_pcchain(bodies)
         stages = [patch_stage(emit_ew_stage(later.dst, later.lhs, later.rhs, later.count, later.ew_cfg), address)
                   for later in ops[i:]]
-        self._submit_pcchain(stages)
-        self.dev.reset_npu()
+        for start in range(0, len(stages), _MAX_FP32_EW_GROUP_OPS):
+          self._submit_pcchain(stages[start:start+_MAX_FP32_EW_GROUP_OPS])
+          self.dev.reset_npu()
         bodies.clear()
         break
       if op.int16_input and op.int32_output:

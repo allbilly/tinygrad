@@ -799,3 +799,37 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 70 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 39. Typed FP32 boundaries and resumed strict interpolation census — complete
+
+- Kept FP32 storage precision attached to semantic boundaries. Independent nested CAST boundaries and FP32 numerator /
+  denominator sums now retain their high/low half expansions through later arithmetic instead of being flattened into
+  one prematurely rounded expression. Weighted NLL3D passes without an NLL-specific renderer path.
+- Extended generic typed LOAD materialization to raw FP32 arguments. Static remaps first gather 32-bit lanes, DPU ADD
+  converts each four-lane group into the canonical FP16 physical ABI, and one mid-program gather compacts the aligned
+  groups. A raw FP32 zero operand avoids the secondary EW input's non-FP32 interpretation; no host numeric conversion
+  is used.
+- Bounded FP32-output PC chains to 16 stages and reset between chunks. Hardware probes established that 17 four-lane
+  conversion tasks pass while 18 in one chain time out; a 3,348-element conversion now completes correctly in 6.7s.
+- Preserved complete static float subgraphs until their single FP16 materialization boundary. Interpolation coordinates
+  are therefore cancelled in FP32 before rounding the fractional weight, rather than rounding the large coordinate and
+  its floor separately. The focused one-axis maximum error fell from 0.02783 to 0.001953.
+- Added composable terminal CAST/BITCAST coverage, periodic dynamic host-gather materialization, semantic TRUNC,
+  grouped boolean structural reduction, and the second generic attempt over Tinygrad's ordinary FP16 rewrite. These
+  additions solve UOp semantics and physical layouts; no tensor-operation lowerer was added.
+- The resumed strict UOp-only census now again extends through collection index 310: 300 passed, 11 explicit contract
+  skips, and 134 collected tests remain. There is no current failing case at that boundary.
+- The legacy oracle is still present, so line saving has not started: `sz.py` reports 10,051 executable renderer lines
+  and 488 runtime lines. The expected large reduction remains gated on completing the remaining strict census first.
+
+Verification:
+
+- Strict resumed loss/cast/bitcast/classification/comparison/rounding/modulo/division/boolean/WHERE prefix: 300 passed
+  and 11 skipped cumulatively through collection index 310.
+- Strict `TestRockchipInterpolateOps`: 8 passed in 56.05s.
+- Strict `TestRockchipInterpolateOps::test_interpolate_bilinear`: 1 passed in 19.92s.
+- Native FP16→FP32 3,348-element stress conversion: exact pass in 6.7s.
+- Independent RK3588 health check: all ADD/MUL/SUB/MAX/NEG/FDIV sizes through 131,072 lanes passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 78 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
