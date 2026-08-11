@@ -2142,3 +2142,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 98. Reuse canonical BOOL constant materialization — complete
+
+- Generic BOOL binary lowering manually allocated BOOL constants in either FP16-mask or INT16 form, mutated an
+  optional operand list, then asserted that both entries had become physical values. Replaced that block with the
+  same `_static(src, preferred)` plus `_coerce_bool()` typed operand comprehension already used by BOOL `WHERE`.
+- Compared milestone-97/current images for BOOL operations combining a constant with a dynamic `BOOL_MASK` and with a
+  dynamic `BOOL_INT16` load. Both images were byte-identical, proving that canonical constant bits and layouts are
+  unchanged.
+- Renderer executable size fell from 4,694 to 4,689 lines. From the 10,233-line baseline, 5,544 executable renderer
+  lines are gone (54.2%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 2/2 BOOL physical-layout programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.76 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

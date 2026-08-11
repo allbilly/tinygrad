@@ -3007,13 +3007,8 @@ class RKContext:
     values = [self.lower(src) if not (src.op is Ops.CONST and src.dtype.scalar() is dtypes.bool) else None for src in u.src]
     preferred = (RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in values) else
                  RKLayout.BOOL_MASK)
-    for i,(src,value) in enumerate(zip(u.src, values)):
-      if value is None:
-        raw = self._constant(UOp.const(int(bool(src.arg)), dtypes.int16)) if preferred is RKLayout.BOOL_INT16 else self._constant(src)
-        values[i] = RKValue(raw.arg, dtypes.bool, self.count, preferred)
-      else: values[i] = self._coerce_bool(value, preferred)
-    lhs, rhs = values
-    assert lhs is not None and rhs is not None
+    lhs, rhs = (self._static(src, preferred) if value is None else self._coerce_bool(value, preferred)
+                for src,value in zip(u.src, values))
     dst = self._dst(u, dtypes.bool, preferred)
     if u.op is Ops.AND: return self._emit(dst, lhs, rhs, _EW_CFG[Ops.MUL])
     if u.op is Ops.OR: return self._emit(dst, lhs, rhs, _EW_CFG[Ops.MAX])
