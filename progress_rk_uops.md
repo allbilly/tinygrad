@@ -1245,3 +1245,24 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 88 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 55. Separate direct-NPU and generic masked-load folding — complete
+
+- A final cold-cache replay after milestone 54 found that the safety rule for generic masked LOADs also disabled the
+  existing all-DPU direct multi-index recognizer. Multi-axis integer fancy indexing therefore rejected even though its
+  exact INT32 bounds-mask producer had correctly been retained.
+- Made additional runtime gate dependencies an explicit opt-in used only by the direct typed-load recognizer. That
+  recognizer executes the merged equality/bounds selection on DPU; the generic host-address path continues to keep
+  predicate-total gates as ordinary NPU WHERE/comparison UOps.
+- Cold multi-axis fancy indexing and cold masked-select now pass together, proving the two ownership paths no longer
+  depend on cached compiler images.
+- No CPU numeric semantics were introduced. This correctness follow-up adds one executable renderer line, taking the
+  renderer from 5,041 to 5,042 lines; runtime remains 488 executable lines.
+
+Verification:
+
+- Cold complete `TestRockchipFancyIndexOps`: 10 passed in 66.17s.
+- Cold conflicting fancy-index/masked-select pair: 2 passed in 8.49s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 88 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

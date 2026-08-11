@@ -4586,7 +4586,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (image:=_lower_dynamic_multi_index_typed_load(direct_load, dtype)) is not None: return image
     root = direct_load[4]
     if root.op is Ops.WHERE and root.src[1].op is Ops.LOAD and root.src[2].op is Ops.CONST and \
-       (folded_load:=_fold_masked_load(root.src[0], root.src[1], root.src[2])) is not None and \
+       (folded_load:=_fold_masked_load(root.src[0], root.src[1], root.src[2], allow_additional_gate_loads=True)) is not None and \
        (image:=_lower_direct_dynamic_typed_load((*direct_load[:4], folded_load), dtype)) is not None: return image
   if vectorize_reductions and (local_output:=_output_store(uops, dtypes.int, allow_local=True)) is not None and \
      (local_extrema:=_lower_vectorized_scalar_local_extrema(uops, local_output)) is not None: return local_extrema
@@ -4941,10 +4941,11 @@ def _fold_minimum(x:UOp) -> UOp|None:
   lhs, rhs = (u for u in operands if u is not None)
   return _native_min(lhs[0], rhs[0])
 
-def _fold_masked_load(gate:UOp, load:UOp, default:UOp) -> UOp|None:
+def _fold_masked_load(gate:UOp, load:UOp, default:UOp, allow_additional_gate_loads:bool=False) -> UOp|None:
   if len(load.src) <= 2 or load.src[1].op is not Ops.CONST: return None
   load_gate = load.src[2]
-  if {u.key for u in gate.toposort() if u.op is Ops.LOAD} - {u.key for u in load_gate.toposort() if u.op is Ops.LOAD}: return None
+  if not allow_additional_gate_loads and \
+     {u.key for u in gate.toposort() if u.op is Ops.LOAD} - {u.key for u in load_gate.toposort() if u.op is Ops.LOAD}: return None
   same_default = float(load.src[1].arg) == float(default.arg)
   # If the outer condition implies the LOAD condition, the inner default is unreachable. This is the padded-pool form.
   outer_implies_inner = _same_condition(gate, load_gate) or (gate.op is Ops.AND and any(_same_condition(x, load_gate) for x in gate.src))
