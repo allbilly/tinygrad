@@ -711,21 +711,15 @@ class RKStaticIndexEvaluator:
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   return RKStaticIndexEvaluator(out_index, count).offsets(load_index, gate)
 
-def _contiguous_output_samples(out_index:UOp, count:int) -> list[dict[UOp, int]]|None:
-  """Prove a contiguous affine output index and return bounded range samples for large matcher validation."""
+def _contiguous_output(out_index:UOp, count:int) -> bool:
+  """Prove that an affine output index covers every destination lane once."""
   ranges, affine = _index_ranges(out_index), _affine_index(out_index)
-  if affine is None or affine[0] != 0 or set(affine[1]) != set(ranges): return None
+  if affine is None or affine[0] != 0 or set(affine[1]) != set(ranges): return False
   extent = 1
   for r,stride in sorted(affine[1].items(), key=lambda item:item[1]):
-    if stride != extent or not r.src or r.src[0].op is not Ops.CONST or (limit:=int(r.src[0].arg)) <= 0: return None
+    if stride != extent or not r.src or r.src[0].op is not Ops.CONST or (limit:=int(r.src[0].arg)) <= 0: return False
     extent *= limit
-  if extent != count: return None
-  envs:list[dict[UOp, int]] = [{}]
-  for r in ranges:
-    limit = int(r.src[0].arg)
-    samples = tuple(dict.fromkeys((0, min(1, limit-1), limit//2, limit-1)))
-    envs = [{**env, r:value} for env in envs for value in samples]
-  return envs
+  return extent == count
 
 def _typed_load_offsets(load:UOp, dtype:DType, out_index:UOp, count:int, allow_fill:bool=False) -> tuple[UOp, tuple[int, ...]]|None:
   """Resolve one typed global load to bounded static offsets."""
@@ -4288,7 +4282,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       if (coordinates:=_lower_bounded_integer_predicate_coordinates(output, source_dtype)) is not None: return coordinates
     if (lookup:=_lower_bounded_int32_lookup(output)) is not None: return lookup
   try:
-    if (_contiguous_output_samples(output[3], output[2]) is None and
+    if (not _contiguous_output(output[3], output[2]) and
         _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)

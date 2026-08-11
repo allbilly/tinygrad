@@ -2310,3 +2310,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 106. Delete unused output sample environments — complete
+
+- `_contiguous_output_samples()` proved affine destination coverage and then built bounded RANGE environment
+  dictionaries for its caller. The sole remaining caller only tested whether the return value was `None`; it never
+  consumed a sample, so every dictionary, midpoint, endpoint, and Cartesian sample expansion was dead code.
+- Replaced the helper with `_contiguous_output()`, a direct boolean proof retaining the same zero-base, range set,
+  stride, positive-limit, and total-extent checks. The existing exact static-vector fallback still validates output
+  permutations that are not recognized by the affine fast proof.
+- Linear, reversed, transposed, duplicate, and scalar index proofs matched milestone 105, and linear/reversed output
+  RKImages were byte-identical. Renderer executable size fell from 4,677 to 4,671 lines. From the 10,233-line baseline,
+  5,562 lines are gone (54.4%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 5/5 output proofs equivalent and 2/2 output-layout RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.00 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
