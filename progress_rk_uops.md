@@ -2407,3 +2407,26 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 111. Cache physical rather than virtual scratch arguments — complete
+
+- Reprofiled `test_dependent_reduction_range_preserves_vector_output_axis`, still the slowest unit at 1.06 seconds in
+  the xdist duration census. Its large case creates 8,177 virtual scratch slots that liveness coloring reduces to only
+  521 physical slots, but remapping still allocated a zero-offset `RKArg` for every virtual slot.
+- Cache one canonical argument per physical slot and select it through the existing virtual-to-physical map. The slot
+  coloring, offsets, physical sizes, and encoded program are unchanged; the large case constructs about 94% fewer
+  cached remap arguments.
+- Scratch coloring/remapping fell from 279.3 to 247.4 ms (11.4%), total direct cProfile time fell from 1.115 to 1.095
+  seconds (1.8%), and calls fell from 1,587,225 to 1,555,353. A warmed alternating benchmark of the largest case
+  improved from a 0.3295-second median to 0.3248 seconds (1.4%).
+- Scalar, vector, and large dependent-reduction RKImages matched milestone 110 byte-for-byte. Renderer remains 4,659
+  executable lines, 5,574 lines or 54.5% below baseline; runtime remains 480 lines. No CPU numeric semantics were
+  introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 dependent-reduction RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.85 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

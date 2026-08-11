@@ -156,10 +156,10 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
       physical.append(spec)
     if slot not in pinned: heapq.heappush(active, (end, target))
     remap[slot] = target
-  remapped_args = tuple(RKArg(RKBufferKind.SCRATCH, remap.get(slot, slot)) for slot in range(len(image.scratch)))
+  physical_args = tuple(RKArg(RKBufferKind.SCRATCH, slot) for slot in range(len(physical)))
   def remap_arg(arg:RKArg) -> RKArg:
     if arg.kind is not RKBufferKind.SCRATCH: return arg
-    return remapped_args[arg.index] if not arg.addend else RKArg(arg.kind, remap[arg.index], arg.addend)
+    return physical_args[remap[arg.index]] if not arg.addend else RKArg(arg.kind, remap[arg.index], arg.addend)
   def remap_gather(gather:RKGather) -> RKGather:
     return replace(gather,
     src_index=remap[gather.src_index] if not gather.values and gather.src_kind is RKBufferKind.SCRATCH else gather.src_index,
