@@ -2919,14 +2919,17 @@ class RKContext:
                self.int_layout is RKLayout.INT32)
     expected = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else self.int_layout if bounded else None
     if expected is None: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
-    def operand(src:UOp) -> RKValue:
-      if (u.op is Ops.MAX and dtype is dtypes.half and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg) < 0):
-        return self._constant(UOp.const(-65504.0, dtypes.half))
-      if (u.op is Ops.MAX and dtype is dtypes.half and src.op is Ops.LOAD and len(src.src) > 2 and src.src[1].op is Ops.CONST and
-          math.isinf(float(src.src[1].arg)) and float(src.src[1].arg) < 0 and _is_static_expr(src.src[2])):
-        return self._load(src, _fp16_bits(-65504.0))
-      return self._operand(src, dtype)
-    lhs, rhs = operand(u.src[0]), operand(u.src[1])
+    if u.op is Ops.MAX and dtype is dtypes.half:
+      def operand(src:UOp) -> RKValue:
+        if src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg) < 0:
+          return self._constant(UOp.const(-65504.0, dtypes.half))
+        if (src.op is Ops.LOAD and len(src.src) > 2 and src.src[1].op is Ops.CONST and
+            math.isinf(float(src.src[1].arg)) and float(src.src[1].arg) < 0 and _is_static_expr(src.src[2])):
+          return self._load(src, _fp16_bits(-65504.0))
+        return self._operand(src, dtype)
+      lhs, rhs = operand(u.src[0]), operand(u.src[1])
+    else:
+      lhs, rhs = self._operand(u.src[0], dtype), self._operand(u.src[1], dtype)
     compatible = (RKLayout.FP16, RKLayout.BOOL_MASK) if expected is RKLayout.FP16 else (expected,)
     if lhs.layout not in compatible or rhs.layout not in compatible: raise _RKGenericReject
     if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:

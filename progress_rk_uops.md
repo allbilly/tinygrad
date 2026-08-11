@@ -2540,3 +2540,26 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 118. Bypass MAX-only operand normalization in ordinary ALU stages — complete
+
+- Reprofiled `test_dependent_reduction_range_preserves_vector_output_axis`. Its roughly 15,900 ordinary ALU stages
+  each allocated and called a nested operand function whose only special behavior applies to FP16 MAX with negative
+  infinity. ADD/MUL/SUB still paid two calls and both MAX-only condition chains.
+- Kept the existing finite-neutral operand function only inside FP16 MAX and call the typed `_operand()` boundary
+  directly for every other ALU UOp. Negative-infinity constants and statically masked loads retain their exact
+  normalization.
+- Complete cProfile time fell from 1.115 to 1.078 seconds (3.3%), `_alu()` cumulative time fell from 325 to 304 ms
+  (6.5%), and calls fell from 1,555,350 to 1,523,475. A warmed alternating benchmark of the largest case improved from
+  a 0.3183-second median to 0.3097 seconds (2.7%).
+- Scalar/vector/large dependent reductions and both negative-infinity MAX forms produced RKImages byte-identical to
+  milestone 117. This measured fast path costs three executable lines, temporarily taking the renderer from 4,635 to
+  4,638 lines; runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 5/5 reduction/MAX RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.89 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
