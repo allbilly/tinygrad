@@ -1981,3 +1981,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 90. Canonicalize standalone scratch arguments — complete
+
+- Eight bounded-index, raw-gather, and boolean-reduction builders each declared the same local `RKArg(SCRATCH, ...)`
+  constructor. Replaced them with one module-level `_scratch_arg()` physical helper, including the callback passed to
+  the existing equality-mask recipe.
+- Reused `_INT16_EW` while touching the long byte-mask constructor block; this only replaces repeated dataclass
+  keywords and keeps the encoded operation flags unchanged.
+- Compared milestone-89/current serialized images for bounded index selection, dynamic raw gather, matrix boolean
+  reduction, and contiguous boolean reduction. All four were byte-identical, including fallback builders not selected
+  by the generic-first unit corpus.
+- Renderer executable size fell from 4,722 to 4,717 lines. From the 10,233-line baseline, 5,516 executable renderer
+  lines are gone (53.9%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 4/4 standalone physical builders byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.30 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
