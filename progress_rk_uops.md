@@ -2042,3 +2042,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 93. Skip semantic clamp matching for physical ADDs — complete
+
+- Reprofiled the dependent reduction after milestone 91. Its 9,258 compensated half ADDs carry
+  `_NATIVE_PRECISE_ADD`, but `_alu()` still attempted the semantic ReLU-cap graph matcher for every one. Restricted
+  that matcher to untagged `arg is None` ADDs, which are the only UOps it can rewrite.
+- `_fold_relu_cap()` disappeared from the profile, `_alu()` fell from 0.467 to 0.420 seconds, and total
+  `_lower_uop_program()` time fell from 1.796 to 1.747 seconds. Scalar, vector, and large dependent-reduction RKImages
+  remained byte-identical.
+- Inlined the single-use COS and TAN recognition callbacks into their owning pattern entries. Old/current COS and TAN
+  rewrite graphs were identical; the UOp math handlers remain unchanged.
+- Renderer executable size fell from 4,712 to 4,709 lines. From the 10,233-line baseline, 5,524 executable renderer
+  lines are gone (54.0%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 dependent-reduction RKImages byte-identical and 2/2 trig rewrite graphs identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=3`: 91 passed in 5.25 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

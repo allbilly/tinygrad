@@ -2931,7 +2931,7 @@ class RKContext:
       dst = self._dst(u, u.dtype.scalar(), src.layout)
       return self._emit(dst, src, src, _EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
-    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None:
+    if u.op is Ops.ADD and u.arg is None and (recipe:=_fold_relu_cap(u)) is not None:
       return self.lower(recipe)
     if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
       return self.lower(recipe)
@@ -5080,16 +5080,11 @@ def _cos_source(x:UOp) -> UOp|None:
   if x.op is not Ops.SIN or len(x.src) != 1 or (phase:=_const_operand(_strip_cast(x.src[0]), Ops.ADD, math.pi/2)) is None: return None
   negative = _const_operand(phase[0], Ops.MUL, -1.0)
   return _strip_cast(negative[0]) if negative is not None else None
-def _fold_cos(x:UOp) -> UOp|None:
-  """Recognize cosine before FP16 loses its pi/2 phase shift."""
-  return _dpu_cos(source) if (source:=_cos_source(x)) is not None else None
-_pm_cos = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), name="x"), _fold_cos)])
-def _fold_tan(x:UOp) -> UOp|None:
-  """Recognize Tensor.tan's SIN(x)/SIN(pi/2-x) expansion before either sine is rewritten."""
-  if x.op is not Ops.FDIV or len(x.src) != 2 or (numerator:=_strip_cast(x.src[0])).op is not Ops.SIN: return None
-  source, cosine_source = _strip_cast(numerator.src[0]), _cos_source(x.src[1])
-  return _dpu_tan(source) if cosine_source is not None and source.key == cosine_source.key else None
-_pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"), _fold_tan)])
+_pm_cos = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), name="x"),
+  lambda x:_dpu_cos(source) if (source:=_cos_source(x)) is not None else None)])
+_pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"),
+  lambda x:_dpu_tan(source) if len(x.src) == 2 and (numerator:=_strip_cast(x.src[0])).op is Ops.SIN and
+  (cosine:=_cos_source(x.src[1])) is not None and (source:=_strip_cast(numerator.src[0])).key == cosine.key else None)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
   sink = graph_rewrite(sink, _pm_alt_sigmoid_gradient, name="rockchip alternate sigmoid gradient")
