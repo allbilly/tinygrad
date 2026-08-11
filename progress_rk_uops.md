@@ -919,3 +919,32 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 43. Delete the superseded operation catalog and make UOp lowering permanent — complete
+
+- Removed the renderer's legacy fallback and the `ROCKCHIP_UOPS`/`ROCKCHIP_UOPS_ONLY` selection boundary. `render()`
+  now always lowers the supplied UOp program, retries only after the ordinary per-UOp FP16 math rewrite, and rejects a
+  program if neither generic pass can represent it.
+- Deleted the operation-specific `lower_ew()` dispatch wall and 94 unreachable lowerers/helpers for tensor power,
+  fancy indexing, scatter, cumulative operations, arg-extrema, sort/top-k, pooling indices, boolean/integer reductions,
+  and related graph-dialect recovery. The retained `lower_ew()` is only the shared physical EW graph emitter used by
+  composable UOp and reduction handlers.
+- Recomputed a conservative module call graph rooted at the renderer/runtime API, exported unit-test ABI, module
+  pattern matchers, decorators, defaults, and class bases. All 253 remaining top-level definitions are reachable; this
+  milestone therefore stops at the safe dead-code boundary instead of deleting still-used typed/structural machinery.
+- Reduced `tinygrad/renderer/rockchip.py` from 10,233 to 6,658 executable lines: 3,575 lines removed, or 35.0%.
+  The physical diff is 39 insertions and 3,884 deletions. Runtime remains 488 executable lines.
+- The remaining 6,658 lines are not the final size target. Much of the generic path still consists of reachable INT32
+  byte-layout recipes, structural reduction materializers, dynamic-address handling, and bounded-stage-count helpers.
+  The next deletion milestone must consolidate those behind canonical `RKValue` conversions, generic RANGE/local-state
+  execution, symmetric gather/scatter, and shared typed compare/WHERE primitives before their callers can be removed.
+
+Verification:
+
+- Focused strict gather/fancy-index/scatter/cumulative/arg-extrema/sort/top-k/reduction/dot replay:
+  83 passed in 482.66s.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP RUN_SLOW=1 .venv/bin/python -m pytest
+  test/backend/test_rockchip.py -q -n0 -x -rs`: 433 passed, 12 skipped, and 154 subtests passed in 1,422.38s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
