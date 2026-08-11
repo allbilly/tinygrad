@@ -80,6 +80,15 @@ class RKImage:
   def execution_class(self) -> RKExecutionClass:
     return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
 
+def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg]) -> RKImage:
+  def gather(value:RKGather) -> RKGather:
+    src, dst = fn(RKArg(value.src_kind, value.src_index)), fn(RKArg(value.dst_kind, value.dst_index))
+    return replace(value, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
+  def host(value:RKHostAddress) -> RKHostAddress: return replace(value, src=fn(value.src), index=fn(value.index), dst=fn(value.dst))
+  return replace(image, gathers=tuple(gather(x) for x in image.gathers), mid_gathers=tuple(gather(x) for x in image.mid_gathers),
+    ew_ops=tuple(replace(op, dst=fn(op.dst), lhs=fn(op.lhs), rhs=fn(op.rhs)) for op in image.ew_ops),
+    host_gathers=tuple(host(x) for x in image.host_gathers), host_scatters=tuple(host(x) for x in image.host_scatters))
+
 def _hoist_leading_vector_materialization(image:RKImage) -> RKImage:
   """Compose a leading vector copy and its lane gathers so scalar execution starts in one NPU chain."""
   if len(image.ew_ops) < 2 or not image.mid_gathers: return image
@@ -820,16 +829,8 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
   def remap_arg(arg:RKArg) -> RKArg:
     if arg.kind is RKBufferKind.SCRATCH: return replace(arg, index=arg.index+scratch_shift)
     return replace(arg, kind=RKBufferKind.SCRATCH, index=value_slot) if arg.index == out_slot else arg
-  def remap_gather(gather:RKGather) -> RKGather:
-    src = remap_arg(RKArg(gather.src_kind, gather.src_index))
-    dst = remap_arg(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
-  pre_ops = tuple(replace(op, dst=remap_arg(op.dst), lhs=remap_arg(op.lhs), rhs=remap_arg(op.rhs)) for op in mapped.ew_ops)
-  gathers = tuple(remap_gather(gather) for gather in mapped.gathers)
-  host_gathers = tuple(replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
-                       for host in mapped.host_gathers)
-  host_scatters = tuple(replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
-                        for host in mapped.host_scatters)
+  mapped = _map_image_args(mapped, remap_arg)
+  pre_ops, gathers, host_gathers, host_scatters = mapped.ew_ops, mapped.gathers, mapped.host_gathers, mapped.host_scatters
   ops = list(pre_ops)
   outer, inner = rows, groups
   stride, arena_slot = _reduction_stride(outer), value_slot+1
@@ -854,8 +855,7 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
                       submit_barrier=op_barriers, stateful=op_barriers))
   scratch = (RKScratch(_scratch_bytes(lanes)), *mapped.scratch, RKScratch(_scratch_bytes(lanes)), RKScratch(inner*stride))
   if post_scale != 1.0: scratch += (RKScratch(_scratch_bytes(rows)),)
-  mapped_mid = tuple(remap_gather(gather) for gather in mapped.mid_gathers)
-  mid = mapped_mid+tuple(replace(gather, after=len(pre_ops)) for gather in mid)
+  mid = mapped.mid_gathers+tuple(replace(gather, after=len(pre_ops)) for gather in mid)
   return RKImage(scratch, struct.pack("<e", post_scale)+mapped.constants,
                  gathers=gathers, ew_ops=tuple(ops), mid_gathers=mid,
                  host_gathers=host_gathers, host_scatters=host_scatters)
@@ -872,23 +872,18 @@ def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   def second_arg(arg:RKArg) -> RKArg:
     if arg.kind is not RKBufferKind.SCRATCH: return arg
     return replace(arg, index=first_constants+arg.index if arg.index < second_constants else len(first.scratch)+arg.index)
-  def first_gather(gather:RKGather) -> RKGather:
-    src, dst = first_arg(RKArg(gather.src_kind, gather.src_index)), first_arg(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
-  first_ops = tuple(replace(op, dst=first_arg(op.dst), lhs=first_arg(op.lhs), rhs=first_arg(op.rhs)) for op in first.ew_ops)
-  second_ops = [replace(op, dst=second_arg(op.dst), lhs=second_arg(op.lhs), rhs=second_arg(op.rhs)) for op in second.ew_ops]
+  first, second = _map_image_args(first, first_arg), _map_image_args(second, second_arg)
+  first_ops, second_ops = first.ew_ops, list(second.ew_ops)
   second_ops[0] = replace(second_ops[0], submit_barrier=True, stateful=True)
   def second_gather(gather:RKGather, after:int) -> RKGather:
-    src, dst = second_arg(RKArg(gather.src_kind, gather.src_index)), second_arg(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index, after=after)
+    return replace(gather, after=after)
   split = len(first_ops)
   second_mid = tuple(second_gather(gather, split) for gather in second.gathers)+tuple(
     second_gather(gather, split+gather.after) for gather in second.mid_gathers)
   scratch = (first.scratch[:first_constants] + second.scratch[:second_constants] + first.scratch[first_constants:] +
              second.scratch[second_constants:])
   return RKImage(scratch, first.constants+second.constants,
-                 gathers=tuple(first_gather(gather) for gather in first.gathers), ew_ops=first_ops+tuple(second_ops),
-                 mid_gathers=tuple(first_gather(gather) for gather in first.mid_gathers)+second_mid)
+                 gathers=first.gathers, ew_ops=first_ops+tuple(second_ops), mid_gathers=first.mid_gathers+second_mid)
 
 def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   """Evaluate one fused FP16 map over the whole reduction domain, then reduce its materialized lanes."""
@@ -947,12 +942,7 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if post is None: return None
   def alias(arg:RKArg) -> RKArg:
     return replace(arg, index=out_slot) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
-  def alias_gather(gather:RKGather) -> RKGather:
-    src, dst = alias(RKArg(gather.src_kind, gather.src_index)), alias(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
-  post = replace(post, gathers=tuple(alias_gather(gather) for gather in post.gathers),
-    ew_ops=tuple(replace(op, dst=alias(op.dst), lhs=alias(op.lhs), rhs=alias(op.rhs)) for op in post.ew_ops),
-    mid_gathers=tuple(alias_gather(gather) for gather in post.mid_gathers))
+  post = _map_image_args(post, alias)
   appended = _append_inplace_image(reduced, post)
   return appended
 
@@ -3843,13 +3833,8 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
   def arg(value:RKArg) -> RKArg:
     return RKArg(RKBufferKind.SCRATCH, slot_to_scratch[value.index], value.addend) \
       if value.kind is RKBufferKind.ARG and value.index in slot_to_scratch else value
-  def gather(value:RKGather) -> RKGather:
-    src, dst = arg(RKArg(value.src_kind, value.src_index)), arg(RKArg(value.dst_kind, value.dst_index))
-    return replace(value, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
-  return replace(appended, scratch=appended.scratch+tuple(RKScratch(64) for _ in sources),
-    gathers=tuple(gather(x) for x in appended.gathers),
-    ew_ops=tuple(replace(op, dst=arg(op.dst), lhs=arg(op.lhs), rhs=arg(op.rhs)) for op in appended.ew_ops),
-    mid_gathers=tuple(gather(x) for x in appended.mid_gathers))
+  appended = _map_image_args(appended, arg)
+  return replace(appended, scratch=appended.scratch+tuple(RKScratch(64) for _ in sources))
 
 def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dict[UOp, tuple[int, ...]]:
   """Execute bounded constant/control local programs used only to materialize global addresses."""
@@ -4025,13 +4010,8 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   values = allocate()
   def map_arg(arg:RKArg) -> RKArg:
     return RKArg(RKBufferKind.SCRATCH, values.index, arg.addend) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
-  def map_gather(gather:RKGather, *, after:int|None=None) -> RKGather:
-    src, dst = map_arg(RKArg(gather.src_kind, gather.src_index)), map_arg(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index,
-                   after=gather.after if after is None else after)
-  ops = [replace(op, dst=map_arg(op.dst), lhs=map_arg(op.lhs), rhs=map_arg(op.rhs)) for op in child.ew_ops]
-  gathers = [map_gather(gather) for gather in child.gathers]
-  mid = [map_gather(gather) for gather in child.mid_gathers]
+  child = _map_image_args(child, map_arg)
+  ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers)
 
   scalar_stride = _reduction_stride(1)
   reduction_values = allocate(total*scalar_stride//2)

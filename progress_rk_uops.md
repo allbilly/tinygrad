@@ -2791,3 +2791,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 131. Give physical RKImages one argument-remap ABI — complete
+
+- Mapped reductions, appended post-reduction programs, multi-local composition, and scalar-extrema execution each
+  carried private copies of the same relocation logic for EW operands, gather endpoints, and host-address records.
+  Added one `_map_image_args()` physical-ABI primitive and deleted those four handwritten remappers.
+- Scratch specifications, constants, scheduling points, and semantic UOps are untouched. Old/current mapped FP32
+  reduction, generic post-op, dependent scalar extrema, and two-local composition programs produced four byte-identical
+  serialized RKImages.
+- Renderer executable size fell from 4,564 to 4,543 lines. From the 10,233-line baseline, 5,690 lines are gone (55.6%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 4/4 relocated RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.67 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
