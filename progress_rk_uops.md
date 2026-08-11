@@ -1804,3 +1804,28 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 82. Unify typed gather-backed materialization — complete
+
+- Bool LOADs, nonaffine dynamic candidate matrices, and ordinary half/INT16/INT32 LOADs each repeated the same
+  gather-key, scratch-allocation, destination-patching, and `RKValue` cache block. Added one `_gather_slot()` boundary
+  so these semantic LOAD forms share the same physical materialization operation.
+- Static vectors and gathered vectors then exposed the same underlying cache/allocate/materialize behavior. Replaced
+  separate `static_slots` and `gather_slots` state with one tagged `materialized_slots` cache and one
+  `_materialized_slot()` implementation. Static, gather, and FP32-raw keys remain disjoint, and requested semantic
+  dtype is preserved when returning a cached physical slot.
+- Removed the gather helper's item-size override mode: callers now pass a complete physical `RKGather`, so its cache
+  key describes the exact materialization. Default raw bits are likewise computed once for both static and dynamic
+  typed LOAD branches.
+- Compared milestone-81/current serialized images for FP16 remap, INT32 direct load, bool direct load, nonaffine
+  dynamic host-address materialization, and FP32 raw load. All five RKImages were byte-identical.
+- Renderer executable size fell from 4,775 to 4,759 lines. From the 10,233-line baseline, 5,474 executable renderer
+  lines are gone (53.5%); runtime remains 480 lines. No CPU numeric semantics or DPU schedule changed.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 5/5 representative materialization programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.40 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

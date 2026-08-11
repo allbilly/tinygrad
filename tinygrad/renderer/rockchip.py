@@ -2664,8 +2664,7 @@ class RKContext:
     self.values:dict[UOp, RKValue] = {}
     self.scratch:list[RKScratch] = []
     self.constants:dict[bytes, int] = {}
-    self.static_slots:dict[tuple[RKLayout, tuple[int, ...]], RKValue] = {}
-    self.gather_slots:dict[tuple, RKValue] = {}
+    self.materialized_slots:dict[tuple, RKValue] = {}
     self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
     self.int32_components:dict[RKArg, tuple[RKValue, ...]] = {}
     self.raw_bytes:dict[RKArg, tuple[RKValue, RKValue]] = {}
@@ -2714,13 +2713,19 @@ class RKContext:
       return RKValue(self.out, dtype, self.count, layout)
     return self._scratch(dtype, layout)
 
+  def _materialized_slot(self, key:tuple, dtype:DType, layout:RKLayout, plan:RKGather, size:int|None=None) -> RKValue:
+    if key not in self.materialized_slots:
+      value = self._scratch(dtype, layout, size)
+      self.gathers.append(replace(plan, dst_index=value.arg.index))
+      self.materialized_slots[key] = value
+    return RKValue(self.materialized_slots[key].arg, dtype, self.count, layout)
+
   def _static_slot(self, dtype:DType, layout:RKLayout, vector:tuple[int, ...]) -> RKValue:
-    key = (layout, vector)
-    if key not in self.static_slots:
-      value = self._scratch(dtype, layout)
-      self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4 if layout is RKLayout.INT32 else 2))
-      self.static_slots[key] = value
-    return RKValue(self.static_slots[key].arg, dtype, self.count, layout)
+    return self._materialized_slot(("static", layout, vector), dtype, layout,
+      RKGather(0, 0, self.count, values=vector, itemsize=4 if layout is RKLayout.INT32 else 2))
+
+  def _gather_slot(self, dtype:DType, layout:RKLayout, plan:RKGather, size:int) -> RKValue:
+    return self._materialized_slot(("gather", layout, _gather_cache_key((plan,))), dtype, layout, plan, size)
 
   def _constant(self, u:UOp, dtype_hint:DType|None=None) -> RKValue:
     dtype = dtype_hint or u.dtype.scalar()
@@ -2804,11 +2809,7 @@ class RKContext:
       _validate_gather_bounds(plan, int(param.src[0].arg))
       groups = tuple(range(0, self.count, _EW_ELEMS_32BIT))
       raw_key = ("fp32_raw", _gather_cache_key((replace(plan, itemsize=4),)))
-      if raw_key not in self.gather_slots:
-        raw = self._scratch(dtype, RKLayout.FP16, len(groups)*16)
-        self.gathers.append(replace(plan, dst_index=raw.arg.index, itemsize=4))
-        self.gather_slots[raw_key] = raw
-      raw = self.gather_slots[raw_key]
+      raw = self._materialized_slot(raw_key, dtype, RKLayout.FP16, replace(plan, itemsize=4), len(groups)*16)
       aligned = self._scratch(dtypes.half, RKLayout.FP16, len(groups)*16)
       zero = self._scratch(dtype, RKLayout.FP16, 16)
       self.gathers.append(RKGather(0, zero.arg.index, _EW_ELEMS_32BIT, values=(0,)*_EW_ELEMS_32BIT, itemsize=4))
@@ -2829,12 +2830,7 @@ class RKContext:
       plan = RKGather(param.arg.slot, 0, self.count, offsets=offsets, fill_bits=int(bool(default.arg)) if default is not None else 0,
                       dst_stride=2, itemsize=1)
       _validate_gather_bounds(plan, int(param.src[0].arg))
-      key = (RKLayout.BOOL_INT16, _gather_cache_key((plan,)))
-      if key not in self.gather_slots:
-        value = self._scratch(dtype, RKLayout.BOOL_INT16, self.count*2)
-        self.gathers.append(replace(plan, dst_index=value.arg.index))
-        self.gather_slots[key] = value
-      return self.gather_slots[key]
+      return self._gather_slot(dtype, RKLayout.BOOL_INT16, plan, self.count*2)
     layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else RKLayout.INT32
     itemsize = 4 if layout is RKLayout.INT32 else 2
     fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
@@ -2874,12 +2870,7 @@ class RKContext:
         offsets = tuple(candidates[candidate][lane] for lane in range(self.count) for candidate in range(index_limit))
         plan = RKGather(param.arg.slot, 0, len(offsets), offsets=offsets, itemsize=itemsize)
         _validate_gather_bounds(plan, source_count)
-        key = (layout, _gather_cache_key((plan,)))
-        if key not in self.gather_slots:
-          matrix = self._scratch(dtype, layout, len(offsets)*itemsize)
-          self.gathers.append(replace(plan, dst_index=matrix.arg.index))
-          self.gather_slots[key] = matrix
-        source, source_count = self.gather_slots[key].arg, len(offsets)
+        source, source_count = self._gather_slot(dtype, layout, plan, len(offsets)*itemsize).arg, len(offsets)
         base, index_scale, lane_stride = 0, 1, index_limit
       value = self._scratch(dtype, layout, self.count*itemsize)
       self.host_gathers.append(RKHostAddress(source,
@@ -2893,12 +2884,7 @@ class RKContext:
     plan = RKGather(param.arg.slot, 0, self.count, offsets=self.static_load_offsets[u], fill_bits=fill_bits) if u in self.static_load_offsets else \
       _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
     _validate_gather_bounds(plan, int(param.src[0].arg))
-    key = (layout, _gather_cache_key((plan,)))
-    if key not in self.gather_slots:
-      value = self._scratch(dtype, layout, self.count*itemsize)
-      self.gathers.append(replace(plan, dst_index=value.arg.index, itemsize=itemsize))
-      self.gather_slots[key] = value
-    return self.gather_slots[key]
+    return self._gather_slot(dtype, layout, replace(plan, itemsize=itemsize), self.count*itemsize)
 
   def _emit(self, dst:RKValue, lhs:RKValue, rhs:RKValue, cfg:int, *, compare:bool=False) -> RKValue:
     integer16, integer32 = dst.layout in (RKLayout.INT16, RKLayout.BOOL_INT16), dst.layout is RKLayout.INT32
