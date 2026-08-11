@@ -1757,3 +1757,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 80. Tag compensated ADDs at construction — complete
+
+- Profiled the new slowest static case, `test_dependent_reduction_range_preserves_vector_output_axis`. Its literal
+  65/128-product correctness path emits 4,012/7,918 real EW stages, but `_precise_mul_sum()` then rebuilt that entire
+  completed UOp graph solely to attach `_NATIVE_PRECISE_ADD` markers.
+- Added one physical `_precise_add()` constructor and use it throughout error-free product/sum construction. Input
+  product DAGs are tagged together once before expansion, while every newly generated ADD owns its marker immediately;
+  the large completed recipe no longer needs another topological traversal and reconstruction.
+- Compared serialized RKImages before and after for scalar 65-term, vector 65-term, large 128-term, and nonaffine
+  64-product programs. All four images were byte-identical, including gathers, scratch coloring, EW stages, and flags.
+  Large lowering fell from 0.740 to 0.568 seconds (23%), the suite's slowest case fell from 2.21 to 1.59 seconds, and
+  the complete static suite now takes 5.29 seconds.
+- Renderer executable size fell from 4,782 to 4,781 lines. From the 10,233-line baseline, 5,452 executable renderer
+  lines are gone (53.3%); runtime remains 480 lines. This is compile-time graph construction only: no CPU numeric
+  semantics and no hardware-stage change.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 4/4 profiled reduction programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.29 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

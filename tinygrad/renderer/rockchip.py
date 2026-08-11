@@ -156,7 +156,7 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
     if physical_reusable[target]: heapq.heappush(active, (end, target))
     remap[slot] = target
   def remap_arg(arg:RKArg) -> RKArg:
-    return replace(arg, index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg
+    return RKArg(arg.kind, remap[arg.index], arg.addend) if arg.kind is RKBufferKind.SCRATCH else arg
   def remap_gather(gather:RKGather) -> RKGather:
     return replace(gather,
     src_index=remap[gather.src_index] if not gather.values and gather.src_kind is RKBufferKind.SCRATCH else gather.src_index,
@@ -781,7 +781,8 @@ def _relu_operand(u:UOp) -> UOp|None:
   return None
 
 
-def _sub_half(lhs:UOp, rhs:UOp, neg_one:UOp) -> UOp: return lhs.alu(Ops.ADD, rhs.alu(Ops.MUL, neg_one))
+def _precise_add(lhs:UOp, rhs:UOp) -> UOp: return UOp(Ops.ADD, lhs.dtype, src=(lhs, rhs), arg=_NATIVE_PRECISE_ADD)
+def _sub_half(lhs:UOp, rhs:UOp, neg_one:UOp) -> UOp: return _precise_add(lhs, rhs.alu(Ops.MUL, neg_one))
 
 def _split_half(x:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
   scaled = x.alu(Ops.MUL, splitter)
@@ -792,14 +793,14 @@ def _two_product(term:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
   lhs_high, lhs_low = _split_half(term.src[0], neg_one, splitter)
   rhs_high, rhs_low = _split_half(term.src[1], neg_one, splitter)
   error = _sub_half(lhs_high.alu(Ops.MUL, rhs_high), term, neg_one)
-  error = error.alu(Ops.ADD, lhs_high.alu(Ops.MUL, rhs_low)).alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_high))
-  return term, error.alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_low))
+  error = _precise_add(_precise_add(error, lhs_high.alu(Ops.MUL, rhs_low)), lhs_low.alu(Ops.MUL, rhs_high))
+  return term, _precise_add(error, lhs_low.alu(Ops.MUL, rhs_low))
 
 def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
-  total = lhs.alu(Ops.ADD, rhs)
+  total = _precise_add(lhs, rhs)
   rhs_virtual = _sub_half(total, lhs, neg_one)
   lhs_error = _sub_half(lhs, _sub_half(total, rhs_virtual, neg_one), neg_one)
-  return total, lhs_error.alu(Ops.ADD, _sub_half(rhs, rhs_virtual, neg_one))
+  return total, _precise_add(lhs_error, _sub_half(rhs, rhs_virtual, neg_one))
 
 def _precise_add_parts(terms:tuple[UOp, ...]|list[UOp]) -> tuple[UOp, UOp]:
   """Recover FP16 addition residuals as a high lane plus a low correction lane."""
@@ -808,16 +809,14 @@ def _precise_add_parts(terms:tuple[UOp, ...]|list[UOp]) -> tuple[UOp, UOp]:
   for part in terms[1:]:
     high, error = _two_sum(high, part, neg_one)
     middle, error = _two_sum(middle, error, neg_one)
-    low = low.alu(Ops.ADD, error)
-  middle = middle.alu(Ops.ADD, low)
-  return high, middle
+    low = _precise_add(low, error)
+  return high, _precise_add(middle, low)
 
 def _precise_sum_parts(terms:list[UOp]) -> tuple[UOp, UOp]:
   """Recover FP16 product and addition residuals as a high lane plus a low correction lane."""
   zero, neg_one, splitter = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half), UOp.const(65.0, dtypes.half)
   pairs = tuple(_two_product(term, neg_one, splitter) if term.op is Ops.MUL else (term, zero) for term in terms)
-  products, errors = tuple(x[0] for x in pairs), tuple(x[1] for x,term in zip(pairs, terms) if term.op is Ops.MUL)
-  return _precise_add_parts(products + errors)
+  return _precise_add_parts(tuple(x[0] for x in pairs) + tuple(x[1] for x,term in zip(pairs, terms) if term.op is Ops.MUL))
 
 def _tag_precise_adds(root:UOp) -> UOp:
   """Mark additions inside an already compensated physical recipe so they are not expanded again."""
@@ -829,8 +828,8 @@ def _tag_precise_adds(root:UOp) -> UOp:
 
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
   """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
-  high, middle = _precise_sum_parts(terms)
-  return _tag_precise_adds(high.alu(Ops.ADD, middle))
+  high, middle = _precise_sum_parts(list(_tag_precise_adds(UOp(Ops.SINK, src=tuple(terms))).src))
+  return _precise_add(high, middle)
 
 def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float,
                                  op_barriers:bool=False, compensated_limit:int=_reduction_stride(1)//2, kahan:bool=False) -> RKImage|None:
