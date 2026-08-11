@@ -352,3 +352,37 @@ Verification:
   433 passed, 12 skipped, 154 subtests passed in 18m27s.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 22. Strict typed-address and local-control milestone — complete
+
+- Stopped applying the legacy whole-program FP16 rewrite before typed lowering. Math UOps now expand inside the generic
+  executor, and semantic `WHERE` nodes remain explicit phase barriers instead of being prematurely converted into
+  arithmetic blends. The complete tensor-power class consequently lowers through ordinary comparison, selection,
+  `LOG2`, multiply, and `EXP2` semantics.
+- Added exact generic INT32 comparison by splitting canonical INT32 values into four raw byte lanes. Equality compares
+  all bytes and signed less-than uses the existing lexicographic byte primitive; resulting masks use the canonical
+  `BOOL_INT16` physical ABI.
+- Added a bounded render-time interpreter for constant `RANGE` plus scalar local `LOAD`/`STORE` programs used only by
+  global addresses. It follows UOp loop/local semantics, memoizes nested accumulator results by their semantic free
+  ranges, and produces static gather offsets without reading or evaluating tensor values on the host.
+- Added packed boolean `LOAD` as a typed memory rule: raw bytes are gathered into zero-extended canonical INT16 lanes,
+  after which ordinary `CAST`, comparison, and arithmetic handlers compose normally.
+- Generalized dynamic raw gather from fixed 16-bit values to 1/2/4-byte typed values. Direct runtime INT32 loads now
+  select and repack all four bytes, while the existing equality-mask machinery remains dtype-independent.
+- Moved `WHERE(output_lane < sum(bool), LOAD(dynamic_index), fill)` into the generic structural/memory path and renamed
+  it around that UOp form. This is the physical gate required by bounded dynamic loads, not a tensor-operation lowerer.
+- Added regressions for nested static local address programs, packed bool loads, full raw INT32 dynamic loads, nested
+  semantic `WHERE` around math, exact INT32 comparison, and phased raw selection.
+- Removed temporary renderer trace-print hooks. Rewrite inspection continues through Tinygrad's normal VIZ/DEBUG tools.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 47 passed.
+- Strict `TestRockchipTensorPowerOps`: 7 passed.
+- Strict `TestRockchipOneHotOps::test_one_hot` and `TestRockchipGatherOps::test_gather`: passed.
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_UOPS_ONLY=1 .venv/bin/python -m pytest
+  test/backend/test_rockchip.py::TestRockchipMaskedSelectOps -q -n0`: 2 passed in 48.56s.
+- A diagnostic strict census before this milestone completed 193 of 445 tests: 148 passed, 39 failed, 6 skipped, and
+  120 subtests passed in 17m56s. It was interrupted in a slow cumulative test; this is a baseline, not a final census.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

@@ -429,9 +429,14 @@ class RockchipProgram(Program['RockchipDevice']):
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}),
                              rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if self.image.mid_gathers:
-      self._run_ew_ops(address, buffer, self.image.ew_ops[:self.image.gather_after])
-      synchronized_gathers(self.image.mid_gathers, True)
-      self._run_ew_ops(address, buffer, self.image.ew_ops[self.image.gather_after:])
+      cursor = 0
+      points = sorted({g.after if g.after >= 0 else self.image.gather_after for g in self.image.mid_gathers})
+      for point in points:
+        self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:point])
+        synchronized_gathers(tuple(g for g in self.image.mid_gathers
+                                   if (g.after if g.after >= 0 else self.image.gather_after) == point), True)
+        cursor = point
+      self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
     if self.image.ew_ops: self.dev._native_int16 = native_int16
     if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
