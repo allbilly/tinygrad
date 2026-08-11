@@ -4624,8 +4624,7 @@ def _fold_masked_load(gate:UOp, load:UOp, default:UOp, allow_additional_gate_loa
   if not same_default and not outer_implies_inner: return None
   return load.replace(src=(load.src[0], default, gate.alu(Ops.AND, load_gate) if same_default else gate))
 
-_pm_masked_loads = PatternMatcher([
-  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
+_pm_masked_materialization = PatternMatcher([
   (UPat(Ops.WHERE, src=(UPat.var("gate"), UPat(Ops.LOAD, name="load"), UPat.cvar("default"))),
    lambda gate,load,default: _fold_masked_load(gate, load, default)),
   (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat.var("val"), UPat.cvar("default"))),
@@ -4633,6 +4632,7 @@ _pm_masked_loads = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat.cvar("default"), UPat.var("val"))),
    lambda gate,default,val: _fold_masked_max(gate, default, val, True)),
 ])
+_pm_masked_loads = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul)]) + _pm_masked_materialization
 
 def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
   if val.op is Ops.MAX:
@@ -4697,13 +4697,8 @@ _pm_fp32_to_fp16 = _pm_storage_common + PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
+]) + _pm_masked_materialization + PatternMatcher([
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.
-  (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat(Ops.LOAD, dtypes.half, name="load"), UPat.cvar("default"))),
-   lambda gate,load,default: _fold_masked_load(gate, load, default)),
-  (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat.var("val"), UPat.cvar("default"))),
-   lambda gate,val,default: _fold_masked_max(gate, default, val, False)),
-  (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat.cvar("default"), UPat.var("val"))),
-   lambda gate,default,val: _fold_masked_max(gate, default, val, True)),
   (UPat(Ops.WHERE, dtypes.half, name="x"), lambda x: x.src[1].alu(Ops.MAX, x.src[2])
    if x.src[0].op is Ops.CMPLT and x.src[0].src[0] is x.src[2] and x.src[0].src[1] is x.src[1] and
       x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),

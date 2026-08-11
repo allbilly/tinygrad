@@ -2063,3 +2063,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 94. Share masked materialization patterns — complete
+
+- The early masked-load pass and the FP32-to-FP16 storage pass embedded the same ordered rules for folding a masked
+  load and the two orientations of a masked `MAX`. Extracted that three-rule physical materialization block once and
+  composed both matchers around it without changing their prefix or suffix rule order.
+- Compared milestone-93/current serialized images for a nested masked load and a nonfinite masked-`MAX` selector;
+  both were byte-identical. The full Rockchip UOp unit suite also covers the storage-boundary matcher composition.
+- Renderer executable size fell from 4,709 to 4,704 lines. From the 10,233-line baseline, 5,529 executable renderer
+  lines are gone (54.0%); runtime remains 480 lines. This only deduplicates DPU graph materialization rules and adds no
+  CPU numeric semantics.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 2/2 affected materialization programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.17 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
