@@ -386,3 +386,31 @@ Verification:
   120 subtests passed in 17m56s. It was interrupted in a slow cumulative test; this is a baseline, not a final census.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 23. Strict predicate-prefix and coordinate execution — complete
+
+- Routed direct unrolled FP16 predicate totals/prefixes, packed-bool prefixes, and typed integer nonzero prefixes through
+  the generic executor. These are blocked physical implementations of `LOAD`, comparison, `CAST`, and `ADD` UOps;
+  they are not tensor-operation handlers.
+- Renamed the fixed nonzero catalog entries around their actual bounded predicate-count plus coordinate-selection UOp
+  semantics, and made both FP16 and integer forms available to strict typed dispatch.
+- Routed exact INT32 equality histograms, occurrence sums, prefix sums, and bounded lookup through strict dispatch. The
+  blocked byte implementation prevents large valid `CMPNE`/`WHERE`/`ADD` programs from overflowing RKImage's 16-bit
+  stage fields while preserving those UOps as the semantic program.
+- Replaced the normalized-prefix sign compare with exact bounded `MAX(delta, 0)` then `MIN(..., 1)` arithmetic. This
+  avoids an unnecessary standalone compare/reset cycle after the INT32-to-FP16 boundary.
+- Reduced the randomized nonzero prefix kernel from 7,691 EW stages and 770 compare submissions to the existing blocked
+  1,069-stage recipe with 12 compares. The final 4,367-UOp coordinate histogram now compresses to 778 byte-exact EW
+  stages instead of being rejected by strict mode.
+- Verified NPU health after the diagnostic driver abort using the independent RK3588 elementwise reference; every
+  ADD/MUL/SUB/MAX/NEG/FDIV size through 131,072 lanes passed.
+- Added host-independent regressions for strict FP16 predicate-prefix dispatch and compare-free normalized INT prefixes.
+
+Verification:
+
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_UOPS_ONLY=1 .venv/bin/python -m pytest
+  test/backend/test_rockchip.py::TestRockchipNonzeroOps -x -q -n0`: 2 passed in 225.13s.
+- Deterministic 32x10 integer-coordinate nonzero pipeline: strict result matched NumPy, 118x2 output.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 49 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

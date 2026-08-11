@@ -440,6 +440,35 @@ def test_packed_bool_load_uses_canonical_int16_lanes():
   assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
 
 
+def test_unrolled_fp16_predicate_prefix_uses_blocked_uop_recipe():
+  source = UOp.param(1, dtypes.half, (4,))
+  def prefix(lane:UOp) -> UOp:
+    terms = []
+    for source_lane in range(4):
+      predicate = UOp(Ops.CMPLT, dtypes.bool, src=(UOp.const(0.0, dtypes.half), source.index(source_lane).load()))
+      active = UOp(Ops.CMPLT, dtypes.bool, src=(UOp.const(source_lane, dtypes.int), lane+1))
+      terms.append(active.where(predicate.cast(dtypes.int), UOp.const(0, dtypes.int)))
+    value = terms[0]
+    for term in terms[1:]: value = value+term
+    return value
+  image = _lower_uop_program(_program(dtypes.int, prefix))
+  assert image is not None and len(image.ew_ops) == 16 and sum(op.compare for op in image.ew_ops) == 3
+
+
+def test_normalized_int_prefix_avoids_compare_submission():
+  source = UOp.param(1, dtypes.int, (4,))
+  def prefix(lane:UOp) -> UOp:
+    terms = []
+    for source_lane in range(4):
+      active = UOp(Ops.CMPLT, dtypes.bool, src=(UOp.const(source_lane, dtypes.int), lane+1))
+      terms.append(source.index(source_lane).load(UOp.const(0, dtypes.int), active))
+    value = terms[0]
+    for term in terms[1:]: value = value+term
+    return (value < 0).where(value+4, value)
+  image = _lower_uop_program(_program(dtypes.int, prefix))
+  assert image is not None and len(image.ew_ops) == 10 and not any(op.compare for op in image.ew_ops)
+
+
 def test_direct_dynamic_int32_load_selects_all_raw_bytes():
   out, source, indices = (UOp.param(0, dtypes.int, (4,)), UOp.param(1, dtypes.int, (9,)), UOp.param(2, dtypes.int, (4,)))
   lane = UOp.range(4, 0)

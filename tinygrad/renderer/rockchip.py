@@ -3777,13 +3777,15 @@ def _lower_unrolled_int_prefix_sum(output:RKOutput) -> RKImage|None:
   reduced = _reduce_rows(ops, [arg(matrix, row*vector_bytes) for row in range(count)], count, _EW_CFG[Ops.ADD])
   result = reduced
   if normalized is not None:
-    zero, extent, negative_delta, negative, correction, normalized_value = range(len(scratch), len(scratch)+6)
-    scratch.extend(RKScratch(_scratch_bytes(count)) for _ in range(6))
-    zero_bits, extent_bits = (_fp16_bits(value) for value in (0.0, normalized[1]))
+    zero, one, extent, negative_delta, positive, negative, correction, normalized_value = range(len(scratch), len(scratch)+8)
+    scratch.extend(RKScratch(_scratch_bytes(count)) for _ in range(8))
+    zero_bits, one_bits, extent_bits = (_fp16_bits(value) for value in (0.0, 1.0, normalized[1]))
     gathers.extend((RKGather(source.arg.slot, zero, count, values=(zero_bits,)*count),
+                    RKGather(source.arg.slot, one, count, values=(one_bits,)*count),
                     RKGather(source.arg.slot, extent, count, values=(extent_bits,)*count)))
     ops.extend((RKEWOp(arg(negative_delta), arg(zero), reduced, count, _EW_CFG[Ops.SUB]),
-                RKEWOp(arg(negative), arg(negative_delta), arg(negative_delta), count, _EW_CFG[Ops.MAX], compare=True),
+                RKEWOp(arg(positive), arg(negative_delta), arg(zero), count, _EW_CFG[Ops.MAX]),
+                RKEWOp(arg(negative), arg(positive), arg(one), count, _EW_CFG_MIN),
                 RKEWOp(arg(correction), arg(negative), arg(extent), count, _EW_CFG[Ops.MUL], stateful=True),
                 RKEWOp(arg(normalized_value), reduced, arg(correction), count, _EW_CFG[Ops.ADD])))
     result = arg(normalized_value)
@@ -5852,10 +5854,10 @@ def _lower_loop_fp16_prefix_count(uops:list[UOp], output:RKOutput) -> RKImage|No
   if not 1 <= count <= _FP16_EXACT_INTEGER or (value:=_unrolled_local_add(uops, out_index)) is None: return None
   return _lower_unrolled_fp16_prefix_count((store, out_param, count, out_index, value))
 
-RKFixedNonzero = tuple[UOp, int, UOp, tuple[int, ...], tuple[tuple[int, ...], ...], int]
-def _fixed_nonzero_plan(output:RKOutput, dtype:DType, predicate:Callable[[UOp], UOp|None],
-                        encodable:Callable[[int], bool]) -> RKFixedNonzero|None:
-  """Prove the common fixed-size Nonzero count, compact-index, coordinate, and fill graph."""
+RKBoundedPredicateCoordinates = tuple[UOp, int, UOp, tuple[int, ...], tuple[tuple[int, ...], ...], int]
+def _bounded_predicate_coordinate_plan(output:RKOutput, dtype:DType, predicate:Callable[[UOp], UOp|None],
+                                       encodable:Callable[[int], bool]) -> RKBoundedPredicateCoordinates|None:
+  """Prove a bounded predicate count plus dynamic-rank coordinate selection and fill program."""
   _, _, count, out_index, root = output
   if not 1 <= count <= _FP16_EXACT_INTEGER or root.op is not Ops.WHERE or len(root.src) != 3: return None
   fill = root.src[2]
@@ -5889,11 +5891,11 @@ def _fixed_nonzero_plan(output:RKOutput, dtype:DType, predicate:Callable[[UOp], 
   except (RuntimeError, OverflowError, struct.error): return None
   return source, rank, index_param, index_offsets, coordinate_rows, fill_value
 
-def _lower_fixed_fp16_nonzero(output:RKOutput) -> RKImage|None:
-  """Select fixed nonzero coordinates through DPU count, exact INT32 equality, and static coordinate rows."""
+def _lower_bounded_fp16_predicate_coordinates(output:RKOutput) -> RKImage|None:
+  """Execute bounded FP16 predicate coordinates with DPU count, exact INT32 equality, and static rows."""
   _, out_param, count, _, _ = output
-  if (plan:=_fixed_nonzero_plan(output, dtypes.half, _nonzero_load,
-                                lambda value:_eval_cast(value, dtypes.half) == value)) is None: return None
+  if (plan:=_bounded_predicate_coordinate_plan(output, dtypes.half, _nonzero_load,
+                                               lambda value:_eval_cast(value, dtypes.half) == value)) is None: return None
   source, rank, index_param, index_offsets, coordinate_rows, fill_value = plan
   source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows)
 
@@ -5941,11 +5943,11 @@ def _lower_fixed_fp16_nonzero(output:RKOutput) -> RKImage|None:
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
                  gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid, gather_after=gather_after)
 
-def _lower_fixed_integer_nonzero(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
-  """Select fixed coordinates of arbitrary integer nonzeros through native INT16 byte masks."""
+def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
+  """Execute bounded integer predicate coordinates through native INT16 byte masks."""
   _, out_param, count, _, _ = output
-  if (plan:=_fixed_nonzero_plan(output, dtype, lambda u:_integer_nonzero_load(u, dtype),
-                                lambda value:-32768 <= value <= 32767)) is None: return None
+  if (plan:=_bounded_predicate_coordinate_plan(output, dtype, lambda u:_integer_nonzero_load(u, dtype),
+                                               lambda value:-32768 <= value <= 32767)) is None: return None
   source, rank, index_param, index_offsets, coordinate_rows, fill_value = plan
   source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows)
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)
@@ -8632,6 +8634,21 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
   if output[1].dtype.scalar() is dtypes.int:
+    if (predicate_total:=_lower_unrolled_fp16_predicate_total(output)) is not None: return predicate_total
+    if (predicate_prefix:=_lower_unrolled_fp16_prefix_count(output)) is not None: return predicate_prefix
+    if (bool_prefix:=_lower_unrolled_bool_prefix_count(output)) is not None: return bool_prefix
+    # Prefixes are ordinary unrolled CAST(CMPNE(LOAD, 0)) UOp sums. Vectorize the
+    # physical byte comparisons here before the scalar INT32 executor is needed.
+    for source_dtype in (dtypes.int16, dtypes.int):
+      if (integer_prefix:=_lower_unrolled_integer_prefix_count(output, source_dtype)) is not None: return integer_prefix
+      if (coordinates:=_lower_bounded_integer_predicate_coordinates(output, source_dtype)) is not None: return coordinates
+    if (coordinates:=_lower_bounded_fp16_predicate_coordinates(output)) is not None: return coordinates
+    # Exact INT32 equality expands to several byte stages per semantic comparison. Block common
+    # unrolled equality sums so a valid UOp program does not overflow RKImage's 16-bit stage counts.
+    if (sum_occurrence:=_lower_unrolled_int32_sum_occurrence(output)) is not None: return sum_occurrence
+    if (occurrence:=_lower_unrolled_int_occurrence_count(output)) is not None: return occurrence
+    if (prefix_sum:=_lower_unrolled_int_prefix_sum(output)) is not None: return prefix_sum
+    if (lookup:=_lower_bounded_int32_lookup(output)) is not None: return lookup
     if (predicate_total:=_lower_loop_fp16_predicate_total(uops, output)) is not None: return predicate_total
     if (predicate_prefix:=_lower_loop_fp16_prefix_count(uops, output)) is not None: return predicate_prefix
     if (equality_add:=_lower_loop_int32_equality_add(uops, output)) is not None: return equality_add
@@ -8727,9 +8744,10 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (fixed_int_select:=_lower_dynamic_load_with_bool_total_gate(int_output)) is not None: return fixed_int_select
     if (predicate_total:=_lower_unrolled_fp16_predicate_total(int_output)) is not None: return predicate_total
     if (positive_prefix:=_lower_unrolled_fp16_prefix_count(int_output)) is not None: return positive_prefix
-    if (fixed_int16_nonzero:=_lower_fixed_integer_nonzero(int_output, dtypes.int16)) is not None: return fixed_int16_nonzero
-    if (fixed_int_nonzero:=_lower_fixed_integer_nonzero(int_output)) is not None: return fixed_int_nonzero
-    if (fixed_nonzero:=_lower_fixed_fp16_nonzero(int_output)) is not None: return fixed_nonzero
+    if (fixed_int16_nonzero:=_lower_bounded_integer_predicate_coordinates(int_output, dtypes.int16)) is not None:
+      return fixed_int16_nonzero
+    if (fixed_int_nonzero:=_lower_bounded_integer_predicate_coordinates(int_output)) is not None: return fixed_int_nonzero
+    if (fixed_nonzero:=_lower_bounded_fp16_predicate_coordinates(int_output)) is not None: return fixed_nonzero
     if (sum_occurrence:=_lower_unrolled_int32_sum_occurrence(int_output)) is not None: return sum_occurrence
     if (int_occurrence:=_lower_unrolled_int_occurrence_count(int_output)) is not None: return int_occurrence
     if (int_prefix:=_lower_unrolled_int_prefix_sum(int_output)) is not None: return int_prefix
