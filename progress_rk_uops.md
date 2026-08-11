@@ -2082,3 +2082,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 95. Reuse the expanded physical dependency order — complete
+
+- Profiled the slowest unit case, `test_dependent_reduction_range_preserves_vector_output_axis`. After expanding its
+  physical recipe, `_lower_uop_program()` already had the exact dependency order, but `RKContext.__init__()` and
+  `RKContext.finish()` each independently topologically sorted the same 17.5k-node graph again.
+- Passed that ordered node dictionary into `RKContext` and reused it for both context classification and iterative
+  lowering. The direct cProfile workload fell from 2,265,951 to 2,059,999 calls and from 1.512 to 1.405 seconds (7.1%);
+  `_lower_uop_program()` cumulative time fell from 1.680 to 1.574 seconds (6.3%). A warmed alternating AB/BA benchmark
+  of the largest 128x128 case improved from a 0.394-second median to 0.382 seconds (3.0%).
+- Scalar, vector, and large dependent-reduction images remained byte-identical to milestone 94. Renderer size remains
+  4,704 executable lines, 5,529 lines or 54.0% below baseline; runtime remains 480 lines. This only reuses graph
+  metadata and adds no CPU numeric semantics.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 dependent-reduction programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

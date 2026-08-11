@@ -2650,7 +2650,7 @@ def _accurate_add_recipe(u:UOp) -> UOp:
 
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
-  def __init__(self, output:RKOutput, *, accurate_adds:bool=True, static_load_offsets:dict[UOp, tuple[int, ...]]|None=None):
+  def __init__(self, output:RKOutput, nodes:dict[UOp, None], *, accurate_adds:bool=True, static_load_offsets:dict[UOp, tuple[int, ...]]|None=None):
     _, self.out_param, self.count, self.out_index, self.root = output
     self.out = RKArg(RKBufferKind.ARG, self.out_param.arg.slot)
     self.values:dict[UOp, RKValue] = {}
@@ -2667,7 +2667,6 @@ class RKContext:
     self.host_gathers:list[RKHostAddress] = []
     self.mid_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
-    nodes = self.root.toposort()
     self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)
     int_range = _exact_int_range(self.root) if self.root.dtype.scalar() is dtypes.int else None
     packed_bool_load = any(node.op is Ops.LOAD and node.dtype.scalar() is dtypes.bool and _root_param(node.src[0]) is not None for node in nodes)
@@ -2688,6 +2687,7 @@ class RKContext:
                        RKLayout.INT32 if dynamic_int_load else
                        RKLayout.INT_FP16 if embedded_half_int else None)
     self.accurate_adds = accurate_adds
+    self.nodes = nodes
     self.static_nodes:set[UOp] = set()
     for node in nodes:
       if node.op in _STATIC_OPS and all(src in self.static_nodes for src in node.src): self.static_nodes.add(node)
@@ -3608,7 +3608,7 @@ class RKContext:
     return value
 
   def finish(self) -> RKImage:
-    nodes = self.root.toposort()
+    nodes = self.nodes
     if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) for node in nodes):
       for node in nodes:
         if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
@@ -4336,7 +4336,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
       if (output:=_output_store(uops, (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool))) is None: return None
-    image = RKContext(output, accurate_adds=(not recipes_ready and (storage_uops is None or storage_product_adds) and
+    image = RKContext(output, expanded_nodes, accurate_adds=(not recipes_ready and (storage_uops is None or storage_product_adds) and
                                              len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
                                              not _has_runtime_address(output[4])),
                       static_load_offsets=static_load_offsets).finish()
