@@ -445,7 +445,7 @@ class RockchipProgram(Program['RockchipDevice']):
       cursor = 0
       by_point:dict[int, list[RKGather]] = {}
       for gather in self.image.mid_gathers:
-        by_point.setdefault(gather.after if gather.after >= 0 else self.image.gather_after, []).append(gather)
+        by_point.setdefault(gather.after, []).append(gather)
       for point,gathers in sorted(by_point.items()):
         self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:point])
         synchronized_gathers(tuple(gathers), True)

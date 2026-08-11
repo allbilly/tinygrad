@@ -482,8 +482,9 @@ def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   value = (zero < value).where(value, zero)
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and image.constants == struct.pack("<eee", 1.0, 65.0, 0.0)
-  assert len(image.gathers) == groups*2 and image.gather_after >= 17 and image.gather_after%17 == 0
-  assert len(image.mid_gathers) == groups*2 and len(image.ew_ops) > image.gather_after
+  split = min(gather.after for gather in image.mid_gathers)
+  assert len(image.gathers) == groups*2 and split >= 17 and split%17 == 0
+  assert len(image.mid_gathers) == groups*2 and len(image.ew_ops) > split
   assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MAX]
 
 
@@ -819,7 +820,7 @@ def test_mapped_loop_reduction_composes_generic_post_uops():
   post = (local.load().cast(dtypes.half)*UOp.const(1/65, dtypes.half)).sqrt()
   output = out.index(0).store(post)
   image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
-  assert image is not None and image.gather_after < len(image.ew_ops)
+  assert image is not None and image.ew_ops
   assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG, 0)
 
 
@@ -881,7 +882,7 @@ def test_leading_vector_materialization_is_composed_into_initial_lane_gathers():
             RKEWOp(copied, arena, RKArg(arena.kind, arena.index, 32), 1, _EW_CFG[Ops.ADD]),
             RKEWOp(RKArg(RKBufferKind.ARG, 0), copied, RKArg(arena.kind, arena.index, 64), 1, _EW_CFG[Ops.ADD])),
     mid_gathers=tuple(RKGather(copied.index, arena.index, 1, base=lane, dst_addend=lane*32,
-                               src_kind=RKBufferKind.SCRATCH, after=1) for lane in range(4)), gather_after=1)
+                               src_kind=RKBufferKind.SCRATCH, after=1) for lane in range(4)))
   folded = _hoist_leading_vector_materialization(image)
   assert len(folded.ew_ops) == 2 and not folded.mid_gathers and len(folded.gathers) == 5
   assert tuple(gather.offsets for gather in folded.gathers[1:]) == ((0,), (1,), (2,), (3,))

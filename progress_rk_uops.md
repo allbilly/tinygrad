@@ -1522,3 +1522,21 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 68. Delete the duplicate image gather split — complete
+
+- Every mid-program gather already serializes its own physical `after` stage, but `RKImage.gather_after` retained a
+  second fallback split in the image header, scratch coloring, image composition, and runtime scheduler. Audited all
+  producers and made the few legacy mid-gather constructors write their existing split directly into `RKGather.after`.
+- Deleted `RKImage.gather_after` and the corresponding header/runtime fallback logic. Image composition now offsets
+  each explicit point, and decode validates every mid-gather point directly. Bumped the serialized ABI to version 34.
+- One unit contract had asserted a `gather_after` value even though its image contained no mid-gathers; replacing that
+  meaningless state assertion with the actual emitted EW/output contract confirmed the field was not semantic.
+- Renderer executable size fell from 4,878 to 4,876 lines; runtime remains 486 lines. From the 10,233-line renderer
+  baseline, 5,357 executable lines are gone (52.3%). No CPU numeric semantics or DPU operation changed.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
