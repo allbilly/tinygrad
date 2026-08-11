@@ -66,6 +66,16 @@ def test_generic_where_owns_ternary_arity():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
 
 
+def test_generic_bool_where_uses_canonical_int16_ternary():
+  lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
+  def select(i):
+    left, right = lhs.index(i).load(), rhs.index(i).load()
+    return (left < right).where(left != UOp.const(0, dtypes.int), UOp.const(False, dtypes.bool))
+  image = _lower_uop_program(_program(dtypes.bool, select))
+  assert image is not None and image.ew_ops[-1].int16_output
+  assert len(image.post_gathers) == 1 and image.post_gathers[0].itemsize == 1
+
+
 def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   def greater_equal(i):

@@ -414,3 +414,31 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n0`: 49 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 24. Strict typed dynamic selection and scatter execution — complete
+
+- Generalized the physical dynamic gather implementation and its direct/multi-index entry points around raw typed
+  values rather than a fixed 16-bit tensor operation. Strict dispatch now materializes half, INT16, and INT32 dynamic
+  loads through the same address-selection machinery.
+- Kept dynamic INT32 address expressions in the canonical `RKLayout.INT32` ABI even when the program result is FP16.
+  Expanded fancy-index selectors can consequently execute their ordinary `LOAD`, comparison, boolean, and `WHERE`
+  UOps without recovering a tensor-level fancy-index dialect.
+- Added true ternary boolean `WHERE` lowering and canonical `BOOL_MASK` to `BOOL_INT16` coercion. Mixed FP16 and INT32
+  predicates now compose in one program, including the nested predicate selectors emitted by scatter and scatter-reduce.
+- Selected nonfinite FP16 constants as raw bits when the selector uses `BOOL_INT16`; this preserves infinity exactly
+  without requiring an FP16 mask or multiplying a nonfinite value by zero.
+- Routed root INT32 bounds predicates and masked dynamic typed loads through strict physical memory materialization.
+- Renamed the remaining dynamic-selection helpers around their UOp/memory semantics. The strict scatter tests execute
+  Tinygrad's expanded selector/reduction UOps; the legacy scatter-specific lowerers are not routed by strict mode.
+- Added a host-independent regression for boolean `WHERE` over exact INT32 comparisons and the canonical packed-bool
+  output boundary.
+
+Verification:
+
+- Strict `TestRockchipFancyIndexOps` plus `TestRockchipScatterOps`: 15 passed in 75.13s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 50 passed.
+- A pre-milestone strict census completed the first 193 of 445 tests before interruption in a long cumulative kernel:
+  161 passed, 26 failed, 6 skipped, and 120 subtests passed in 22m34s. This was 13 fewer failures than the preceding
+  148-pass/39-failure prefix; the four scatter failures reported by that census are now fixed by this milestone.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
