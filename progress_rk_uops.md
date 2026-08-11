@@ -1503,3 +1503,22 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed, including all RKImage round trips.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 67. Remove fixed target, version, and alignment state — complete
+
+- Audited every image and scratch producer. All images target RK3588, every decoder rejects versions other than the
+  current one, and every scratch allocation uses 4 KiB alignment. These values were carried as per-object state even
+  though no producer could vary them and neither target nor version affected runtime execution.
+- Removed `RKTarget`, `RKImage.target`, `RKImage.version`, and `RKScratch.alignment`. The serializer now writes its
+  compile-time image version directly, scratch records contain only their variable size, and the runtime applies the
+  sole 4 KiB scratch-alignment contract directly. Bumped the serialized ABI to version 33.
+- Renderer executable size fell from 4,880 to 4,878 lines; runtime remains 486 lines. From the 10,233-line renderer
+  baseline, 5,355 executable lines are gone (52.3%). More importantly, 37 physical lines and three false ABI degrees
+  of freedom were removed.
+- No CPU numeric semantics or generated DPU task changed. Serialized-image round trips cover the narrowed records.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

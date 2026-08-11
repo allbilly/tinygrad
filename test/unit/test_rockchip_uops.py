@@ -1,7 +1,7 @@
 import math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKTarget, RKValue,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
@@ -875,7 +875,7 @@ def test_generic_ew_chain_reuses_dead_scratch_values():
 
 def test_leading_vector_materialization_is_composed_into_initial_lane_gathers():
   arg, vector, copied, arena = RKArg(RKBufferKind.ARG, 1), *(RKArg(RKBufferKind.SCRATCH, i) for i in range(3))
-  image = RKImage(RKTarget.RK3588, tuple(RKScratch(128) for _ in range(3)),
+  image = RKImage(tuple(RKScratch(128) for _ in range(3)),
     gathers=(RKGather(arg.index, vector.index, 4, axes=((1, 4, 1),)),),
     ew_ops=(RKEWOp(copied, vector, vector, 4, _EW_CFG[Ops.MAX]),
             RKEWOp(copied, arena, RKArg(arena.kind, arena.index, 32), 1, _EW_CFG[Ops.ADD]),
@@ -890,7 +890,7 @@ def test_leading_vector_materialization_is_composed_into_initial_lane_gathers():
 def test_scratch_reuse_spans_mid_gathers_without_aliasing_their_state():
   scratch = tuple(RKScratch(64) for _ in range(5))
   arg, slots = RKArg(RKBufferKind.ARG, 0), tuple(RKArg(RKBufferKind.SCRATCH, i) for i in range(5))
-  image = RKImage(RKTarget.RK3588, scratch, gathers=(RKGather(0, 0, 1, values=(0,)),), ew_ops=(
+  image = RKImage(scratch, gathers=(RKGather(0, 0, 1, values=(0,)),), ew_ops=(
     RKEWOp(slots[1], slots[0], slots[0], 1, _EW_CFG[Ops.ADD]),
     RKEWOp(slots[2], slots[1], slots[0], 1, _EW_CFG[Ops.ADD]),
     RKEWOp(slots[4], slots[3], slots[3], 1, _EW_CFG[Ops.ADD]),),

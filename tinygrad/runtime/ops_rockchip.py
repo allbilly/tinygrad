@@ -47,7 +47,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self._scratch_offsets:list[int] = []
     self._scratch_size = 0
     for spec in self.image.scratch:
-      self._scratch_size = _align_up(self._scratch_size, spec.alignment)
+      self._scratch_size = _align_up(self._scratch_size, 4096)
       self._scratch_offsets.append(self._scratch_size)
       self._scratch_size += spec.size
     self._scratch_arena:HCQBuffer|None = None
