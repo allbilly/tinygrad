@@ -2866,3 +2866,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 135. Delete duplicate PC-chain size calculation — complete
+
+- `_submit_pcchain()` already walks every body to build aligned command offsets and the total qword count, but then
+  `_pcchain_sizes()` independently walked the same lengths to compute an asserted-equivalent allocation size. Deleted
+  the second pass and derive command and task-buffer sizes directly from the authoritative offset walk.
+- Five single/multi-body, odd/even, and maximum-sized PC-chain cases produced identical command and descriptor sizes.
+  Validation retains the same body-count and 16-bit register-amount boundary.
+- Runtime executable size fell from 464 to 460 lines. Renderer remains 4,535 executable lines, 5,698 lines below its
+  10,233-line baseline (55.7%). No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current PC-chain size comparison: 5/5 identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.41 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
