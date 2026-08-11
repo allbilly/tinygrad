@@ -2848,3 +2848,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 134. Give runtime EW execution one PC-body flush transition — complete
+
+- `_run_ew_ops()` repeated the same accumulated-PC submission and list reset across barrier, FP32 output, native
+  precision changes, INT32 conversion, compare, and terminal paths. Replaced those copies with one local `flush()`
+  transition while retaining every existing precision-state update and reset point.
+- Fake-device replay of mixed ordinary/barrier/compare/INT16, terminal FP32, and INT32-conversion programs produced
+  three identical submission-body/reset sequences before and after the rewrite.
+- Runtime executable size fell from 470 to 464 lines. Renderer remains 4,535 executable lines, 5,698 lines below its
+  10,233-line baseline (55.7%). No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current runtime execution-sequence comparison: 3/3 identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.55 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

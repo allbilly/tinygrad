@@ -261,31 +261,31 @@ class RockchipProgram(Program['RockchipDevice']):
               self._submit_pcchain(tile_bodies)
         return
     bodies:list[tuple[int, ...]] = []
+    def flush() -> None:
+      if bodies: self._submit_pcchain(bodies)
+      bodies.clear()
     body_precision = 0
     restore_fp16 = False
     for i, op in enumerate(ops):
       if op.submit_barrier and bodies:
-        self._submit_pcchain(bodies)
-        bodies.clear()
+        flush()
         body_precision = 0
       if op.ew_cfg & _EW_STAGE_FP32_OUT:
         if any(not later.ew_cfg & _EW_STAGE_FP32_OUT for later in ops[i+1:]):
           raise RuntimeError("FP32 EW output must be terminal")
-        if bodies: self._submit_pcchain(bodies)
+        flush()
         stages = [patch_stage(emit_ew_stage(later.dst, later.lhs, later.rhs, later.count, later.ew_cfg), address)
                   for later in ops[i:]]
         for start in range(0, len(stages), _MAX_FP32_EW_GROUP_OPS):
           self._submit_pcchain(stages[start:start+_MAX_FP32_EW_GROUP_OPS])
           self.dev.reset_npu()
-        bodies.clear()
         break
       if op.int16_input and op.int32_output:
         if op.int16_output or op.int32_input: raise RuntimeError("conflicting INT16→INT32 EW precision")
         if op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
           raise RuntimeError("INT32 argument output must be terminal")
         if bodies and body_precision not in (0, 16):
-          self._submit_pcchain(bodies)
-          bodies.clear()
+          flush()
         stages = []
         for start in range(0, op.count, 8):
           count = min(8, op.count-start)
@@ -297,8 +297,7 @@ class RockchipProgram(Program['RockchipDevice']):
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
         precision = 16 if op.int16_input else 32
         if bodies and body_precision != precision:
-          self._submit_pcchain(bodies)
-          bodies.clear()
+          flush()
         body_precision, itemsize = precision, precision//8
         limit = _MAX_EW_ELEMS_FP16 if precision == 16 else _MAX_EW_ELEMS_FP16//2
         for start in range(0, op.count, limit):
@@ -311,23 +310,18 @@ class RockchipProgram(Program['RockchipDevice']):
       if op.int32_input or op.int32_output:
         if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
           raise RuntimeError("INT32 argument output must be terminal")
-        if bodies:
-          self._submit_pcchain(bodies)
-          bodies.clear()
+        flush()
         self._run_int32_conversion(op, address, buffer)
         body_precision = 0
         continue
       if op.int16_input:
         raise RuntimeError("mixed INT16 EW conversion is unsupported")
       if body_precision:
-        self._submit_pcchain(bodies)
-        bodies.clear()
+        flush()
         body_precision = 0
         restore_fp16 = not op.compare
       if op.compare:
-        if bodies:
-          self._submit_pcchain(bodies)
-          bodies.clear()
+        flush()
         for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
           count = min(_MAX_EW_ELEMS_FP16, op.count-start)
           offset = start*2
@@ -343,7 +337,7 @@ class RockchipProgram(Program['RockchipDevice']):
                               stateful=op.stateful or op.int16_output or restore_fp16, int16_output=op.int16_output)
         bodies.append(patch_stage(stage, address))
         restore_fp16 = False
-    if bodies: self._submit_pcchain(bodies)
+    flush()
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
