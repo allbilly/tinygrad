@@ -1136,3 +1136,28 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 86 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 51. Delete bool-total dynamic-load recovery — complete
+
+- Tested deletion of the 147-line dependent scalar-local extrema recognizer. All 27 arg-extrema/sort/top-k/max-pool/
+  cumulative-extrema methods remained numerically correct, but `softmax_argmax` regressed from about 3.4s to 156.11s.
+  Restored that handler as a measured temporary physical optimization until generic multi-local execution is bounded.
+- Independently disconnected all three dynamic-load graph recognizers. Generic `RKHostAddress` handled ordinary typed
+  runtime loads, but strict SPECIAL-lane negative-normalized and multi-axis fancy-index programs proved the direct and
+  multi-index structural parsers are still required; both were restored.
+- Masked-select and nonzero passed without the bool-total-gated dynamic-load recognizer. Deleted that handler and its
+  private bool-count parser. Those programs now compose through generic UOps/address materialization instead of a
+  specialized `lane < sum(bool)` graph dialect.
+- No CPU numeric evaluator was introduced. Host address execution remains limited to reading indices, calculating
+  addresses, and copying raw typed bytes; predicate totals and selection semantics remain NPU UOps.
+- Reduced the renderer from 5,222 to 5,140 executable lines, another 82 lines. From the 10,233-line pre-deletion
+  baseline, 5,093 executable lines are gone (49.8%). The physical renderer diff is 88 deletions; runtime remains 488
+  executable lines.
+
+Verification:
+
+- Trial strict arg-extrema/sort/top-k/max-pool/cumulative-extrema gate: 27 passed and 33 subtests passed in 312.10s.
+- Final strict one-hot/gather/masked-select/nonzero/fancy-index/scatter gate: 21 passed in 137.16s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 86 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
