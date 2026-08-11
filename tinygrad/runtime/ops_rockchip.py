@@ -263,6 +263,7 @@ class RockchipProgram(Program['RockchipDevice']):
         return
     bodies:list[tuple[int, ...]] = []
     body_precision = 0
+    restore_fp16 = False
     for i, op in enumerate(ops):
       if op.submit_barrier and bodies:
         self._submit_pcchain(bodies)
@@ -326,9 +327,9 @@ class RockchipProgram(Program['RockchipDevice']):
         raise RuntimeError("mixed INT16 EW conversion is unsupported")
       if body_precision:
         self._submit_pcchain(bodies)
-        self.dev.reset_npu()
         bodies.clear()
         body_precision = 0
+        restore_fp16 = not op.compare
       if op.compare:
         if bodies:
           self._submit_pcchain(bodies)
@@ -349,8 +350,9 @@ class RockchipProgram(Program['RockchipDevice']):
         stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
                               RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
                               RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
-                              stateful=op.stateful or op.int16_output, int16_output=op.int16_output)
+                              stateful=op.stateful or op.int16_output or restore_fp16, int16_output=op.int16_output)
         bodies.append(patch_stage(stage, address))
+        restore_fp16 = False
     if bodies: self._submit_pcchain(bodies)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):

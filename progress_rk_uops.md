@@ -1402,3 +1402,26 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 62. Restore FP16 state without resetting after native INT16 chains — complete
+
+- Profiled the current slowest case, the 512-element half of `test_simple_cummin`. Its instrumented 89.69s execution
+  spent 55.03s in ioctl and 54.01s specifically in 513 NPU resets. The cumulative-index image alternates long native
+  INT16 byte/mask chains with one ordinary FP16 MAX at each structural gather point.
+- Replaced reset-on-INT16-to-FP16 transition with a fully stateful FP16 stage. The emitted DPU operation, dependency
+  order, gathers, submits, and tasks are unchanged; the stateful stage explicitly restores the ordinary FP16 register
+  configuration that the reset previously supplied.
+- A cold standalone 512-element cumulative minimum still executes exactly 2,052 submits and 24,158 DPU tasks, but now
+  completes in 12.65s. The complete 512/1,022-element `test_simple_cummin` fell from 207.61s to 28.77s, about 86% faster.
+- The full cumulative-extrema, comparison, and cast hardware gate passes, covering native INT16, ordinary FP16,
+  comparison isolation, terminal integer conversion, and subsequent-program state recovery.
+- No CPU numeric semantics were introduced. This runtime scheduling change adds two executable lines, taking runtime
+  from 489 to 491; renderer remains 4,971 executable lines.
+
+Verification:
+
+- Cold `TestRockchipCumulativeExtremaOps::test_simple_cummin`: 1 passed in 28.77s.
+- Cold cumulative-extrema/comparison/cast gate: 15 passed in 80.51s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
