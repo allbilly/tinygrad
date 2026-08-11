@@ -1115,14 +1115,13 @@ def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16
 
 
 def _ew_eq_mask(ops:list[RKEWOp], arg:Callable[[int], RKArg], lhs:int, rhs:int, temps:tuple[int, int, int, int], one:int,
-                lanes:int) -> RKArg:
+                lanes:int) -> None:
   """Append SUB, ABS, nonzero comparison, and inversion for an FP16 equality mask."""
   diff, magnitude, unequal, equal = temps
   ops.extend((RKEWOp(arg(diff), arg(lhs), arg(rhs), lanes, _EW_CFG[Ops.SUB]),
               RKEWOp(arg(magnitude), arg(diff), arg(diff), lanes, _EW_CFG_ABS, submit_barrier=True, stateful=True),
               RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), lanes, _EW_CFG[Ops.MAX], compare=True),
               RKEWOp(arg(equal), arg(one), arg(unequal), lanes, _EW_CFG[Ops.SUB], stateful=True)))
-  return arg(equal)
 
 
 def _ew_native_int16_eq_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], lhs:RKArg, rhs:RKArg,
@@ -3446,12 +3445,10 @@ class RKContext:
     self.ew_ops.append(RKEWOp(value.arg, source.arg, zero.arg, self.count, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
     return value
 
-  def _widen_exact_int(self, source:RKValue) -> RKValue:
+  def _widen_exact_int(self, source:RKValue) -> None:
     if self.out_param.dtype.scalar() is not dtypes.int or source.layout is not RKLayout.INT_FP16: raise _RKGenericReject
     tiles = self._scratch(dtypes.int, RKLayout.INT32, _int32_tiles_bytes(self.count))
-    value = RKValue(self.out, dtypes.int, self.count, RKLayout.INT32)
-    self.ew_ops.append(RKEWOp(value.arg, source.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
-    return value
+    self.ew_ops.append(RKEWOp(self.out, source.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
 
   def _narrow_int32(self, source:RKValue) -> RKValue:
     if source.layout is not RKLayout.INT32: raise _RKGenericReject

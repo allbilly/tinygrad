@@ -2330,3 +2330,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 107. Delete discarded physical return values — complete
+
+- Audited every renderer helper whose calls are used only as statements. `_ew_eq_mask()` returned a newly constructed
+  `RKArg` for its known equality slot, but its sole grouped-BOOL caller discarded that object and continued using the
+  slot number directly. Changed the helper to an emission-only `None` contract and removed the construction.
+- `_widen_exact_int()` similarly created an `RKValue` only to read its `.arg` for one final EW stage, then returned it
+  to `finish()`, which discarded it. The output boundary now writes directly to the canonical `self.out` argument and
+  returns `None`.
+- Grouped OR/AND reduction images and exact FP16-to-INT32 widening images matched milestone 106 byte-for-byte.
+  Renderer executable size fell from 4,671 to 4,668 lines. From the 10,233-line baseline, 5,565 lines are gone (54.4%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 2/2 grouped BOOL operators and 1/1 exact INT widening image identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.78 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
