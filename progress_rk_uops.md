@@ -2122,3 +2122,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 97. Delete impossible BOOL layout guards — complete
+
+- Both BOOL binary lowering and BOOL `WHERE` choose `preferred` from exactly `BOOL_INT16` or `BOOL_MASK`, then checked
+  whether it was outside that same two-value set. Removed those impossible branches. BOOL binary lowering also
+  rechecked `_coerce_bool()`'s guaranteed postcondition immediately after coercing both operands; removed that dead
+  guard as well.
+- Removed the one-call `_accurate_add()` forwarding method and routed its dispatch directly through
+  `_accurate_add_recipe()` and the context's ordinary memoized `lower()` path.
+- Compared milestone-96/current images for composed BOOL binary arithmetic, BOOL `WHERE`, and compensated product ADD;
+  all three were byte-identical. Renderer executable size fell from 4,700 to 4,694 lines. From the 10,233-line
+  baseline, 5,539 lines are gone (54.1%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 affected generic programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.04 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

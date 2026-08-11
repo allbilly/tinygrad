@@ -2979,10 +2979,6 @@ class RKContext:
     dst = self._dst(u, out_dtype, layout)
     return self._emit(dst, lhs, rhs, cfg, compare=compare)
 
-  def _accurate_add(self, u:UOp) -> RKValue:
-    recipe = _accurate_add_recipe(u)
-    return self.lower(recipe)
-
   def _coerce_bool(self, value:RKValue, layout:RKLayout) -> RKValue:
     if value.layout is layout: return value
     if value.layout is not RKLayout.BOOL_MASK or layout is not RKLayout.BOOL_INT16: raise _RKGenericReject
@@ -3011,7 +3007,6 @@ class RKContext:
     values = [self.lower(src) if not (src.op is Ops.CONST and src.dtype.scalar() is dtypes.bool) else None for src in u.src]
     preferred = (RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in values) else
                  RKLayout.BOOL_MASK)
-    if preferred not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
     for i,(src,value) in enumerate(zip(u.src, values)):
       if value is None:
         raw = self._constant(UOp.const(int(bool(src.arg)), dtypes.int16)) if preferred is RKLayout.BOOL_INT16 else self._constant(src)
@@ -3019,7 +3014,6 @@ class RKContext:
       else: values[i] = self._coerce_bool(value, preferred)
     lhs, rhs = values
     assert lhs is not None and rhs is not None
-    if lhs.layout is not preferred or rhs.layout is not preferred: raise _RKGenericReject
     dst = self._dst(u, dtypes.bool, preferred)
     if u.op is Ops.AND: return self._emit(dst, lhs, rhs, _EW_CFG[Ops.MUL])
     if u.op is Ops.OR: return self._emit(dst, lhs, rhs, _EW_CFG[Ops.MAX])
@@ -3316,7 +3310,6 @@ class RKContext:
       dynamic = [None if src in self.static_nodes else self.lower(src) for src in u.src]
       preferred = (RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in dynamic) else
                    RKLayout.BOOL_MASK)
-      if preferred not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
       values = [self._static(src, preferred) if value is None else self._coerce_bool(value, preferred)
                 for src,value in zip(u.src, dynamic)]
       selector, yes, no = values
@@ -3582,7 +3575,7 @@ class RKContext:
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject(f"cast {source.layout.name}->{dtype}")
     elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None and self.accurate_adds:
-      try: value = self._accurate_add(u)
+      try: value = self.lower(_accurate_add_recipe(u))
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): value = self._compare(u)
