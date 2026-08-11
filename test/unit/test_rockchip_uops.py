@@ -4,7 +4,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
-  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
+  _canonical_half_storage, _finite_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -851,7 +851,7 @@ def test_static_structural_expansion_is_bounded():
 def test_deep_generic_graph_canonicalization_is_iterative():
   value = UOp.const(0, dtypes.int)
   for _ in range(4096): value = value + UOp.const(1, dtypes.int)
-  rewritten, _ = _finite_int_max_neutrals(value, value.toposort())
+  rewritten, _ = _finite_max_neutrals(value, value.toposort())
   assert rewritten.key == value.key
 
 

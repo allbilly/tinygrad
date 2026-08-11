@@ -3699,20 +3699,11 @@ _pm_fp32_sin_storage = PatternMatcher([
    lambda root:_expand_math_uops(root, root.toposort())),
 ])
 
-def _finite_max_neutral_selectors(root:UOp) -> UOp:
-  """Use the canonical finite FP16 MAX neutral for selected negative-infinity padding."""
-  if root.op is not Ops.MAX: return root
-  cache:dict[UOp, UOp] = {}
-  for node in root.toposort():
-    src = tuple(cache[x] for x in node.src)
-    if (node.op is Ops.WHERE and src[1].op is Ops.CONST and src[1].dtype.scalar() in (dtypes.half, dtypes.float) and
-        math.isinf(float(src[1].arg)) and float(src[1].arg) < 0.0): src = (src[0], src[1].const_like(-65504.0), src[2])
-    cache[node] = node.replace(src=src)
-  return cache[root]
-
-def _finite_int_max_neutrals(root:UOp, nodes:dict[UOp, None]) -> tuple[UOp, dict[UOp, None]]:
-  """Canonicalize INT32_MIN only while it acts as a structural MAX neutral in exact scratch arithmetic."""
-  if not any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min for u in nodes): return root,nodes
+def _finite_max_neutrals(root:UOp, nodes:dict[UOp, None]) -> tuple[UOp, dict[UOp, None]]:
+  """Canonicalize finite physical neutrals for FP selectors and exact INT32 MAX arithmetic."""
+  int_min = any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min for u in nodes)
+  if root.op is not Ops.MAX and not int_min: return root,nodes
+  finite_selectors = root.op is Ops.MAX
   cache:dict[tuple[UOp, bool], UOp] = {}
   stack:list[tuple[UOp, bool, bool]] = [(root, False, False)]
   while stack:
@@ -3723,7 +3714,11 @@ def _finite_int_max_neutrals(root:UOp, nodes:dict[UOp, None]) -> tuple[UOp, dict
     if active and u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min:
       cache[key] = u.const_like(-2048)
     elif ready:
-      cache[key] = u.replace(src=tuple(cache[(src, active)] for src in u.src))
+      src = tuple(cache[(source, active)] for source in u.src)
+      if (finite_selectors and u.op is Ops.WHERE and src[1].op is Ops.CONST and
+          src[1].dtype.scalar() in (dtypes.half, dtypes.float) and math.isinf(float(src[1].arg)) and float(src[1].arg) < 0.0):
+        src = (src[0], src[1].const_like(-65504.0), src[2])
+      cache[key] = u.replace(src=src)
     else:
       stack.append((u, under_max, True))
       stack.extend((src, active, False) for src in reversed(u.src))
@@ -4299,9 +4294,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
     root = graph_rewrite(local_root, _pm_masked_loads, name="rockchip masked load materialization")
-    root = _finite_max_neutral_selectors(root)
     root_nodes = root.toposort()
-    root,root_nodes = _finite_int_max_neutrals(root, root_nodes)
+    root,root_nodes = _finite_max_neutrals(root, root_nodes)
     defer_nodes = storage_uops if storage_uops is not None else root_nodes
     defer_math = len(defer_nodes) > 256
     if not recipes_ready and not defer_math and \

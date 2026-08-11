@@ -2244,3 +2244,25 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 103. Merge finite MAX neutral canonicalization — complete
+
+- Final generic canonicalization ran one complete bottom-up walker to replace selected FP16/FP32 negative-infinity
+  padding under a root MAX, then a separate context-aware walker to replace INT32_MIN only beneath integer MAX nodes.
+  Combined both semantics into one iterative context-aware `_finite_max_neutrals()` pass over the dependency order
+  already owned by `_lower_uop_program()`.
+- The merged pass retains the exact activation boundaries: finite FP selector replacement only when the program root
+  is MAX, and `-2048` replacement only for INT32_MIN reached under integer MAX. Programs requiring neither return the
+  original root and node order unchanged.
+- Compared milestone-102/current rewrite graphs for FP selector, INT32 neutral, and no-op roots; all three keys were
+  identical. The representative FP selector RKImage was also byte-identical.
+- Renderer executable size fell from 4,681 to 4,677 lines. From the 10,233-line baseline, 5,556 executable renderer
+  lines are gone (54.3%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 canonical graphs and 1/1 affected RKImage identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.33 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
