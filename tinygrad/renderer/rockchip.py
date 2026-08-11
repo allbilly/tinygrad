@@ -14,10 +14,10 @@ from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewr
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 34
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 35
 _HEADER = struct.Struct("<4sHHHHHIIIII")  # magic/version, scratch/gather/host counts, ops/constants, phase counts, reserved
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<I"), struct.Struct("<HHIBBBBBiIIii"), struct.Struct("<IIi")
-_HOST_ADDRESS = struct.Struct("<BBBBBHHHIIIIIIiiiiii")
+_HOST_ADDRESS = struct.Struct("<BBBBBHHHIIIIIiiiiii")
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
 _ITEM_FORMAT = {1:"B", 2:"H", 4:"I"}
@@ -58,7 +58,7 @@ class RKGather:
 class RKHostAddress:
   """Host-calculated raw-lane movement. It never owns numeric or reduction semantics."""
   src: RKArg; index: RKArg; dst: RKArg; count: int; src_count: int; dst_count: int
-  itemsize: int = 2; index_itemsize: int = 4; fill_bits: int = 0; normalize_negative: bool = False
+  itemsize: int = 2; index_itemsize: int = 4; fill_bits: int = 0
   index_limit: int = 0; base: int = 0; index_scale: int = 1; lane_stride: int = 0
 
 @dataclass(frozen=True)
@@ -206,7 +206,7 @@ def encode_image(image:RKImage) -> bytes:
     if host.itemsize not in _ITEM_FORMAT or host.index_itemsize not in (2, 4): raise ValueError("invalid RKHostAddress item size")
     out += _HOST_ADDRESS.pack(int(host.src.kind), int(host.index.kind), int(host.dst.kind), host.itemsize, host.index_itemsize,
       host.src.index, host.index.index, host.dst.index, host.count, host.src_count, host.dst_count, host.fill_bits,
-      int(host.normalize_negative), host.index_limit, host.src.addend, host.index.addend, host.dst.addend,
+      host.index_limit, host.src.addend, host.index.addend, host.dst.addend,
       host.base, host.index_scale, host.lane_stride)
   for op in image.ew_ops:
     if op.bool_output and not op.int32_output: raise ValueError("bool output requires INT32 conversion")
@@ -251,16 +251,15 @@ def decode_image(blob:bytes) -> RKImage:
   host_addresses:list[RKHostAddress] = []
   for _ in range(nhost_gather+nhost_scatter):
     src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \
-      fill_bits, host_flags, index_limit, src_addend, index_addend, dst_addend, base, index_scale, lane_stride = \
+      fill_bits, index_limit, src_addend, index_addend, dst_addend, base, index_scale, lane_stride = \
       _HOST_ADDRESS.unpack_from(blob, off)
     off += _HOST_ADDRESS.size
     if (src_kind not in (0, 1) or index_kind not in (0, 1) or dst_kind not in (0, 1) or itemsize not in _ITEM_FORMAT or
-        index_itemsize not in (2, 4) or host_flags & ~1 or min(count, src_count, dst_count, index_limit) < 0):
+        index_itemsize not in (2, 4) or min(count, src_count, dst_count, index_limit) < 0):
       raise ValueError("invalid RKHostAddress")
     host_addresses.append(RKHostAddress(RKArg(RKBufferKind(src_kind), src_index, src_addend),
       RKArg(RKBufferKind(index_kind), index_index, index_addend), RKArg(RKBufferKind(dst_kind), dst_index, dst_addend),
-      count, src_count, dst_count, itemsize, index_itemsize, fill_bits, bool(host_flags & 1),
-      index_limit, base, index_scale, lane_stride))
+      count, src_count, dst_count, itemsize, index_itemsize, fill_bits, index_limit, base, index_scale, lane_stride))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size

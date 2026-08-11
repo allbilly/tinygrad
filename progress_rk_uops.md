@@ -1540,3 +1540,21 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 69. Delete the unconstructible host negative-index flag — complete
+
+- Audited every `RKHostAddress` constructor. None enabled `normalize_negative`; negative-index normalization that is
+  semantically present in Tinygrad is either executed by the native typed-load path or already represented in the
+  address UOps before host materialization. The serialized flag and runtime NumPy branch were therefore unreachable.
+- Removed `RKHostAddress.normalize_negative`, its image-record word, decoder validation, and runtime branch. Bumped the
+  serialized ABI to version 35.
+- Renderer executable size fell from 4,876 to 4,874 lines and runtime fell from 486 to 485 lines. From the 10,233-line
+  renderer baseline, 5,359 executable lines are gone (52.4%).
+- No CPU numeric semantics were added; this deletes an unused host-side semantic option while retaining bounded raw
+  address calculation and movement.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
