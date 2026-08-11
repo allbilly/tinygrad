@@ -95,6 +95,7 @@ def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
   assert image is not None and len(image.ew_ops) > 10
   assert image.post_gathers and image.post_gathers[-1].itemsize == 1
   assert not any(op.compare for op in image.ew_ops)
+  assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MUL] and image.ew_ops[-1].int16_output
 
 
 def test_fp16_equality_uses_exact_raw_bytes_without_compare_resets():

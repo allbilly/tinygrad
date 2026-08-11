@@ -667,3 +667,30 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 67 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 34. IEEE inverted comparisons and exact half-value predicates — complete
+
+- Made boolean `CMPNE(CMPLT(half, half), true)` preserve IEEE unordered semantics compositionally. The handler reuses
+  the canonical raw FP16 classification cached in each operand's `RKValue`, computes `(1 - less) * numeric`, and keeps
+  NaN lanes false for `>=` and `<=` without a compare ioctl or tensor-operation lowerer.
+- Strengthened the host-independent inverted-comparison regression to require that final native INT16 numeric mask.
+- Added exact equality as a semantic short circuit in Tinygrad's `isclose` UOp construction. With HALF as the default,
+  Tinygrad's fused algebra can reduce `x - (x + epsilon)` before the half value is materialized; accepting the ordinary
+  equality UOps restores the mathematically valid result on CPU and Rockchip without adding an `isclose` renderer path.
+- Updated the `WHERE` submit-count audit for the generic executor. Two permuted typed selections now use four submits
+  rather than the legacy catalog's 24; the old expectation remains active under `ROCKCHIP_UOPS=0`.
+- Cast, bitcast, classification, comparison, contract skips, logical predicates, rounding, modulo, division rounding,
+  boolean reductions, `WHERE`, and interpolation all pass in the contiguous strict census. The verified prefix extends
+  through collection index 310: 300 passed, 11 skipped, and 134 collected tests remain to be censused.
+
+Verification:
+
+- Strict collection indices 264–310: 42 passed and 5 contract skips across the complete class runs.
+- Strict `TestRockchipComparisonOps::test_cmp_ge`: 1 passed in 3.23s.
+- Strict `TestRockchipLogicalPredicateOps`: 4 passed in 5.14s.
+- Strict `TestRockchipBooleanReductionOps` plus `TestRockchipWhereOps`: 10 passed in 11.49s.
+- Strict `TestRockchipInterpolateOps`: 8 passed in 7.99s.
+- CPU `DEFAULT_FLOAT=HALF TestOps::test_isclose`: 1 passed in 13.79s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 67 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

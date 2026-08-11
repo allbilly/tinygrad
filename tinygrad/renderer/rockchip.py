@@ -8193,6 +8193,21 @@ class RKContext:
 
   def _bool_binary(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
+    if u.op is Ops.CMPNE:
+      for expression,marker in (u.src, u.src[::-1]):
+        if (marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and
+            expression.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in expression.src)):
+          less = self.lower(expression)
+          if less.layout is not RKLayout.BOOL_INT16: raise _RKGenericReject
+          operands = tuple(self._operand(src, dtypes.half) for src in expression.src)
+          nan = tuple(self._fp16_component_values(value)[2] for value in operands)
+          one = self._constant(UOp.const(1, dtypes.int16))
+          inverse, either_nan, numeric = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(3))
+          self._emit(inverse, one, less, _EW_CFG[Ops.SUB])
+          self._emit(either_nan, RKValue(nan[0], dtypes.int16, self.count, RKLayout.INT16),
+                     RKValue(nan[1], dtypes.int16, self.count, RKLayout.INT16), _EW_CFG[Ops.MAX])
+          self._emit(numeric, one, either_nan, _EW_CFG[Ops.SUB])
+          return self._emit(self._dst(u, dtypes.bool, RKLayout.BOOL_INT16), inverse, numeric, _EW_CFG[Ops.MUL])
     values = [self.lower(src) if not (src.op is Ops.CONST and src.dtype.scalar() is dtypes.bool) else None for src in u.src]
     preferred = (RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in values) else
                  RKLayout.BOOL_MASK)
