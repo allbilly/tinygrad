@@ -12,7 +12,8 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _PC_DATA_AMOUNT_MAX = (1 << 16) - 1
-_SUBMIT_TIMEOUT_MS = 30_000
+_SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
+_SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
@@ -100,11 +101,14 @@ class RockchipProgram(Program['RockchipDevice']):
         task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
         regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
         subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
-    try: submit()
-    except TimeoutError:
-      self.dev.timeout_retries += 1
-      self.dev.reset_npu()
-      submit()
+    for attempt in range(_SUBMIT_RETRIES+1):
+      try:
+        submit()
+        break
+      except TimeoutError:
+        self.dev.timeout_retries += 1
+        if attempt == _SUBMIT_RETRIES: raise
+        self.dev.reset_npu()
     self.submit_count += 1
     self.dev.submit_count += 1
     self.dev.task_count += n
@@ -130,7 +134,9 @@ class RockchipProgram(Program['RockchipDevice']):
     for i, body in enumerate(bodies):
       base = offsets[i]
       ctypes.memmove(int(cmd.va_addr) + base*8, (ctypes.c_uint64 * len(body))(*body), len(body)*8)
-      next_addr = (base_dma + offsets[i+1]*8) & 0xfffffff0 if i+1 < n else 0
+      # REGISTER_AMOUNTS=0 terminates the chain. Keep its speculative base-address fetch inside the mapped
+      # zero-filled guard page: RK3588 can otherwise race completion with an IOMMU read from address zero.
+      next_addr = (base_dma + (offsets[i+1] if i+1 < n else words)*8) & 0xfffffff0
       next_amount = len(bodies[i+1]) if i+1 < n else 0
       tail = (_pc(rk.TARGET_PC_REG, rk.REG_PC_BASE_ADDRESS, next_addr),
               _pc(rk.TARGET_PC_REG, rk.REG_PC_REGISTER_AMOUNTS, next_amount),

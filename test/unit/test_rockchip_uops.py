@@ -437,6 +437,16 @@ def test_fp32_pure_add_tree_uses_compensated_half_expansion_at_output_boundary()
   assert image is not None and 64 < len(image.ew_ops) < 2000
 
 
+def test_nested_fp32_product_sum_is_committed_before_outer_half_add():
+  lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  bias = UOp.param(3, dtypes.half, (1,)).index(0).load()
+  products = [(lhs.index(i).load() * rhs.index(i).load()).cast(dtypes.float) for i in range(4)]
+  product_sum = products[0]
+  for product in products[1:]: product_sum = product_sum + product
+  image = _lower_uop_program(_program(dtypes.half, lambda _i:product_sum.cast(dtypes.half) + bias, count=1))
+  assert image is not None and len(image.ew_ops) > 20 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_fp32_math_uop_converts_at_half_storage_boundary():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,

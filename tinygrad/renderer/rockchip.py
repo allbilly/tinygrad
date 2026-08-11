@@ -7845,6 +7845,18 @@ def _fp32_add_terms(u:UOp) -> list[UOp]:
   flatten(u)
   return terms
 
+def _fp32_add_has_product_terms(u:UOp) -> bool:
+  """Whether a floating ADD tree contains a direct floating or cast-half product term."""
+  terms:list[UOp] = []
+  stack = [u]
+  while stack:
+    node = stack.pop()
+    if node.op is Ops.ADD and node.dtype.scalar() is dtypes.float: stack.extend(node.src)
+    else: terms.append(node)
+  return any((term.op is Ops.MUL and term.dtype.scalar() is dtypes.float) or
+             (term.op is Ops.CAST and len(term.src) == 1 and term.src[0].op is Ops.MUL and
+              term.src[0].dtype.scalar() is dtypes.half) for term in terms)
+
 def _accurate_add_recipe(u:UOp) -> UOp:
   terms:list[UOp] = []
   def flatten(x:UOp) -> None:
@@ -9374,18 +9386,25 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if vectorize_reductions and (local_output:=_output_store(uops, dtypes.int, allow_local=True)) is not None and \
      (local_extrema:=_lower_vectorized_scalar_local_extrema(uops, local_output)) is not None: return local_extrema
   storage_uops:list[UOp]|None = None
+  storage_product_adds = False
   if any(u.dtype.scalar() is dtypes.float for u in uops):
     sink = next((u for u in uops if u.op is Ops.SINK), None)
     if sink is not None:
       storage_sink = sink
-      if (storage_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
-         storage_output[4].op is Ops.CAST and len(storage_output[4].src) == 1 and storage_output[4].src[0].dtype.scalar() is dtypes.float:
-        try:
-          source = storage_output[4].src[0]
-          if not _has_runtime_address(source):
-            converted = _expand_math_uops(storage_output[4]) if source.op is Ops.SIN else _canonical_half_storage(source)
-            storage_sink = sink.substitute({storage_output[4]:converted})
-        except _RKGenericReject: pass
+      if (storage_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None:
+        storage_root = storage_output[4]
+        root_storage = storage_root.op is Ops.CAST and len(storage_root.src) == 1 and storage_root.dtype.scalar() is dtypes.half and \
+          storage_root.src[0].dtype.scalar() is dtypes.float
+        storage_product_adds = any(boundary.op is Ops.CAST and boundary.dtype.scalar() is dtypes.half and len(boundary.src) == 1 and
+          boundary.src[0].dtype.scalar() is dtypes.float and _fp32_add_has_product_terms(boundary.src[0]) and
+          (boundary is not storage_root or len(boundary.src[0].toposort()) > 64) for boundary in storage_root.toposort())
+        if root_storage:
+          try:
+            source = storage_root.src[0]
+            if not _has_runtime_address(source):
+              converted = _expand_math_uops(storage_root) if source.op is Ops.SIN else _canonical_half_storage(source)
+              storage_sink = sink.substitute({storage_root:converted})
+          except _RKGenericReject: pass
       storage_sink = graph_rewrite(storage_sink, _pm_fp32_sin_storage, name="rockchip fp32 sin storage")
       storage_uops = list(graph_rewrite(storage_sink, _pm_generic_storage_precision,
                                         name="rockchip generic storage precision").toposort())
@@ -9430,14 +9449,14 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
     root = _finite_int_max_neutrals(_finite_max_neutral_selectors(local_root))
-    if not recipes_ready: root = _expand_math_uops(root, accurate_adds=storage_uops is None)
+    if not recipes_ready: root = _expand_math_uops(root, accurate_adds=storage_uops is None or storage_product_adds)
     expanded_nodes = root.toposort()
     if len(expanded_nodes) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
       if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool))) is None: return None
-    image = RKContext(output, accurate_adds=(not recipes_ready and storage_uops is None and
+    image = RKContext(output, accurate_adds=(not recipes_ready and (storage_uops is None or storage_product_adds) and
                                              len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
                                              not _has_runtime_address(output[4])),
                       static_load_offsets=static_load_offsets).finish()

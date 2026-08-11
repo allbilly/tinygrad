@@ -741,3 +741,36 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 68 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 37. Complete per-UOp census and stable physical submission — complete
+
+- Completed the authoritative strict census in one process. All 445 collected Rockchip cases are now accounted for:
+  433 passed and 12 explicit contract skips, with another 154 parameterized subtests passing.
+- Kept FP32 storage precision attached to UOp structure. Pure root ADD trees are committed once; large root product-ADD
+  trees and product-ADD boundaries nested under later FP16 arithmetic retain the bounded accurate-ADD pass. This covers
+  ordinary reductions, small and large dot products, biased convolutions, and causal attention without recognizing any
+  tensor operation.
+- Added a host-independent nested storage regression for `ADD(CAST(FP32 product sum -> FP16), FP16 bias)`. The handler
+  discovers only CAST, ADD, and MUL semantics and preserves true UOp arity.
+- Terminated PC chains with `REGISTER_AMOUNTS=0` while pointing the speculative terminal fetch into the existing mapped,
+  zero-filled guard page. This removed the reproducible address-zero IOMMU fault without splitting physical stages into
+  one ioctl per UOp.
+- Made transient driver-start timeout recovery bounded and configurable. The production defaults use a 6-second submit
+  timeout with at most four reset-and-retry attempts; `ROCKCHIP_SUBMIT_TIMEOUT_MS` and `ROCKCHIP_SUBMIT_RETRIES` can
+  tighten the policy for diagnostics.
+- The old operation-specific catalog remains present as an oracle, so the renderer is still 9,892 executable lines.
+  Passing the complete census is the prerequisite for deleting those superseded paths in the next milestones; no LOC
+  saving is claimed yet.
+
+Verification:
+
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -x -q -n0`:
+  433 passed, 12 skipped, and 154 subtests passed in 1,467.42s.
+- Strict `TestRockchip` plus `TestRockchipAttentionOps`: 35 passed in 137.94s.
+- Strict convolution/attention/reduction precision regressions: 5 passed in 9.99s.
+- Strict masked-select and nonzero programs after guarded PC termination: 4 passed in 81.71s, with no new address-zero
+  IOMMU fault.
+- Independent RK3588 health check: all ADD/MUL/SUB/MAX/NEG/FDIV sizes through 131,072 lanes passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 69 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
