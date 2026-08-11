@@ -1854,3 +1854,29 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 84. Make static UOp substitution iterative — complete
+
+- Audited the one-line `_substitute_static_ranges()` forwarding wrapper. Replacing it outright with generic
+  `UOp.substitute()` was functionally correct but profiling rejected it: 264 small substitutions cost 0.362 seconds.
+  Rewrote the operation as a compact iterative topological UOp pass, preserving exact replacement semantics without
+  recursion or general pattern-rewrite overhead; the same workload now takes 0.034 seconds (91% faster).
+- Generic LOAD lowering recomputed the same index and gate topological orders up to twelve times while classifying
+  dynamic addressing. Materialize each node order once and share the runtime-address predicate, dynamic-index parser,
+  and gate proof. This is graph inspection only; host code still performs no arithmetic semantics.
+- Removed unused default dtype modes from three internal specialized entry points; every caller already supplies the
+  semantic source dtype explicitly. Kept `_iter_range_env(max_envs=...)` after its direct bounded-allocation contract
+  test proved that parameter is live.
+- Compared milestone-83/current serialized images for 65-term and 128-term dependent reductions plus nonaffine dynamic
+  host-address materialization; all three were byte-identical. Profiled test process time fell from 3.657 to 3.318
+  seconds, and the full suite's slowest case fell from 1.51 to 1.41 seconds.
+- Renderer executable size fell from 4,756 to 4,754 lines. From the 10,233-line baseline, 5,479 executable renderer
+  lines are gone (53.5%); runtime remains 480 lines. No CPU numeric semantics or DPU stage changed.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 profiled structural/address programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=6`: 91 passed in 5.26 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

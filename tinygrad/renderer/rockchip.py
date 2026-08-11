@@ -2058,7 +2058,7 @@ def _bounded_predicate_coordinate_plan(output:RKOutput, dtype:DType, predicate:C
   except (RuntimeError, OverflowError, struct.error): return None
   return source, rank, index_param, index_offsets, coordinate_rows, fill_value
 
-def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
+def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType) -> RKImage|None:
   """Execute bounded integer predicate coordinates through native INT16 byte masks."""
   _, out_param, count, _, _ = output
   if (plan:=_bounded_predicate_coordinate_plan(output, dtype, lambda u:_nonzero_load(u, dtype),
@@ -2115,7 +2115,7 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   return RKImage(tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid)
 
 
-def _lower_direct_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
+def _lower_direct_dynamic_typed_load(output:RKOutput, dtype:DType) -> RKImage|None:
   """Materialize a bounds-masked typed LOAD addressed by one dynamic INT32 index."""
   _, out_param, count, out_index, load = output
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
@@ -2161,7 +2161,7 @@ def _lower_direct_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -
   return _dynamic_raw_gather_image(out_param.arg.slot, count, ((index_param.arg.slot, index_count, index_offsets),), plans,
                                    (coordinates,), gate=external_gate, itemsize=dtype.itemsize)
 
-def _lower_dynamic_multi_index_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
+def _lower_dynamic_multi_index_typed_load(output:RKOutput, dtype:DType) -> RKImage|None:
   """Materialize one typed LOAD addressed by positive or negative-normalized dynamic INT32 axes."""
   _, out_param, count, out_index, load = output
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
@@ -2780,12 +2780,11 @@ class RKContext:
     if dtype not in (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool) or not u.src or u.src[0].op is not Ops.INDEX or \
        (param:=_root_param(u.src[0])) is None or param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST:
       raise _RKGenericReject
-    index = u.src[0].src[1]
-    gate = u.src[2] if len(u.src) > 2 else None
-    default = u.src[1] if len(u.src) > 1 else None
+    index, gate, default = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None, u.src[1] if len(u.src) > 1 else None
+    index_nodes, gate_nodes = index.toposort(), () if gate is None else gate.toposort()
+    runtime_address = any(x.op is Ops.LOAD for x in (*index_nodes, *gate_nodes))
     if default is not None and default.op is not Ops.CONST:
-      if dtype not in (dtypes.half, dtypes.int16, dtypes.int) or gate is None or \
-         any(x.op is Ops.LOAD for x in index.toposort()) or any(x.op is Ops.LOAD for x in gate.toposort()):
+      if dtype not in (dtypes.half, dtypes.int16, dtypes.int) or gate is None or runtime_address:
         raise _RKGenericReject
       expected = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else RKLayout.INT32
       itemsize = 4 if expected is RKLayout.INT32 else 2
@@ -2802,8 +2801,7 @@ class RKContext:
       self.gathers.append(replace(plan, dst_index=value.arg.index, partial=True, itemsize=itemsize))
       return value
     if dtype is dtypes.float:
-      if any(x.op is Ops.LOAD for x in index.toposort()) or gate is not None and any(x.op is Ops.LOAD for x in gate.toposort()):
-        raise _RKGenericReject
+      if runtime_address: raise _RKGenericReject
       fill_bits = struct.unpack("<I", struct.pack("<f", float(0 if default is None else default.arg)))[0]
       plan = _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
       _validate_gather_bounds(plan, int(param.src[0].arg))
@@ -2824,8 +2822,7 @@ class RKContext:
         src_kind=RKBufferKind.SCRATCH, after=len(self.ew_ops)))
       return RKValue(compact.arg, dtype, self.count, RKLayout.FP16)
     if dtype is dtypes.bool:
-      if any(x.op is Ops.LOAD for x in index.toposort()) or gate is not None and any(x.op is Ops.LOAD for x in gate.toposort()):
-        raise _RKGenericReject
+      if runtime_address: raise _RKGenericReject
       offsets = _gather_offsets(self.out_index, index, gate, self.count)
       plan = RKGather(param.arg.slot, 0, self.count, offsets=offsets, fill_bits=int(bool(default.arg)) if default is not None else 0,
                       dst_stride=2, itemsize=1)
@@ -2835,11 +2832,10 @@ class RKContext:
     itemsize = 4 if layout is RKLayout.INT32 else 2
     fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
       _int16_bits(0 if default is None else default.arg) if dtype is dtypes.int16 else int(0 if default is None else default.arg) & 0xffffffff
-    if u not in self.static_load_offsets and (any(x.op is Ops.LOAD for x in index.toposort()) or
-                                              gate is not None and any(x.op is Ops.LOAD for x in gate.toposort())):
+    if u not in self.static_load_offsets and runtime_address:
       if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1": raise _RKGenericReject
       runtime_index = _runtime_affine_index(index, self.out_index, self.count)
-      runtime_loads = {node.key:node for node in (*index.toposort(), *((() if gate is None else gate.toposort())))
+      runtime_loads = {node.key:node for node in (*index_nodes, *gate_nodes)
                        if _runtime_index(node) is not None}
       if runtime_index is not None:
         runtime_load, index_param, index_itemsize, index_offset, base, index_scale, lane_stride = runtime_index
@@ -2854,10 +2850,10 @@ class RKContext:
       else: raise _RKGenericReject
       index_limit = int(param.src[0].arg)
       if gate is not None:
-        limits = [int(node.src[1].arg) for node in gate.toposort() if node.op is Ops.CMPLT and
+        limits = [int(node.src[1].arg) for node in gate_nodes if node.op is Ops.CMPLT and
                   node.src[0].key == runtime_load.key and node.src[1].op is Ops.CONST and int(node.src[1].arg) > 0]
         if len(set(limits)) != 1 or not _bounded_index_gate(gate, runtime_load, limits[0]) or \
-           {node.key for node in gate.toposort() if node.op is Ops.LOAD} != {runtime_load.key}: raise _RKGenericReject
+           {node.key for node in gate_nodes if node.op is Ops.LOAD} != {runtime_load.key}: raise _RKGenericReject
         index_limit = limits[0]
       source = RKArg(RKBufferKind.ARG, param.arg.slot)
       source_count = int(param.src[0].arg)
@@ -3697,7 +3693,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   cache:dict[UOp, UOp] = {}
   exact_static_selection = root.op is Ops.WHERE and _is_static_expr(root.src[0]) and not any(
     node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and not math.isfinite(float(node.arg))
-    for node in root.toposort())
+    for node in nodes)
   def physical_recipe(recipe:UOp, opaque:tuple[UOp, ...]=()) -> UOp:
     placeholders = {source:UOp.param(-index-1, source.dtype, ()) for index,source in enumerate(opaque)}
     rewritten = _fp16_rewrite(list(UOp(Ops.SINK, src=(recipe.substitute(placeholders),)).toposort()))
@@ -3772,7 +3768,9 @@ def _finite_int_max_neutrals(root:UOp) -> UOp:
   return cache[(root, False)]
 
 def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
-  return root.substitute(replacements)
+  cache:dict[UOp, UOp] = {}
+  for u in root.toposort(): cache[u] = replacements[u] if u in replacements else u.replace(src=tuple(cache[src] for src in u.src))
+  return cache[root]
 
 def _unroll_static_reduces(root:UOp) -> UOp:
   """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
