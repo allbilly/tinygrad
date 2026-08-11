@@ -2708,3 +2708,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 127. Unify scalar and vector static expression evaluation — complete
+
+- Replaced the separate scalar and NumPy-vector static opcode evaluators with one typed evaluator. Scalar mode retains
+  short-circuit `WHERE` and tinygrad integer division/remainder helpers; vector mode retains NumPy broadcasting,
+  overflow casting, masked zero-divisor behavior, and eager `WHERE` materialization.
+- The evaluator remains limited to compile-time constants and static index/address construction. It does not execute
+  runtime tensor arithmetic on the CPU, and the generated hardware programs are unchanged.
+- Renderer executable size fell from 4,613 to 4,598 lines. From the 10,233-line baseline, 5,635 lines are gone (55.1%);
+  runtime remains 480 lines.
+
+Verification:
+
+- Old/current evaluator comparison: 38/38 scalar, vector, overflow, division, and short-circuit cases identical.
+- Old/current program comparison: 5/5 representative static gather, selector, integer, and predicate RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.77 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

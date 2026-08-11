@@ -472,77 +472,64 @@ def _eval_cast(value:int|float|bool, dtype:DType) -> int|float|bool:
   if dtype.scalar() is dtypes.float: return struct.unpack("<f", struct.pack("<f", float(value)))[0]
   return float(value)
 
-def _eval_expr(u:UOp, env:dict[UOp, int], cache:dict[UOp, int|float|bool]) -> int|float|bool:
-  if u in cache: return cache[u]
-  if u.op is Ops.CONST: ret = _eval_cast(u.arg, u.dtype)
-  elif u.op in (Ops.RANGE, Ops.SPECIAL): ret = env[u]
-  elif u.op is Ops.PARAM: raise RuntimeError("RKPLAN_REJECT:dynamic_static_expr")
-  elif u.op is Ops.CAST: ret = _eval_cast(_eval_expr(u.src[0], env, cache), u.dtype)
-  elif u.op is Ops.WHERE:
-    ret = _eval_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype)
-  else:
-    lhs = _eval_expr(u.src[0], env, cache)
-    if u.op is Ops.RECIPROCAL: ret = _eval_cast(1.0 / float(lhs), u.dtype)
-    elif u.op is Ops.TRUNC: ret = _eval_cast(int(lhs), u.dtype)
-    else:
-      rhs = _eval_expr(u.src[1], env, cache)
-      if u.op is Ops.ADD: ret = _eval_cast(lhs + rhs, u.dtype)
-      elif u.op is Ops.MUL: ret = _eval_cast(lhs * rhs, u.dtype)
-      elif u.op is Ops.SUB: ret = _eval_cast(lhs - rhs, u.dtype)
-      elif u.op is Ops.CDIV: ret = _eval_cast(cdiv(int(lhs), int(rhs)), u.dtype)
-      elif u.op is Ops.CMOD: ret = _eval_cast(cmod(int(lhs), int(rhs)), u.dtype)
-      elif u.op is Ops.FLOORDIV: ret = _eval_cast(floordiv(int(lhs), int(rhs)), u.dtype)
-      elif u.op is Ops.FLOORMOD: ret = _eval_cast(floormod(int(lhs), int(rhs)), u.dtype)
-      elif u.op is Ops.MAX: ret = _eval_cast(max(lhs, rhs), u.dtype)
-      elif u.op is Ops.CMPLT: ret = lhs < rhs
-      elif u.op is Ops.CMPNE: ret = lhs != rhs
-      elif u.op is Ops.AND: ret = _eval_cast(int(lhs) & int(rhs), u.dtype)
-      elif u.op is Ops.OR: ret = _eval_cast(int(lhs) | int(rhs), u.dtype)
-      elif u.op is Ops.XOR: ret = _eval_cast(int(lhs) ^ int(rhs), u.dtype)
-      else: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
-  cache[u] = ret
-  return ret
-
-def _eval_int(u:UOp, env:dict[UOp, int]) -> int: return int(_eval_expr(u, env, {}))
+_StaticValue = int|float|bool|np.ndarray
 
 def _vector_cast(value, dtype:DType) -> np.ndarray:
   return np.asarray(value, dtype=np.dtype(dtype.scalar().fmt) if dtype.scalar().fmt is not None else None)
 
-def _eval_vector(u:UOp, env:dict[UOp, np.ndarray], cache:dict[UOp, np.ndarray]) -> np.ndarray:
+def _static_cast(value:_StaticValue, dtype:DType) -> _StaticValue:
+  return _vector_cast(value, dtype) if isinstance(value, np.ndarray) else _eval_cast(value, dtype)
+
+def _eval_expr(u:UOp, env:dict[UOp, _StaticValue], cache:dict[UOp, _StaticValue], vector:bool=False) -> _StaticValue:
   if u in cache: return cache[u]
-  if u.op is Ops.CONST: ret = _vector_cast(u.arg, u.dtype)
+  ret:_StaticValue; value:_StaticValue
+  if u.op is Ops.CONST: ret = _vector_cast(u.arg, u.dtype) if vector else _eval_cast(u.arg, u.dtype)
   elif u.op in (Ops.RANGE, Ops.SPECIAL): ret = env[u]
   elif u.op is Ops.PARAM: raise RuntimeError("RKPLAN_REJECT:dynamic_static_expr")
-  elif u.op is Ops.CAST: ret = _vector_cast(_eval_vector(u.src[0], env, cache), u.dtype)
+  elif u.op is Ops.CAST: ret = _static_cast(_eval_expr(u.src[0], env, cache, vector), u.dtype)
   elif u.op is Ops.WHERE:
-    ret = _vector_cast(np.where(_eval_vector(u.src[0], env, cache), _eval_vector(u.src[1], env, cache),
-                                _eval_vector(u.src[2], env, cache)), u.dtype)
+    condition = _eval_expr(u.src[0], env, cache, vector)
+    value = np.where(condition, _eval_expr(u.src[1], env, cache, vector), _eval_expr(u.src[2], env, cache, vector)) \
+      if vector else _eval_expr(u.src[1] if condition else u.src[2], env, cache)
+    ret = _static_cast(value, u.dtype)
   else:
-    lhs = _eval_vector(u.src[0], env, cache)
-    if u.op is Ops.RECIPROCAL: ret = _vector_cast(1.0 / lhs, u.dtype)
-    elif u.op is Ops.TRUNC: ret = _vector_cast(np.trunc(lhs), u.dtype)
+    lhs = _eval_expr(u.src[0], env, cache, vector)
+    if u.op is Ops.RECIPROCAL: value = 1.0 / lhs
+    elif u.op is Ops.TRUNC: value = np.trunc(lhs) if vector else int(lhs)
     else:
-      rhs = _eval_vector(u.src[1], env, cache)
-      if u.op is Ops.ADD: ret = _vector_cast(lhs + rhs, u.dtype)
-      elif u.op is Ops.MUL: ret = _vector_cast(lhs * rhs, u.dtype)
-      elif u.op is Ops.SUB: ret = _vector_cast(lhs - rhs, u.dtype)
+      rhs = _eval_expr(u.src[1], env, cache, vector)
+      if u.op is Ops.ADD: value = lhs + rhs
+      elif u.op is Ops.MUL: value = lhs * rhs
+      elif u.op is Ops.SUB: value = lhs - rhs
       elif u.op in (Ops.CDIV, Ops.CMOD):
-        with np.errstate(divide="ignore", invalid="ignore"):
-          quotient = np.where(rhs != 0, np.trunc(lhs / rhs), 0)
-        ret = _vector_cast(quotient if u.op is Ops.CDIV else lhs-quotient*rhs, u.dtype)
+        if vector:
+          left, right = np.asarray(lhs), np.asarray(rhs)
+          with np.errstate(divide="ignore", invalid="ignore"): quotient = np.where(right != 0, np.trunc(left/right), 0)
+          value = quotient if u.op is Ops.CDIV else left-quotient*right
+        else: value = cdiv(int(lhs), int(rhs)) if u.op is Ops.CDIV else cmod(int(lhs), int(rhs))
       elif u.op in (Ops.FLOORDIV, Ops.FLOORMOD):
-        quotient = np.zeros(np.broadcast_shapes(lhs.shape, rhs.shape), dtype=np.result_type(lhs, rhs))
-        np.floor_divide(lhs, rhs, out=quotient, where=rhs != 0)
-        ret = _vector_cast(quotient if u.op is Ops.FLOORDIV else lhs-quotient*rhs, u.dtype)
-      elif u.op is Ops.MAX: ret = _vector_cast(np.maximum(lhs, rhs), u.dtype)
-      elif u.op is Ops.CMPLT: ret = lhs < rhs
-      elif u.op is Ops.CMPNE: ret = lhs != rhs
-      elif u.op is Ops.AND: ret = _vector_cast(np.bitwise_and(lhs, rhs), u.dtype)
-      elif u.op is Ops.OR: ret = _vector_cast(np.bitwise_or(lhs, rhs), u.dtype)
-      elif u.op is Ops.XOR: ret = _vector_cast(np.bitwise_xor(lhs, rhs), u.dtype)
+        if vector:
+          left, right = np.asarray(lhs), np.asarray(rhs)
+          quotient = np.zeros(np.broadcast_shapes(left.shape, right.shape), dtype=np.result_type(left, right))
+          np.floor_divide(left, right, out=quotient, where=right != 0)
+          value = quotient if u.op is Ops.FLOORDIV else left-quotient*right
+        else: value = floordiv(int(lhs), int(rhs)) if u.op is Ops.FLOORDIV else floormod(int(lhs), int(rhs))
+      elif u.op is Ops.MAX: value = np.maximum(lhs, rhs) if vector else max(lhs, rhs)
+      elif u.op is Ops.CMPLT: value = lhs < rhs
+      elif u.op is Ops.CMPNE: value = lhs != rhs
+      elif u.op is Ops.AND: value = np.bitwise_and(lhs, rhs) if vector else int(lhs) & int(rhs)
+      elif u.op is Ops.OR: value = np.bitwise_or(lhs, rhs) if vector else int(lhs) | int(rhs)
+      elif u.op is Ops.XOR: value = np.bitwise_xor(lhs, rhs) if vector else int(lhs) ^ int(rhs)
       else: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+    ret = _static_cast(value, u.dtype)
   cache[u] = ret
   return ret
+
+def _eval_int(u:UOp, env:dict[UOp, int]) -> int:
+  return int(_eval_expr(u, typing_cast(dict[UOp, _StaticValue], env), {}))
+
+def _eval_vector(u:UOp, env:dict[UOp, np.ndarray], cache:dict[UOp, np.ndarray]) -> np.ndarray:
+  return np.asarray(_eval_expr(u, typing_cast(dict[UOp, _StaticValue], env), typing_cast(dict[UOp, _StaticValue], cache), True))
 
 _STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.SPECIAL, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.TRUNC, Ops.WHERE,
                Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.XOR, Ops.MAX}
@@ -2717,7 +2704,7 @@ class RKContext:
   def _static(self, u:UOp, bool_layout:RKLayout=RKLayout.BOOL_MASK) -> RKValue:
     dtype = u.dtype.scalar()
     if not _index_ranges(u):
-      scalar = _eval_expr(u, {}, {})
+      scalar = typing_cast(int|float|bool, _eval_expr(u, {}, {}))
       if dtype is dtypes.bool and bool_layout is RKLayout.BOOL_INT16:
         value = self._constant(UOp.const(int(bool(scalar)), dtypes.int16))
         return RKValue(value.arg, dtype, self.count, bool_layout)
