@@ -1598,3 +1598,22 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 72. Unify raw two-byte physical decomposition — complete
+
+- Replaced the separate FP16 and INT16 raw-byte caches and splitters with one `RKValue` physical operation. Both
+  layouts occupy the same two-byte lane representation; their semantic distinction remains in `RKValue.layout`, while
+  raw movement now depends only on the shared physical width.
+- INT16 bitwise operations, FP16 IEEE comparisons, and repacked INT16 results all reuse the same byte cache. This
+  removes duplicated scratch allocation, gather scheduling, and cache bookkeeping without recognizing any tensor op.
+- Renderer executable size fell from 4,860 to 4,848 lines. From the 10,233-line baseline, 5,385 executable lines are
+  gone (52.6%); runtime remains 484 lines.
+- No CPU numeric semantics were introduced. Byte splitting and repacking remain raw gather movement, while boolean and
+  arithmetic recipes remain DPU execution.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed, including exact FP16 payload/sign
+  bitcasts, INT16 masks, byte logic, serialization, and scratch scheduling.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

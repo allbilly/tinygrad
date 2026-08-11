@@ -2679,9 +2679,8 @@ class RKContext:
     self.gather_slots:dict[tuple, RKValue] = {}
     self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
     self.int32_components:dict[RKArg, tuple[RKValue, ...]] = {}
-    self.int16_raw:dict[RKArg, tuple[RKValue, RKValue]] = {}
+    self.raw_bytes:dict[RKArg, tuple[RKValue, RKValue]] = {}
     self.int16_masks:dict[RKArg, int] = {}
-    self.fp16_raw:dict[RKArg, tuple[RKValue, RKValue]] = {}
     self.fp16_components:dict[RKArg, tuple[RKValue, RKArg, RKArg]] = {}
     self.fp16_ordered:dict[RKArg, tuple[RKArg, RKArg]] = {}
     self.gathers:list[RKGather] = []
@@ -2968,29 +2967,17 @@ class RKContext:
     dst = self._dst(u, dtypes.half, RKLayout.FP16) if u is self.root else neg_lhs
     return self._emit(dst, zero, neg_lhs, _EW_CFG[Ops.SUB])
 
-  def _fp16_raw_bytes(self, value:RKValue) -> tuple[RKValue, RKValue]:
-    if value.layout is not RKLayout.FP16: raise _RKGenericReject
-    if value.arg in self.fp16_raw: return self.fp16_raw[value.arg]
+  def _raw_bytes(self, value:RKValue) -> tuple[RKValue, RKValue]:
+    if value.layout not in (RKLayout.FP16, RKLayout.INT16): raise _RKGenericReject
+    if value.arg in self.raw_bytes: return self.raw_bytes[value.arg]
     low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
     split_after = len(self.ew_ops)
     for byte,part in enumerate((low, high)):
       self.mid_gathers.append(RKGather(value.arg.index, part.arg.index, self.count,
         base=value.arg.addend+byte, axes=((1, self.count, 2),), dst_stride=2,
         src_kind=value.arg.kind, itemsize=1, after=split_after))
-    self.fp16_raw[value.arg] = low, high
-    return self.fp16_raw[value.arg]
-
-  def _int16_raw_bytes(self, value:RKValue) -> tuple[RKValue, RKValue]:
-    if value.layout is not RKLayout.INT16: raise _RKGenericReject
-    if value.arg in self.int16_raw: return self.int16_raw[value.arg]
-    low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
-    split_after = len(self.ew_ops)
-    for byte,part in enumerate((low, high)):
-      self.mid_gathers.append(RKGather(value.arg.index, part.arg.index, self.count,
-        base=value.arg.addend+byte, axes=((1, self.count, 2),), dst_stride=2,
-        src_kind=value.arg.kind, itemsize=1, after=split_after))
-    self.int16_raw[value.arg] = low, high
-    return self.int16_raw[value.arg]
+    self.raw_bytes[value.arg] = low, high
+    return self.raw_bytes[value.arg]
 
   def _pack_int16_bytes(self, u:UOp, low:RKValue, high:RKValue, mask:int|None=None) -> RKValue:
     result = self._dst(u, dtypes.int16, RKLayout.INT16)
@@ -2999,7 +2986,7 @@ class RKContext:
       self.mid_gathers.append(RKGather(source.arg.index, result.arg.index, self.count,
         base=source.arg.addend, axes=((1, self.count, 2),), dst_stride=2, dst_addend=byte,
         dst_kind=result.arg.kind, src_kind=source.arg.kind, itemsize=1, after=pack_after))
-    self.int16_raw[result.arg] = low, high
+    self.raw_bytes[result.arg] = low, high
     if mask is not None: self.int16_masks[result.arg] = mask
     return result
 
@@ -3126,7 +3113,7 @@ class RKContext:
         if marker.op is not Ops.CONST or (mask:=int(marker.arg)&0xffff) not in (0x7fff, 0x8000): continue
         value = self.lower(source)
         if value.layout is not RKLayout.INT16: raise _RKGenericReject
-        low, high = self._int16_raw_bytes(value)
+        low, high = self._raw_bytes(value)
         zero, one, const127, const128 = (self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 127, 128))
         delta, positive, sign, sign_scale = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(4))
         self._emit(delta, high, const127, _EW_CFG[Ops.SUB])
@@ -3142,7 +3129,7 @@ class RKContext:
       values = tuple(self.lower(source) for source in u.src)
       masks = tuple(self.int16_masks.get(value.arg) for value in values)
       if all(mask is not None for mask in masks) and typing_cast(int, masks[0]) & typing_cast(int, masks[1]) == 0:
-        parts = tuple(self._int16_raw_bytes(value) for value in values)
+        parts = tuple(self._raw_bytes(value) for value in values)
         low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
         self._emit(low, parts[0][0], parts[1][0], _EW_CFG[Ops.ADD])
         self._emit(high, parts[0][1], parts[1][1], _EW_CFG[Ops.ADD])
@@ -3306,7 +3293,7 @@ class RKContext:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
     if value.arg in self.fp16_components: return self.fp16_components[value.arg]
-    low, high = self._fp16_raw_bytes(value)
+    low, high = self._raw_bytes(value)
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 123, 124, 127, 128)}
     def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
     clean_high,nan = _fp16_high_and_nan(self.ew_ops, allocate, high.arg, low.arg,
