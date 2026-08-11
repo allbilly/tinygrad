@@ -705,3 +705,30 @@ def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):
 
   monkeypatch.delenv("ROCKCHIP_HOST_GATHER")
   assert _lower_uop_program(gather_uops) is None and _lower_uop_program(scatter_uops) is None
+
+
+def test_dynamic_host_gather_carries_affine_lane_address_abi(monkeypatch):
+  monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "1")
+  count = 4
+  out, source = UOp.param(0, dtypes.half, (count,)), UOp.param(1, dtypes.half, (count*10,))
+  indices, lane = UOp.param(2, dtypes.int, (count,)), UOp.range(count, 0)
+  value = source.index(lane*10+indices.index(lane).load()).load()
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and len(image.host_gathers) == 1
+  address = image.host_gathers[0]
+  assert (address.base, address.index_scale, address.lane_stride, address.index_limit) == (0, 1, 10, count*10)
+  assert decode_image(encode_image(image)) == image
+
+
+def test_nonaffine_scalar_mul_sum_uses_static_gather_product_residual_and_kahan():
+  groups = 64
+  out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (groups,)), UOp.param(2, dtypes.half, (groups,))
+  permutation = tuple((lane*17)%groups for lane in range(groups))
+  terms = [lhs.index(permutation[lane]).load()*rhs.index(lane).load() for lane in range(groups)]
+  value = terms[0]
+  for term in terms[1:]: value = value+term
+  image = _lower_uop_program(list(out.index(UOp.const(0, dtypes.int)).store(value).sink().toposort()))
+  assert image is not None and any(gather.offsets == permutation for gather in image.gathers)
+  assert len(image.mid_gathers) == groups*2 and sum(op.submit_barrier for op in image.ew_ops) >= groups*2
+  assert any(gather.values and 0x5410 in gather.values for gather in image.gathers)  # FP16 splitter 65
+  assert decode_image(encode_image(image)) == image

@@ -639,3 +639,31 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 65 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 33. Composable loss reductions and indexed storage — complete
+
+- Generalized static `INDEX` materialization so non-affine offsets become an explicit `RKGather`, while affine repeated
+  inputs retain their compact mapped-address representation. Loss expressions now consume the same physical `RKValue`
+  ABI as ordinary elementwise programs instead of requiring cross-entropy or NLL graph recognition.
+- Kept runtime-addressed loads literal through the UOp executor and added a symmetric, opt-in `HOST_ADDRESS` ABI for
+  affine dynamic gather addresses. Host fallback is limited to index calculation and raw layout materialization; it does
+  not evaluate arithmetic, comparison, reduction, or transcendental semantics.
+- Added bounded integer-to-half conversion at the physical storage boundary. Sparse loss label counts and denominators
+  now use the generic typed `CAST` recipe without rediscovering a categorical-loss graph dialect.
+- Added product-error materialization and compensated scalar addition for medium mixed-sign FP32 `MUL`/`ADD` reductions.
+  This preserves the semantic UOps while accounting for FP16 product rounding at the physical boundary.
+- Removed the unsafe matrix regrouping shortcut. Non-affine class-probability loss reductions now execute their ordinary
+  UOp reduction structure, trading speed for deterministic correctness.
+- Added host-independent regressions for affine dynamic host-address encoding and non-affine scalar product reductions.
+- The complete strict loss class now passes. The verified strict prefix extends through collection index 263:
+  258 passed, 6 skipped, and 181 collected tests remain to be censused.
+
+Verification:
+
+- Strict `TestRockchipLossOps`: 14 passed in 228.35s.
+- Strict direct NLL variants: 6 passed in 62.69s.
+- Strict `test_cross_entropy_reductions`: three consecutive focused passes.
+- Independent RK3588 health check: all ADD/MUL/SUB/MAX/NEG/FDIV sizes through 131,072 lanes passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 67 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

@@ -376,9 +376,12 @@ class RockchipProgram(Program['RockchipDevice']):
         dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)[op.dst.addend//op.itemsize:]
         if len(idx) != op.count or len(src) < (op.count if scatter else op.src_count) or len(dst) < (op.dst_count if scatter else op.count):
           raise RuntimeError("RKHostAddress exceeds buffer")
-        limit = op.dst_count if scatter else op.src_count
+        limit = op.dst_count if scatter else op.index_limit or op.src_count
         if op.normalize_negative: idx = np.where(idx < 0, idx+limit, idx)
         valid = (idx >= 0) & (idx < limit)
+        if not scatter:
+          idx = op.base + np.arange(op.count, dtype=np.intp)*op.lane_stride + idx*op.index_scale
+          valid &= (idx >= 0) & (idx < op.src_count)
         if scatter:
           for lane in range(op.count):
             if valid[lane]: dst[idx[lane]] = src[lane]
