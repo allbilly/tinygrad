@@ -2600,3 +2600,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 121. Consolidate CAST ABI relabeling and BOOL recipes — complete
+
+- Merged the remaining FP16-backed identity conversions for semantic half/float and the native-INT16 identity
+  conversions for semantic INT16/bounded INT, retaining every prior source-layout and dtype guard.
+- BOOL_INT16 conversion to half, float, or INT_FP16 now builds its shared 0/1 selection recipe once; only the INT
+  destination applies the existing physical-layout relabel afterward.
+- Half→float, embedded-int→half, BOOL_INT16→half, packed-bool→INT16, and packed-bool→INT programs produced RKImages
+  byte-identical to milestone 120. Renderer executable size fell from 4,631 to 4,628 lines. From the 10,233-line
+  baseline, 5,605 lines are gone (54.8%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 5/5 identity/BOOL CAST RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.76 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

@@ -3493,22 +3493,19 @@ class RKContext:
         value = self.lower(recipe)
       elif source.layout is RKLayout.INT32 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.int):
         value = self._narrow_int32(source)
-      elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.bool):
+      elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.bool or
+                                                     dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16):
         recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
         value = self.lower(recipe)
-      elif dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16):
+        if dtype is dtypes.int:
+          if value.layout is not RKLayout.FP16: raise _RKGenericReject
+          value = RKValue(value.arg, dtype, self.count, RKLayout.INT_FP16)
+      elif (source.layout is RKLayout.FP16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.half) or
+            dtype is dtypes.half and source.layout in (RKLayout.BOOL_MASK, RKLayout.INT_FP16)):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
-      elif dtype is dtypes.float and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
-        value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
-      elif dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16):
+      elif (dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16) or
+            dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT16):
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
-      elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT16:
-        value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
-      elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT_FP16:
-        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        converted = self.lower(recipe)
-        if converted.layout is not RKLayout.FP16: raise _RKGenericReject
-        value = RKValue(converted.arg, dtype, self.count, RKLayout.INT_FP16)
       elif dtype is dtypes.int and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         if self.int_layout is RKLayout.INT_FP16:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
