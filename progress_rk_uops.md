@@ -2466,3 +2466,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 114. Collapse repeated WHERE recipe dispatch — complete
+
+- The generic `_where()` handler repeated the same two-line “try matcher, lower returned UOp recipe” control flow for
+  absolute value, ordered MIN/MAX selection, and finite-threshold selection. Replaced the three copies with one fixed
+  ordered matcher loop; recipe priority and physical lowering remain unchanged.
+- Representative ordered-minimum, absolute-value, and threshold-selection programs produced RKImages byte-identical
+  to milestone 113.
+- Renderer executable size fell from 4,653 to 4,649 lines. From the 10,233-line baseline, 5,584 lines are gone (54.6%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 WHERE recipe RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.83 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

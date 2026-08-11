@@ -3343,12 +3343,8 @@ class RKContext:
           partial=bool(partial), dst_kind=RKBufferKind.ARG, src_kind=value.arg.kind, itemsize=itemsize))
       return RKValue(self.out, dtype, self.count, expected)
     condition_uop = _strip_cast(u.src[0])
-    if (recipe:=_fold_where_abs(u)) is not None:
-      return self.lower(recipe)
-    if (recipe:=_fold_ordered_where(u)) is not None:
-      return self.lower(recipe)
-    if (recipe:=_fold_threshold_where(u)) is not None:
-      return self.lower(recipe)
+    for fold in (_fold_where_abs, _fold_ordered_where, _fold_threshold_where):
+      if (recipe:=fold(u)) is not None: return self.lower(recipe)
     if (u.src[1].op is Ops.EXP2 and u.src[2].op is Ops.CONST and float(u.src[2].arg) == 1.0 and
         len(u.src[1].src) == 1 and (scaled:=u.src[1].src[0]).op is Ops.MUL):
       infinite = next((factor for factor in scaled.src if factor.op is Ops.CONST and
