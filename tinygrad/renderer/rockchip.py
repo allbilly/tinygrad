@@ -234,21 +234,12 @@ def decode_image(blob:bytes) -> RKImage:
       _GATHER.unpack_from(blob, off); off += _GATHER.size
     if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in _ITEM_FORMAT or dst_kind not in (0, 1) or src_kind not in (0, 1) or
         dst_stride < 1 or dst_addend < 0): raise ValueError("invalid RKGather")
-    if kind == 2:
-      values = struct.unpack_from(f"<{count}{_ITEM_FORMAT[itemsize]}", blob, off); off += itemsize*count
-      gathers.append(RKGather(src_index, dst_index, count, fill_bits=fill_bits, values=values,
-                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
-                              src_kind=RKBufferKind(src_kind), after=after))
-    elif kind in (1, 3):
-      offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
-      gathers.append(RKGather(src_index, dst_index, count, offsets=offsets, fill_bits=fill_bits, partial=kind == 3,
-                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
-                              src_kind=RKBufferKind(src_kind), after=after))
-    else:
-      axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
-      gathers.append(RKGather(src_index, dst_index, count, base, axes, fill_bits=fill_bits,
-                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
-                              src_kind=RKBufferKind(src_kind), after=after))
+    axes:tuple[tuple[int, int, int], ...] = (); offsets:tuple[int, ...] = (); values:tuple[int, ...] = ()
+    if kind == 2: values = struct.unpack_from(f"<{count}{_ITEM_FORMAT[itemsize]}", blob, off); off += itemsize*count
+    elif kind in (1, 3): offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
+    else: axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
+    gathers.append(RKGather(src_index, dst_index, count, base if kind == 0 else 0, axes, offsets, fill_bits, values, kind == 3,
+      dst_stride, dst_addend, RKBufferKind(dst_kind), itemsize, RKBufferKind(src_kind), after))
   host_addresses:list[RKHostAddress] = []
   for _ in range(nhost_gather+nhost_scatter):
     src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \

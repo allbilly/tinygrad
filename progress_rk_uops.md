@@ -2884,3 +2884,20 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 136. Unify RKImage gather decoding — complete
+
+- Affine, explicit-offset, embedded-value, and partial gather records each rebuilt the same `RKGather` ABI fields in
+  separate decoder branches. Decode only the kind-specific payload now, then construct the physical gather once.
+- All four gather kinds, including 8/16/32-bit embedded values, preserved every decoded field and serialized byte.
+  This is physical image handling only; no CPU numeric semantics were introduced.
+- Renderer executable size fell from 4,535 to 4,526 lines. From the 10,233-line baseline, 5,707 lines are gone (55.8%);
+  runtime remains 460 lines.
+
+Verification:
+
+- Old/current gather decode comparison: 6/6 payload variants field-identical; 322/322 serialized bytes identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.88 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
