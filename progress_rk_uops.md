@@ -2103,3 +2103,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 96. Deduplicate nonfinite WHERE denominator setup — complete
+
+- A fresh private-symbol audit found no unreferenced renderer component, but the generic typed `WHERE` handler built
+  the same inverted selector denominator separately in its NaN and signed-infinity branches. Hoisted that shared DPU
+  stage above the correction split; NaN still uses `0/denominator`, while infinity still uses the signed quotient
+  correction.
+- Compared milestone-95/current images for NaN, positive infinity, and negative infinity in both `WHERE` arms. All six
+  images were byte-identical, including scratch coloring and EW ordering.
+- Renderer executable size fell from 4,704 to 4,700 lines. From the 10,233-line baseline, 5,533 executable renderer
+  lines are gone (54.1%); runtime remains 480 lines. No host computation or CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 6/6 nonfinite `WHERE` programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.02 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

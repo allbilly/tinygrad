@@ -3426,21 +3426,17 @@ class RKContext:
         yes, no = (self.lower(src) for src in u.src[1:])
         return self._raw_where(u, selector, yes, no)
       if selector.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
-      if math.isnan(float(u.src[1+inf_index].arg)):
-        zero, one = self._constant(UOp.const(0.0, dtypes.half)), self._constant(UOp.const(1.0, dtypes.half))
-        if inf_index == 0:
-          denominator = self._scratch(dtypes.half, RKLayout.FP16)
-          self._emit(denominator, one, selector, _EW_CFG[Ops.SUB])
-        else: denominator = selector
-        correction = self._scratch(dtypes.half, RKLayout.FP16)
-        self._emit(correction, zero, denominator, _EW_CFG[Ops.FDIV])
-        return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), finite, correction, _EW_CFG[Ops.ADD])
-      one, sign = self._constant(UOp.const(1.0, dtypes.half)), self._constant(
-        UOp.const(math.copysign(1.0, float(u.src[1+inf_index].arg)), dtypes.half))
+      one = self._constant(UOp.const(1.0, dtypes.half))
       if inf_index == 0:
         denominator = self._scratch(dtypes.half, RKLayout.FP16)
         self._emit(denominator, one, selector, _EW_CFG[Ops.SUB])
       else: denominator = selector
+      if math.isnan(float(u.src[1+inf_index].arg)):
+        zero = self._constant(UOp.const(0.0, dtypes.half))
+        correction = self._scratch(dtypes.half, RKLayout.FP16)
+        self._emit(correction, zero, denominator, _EW_CFG[Ops.FDIV])
+        return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), finite, correction, _EW_CFG[Ops.ADD])
+      sign = self._constant(UOp.const(math.copysign(1.0, float(u.src[1+inf_index].arg)), dtypes.half))
       quotient, correction = self._scratch(dtypes.half, RKLayout.FP16), self._scratch(dtypes.half, RKLayout.FP16)
       self._emit(quotient, sign, denominator, _EW_CFG[Ops.FDIV])
       self._emit(correction, quotient, sign, _EW_CFG[Ops.SUB])
