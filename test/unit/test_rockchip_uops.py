@@ -763,6 +763,17 @@ def test_direct_dynamic_int32_load_selects_all_raw_bytes():
   assert decode_image(encode_image(image)) == image
 
 
+def test_dynamic_index_materializer_composes_external_bool_gate():
+  out, source = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (4,))
+  indices, mask, lane = UOp.param(2, dtypes.int, (4,)), UOp.param(3, dtypes.bool, (4,)), UOp.range(4, 0)
+  index = indices.index(lane).load()
+  gate = (((index < 0) != UOp.const(True, dtypes.bool)) & (index < 4)) & mask.index(lane).load()
+  image = _lower_uop_program(list(out.index(lane).store(source.index(index).load(UOp.const(0.0, dtypes.half), gate)).end(lane).sink().toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert any(gather.src_index == mask.arg.slot and gather.itemsize == 1 for gather in image.gathers)
+  assert decode_image(encode_image(image)) == image
+
+
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:lhs.index(i).load() & rhs.index(i).load()))

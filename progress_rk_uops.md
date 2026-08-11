@@ -2924,3 +2924,26 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 138. Delete the overlapping direct dynamic-index catalog entry — complete
+
+- The 48-line direct dynamic typed-LOAD recognizer and the general multi-index materializer duplicated the same native
+  raw-byte selection for one positive or negative-normalized INT32 index. Extended the general materializer with its
+  only missing capability—one external raw bool gate—then deleted the direct recognizer and both dispatch references.
+- Positive FP16, externally gated FP16, and direct INT32 programs produce byte-identical images to the removed path.
+  Negative-normalized input now uses the general executor's existing alternate-coordinate representation, which shares
+  one positive candidate plan between `i` and `i-extent` rather than constructing two operation-specific plan sets.
+- Added a regression proving that the composed external bool gate remains `NATIVE`, enters as a raw one-byte gather,
+  and introduces no host-address or CPU numeric execution.
+- Renderer executable size fell from 4,522 to 4,492 lines. From the 10,233-line baseline, 5,741 lines are gone (56.1%);
+  runtime remains 460 lines.
+
+Verification:
+
+- Old/current positive FP16 image: 3,917/3,917 bytes identical.
+- Old/current externally gated FP16 image: 4,058/4,058 bytes identical.
+- Old/current direct INT32 image: 9,103/9,103 bytes identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 92 passed in 5.04 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
