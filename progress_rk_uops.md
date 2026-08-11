@@ -2430,3 +2430,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 112. Delete the accurate-ADD private traversal — complete
+
+- `_accurate_add_recipe()` retained a recursive half-ADD walker because native/tagged ADD nodes must remain opaque.
+  Added an optional `plain` boundary to the shared iterative `_flatten_binary()` and used it to stop precisely at ADDs
+  carrying a physical recipe tag, then kept the existing FP32-cast expansion over those ordered leaves.
+- Ordinary, balanced, and tagged-boundary accurate recipes matched milestone 111 exactly, as did a representative
+  nested product-sum RKImage. A 4,096-deep plain ADD tree now flattens without Python recursion.
+- Renderer executable size fell from 4,659 to 4,656 lines. From the 10,233-line baseline, 5,577 lines are gone (54.5%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 accurate recipe keys and 1/1 product-sum RKImage identical; 4,096-deep tree accepted.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.66 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

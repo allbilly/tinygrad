@@ -1086,11 +1086,11 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
     if (finished:=_append_inplace_image(finished, relu_image)) is None: return None
   return finished
 
-def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
+def _flatten_binary(root:UOp, op:Ops, *, plain:bool=False) -> list[UOp]:
   leaves, stack = [], [root]
   while stack:
     node = stack.pop()
-    if node.op is op: stack.extend(reversed(node.src))
+    if node.op is op and (not plain or node.arg is None): stack.extend(reversed(node.src))
     else: leaves.append(node)
   return leaves
 
@@ -2620,14 +2620,11 @@ def _fp32_ratio_to_half(u:UOp) -> UOp|None:
 
 def _accurate_add_recipe(u:UOp) -> UOp:
   terms:list[UOp] = []
-  def flatten(x:UOp) -> None:
-    if x.op is Ops.ADD and x.dtype.scalar() is dtypes.half and x.arg is None:
-      flatten(x.src[0]); flatten(x.src[1])
-    elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half and len(x.src) == 1 and x.src[0].dtype.scalar() is dtypes.float and \
-         x.src[0].op is Ops.ADD:
+  for x in _flatten_binary(u, Ops.ADD, plain=True):
+    if x.op is Ops.CAST and x.dtype.scalar() is dtypes.half and len(x.src) == 1 and x.src[0].dtype.scalar() is dtypes.float and \
+       x.src[0].op is Ops.ADD:
       terms.extend(_fp32_add_terms(x.src[0]))
     else: terms.append(x)
-  flatten(u)
   if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
   if any(any(node.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) for node in term.toposort()) for term in terms):
     raise _RKGenericReject
