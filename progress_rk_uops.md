@@ -510,3 +510,23 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 58 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 28. Canonical INT32 inputs under bounded integer roots — complete
+
+- Made a dynamic INT32 `LOAD` select the canonical `RKLayout.INT32` ABI even when range analysis proves the final root
+  is bounded enough for FP16 or INT16. Physical input representation now takes precedence over result-range storage.
+- Prevented the bounded comparison shortcut from converting a real INT32 input load through `_int_fp16_expr`. Exact
+  comparisons split the canonical four-byte value, execute byte-wise masks, and widen the bounded result only at the
+  output boundary.
+- This directly composes Tinygrad's one-hot `LOAD`, coordinate arithmetic, `CMPNE`, and ternary `WHERE` UOps without a
+  one-hot lowerer.
+- Added a host-independent nested-range regression matching the 3-by-6 one-hot UOp program.
+
+Verification:
+
+- Strict `TestRockchipOneHotOps::test_one_hot`: 1 passed in 2.81s.
+- The fresh full strict census reached the first previously unknown gap after 111 passed, 6 skipped, and 96 subtests
+  passed in 11m57s; that sole failure was the one-hot case fixed by this milestone.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 59 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

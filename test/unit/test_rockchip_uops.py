@@ -272,6 +272,16 @@ def test_int16_to_int32_is_an_explicit_output_boundary():
   assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
 
 
+def test_bounded_int_root_keeps_dynamic_int32_load_in_canonical_layout():
+  out, source = UOp.param(0, dtypes.int, (18,)), UOp.param(1, dtypes.int, (3,))
+  row = UOp.range(3, 1)
+  cls = UOp.range(6, 0, src=(row,))
+  different = source.index(row).load() != cls
+  value = different.where(UOp.const(0, dtypes.int), UOp.const(1, dtypes.int))
+  image = _lower_uop_program(list(out.index(row*6+cls).store(value).end(cls, row).sink().toposort()))
+  assert image is not None and image.mid_gathers and image.ew_ops[-1].int32_output
+
+
 def test_bounded_semantic_int_does_not_alias_int32_output_before_widening():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:

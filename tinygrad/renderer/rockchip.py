@@ -7724,7 +7724,8 @@ class RKContext:
                             node.src[0].dtype.scalar() in (dtypes.half, dtypes.bool) for node in nodes)
     dynamic_int_load = any(node.op is Ops.LOAD and node.dtype.scalar() is dtypes.int and node.src and
                            _root_param(node.src[0]) is not None for node in nodes)
-    self.int_layout = (RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and packed_bool_load and int_range is not None and
+    self.int_layout = (RKLayout.INT32 if self.root.dtype.scalar() is dtypes.int and dynamic_int_load else
+                       RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and packed_bool_load and int_range is not None and
                        -32768 <= int_range[0] <= int_range[1] <= 32767 else
                        RKLayout.INT_FP16 if self.root.dtype.scalar() is dtypes.int and int_range is not None and
                        -2048 <= int_range[0] <= int_range[1] <= 2048 else
@@ -8026,7 +8027,7 @@ class RKContext:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
     if all(src.dtype.scalar() is dtypes.int for src in u.src):
       bounds = tuple(_exact_int_range(src) for src in u.src)
-      if self.int_layout is RKLayout.INT_FP16 or all(
+      if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(
         bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds
       ):
         recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in u.src), arg=u.arg)
