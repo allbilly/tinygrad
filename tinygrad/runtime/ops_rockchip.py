@@ -452,7 +452,6 @@ class RockchipProgram(Program['RockchipDevice']):
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
     if self.image.ew_ops: self.dev._native_int16 = native_int16
-    if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if self.image.host_scatters:
       touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \
                 {(op.index.kind, op.index.index) for op in self.image.host_scatters} | \

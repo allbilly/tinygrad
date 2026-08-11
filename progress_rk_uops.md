@@ -1558,3 +1558,24 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 70. Merge terminal gathers into the physical stage timeline — complete
+
+- `post_gathers` were not a distinct hardware operation: they were raw gathers executed after the final EW stage,
+  exactly the point already represented by `RKGather.after == len(ew_ops)`. Moved every specialized and generic image
+  producer onto that explicit point and deleted the separate `RKImage` phase.
+- Removed the post-gather header count, decoder partition, scratch-coloring pass, image-composition branches, serialized
+  field, and runtime submission branch. Existing terminal mid-gathers and former post-gathers now retain their original
+  order in one synchronized batch. Bumped the serialized ABI to version 36.
+- The unit audit exposed one obsolete distinction: a raw-bitcast image already had two ordinary scratch gathers at the
+  final point before its separate output gather. The contract now verifies the terminal ARG movement rather than the
+  deleted phase label.
+- Renderer executable size fell from 4,874 to 4,869 lines and runtime fell from 485 to 484 lines. From the 10,233-line
+  renderer baseline, 5,364 executable lines are gone (52.4%). No CPU numeric semantics or DPU arithmetic changed.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed, including all image round trips and
+  terminal raw-bit layout contracts.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
