@@ -2222,3 +2222,25 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 102. Delete redundant scratch-coloring state — complete
+
+- Reprofiled the dependent reduction after milestone 99. Scratch coloring is now the largest standalone compiler pass,
+  but an identity shortcut is impossible in the large case: only 7 of 23,754 EW arguments retain their virtual index.
+- Audited the interval allocator instead. Its separate `starts` array duplicated the first-use information already
+  represented by `ends == -1` and ordered discovery, so first-touch records now carry their event directly. Its
+  `physical_reusable` array was also redundant: only reusable targets enter `active`, and pinned targets are never
+  inserted, making the pop-time boolean check invariantly true.
+- Deleted both parallel state arrays and their writes/checks. The profiled workload makes 1,062 fewer calls, although
+  scratch-coloring wall time remains within noise at about 0.30 seconds, so no speedup is claimed.
+- Compared milestone-101/current images for a large unpinned reduction, pinned raw-bit mid-gathers, static selection,
+  and host-address gathering; all four were byte-identical. Renderer executable size fell from 4,682 to 4,681 lines.
+  From the 10,233-line baseline, 5,552 lines are gone (54.3%); runtime remains 480 lines. No CPU semantics were added.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 4/4 allocator schedule families byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.64 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

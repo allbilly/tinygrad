@@ -110,11 +110,11 @@ def _hoist_leading_vector_materialization(image:RKImage) -> RKImage:
 
 def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKImage:
   """Color virtual scratch lifetimes across the complete physical execution schedule."""
-  starts, ends, order = [-1] * len(image.scratch), [-1] * len(image.scratch), list[int]()
+  ends, order = [-1] * len(image.scratch), list[tuple[int, int]]()
   def touch(arg:RKArg, event:int) -> None:
     if arg.kind is not RKBufferKind.SCRATCH: return
-    if not 0 <= arg.index < len(starts): raise ValueError("invalid virtual scratch slot")
-    if starts[arg.index] < 0: starts[arg.index] = event; order.append(arg.index)
+    if not 0 <= arg.index < len(ends): raise ValueError("invalid virtual scratch slot")
+    if ends[arg.index] < 0: order.append((event, arg.index))
     ends[arg.index] = event
   def touch_gather(gather:RKGather, event:int) -> None:
     if not gather.values: touch(RKArg(gather.src_kind, gather.src_index), event)
@@ -138,24 +138,23 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   # Mid-program gathers may populate one logical slot in several partial phases. The runtime clears a
   # destination once per physical slot, so these stateful materialization slots must not alias.
   pinned = {gather.dst_index for gather in image.mid_gathers if gather.dst_kind is RKBufferKind.SCRATCH}
-  intervals = ((starts[slot], ends[slot], slot) for slot in order)
+  intervals = ((start, ends[slot], slot) for start,slot in order)
   remap:dict[int, int] = {}
   physical:list[RKScratch] = []
-  physical_reusable:list[bool] = []
   active:list[tuple[int, int]] = []
   available:list[int] = []
   for start,end,slot in intervals:
     while active and active[0][0] < start:
       _,target = heapq.heappop(active)
-      if physical_reusable[target]: heapq.heappush(available, target)
+      heapq.heappush(available, target)
     spec = image.scratch[slot]
     if slot not in pinned and available:
       target = heapq.heappop(available)
       physical[target] = RKScratch(max(physical[target].size, spec.size))
     else:
       target = len(physical)
-      physical.append(spec); physical_reusable.append(slot not in pinned)
-    if physical_reusable[target]: heapq.heappush(active, (end, target))
+      physical.append(spec)
+    if slot not in pinned: heapq.heappush(active, (end, target))
     remap[slot] = target
   remapped_args = tuple(RKArg(RKBufferKind.SCRATCH, remap.get(slot, slot)) for slot in range(len(image.scratch)))
   def remap_arg(arg:RKArg) -> RKArg:
