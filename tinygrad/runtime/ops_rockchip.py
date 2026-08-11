@@ -461,11 +461,6 @@ class RockchipProgram(Program['RockchipDevice']):
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       apply_host_addresses(self.image.host_scatters, True)
       self.dev._sync_buffers(tuple(buffer(op.dst.kind, op.dst.index) for op in self.image.host_scatters), rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    if (fill:=self.image.fill) is not None:
-      bits = self.image.constants[:fill.itemsize] * fill.count
-      dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]
-      ctypes.memmove(int(dest.va_addr), bits, len(bits))
-      self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):

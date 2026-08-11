@@ -1485,3 +1485,21 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 66. Delete the unreachable fill ABI — complete
+
+- Audited every `RKImage` producer across the repository. No renderer path constructed `RKFill`; only the decoder
+  could recreate it, leaving its serializer flag, scratch-lifetime handling, append guards, and runtime host memcpy
+  branch unreachable from any compiled UOp program.
+- Deleted `RKFill` end to end and reserved its former header flag. Bumped `RKIMAGE_VERSION` from 31 to 32 so any stale
+  serialized blob is rejected explicitly rather than interpreted under the narrower physical ABI.
+- Renderer executable size fell from 4,891 to 4,880 lines and runtime fell from 491 to 486 lines. From the 10,233-line
+  pre-deletion renderer baseline, 5,353 executable lines are gone (52.3%).
+- No CPU numeric semantics or generated execution behavior changed. Compile-time constants continue through ordinary
+  gather materialization; this removes a host numeric-fill path that the UOp renderer never emitted.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed, including all RKImage round trips.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
