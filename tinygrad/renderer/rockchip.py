@@ -80,13 +80,16 @@ class RKImage:
   def execution_class(self) -> RKExecutionClass:
     return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
 
-def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg]) -> RKImage:
+def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg], map_value_sources:bool=True) -> RKImage:
   def gather(value:RKGather) -> RKGather:
-    src, dst = fn(RKArg(value.src_kind, value.src_index)), fn(RKArg(value.dst_kind, value.dst_index))
+    source = RKArg(value.src_kind, value.src_index)
+    src, dst = fn(source) if map_value_sources or not value.values else source, fn(RKArg(value.dst_kind, value.dst_index))
     return replace(value, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
   def host(value:RKHostAddress) -> RKHostAddress: return replace(value, src=fn(value.src), index=fn(value.index), dst=fn(value.dst))
+  def ew(op:RKEWOp) -> RKEWOp: return RKEWOp(fn(op.dst), fn(op.lhs), fn(op.rhs), op.count, op.ew_cfg, op.submit_barrier,
+    op.compare, op.stateful, op.int32_output, op.int32_input, op.bool_output, op.int16_output, op.int16_input)
   return replace(image, gathers=tuple(gather(x) for x in image.gathers), mid_gathers=tuple(gather(x) for x in image.mid_gathers),
-    ew_ops=tuple(replace(op, dst=fn(op.dst), lhs=fn(op.lhs), rhs=fn(op.rhs)) for op in image.ew_ops),
+    ew_ops=tuple(ew(op) for op in image.ew_ops),
     host_gathers=tuple(host(x) for x in image.host_gathers), host_scatters=tuple(host(x) for x in image.host_scatters))
 
 def _hoist_leading_vector_materialization(image:RKImage) -> RKImage:
@@ -169,25 +172,14 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   def remap_arg(arg:RKArg) -> RKArg:
     if arg.kind is not RKBufferKind.SCRATCH: return arg
     return physical_args[remap[arg.index]] if not arg.addend else RKArg(arg.kind, remap[arg.index], arg.addend)
-  def remap_gather(gather:RKGather) -> RKGather:
-    return replace(gather,
-    src_index=remap[gather.src_index] if not gather.values and gather.src_kind is RKBufferKind.SCRATCH else gather.src_index,
-    dst_index=remap[gather.dst_index] if gather.dst_kind is RKBufferKind.SCRATCH else gather.dst_index)
-  def remap_host(host:RKHostAddress) -> RKHostAddress:
-    return replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
-  gathers = tuple(remap_gather(gather) for gather in image.gathers)
-  ew_ops = tuple(RKEWOp(remap_arg(op.dst), remap_arg(op.lhs), remap_arg(op.rhs), op.count, op.ew_cfg, op.submit_barrier,
-    op.compare, op.stateful, op.int32_output, op.int32_input, op.bool_output, op.int16_output, op.int16_input) for op in image.ew_ops)
+  image = _map_image_args(image, remap_arg, False)
   by_slot:dict[int, bytes] = {}
   for bits,slot in constant_slots.items():
     target = remap[slot]
     if target in by_slot and by_slot[target] != bits: raise ValueError("overlapping scratch constants")
     by_slot[target] = bits
   constants = b"" if not by_slot else b"".join(by_slot.get(slot, b"\0\0") for slot in range(max(by_slot)+1))
-  return replace(image, scratch=tuple(physical), constants=constants, gathers=gathers, ew_ops=ew_ops,
-    mid_gathers=tuple(remap_gather(gather) for gather in image.mid_gathers),
-    host_gathers=tuple(remap_host(host) for host in image.host_gathers),
-    host_scatters=tuple(remap_host(host) for host in image.host_scatters))
+  return replace(image, scratch=tuple(physical), constants=constants)
 
 @dataclass(frozen=True, slots=True)
 class RKReloc: word: int; arg: RKArg

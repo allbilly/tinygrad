@@ -2810,3 +2810,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 132. Delete the scratch allocator's private relocation pass — complete
+
+- `_reuse_linear_scratch()` still rebuilt gathers, EW stages, and host-address records with a private copy of the
+  relocation logic introduced in milestone 131. Routed its virtual-to-physical slot coloring through
+  `_map_image_args()` and deleted the duplicate gather/host/EW reconstruction.
+- Added the one required distinction to the shared ABI: compile-time value gathers retain their ignored source field
+  during scratch coloring. The remaining explicit 64-term non-affine MUL/ADD program produced a byte-identical image.
+- Its alternating renderer-only benchmark remained stable at 0.096384 seconds versus 0.096578 seconds before the
+  refactor. This case deliberately remains literal ordinary UOp execution rather than a recovered matmul dialect.
+- Renderer executable size fell from 4,543 to 4,535 lines. From the 10,233-line baseline, 5,698 lines are gone (55.7%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current non-affine reduction RKImage: byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.61 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
