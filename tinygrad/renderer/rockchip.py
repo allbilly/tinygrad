@@ -634,7 +634,7 @@ def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
-def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, list[dict[UOp, int]], UOp, int]|None:
+def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, UOp, int]|None:
   if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
   rows = int(out_param.src[0].arg)
   out_ranges = _index_ranges(store.src[0].src[1])
@@ -645,43 +645,24 @@ def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[in
   try: envs = _iter_range_env(out_ranges)
   except RuntimeError: return None
   if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
-  return rows, envs, reduce_range, groups
+  return rows, reduce_range, groups
 
 @dataclass(frozen=True)
 class RKLoopReduction:
-  store:UOp; out:UOp; nodes:list[UOp]; rows:int; envs:list[dict[UOp, int]]; reduce_range:UOp; groups:int; update:UOp; post_scale:float
-  post_sqrt:bool = False; post_reciprocal:bool = False; post_cuberoot:bool = False
+  store:UOp; out:UOp; rows:int; reduce_range:UOp; groups:int; update:UOp
 
 
 def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
-  """Parse the output, accumulator update, shape, and optional final scale of a loop reduction."""
-  if (output:=_output_store(uops, (dtypes.half, dtypes.float), allow_local=True)) is None: return None
+  """Parse the plain local ADD loop consumed by the dot-product physical path."""
+  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
   store, out, _, _, root = output
+  if _local_load(root) is None: return None
   nodes = list(root.toposort())
   if (shape:=_loop_reduction_shape(store, out, nodes)) is None: return None
-  rows, envs, reduce_range, groups = shape
+  rows, reduce_range, groups = shape
   updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
   if len(updates) != 1: return None
-  value_root = root
-  if root.op is Ops.MAX:
-    unclamped, epsilon = next(((value, const) for value,const in (root.src, root.src[::-1]) if const.op is Ops.CONST), (None, None))
-    if unclamped is None or epsilon is None or _fp16_bits(float(epsilon.arg)) != 0: return None
-    value_root = unclamped
-  post_sqrt = value_root.op is Ops.SQRT and len(value_root.src) == 1
-  post_reciprocal = value_root.op is Ops.FDIV and len(value_root.src) == 2 and value_root.src[0].op is Ops.CONST and \
-                    float(value_root.src[0].arg) == 1.0 and _local_load(value_root.src[1]) is not None
-  local_values = {load.key:load for node in value_root.toposort() if (load:=_local_load(node)) is not None}
-  post_cuberoot = not post_sqrt and not post_reciprocal and len(local_values) == 1 and any(
-    node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and abs(float(node.arg)-1/3) < 1e-6
-    for node in value_root.toposort())
-  value = (value_root.src[0] if post_sqrt else value_root.src[1] if post_reciprocal else
-           next(iter(local_values.values())) if post_cuberoot else value_root)
-  if _local_load(value) is not None: post_scale = 1.0
-  elif value.op is Ops.MUL and (load:=next((x for x in value.src if _local_load(x) is not None), None)) is not None and \
-       (scale:=value.src[1 if value.src[0] is load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
-  else: return None
-  return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]),
-                         post_scale, post_sqrt, post_reciprocal, post_cuberoot)
+  return RKLoopReduction(store, out, rows, reduce_range, groups, _strip_cast(updates[0].src[1]))
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
@@ -927,8 +908,6 @@ def _lower_composed_uops(uops:list[UOp], *, recipes_ready:bool=False) -> RKImage
 
 def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
-  if (loop.out.dtype.scalar() is not dtypes.half or loop.post_scale != 1.0 or
-      loop.post_sqrt or loop.post_reciprocal or loop.post_cuberoot): return None
   store, update, reduce_range, groups = loop.store, loop.update, loop.reduce_range, loop.groups
   if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None: return None
   product = _strip_cast(update.src[1 if update.src[0] is acc else 0])

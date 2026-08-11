@@ -1221,3 +1221,27 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 88 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 54. Narrow the residual loop matcher to dot semantics — complete
+
+- Retried the 60-line INT32 bounds-mask deletion after fixing cold masked-LOAD folding. Cold masked-select/nonzero and
+  all renderer units passed without it, but multi-axis integer fancy indexing still rejected while consuming its
+  boolean bounds buffer. Restored the exact DPU byte-mask executor; replacing it with host comparison would violate
+  the no-CPU-numeric boundary.
+- Milestone 53 left `RKLoopReduction` with only one caller: the dot-product physical path. Removed the now-dead scalar
+  reduction fields and parsing for generic nodes/environments, post-scale, sqrt, reciprocal, cuberoot, and clamping.
+  The matcher now accepts only a plain FP16 local accumulator result and returns the six values dot lowering consumes.
+- This is dead-state deletion rather than a new graph dialect. Non-dot reductions fall directly through to the generic
+  mapped/local UOp executor, while dot retains its existing product-precision recipe.
+- No CPU numeric semantics or host data evaluation were introduced.
+- Reduced the renderer from 5,062 to 5,041 executable lines, another 21 lines. From the 10,233-line pre-deletion
+  baseline, 5,192 executable lines are gone (50.7%). The physical renderer diff is 8 insertions and 29 deletions;
+  runtime remains 488 executable lines.
+
+Verification:
+
+- Cold complete dot/einsum gate: 13 passed in 24.24s.
+- Cold std/normalize/full-sum fallthrough gate: 3 passed in 36.46s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 88 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
