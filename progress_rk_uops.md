@@ -2484,3 +2484,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 115. Share static vector-evaluation setup — complete
+
+- `_static_values()` and `_static_int_vectors()` independently collected output RANGE dependencies, rejected foreign
+  ranges, enumerated bounded environments, built NumPy lane vectors, and initialized the expression cache. Moved that
+  identical address/static-materialization setup into `_static_vector_env()`.
+- Scalar static values, three simultaneously evaluated integer rows, foreign-range rejection, and a representative
+  multi-axis static-selection RKImage matched milestone 114 exactly. This helper evaluates compile-time indices and
+  constants only; it does not execute tensor numeric semantics on the host.
+- Renderer executable size fell from 4,649 to 4,646 lines. From the 10,233-line baseline, 5,587 lines are gone (54.6%);
+  runtime remains 480 lines.
+
+Verification:
+
+- Old/current comparison: scalar/vector values, rejection behavior, and 1/1 RKImage identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.68 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

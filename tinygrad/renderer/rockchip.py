@@ -599,12 +599,14 @@ def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
-def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
+def _static_vector_env(out_index:UOp, exprs:tuple[UOp, ...]) -> tuple[list[dict[UOp, int]], dict[UOp, np.ndarray], dict[UOp, np.ndarray]]:
   ranges = _index_ranges(out_index)
-  if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
+  if any(r not in ranges for expr in exprs for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
   envs = _iter_range_env(ranges)
-  vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
-  cache:dict[UOp, np.ndarray] = {}
+  return envs, {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}, {}
+
+def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
+  envs, vector_env, cache = _static_vector_env(out_index, (expr,))
   dst_lanes = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
   expr_lanes = np.broadcast_to(_eval_vector(expr, vector_env, cache), len(envs))
   values:list[int|None] = [None] * count
@@ -622,11 +624,7 @@ def _static_int_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
 
 def _static_int_vectors(out_index:UOp, exprs:tuple[UOp, ...], count:int) -> tuple[tuple[int, ...], ...]:
   """Vector-evaluate static integer rows with one shared index-expression cache."""
-  ranges = _index_ranges(out_index)
-  if any(r not in ranges for expr in exprs for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
-  envs = _iter_range_env(ranges)
-  vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
-  cache:dict[UOp, np.ndarray] = {}
+  envs, vector_env, cache = _static_vector_env(out_index, exprs)
   dst = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
   if len(envs) != count or np.any((dst < 0) | (dst >= count)) or not np.array_equal(np.sort(dst), np.arange(count)):
     return tuple(_static_int_vector(out_index, expr, count) for expr in exprs)
