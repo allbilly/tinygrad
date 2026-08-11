@@ -634,36 +634,6 @@ def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
-def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, UOp, int]|None:
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  rows = int(out_param.src[0].arg)
-  out_ranges = _index_ranges(store.src[0].src[1])
-  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
-  if rows <= 0 or len(reduce_ranges) != 1: return None
-  reduce_range = reduce_ranges[0]
-  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
-  try: envs = _iter_range_env(out_ranges)
-  except RuntimeError: return None
-  if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
-  return rows, reduce_range, groups
-
-@dataclass(frozen=True)
-class RKLoopReduction:
-  store:UOp; out:UOp; rows:int; reduce_range:UOp; groups:int; update:UOp
-
-
-def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
-  """Parse the plain local ADD loop consumed by the dot-product physical path."""
-  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
-  store, out, _, _, root = output
-  if _local_load(root) is None: return None
-  nodes = list(root.toposort())
-  if (shape:=_loop_reduction_shape(store, out, nodes)) is None: return None
-  rows, reduce_range, groups = shape
-  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
-  if len(updates) != 1: return None
-  return RKLoopReduction(store, out, rows, reduce_range, groups, _strip_cast(updates[0].src[1]))
-
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
   if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
@@ -900,44 +870,6 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
     if tagged.op is Ops.ADD: tagged = tagged.replace(arg=_NATIVE_PRECISE_ADD)
     cache[u] = tagged
   return cache[root]
-
-def _lower_composed_uops(uops:list[UOp], *, recipes_ready:bool=False) -> RKImage:
-  image = _lower_uop_program(uops, vectorize_reductions=False, recipes_ready=recipes_ready)
-  if image is None: raise RuntimeError("RKPLAN_REJECT:composed_uops")
-  return image
-
-def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
-  """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
-  store, update, reduce_range, groups = loop.store, loop.update, loop.reduce_range, loop.groups
-  if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None: return None
-  product = _strip_cast(update.src[1 if update.src[0] is acc else 0])
-  if product.op is not Ops.MUL or product.arg is not None or product.dtype.scalar() is not dtypes.half: return None
-  for operand in product.src:
-    operand = _strip_cast(operand)
-    param = _root_param(operand.src[0]) if operand.op is Ops.LOAD and operand.src and operand.src[0].op is Ops.INDEX else None
-    if param is None or operand.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST: return None
-  terms = [product.substitute({reduce_range:reduce_range.const_like(r)}) for r in range(groups)]
-  if groups >= _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS:
-    try: return _lower_composed_uops([store.replace(src=(store.src[0], _precise_mul_sum(terms), *store.src[2:]))])
-    except RuntimeError: pass
-  summed = terms[0]
-  for term in terms[1:]: summed = summed.alu(Ops.ADD, term)
-  precise_store = store.replace(src=(store.src[0], summed, *store.src[2:]))
-  if (precise:=_lower_vectorized_mul_add_reduction(list(UOp(Ops.SINK, src=(precise_store,)).toposort()))) is not None: return precise
-  # Materialize bounded dot domains so the arena reduction preserves a real balanced tree instead of a rewritten ADD chain.
-  lanes, out_index = loop.rows*groups, store.src[0].src[1]
-  if lanes <= _MAX_EW_ELEMS_FP16*(_reduction_stride(1)//2):
-    linear_index = reduce_range.alu(Ops.MUL, reduce_range.const_like(loop.rows)).alu(Ops.ADD, out_index)
-    fake_out = loop.out.replace(src=(loop.out.src[0].const_like(lanes),))
-    fake_index = store.src[0].replace(src=(fake_out, linear_index))
-    fake_store = store.replace(src=(fake_index, product, *store.src[2:]))
-    try: mapped = _lower_composed_uops(_fp16_rewrite(list(UOp(Ops.SINK, src=(fake_store,)).toposort())), recipes_ready=True)
-    except RuntimeError: mapped = None
-    if mapped is not None and (finished:=_finish_mapped_add_reduction(mapped, loop.out.arg.slot, loop.rows, groups, 1.0)) is not None:
-      return finished
-  while len(terms) > 1:
-    terms = [terms[i].alu(Ops.ADD, terms[i+1]) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
-  return _lower_composed_uops([store.replace(src=(store.src[0], terms[0], *store.src[2:]))])
 
 def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float,
                                  op_barriers:bool=False, compensated_limit:int=_reduction_stride(1)//2, kahan:bool=False) -> RKImage|None:
@@ -4543,8 +4475,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       storage_uops = list(graph_rewrite(storage_sink, _pm_generic_storage_precision,
                                         name="rockchip generic storage precision").toposort())
   if vectorize_reductions and (mul_add:=_lower_vectorized_mul_add_reduction(uops)) is not None: return mul_add
-  if vectorize_reductions and (scalar_loop:=_loop_reduction_match(uops)) is not None:
-    if (dot_reduction:=_lower_dot_loop_reduction(scalar_loop)) is not None: return dot_reduction
   mapped_loop = _lower_mapped_add_loop_reduction(uops) if vectorize_reductions else None
   if mapped_loop is not None: return mapped_loop
   if storage_uops is not None: uops = storage_uops

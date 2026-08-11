@@ -1425,3 +1425,24 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 63. Delete the dot-loop graph recognizer — complete
+
+- Disconnected the remaining dot-loop fast path so dot, matvec, multidot, broadcast-dot, and einsum programs had to
+  use the ordinary mapped static ADD reduction. The complete cold dot/einsum gate passed before deletion, proving the
+  private graph parser was no longer required for correctness or precision.
+- Deleted `_loop_reduction_shape`, `RKLoopReduction`, `_loop_reduction_match`, `_lower_dot_loop_reduction`, and the now
+  unreachable `_lower_composed_uops` wrapper. This removes tensor-program recovery of MUL+ADD loops; the surviving
+  structural executor consumes RANGE/local LOAD/STORE/ADD semantics generically.
+- Renderer executable size fell from 4,971 to 4,910 lines, another 61 lines. From the 10,233-line pre-deletion
+  baseline, 5,323 executable lines are gone (52.0%). The physical renderer diff is 70 deletions; runtime remains 491
+  executable lines.
+- No CPU numeric semantics were introduced. Products and reductions remain DPU EW stages, and no WMMA/matmul graph
+  recognition replaced the deleted path.
+
+Verification:
+
+- Cold complete `TestRockchipDotOps` and `TestRockchipEinsumOps`: 13 passed in 22.34s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
