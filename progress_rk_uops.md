@@ -1335,3 +1335,25 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 90 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 59. Group synchronized gathers once per execution point — complete
+
+- Continued the `TestRockchipNonzeroOps::test_nonzero` profile from milestone 56. Runtime line-level profiling found
+  9.60s spent rebuilding each synchronized-gather batch by rescanning every mid-gather for every one of its 9,070
+  execution points.
+- Replaced that quadratic scheduling pass with one stable grouping pass keyed by execution point. Gather order within
+  every point, DPU stage boundaries, synchronization, and raw memory movement are unchanged.
+- Cold `test_nonzero` fell from 35.00s after the physical-ABI improvement to 28.34s. Relative to its original 47.93s
+  cold baseline, the two profiled fixes reduce call time by about 41%.
+- The gather-heavy 512/1022-element cumulative-minimum fixture passes cold, exercising the multi-point scheduler over
+  large prefix programs.
+- No CPU numeric semantics were introduced. This scheduling optimization adds one executable runtime line, taking it
+  from 488 to 489; the renderer remains 5,009 executable lines.
+
+Verification:
+
+- Cold full `TestRockchipNonzeroOps::test_nonzero`: 1 passed in 28.34s call time.
+- Cold `TestRockchipCumulativeExtremaOps::test_simple_cummin`: 1 passed in 207.61s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 90 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
