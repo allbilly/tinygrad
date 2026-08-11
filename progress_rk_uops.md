@@ -1717,3 +1717,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 78. Unify EW command-stage finalization — complete
+
+- Normal FP16 and stateful EW emitters duplicated command packing, three relocation records, relocation placeholder
+  commands, the RDMA feature-mode tail, and `RKStage` construction. Moved that shared physical encoding into one
+  `_finish_ew_stage()` helper; each emitter now owns only its genuinely different register program and feature value.
+- Compared the refactored emitter directly with commit `d0f83926c` across ten normal, FDIV, ReLU6, compare, stateful,
+  native INT16, native INT32, INT16→INT32, FP32-input, and FP32-output configurations. Command tuples and relocation
+  `(word, kind, index, addend)` records were byte-identical in every case.
+- Reused the context's one root topological order for mask detection, integer-layout classification, and static-node
+  classification instead of traversing the same root three times.
+- Renderer executable size fell from 4,789 to 4,785 lines. From the 10,233-line baseline, 5,448 executable renderer
+  lines are gone (53.2%); runtime remains 480 lines. No execution semantics or host numeric work changed.
+
+Verification:
+
+- Previous/current EW encoder comparison: 10/10 command and relocation configurations identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

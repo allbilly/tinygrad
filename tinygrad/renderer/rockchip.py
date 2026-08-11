@@ -360,6 +360,15 @@ def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKG
   return RKGather(source.index, out_slot, count, base=source.addend, axes=((1, count, stride),),
                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
 
+def _finish_ew_stage(regs:tuple[tuple[int, int, int], ...], dst:RKArg, lhs:RKArg, rhs:RKArg, rdma_feature:int) -> RKStage:
+  commands = [_cmd(*x) for x in regs]
+  bindings = ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
+              (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs))
+  relocs = tuple(RKReloc(len(commands)+i, arg) for i,(_,_,arg) in enumerate(bindings))
+  commands.extend(_cmd(target, reg, 0) for target,reg,_ in bindings)
+  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature))
+  return RKStage(tuple(commands), relocs)
+
 def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                          int32_output:bool=False, int32_input:bool=False,
                          int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False, fp32_input:bool=False) -> RKStage:
@@ -403,15 +412,9 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
-  commands = [_cmd(*x) for x in regs]
-  relocs:list[RKReloc] = []
-  for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
-                           (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
-    relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
   rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if int16_input else 2
   rdma_feature = (rdma_precision<<15)|(15<<11)|(rdma_precision<<5)|(0 if is_div or int16_input or fp32_input else 1<<3)|1
-  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature))
-  return RKStage(tuple(commands), tuple(relocs))
+  return _finish_ew_stage(regs, dst, lhs, rhs, rdma_feature)
 
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                   stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
@@ -438,13 +441,7 @@ def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compar
     (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|(2<<2)))
-  commands = [_cmd(*x) for x in regs]
-  relocs:list[RKReloc] = []
-  for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
-                           (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
-    relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
-  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(0 if is_div else 1<<3)|1))
-  return RKStage(tuple(commands), tuple(relocs))
+  return _finish_ew_stage(regs, dst, lhs, rhs, (2<<15)|(15<<11)|(2<<5)|(0 if is_div else 1<<3)|1)
 
 def _root_param(u:UOp) -> UOp|None:
   while u.op is not Ops.PARAM:
@@ -2682,8 +2679,8 @@ class RKContext:
     self.host_gathers:list[RKHostAddress] = []
     self.mid_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
-    self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort())
     nodes = self.root.toposort()
+    self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)
     int_range = _exact_int_range(self.root) if self.root.dtype.scalar() is dtypes.int else None
     packed_bool_load = any(node.op is Ops.LOAD and node.dtype.scalar() is dtypes.bool and _root_param(node.src[0]) is not None for node in nodes)
     native_bool = any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in node.src) for node in nodes)
@@ -2704,7 +2701,7 @@ class RKContext:
                        RKLayout.INT_FP16 if embedded_half_int else None)
     self.accurate_adds = accurate_adds
     self.static_nodes:set[UOp] = set()
-    for node in self.root.toposort():
+    for node in nodes:
       if node.op in _STATIC_OPS and all(src in self.static_nodes for src in node.src): self.static_nodes.add(node)
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
