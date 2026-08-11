@@ -1781,3 +1781,26 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 81. Canonicalize static slots and physical remapping — complete
+
+- Removed two copies of typed static-vector allocation/cache/gather logic. INT32 constants and arbitrary static UOp
+  vectors now use one `_static_slot()` physical materializer, while preserving the requested `RKValue.dtype` when two
+  semantic dtypes share the same canonical layout and bits.
+- Generic half/INT16/INT32 LOAD lowering computed the identical default raw bits independently in its dynamic
+  host-address and static-gather branches. Compute that boundary encoding once after float/bool handling and share it;
+  host movement remains raw addressing only.
+- Reprofiled the remaining slow dependent reduction. Scratch coloring spent 0.612 seconds largely cloning immutable
+  dataclasses. Direct `RKArg` and `RKEWOp` reconstruction preserves every field while cutting coloring to 0.475 seconds
+  (22%). Compared old/current serialized images for scalar, vector, and large reductions; all were byte-identical.
+- The slowest suite case fell from 1.59 to 1.40 seconds and the complete suite from 5.29 to 4.98 seconds. Renderer
+  executable size fell from 4,781 to 4,775 lines; from the 10,233-line baseline, 5,458 lines are gone (53.3%). Runtime
+  remains 480 lines. No CPU numeric semantics or physical command changes were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: scalar/vector/large profiled reductions byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=6`: 91 passed in 4.98 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
