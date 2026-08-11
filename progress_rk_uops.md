@@ -1067,3 +1067,30 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 48. Delete prefix and occurrence graph recovery — complete
+
+- Disconnected and replayed the seven remaining prefix/count/histogram dispatch entries. Generic UOp execution passed
+  cumulative ADD/MUL/extrema, one-hot, masked-select, nonzero, arg-extrema, sort, and top-k without those recognizers.
+- Deleted the complete now-unreachable 16-function dependency component: scalar local-loop recovery, unrolled FP16 and
+  INT32 prefix builders, predicate masks, prefix row materializers, and the INT32 occurrence image. This removes another
+  tensor-graph dialect rather than preserving it as an optimization catalog.
+- Closed the one generic gap exposed by a unit-only normalized INT32 prefix: comparisons now normalize weak integer
+  constants to typed integer operands. The program then composes through ordinary INT32 compare/WHERE UOps. Updated
+  the two unit contracts to require accepted, serializable generic images instead of obsolete physical stage counts.
+- No CPU numeric semantics were introduced. Compile-time static address/layout evaluation remains the only vectorized
+  host calculation; dynamic arithmetic, comparison, WHERE, prefix, and reduction semantics execute as NPU stages.
+- Reduced the renderer from 5,641 to 5,254 executable lines, another 387 lines. From the 10,233-line pre-deletion
+  baseline, 4,979 executable lines are gone (48.7%). The physical renderer diff is 5 insertions and 420 deletions;
+  runtime remains 488 executable lines.
+- The generic path was also faster for several formerly recovered programs: simple cumprod fell from 23.32s to 12.12s
+  and logcumsumexp from 19.15s to 5.74s in the focused duration reports.
+
+Verification:
+
+- Strict cumulative ADD/MUL/extrema gate: 18 passed in 147.45s.
+- Strict one-hot/masked-select/nonzero/arg-extrema/sort/top-k gate: 11 passed in 102.52s.
+- Post-gap-fix strict cumsum/simple-cumsum/masked-select gate: 3 passed in 31.42s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
