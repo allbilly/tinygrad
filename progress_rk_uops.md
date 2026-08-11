@@ -2002,3 +2002,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 91. Use iterative substitution at the final local boundary — complete
+
+- Reprofiled `test_dependent_reduction_range_preserves_vector_output_axis`. The single-buffer local interpreter's
+  final accumulator replacement still called generic `UOp.substitute()` even though the multi-buffer branch and each
+  range iteration already used `_substitute_static_ranges()`. That one generic call cost 0.355 seconds in the profile.
+- Routed the final replacement through the same iterative topological substitution pass. `_unroll_static_local()`
+  fell from 0.619 to 0.261 seconds (58%), and total `_lower_uop_program()` time in cProfile fell from 2.049 to 1.796
+  seconds. The alternating direct scalar/vector/large workload median fell from 0.932 to 0.737 seconds (20.9%).
+- Compared milestone-90/current serialized images for scalar, vector, and large dependent reductions; all three were
+  byte-identical. Renderer size remains 4,717 executable lines, 5,516 lines or 53.9% below baseline; runtime remains
+  480 lines. This is graph substitution only and adds no CPU numeric semantics.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 dependent reductions byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=5`: 91 passed in 5.10 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

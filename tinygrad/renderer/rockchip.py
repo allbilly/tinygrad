@@ -3846,7 +3846,7 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
     terms.append(_substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges}))
   reduced = _structural_reduce(update.op, update.dtype, terms)
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
-  return root.substitute(substitutions)
+  return _substitute_static_ranges(root, substitutions)
 
 @dataclass(frozen=True)
 class _RKStaticLocalDef:
