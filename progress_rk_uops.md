@@ -2671,3 +2671,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 125. Give all comparison UOps one semantic dispatcher — complete
+
+- `lower()` separately intercepted half comparisons, direct boolean equality, IEEE-derived equality, and then remaining
+  comparisons before they converged on `_compare()`. Routed every `CMPLT`, `CMPNE`, and `CMPEQ` through `_compare()`
+  first; that handler already owns half, bool, bounded/wide integer, INT16, and IEEE fallback semantics. Boolean
+  `AND/OR/XOR` retain their direct and derived-mask paths.
+- Half, bool, INT32, mixed half/float comparisons and direct boolean AND produced 11 RKImages byte-identical to
+  milestone 124.
+- Renderer executable size fell from 4,615 to 4,614 lines. From the 10,233-line baseline, 5,619 lines are gone (54.9%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 11/11 comparison/logical RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.76 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
