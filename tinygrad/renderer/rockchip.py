@@ -12,6 +12,8 @@ from tinygrad.helpers import Target, cdiv, ceildiv, cmod, floordiv, floormod, ro
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
+from tinygrad.uop.symbolic import sym
+from tinygrad.uop.weak import pm_commit_weak
 
 RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 30
 _HEADER = struct.Struct("<4sHHHHHHIIIIII")  # magic/version/target, scratch/gather/host counts, ops/constants, phase split, flags
@@ -1065,17 +1067,27 @@ def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
   lhs_error = _sub_half(lhs, _sub_half(total, rhs_virtual, neg_one), neg_one)
   return total, lhs_error.alu(Ops.ADD, _sub_half(rhs, rhs_virtual, neg_one))
 
-def _precise_mul_sum(terms:list[UOp]) -> UOp:
-  """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
-  zero, neg_one, splitter = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half), UOp.const(65.0, dtypes.half)
-  pairs = tuple(_two_product(term, neg_one, splitter) if term.op is Ops.MUL else (term, zero) for term in terms)
-  products, errors = tuple(x[0] for x in pairs), tuple(x[1] for x,term in zip(pairs, terms) if term.op is Ops.MUL)
-  high, middle, low = products[0], zero, zero
-  for part in products[1:] + errors:
+def _precise_add_parts(terms:tuple[UOp, ...]|list[UOp]) -> tuple[UOp, UOp]:
+  """Recover FP16 addition residuals as a high lane plus a low correction lane."""
+  zero, neg_one = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half)
+  high, middle, low = terms[0], zero, zero
+  for part in terms[1:]:
     high, error = _two_sum(high, part, neg_one)
     middle, error = _two_sum(middle, error, neg_one)
     low = low.alu(Ops.ADD, error)
   middle = middle.alu(Ops.ADD, low)
+  return high, middle
+
+def _precise_sum_parts(terms:list[UOp]) -> tuple[UOp, UOp]:
+  """Recover FP16 product and addition residuals as a high lane plus a low correction lane."""
+  zero, neg_one, splitter = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half), UOp.const(65.0, dtypes.half)
+  pairs = tuple(_two_product(term, neg_one, splitter) if term.op is Ops.MUL else (term, zero) for term in terms)
+  products, errors = tuple(x[0] for x in pairs), tuple(x[1] for x,term in zip(pairs, terms) if term.op is Ops.MUL)
+  return _precise_add_parts(products + errors)
+
+def _precise_mul_sum(terms:list[UOp]) -> UOp:
+  """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
+  high, middle = _precise_sum_parts(terms)
   root = high.alu(Ops.ADD, middle)
   cache:dict[UOp, UOp] = {}
   for u in root.toposort():
@@ -7677,6 +7689,24 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
     return _precise_mul_sum(_fp32_add_terms(u))
   raise _RKGenericReject
 
+def _nested_fp32_storage_cast(x:UOp) -> UOp|None:
+  try: return _fp32_expr_to_half(x)
+  except _RKGenericReject: return None
+
+_pm_half_storage_algebra = PatternMatcher([
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.float, name="x"),)), _nested_fp32_storage_cast),
+  (UPat(Ops.FDIV, dtypes.half, src=(UPat.var("x"), UPat.var("y"))),
+   lambda x,y:x.alu(Ops.MUL, UOp(Ops.RECIPROCAL, dtypes.half, src=(y,)))),
+])
+
+def _canonical_half_storage(source:UOp) -> UOp:
+  """Commit one FP32 storage expression, then reuse Tinygrad's ordinary algebra on its now-identical half values."""
+  converted = _fp32_expr_to_half(source)
+  if len(source.toposort()) > 64: return converted
+  simplified = graph_rewrite(converted, _pm_half_storage_algebra+sym,
+                             name="rockchip half storage algebra")
+  return graph_rewrite(simplified, pm_commit_weak, name="rockchip commit storage constants")
+
 def _fp32_add_terms(u:UOp) -> list[UOp]:
   terms:list[UOp] = []
   def flatten(x:UOp) -> None:
@@ -7697,6 +7727,8 @@ def _accurate_add_recipe(u:UOp) -> UOp:
     else: terms.append(x)
   flatten(u)
   if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
+  if any(any(node.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) for node in term.toposort()) for term in terms):
+    raise _RKGenericReject
   return _precise_mul_sum(terms)
 
 class RKContext:
@@ -8681,7 +8713,7 @@ def _expand_math_uops(root:UOp) -> UOp:
   def rewrite(u:UOp) -> UOp:
     if u in cache: return cache[u]
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
-      mapped = _fp32_expr_to_half(u.src[0])
+      mapped = rewrite(physical_recipe(_dpu_sin(u.src[0].src[0]))) if u.src[0].op is Ops.SIN else _canonical_half_storage(u.src[0])
       cache[u] = mapped
       return mapped
     if u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
@@ -8705,6 +8737,11 @@ def _expand_math_uops(root:UOp) -> UOp:
     cache[u] = mapped
     return mapped
   return rewrite(root)
+
+_pm_fp32_sin_storage = PatternMatcher([
+  (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat(Ops.SIN, dtypes.float),)),
+   lambda root:_expand_math_uops(root)),
+])
 
 def _finite_max_neutral_selectors(root:UOp) -> UOp:
   """Use the canonical finite FP16 MAX neutral for selected negative-infinity padding."""
@@ -9179,8 +9216,12 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       storage_sink = sink
       if (storage_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
          storage_output[4].op is Ops.CAST and len(storage_output[4].src) == 1 and storage_output[4].src[0].dtype.scalar() is dtypes.float:
-        try: storage_sink = sink.substitute({storage_output[4]:_fp32_expr_to_half(storage_output[4].src[0])})
+        try:
+          converted = _expand_math_uops(storage_output[4]) if storage_output[4].src[0].op is Ops.SIN else \
+            _canonical_half_storage(storage_output[4].src[0])
+          storage_sink = sink.substitute({storage_output[4]:converted})
         except _RKGenericReject: pass
+      storage_sink = graph_rewrite(storage_sink, _pm_fp32_sin_storage, name="rockchip fp32 sin storage")
       storage_uops = list(graph_rewrite(storage_sink, _pm_generic_storage_precision,
                                         name="rockchip generic storage precision").toposort())
       if (indexed:=dynamic_index_accumulation(storage_uops)) is not None: return indexed
@@ -10068,11 +10109,43 @@ def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float,
     for coefficient in split: reduced = reduced.alu(Ops.SUB, correction.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
   return bounded, multiple, reduced
 
+def _dpu_periodic_reduce_parts(source:UOp, reciprocal_period:float, split:tuple[float, ...], half_period:float) -> tuple[UOp, UOp]:
+  """Return a periodic reduction as an FP16 high lane plus its arithmetic residual."""
+  bounded, multiple, _ = _dpu_periodic_reduce(source, reciprocal_period, split, half_period)
+  return _precise_add_parts([bounded, *(multiple.alu(Ops.MUL, UOp.const(-coefficient, dtypes.half)) for coefficient in split)])
+
 def _dpu_sin(source:UOp) -> UOp:
   """Approximate FP16 SIN without LUTs using Cody-Waite reduction and an odd polynomial."""
-  source = source.cast(dtypes.half)
   one = UOp.const(1.0, dtypes.half)
-  _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
+  period_split = (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125)
+  if source.dtype.scalar() is dtypes.float:
+    terms:list[UOp] = []
+    residuals:list[UOp] = []
+    def flatten(u:UOp) -> None:
+      if u.op is Ops.ADD and u.dtype.scalar() is dtypes.float: flatten(u.src[0]); flatten(u.src[1])
+      elif u.op is Ops.CONST:
+        high = struct.unpack("<e", struct.pack("<e", float(u.arg)))[0]
+        terms.append(UOp.const(high, dtypes.half))
+        if (low:=float(u.arg)-high) != 0.0: residuals.append(UOp.const(low, dtypes.half))
+      else: terms.append(_fp32_expr_to_half(u))
+    flatten(source)
+    reduced_parts = [_dpu_periodic_reduce_parts(term, 1/(2*math.pi), period_split, math.pi) for term in terms]
+    reduced_terms = [part[0] for part in reduced_parts]
+    residuals.extend(part[1] for part in reduced_parts)
+    reduced, addition_residual = _precise_sum_parts(reduced_terms)
+    residuals.append(addition_residual)
+    for _ in range(3):
+      correction = _positive_mask(reduced.alu(Ops.SUB, UOp.const(math.pi, dtypes.half))).alu(
+        Ops.SUB, _positive_mask(UOp.const(-math.pi, dtypes.half).alu(Ops.SUB, reduced)))
+      reduced, normalization_residual = _precise_add_parts(
+        [reduced, *(correction.alu(Ops.MUL, UOp.const(-coefficient, dtypes.half)) for coefficient in period_split)])
+      residuals.append(normalization_residual)
+    invalid = terms[0].alu(Ops.MUL, UOp.const(0.0, dtypes.half))
+    for term in terms[1:]: invalid = invalid.alu(Ops.ADD, term.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
+  else:
+    source = source.cast(dtypes.half)
+    _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), period_split, math.pi)
+    invalid = source.alu(Ops.MUL, UOp.const(0.0, dtypes.half))
   magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
   reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
   pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
@@ -10084,7 +10157,14 @@ def _dpu_sin(source:UOp) -> UOp:
     polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
   sign = one.alu(Ops.SUB, _positive_mask(UOp.const(0.0, dtypes.half).alu(Ops.SUB, reduced)).alu(
     Ops.MUL, UOp.const(2.0, dtypes.half)))
-  return angle.alu(Ops.MUL, polynomial).alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
+  result = angle.alu(Ops.MUL, polynomial).alu(Ops.MUL, sign)
+  if source.dtype.scalar() is dtypes.float and residuals:
+    residual = residuals[0]
+    for term in residuals[1:]: residual = residual.alu(Ops.ADD, term)
+    cosine = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320)).alu(
+      Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half))))
+    result = result.alu(Ops.ADD, residual.alu(Ops.MUL, cosine))
+  return result.alu(Ops.ADD, invalid)
 
 def _dpu_cos(source:UOp) -> UOp:
   """Approximate FP16 COS after reducing the original angle, preserving large-input phase."""

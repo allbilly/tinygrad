@@ -1,8 +1,8 @@
 import math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _EW_CFG_ABS, _NATIVE_SIGN,
-  _MAX_EW_ELEMS_FP16, _gather_plan, _iter_range_env, _lower_uop_program, decode_image, encode_image)
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _NATIVE_SIGN,
+  _MAX_EW_ELEMS_FP16, _canonical_half_storage, _gather_plan, _iter_range_env, _lower_uop_program, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -434,6 +434,31 @@ def test_fp32_math_uop_converts_at_half_storage_boundary():
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:source.index(i).load().cast(dtypes.float).exp2().cast(dtypes.half)))
   assert image is not None and len(image.ew_ops) > 10
+
+
+def test_fp32_sin_additive_phase_reduces_terms_before_half_storage_boundary():
+  source = UOp.param(1, dtypes.half, (4,))
+  def shifted_sin(i):
+    value = source.index(i).load().cast(dtypes.float)
+    phase = UOp.const(math.pi/2, dtypes.float) + value * UOp.const(-1.0, dtypes.float)
+    return UOp(Ops.SIN, dtypes.float, src=(phase,)).cast(dtypes.half)
+  image = _lower_uop_program(_program(dtypes.half, shifted_sin))
+  assert image is not None and sum(op.ew_cfg == _EW_CFG_FLOOR for op in image.ew_ops) >= 2
+  assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and decode_image(encode_image(image)) == image
+
+
+def test_fp32_storage_reuses_generic_algebra_after_nested_half_casts():
+  source = UOp.param(1, dtypes.half, (1,)).index(UOp.const(0, dtypes.int)).load()
+  exponent = source.cast(dtypes.float) * UOp.const(1/math.log(2), dtypes.float)
+  exponential = UOp(Ops.EXP2, dtypes.float, src=(exponent,))
+  denominator = UOp.const(1.0, dtypes.half) + exponential.cast(dtypes.half)
+  inverse = UOp(Ops.FDIV, dtypes.half, src=(UOp.const(1.0, dtypes.half), denominator))
+  correction = inverse + (UOp.const(1.0, dtypes.half) - inverse) / denominator * UOp.const(-1.0, dtypes.half)
+  canonical = _canonical_half_storage(exponential * correction.cast(dtypes.float))
+  assert canonical.op is Ops.ADD and sum(node.op is Ops.EXP2 for node in canonical.toposort()) == 1
+  assert not any(node.dtype.scalar() is dtypes.float for node in canonical.toposort())
+  image = _lower_uop_program(_program(dtypes.half, lambda _i:canonical, count=1))
+  assert image is not None and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
 def test_fp32_boundary_activation_preserves_accurate_reduction():

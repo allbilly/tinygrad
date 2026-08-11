@@ -614,3 +614,28 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 63 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 32. Composable FP32 math operands at the FP16 physical boundary — complete
+
+- Made the FP32-to-FP16 storage boundary recursively lower semantic math UOps before committing the physical half
+  representation. A nested `SIN`, `EXP2`, `LOG2`, or `SQRT` therefore remains owned by its UOp recipe while surrounding
+  half arithmetic reuses Tinygrad's ordinary symbolic algebra.
+- Preserved additive FP32 phase operands for `SIN` by reducing each physical term independently and carrying constant,
+  addition, and split-period rounding residuals as an FP16 high/correction pair. This executes Tinygrad's expanded
+  cosine and tangent programs literally; no cosine, tangent, softmax, or sigmoid tensor-operation lowerer is used.
+- Split compensated arithmetic into addition-only and product-aware forms. Periodic reduction can retain the small
+  residual needed beside tangent poles without applying Dekker multiplication to a large period multiple and
+  overflowing its FP16 splitter.
+- Bounded storage algebra simplification to small expressions. Large softmax sums retain their physical precision tags
+  and compile in about one second instead of recursively rediscovering accurate-add expansions and exhausting memory.
+- Added host-independent regressions for additive FP32 SIN phase materialization and nested storage algebra reuse.
+- The complete strict transcendental class now passes. The verified strict prefix extends through collection index 249:
+  244 passed, 6 skipped, and 195 collected tests remain to be censused.
+
+Verification:
+
+- Strict `TestRockchipTranscendentalOps`: 45 passed in 143.24s.
+- Strict `TestRockchipTranscendentalOps::test_tan`: 1 passed in 31.51s, including both near-pole vectors and large angles.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 65 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
