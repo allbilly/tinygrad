@@ -1923,3 +1923,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 87. Deduplicate storage-boundary recipes — complete
+
+- `_pm_fp32_to_fp16` and `_pm_generic_storage_precision` repeated the same ten FP32/FP16 physical rewrite rules.
+  Defined that ordered rule sequence once as `_pm_storage_common`; the full conversion pass adds its bool/WHERE rules,
+  while generic storage precision adds its float-WHERE boundary before the shared rules. No semantic UOp or physical
+  recipe changed.
+- Inlined the single-use binary16 predecessor calculation at LOG2 exponent extraction and removed its wrapper.
+- Compared milestone-86/current serialized images for bool-to-half conversion, FP32 storage algebra, float `WHERE`,
+  and LOG2; all four were byte-identical.
+- Renderer executable size fell from 4,747 to 4,736 lines. From the 10,233-line baseline, 5,497 executable renderer
+  lines are gone (53.7%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 4/4 representative storage/math programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.18 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

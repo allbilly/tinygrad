@@ -4700,10 +4700,9 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
   unit = UOp.const(-1.0 if value < 0 else 1.0, dtypes.half)
   return unit.alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
 
-_pm_fp32_to_fp16 = PatternMatcher([
+_pm_storage_common = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
   (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)), _fold_bool_to_half),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
@@ -4712,6 +4711,9 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+])
+_pm_fp32_to_fp16 = _pm_storage_common + PatternMatcher([
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)), _fold_bool_to_half),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
@@ -4727,19 +4729,7 @@ _pm_fp32_to_fp16 = PatternMatcher([
       x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
-_pm_generic_storage_precision = PatternMatcher([
-  (UPat(Ops.WHERE, dtypes.float, name="x"), _fp32_where_to_fp16),
-  (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
-  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
-  (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
-  (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
-  (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
-])
+_pm_generic_storage_precision = PatternMatcher([(UPat(Ops.WHERE, dtypes.float, name="x"), _fp32_where_to_fp16)]) + _pm_storage_common
 _pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
                           (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_where_abs)])
 _pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round)])
@@ -5071,10 +5061,6 @@ def _fold_masked_exp2(x:UOp) -> UOp|None:
   value, mask = (no, UOp.const(1.0, dtypes.half).alu(Ops.SUB, gate.cast(dtypes.half))) if padded[0] else (yes, gate.cast(dtypes.half))
   return _mask_mul(_dpu_exp2_nonpositive(value.cast(dtypes.half).alu(Ops.MUL, factor.cast(dtypes.half))), mask)
 
-def _fp16_predecessor(value:float) -> float:
-  """Return the previous positive binary16 value for inclusive threshold masks."""
-  return struct.unpack("<e", struct.pack("<H", _fp16_bits(value)-1))[0]
-
 def _dpu_log2(source:UOp) -> UOp:
   """Approximate FP16 LOG2 without LUTs using threshold exponent extraction and an atanh polynomial."""
   source = source.cast(dtypes.half)
@@ -5083,7 +5069,8 @@ def _dpu_log2(source:UOp) -> UOp:
   mantissa = _native_min(source.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)), UOp.const(65504.0, dtypes.half))
   exponent = zero
   for factor,shift in ((256.0, 8.0), (16.0, 4.0), (4.0, 2.0), (2.0, 1.0)):
-    mask = _finite_positive_mask(mantissa.alu(Ops.SUB, UOp.const(_fp16_predecessor(factor), dtypes.half)))
+    predecessor = struct.unpack("<e", struct.pack("<H", _fp16_bits(factor)-1))[0]
+    mask = _finite_positive_mask(mantissa.alu(Ops.SUB, UOp.const(predecessor, dtypes.half)))
     divisor = one.alu(Ops.ADD, mask.alu(Ops.MUL, UOp.const(factor-1.0, dtypes.half)))
     mantissa = mantissa.alu(Ops.FDIV, divisor)
     exponent = exponent.alu(Ops.ADD, mask.alu(Ops.MUL, UOp.const(shift, dtypes.half)))
