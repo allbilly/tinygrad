@@ -220,6 +220,13 @@ def test_max_materializes_negative_infinity_fill_as_finite_neutral():
   assert image is not None and image.gathers[0].fill_bits == 0xfbff
 
 
+def test_guarded_load_with_infinite_fill_falls_through_dynamic_address_probes():
+  source = UOp.param(1, dtypes.half, (2,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:
+    source.index(i).load(UOp.const(math.inf, dtypes.half), i < UOp.const(2, dtypes.int))))
+  assert image is not None and any(gather.fill_bits == 0x7c00 for gather in image.gathers)
+
+
 def test_static_root_where_uses_exact_gathers_and_finite_padding_neutral():
   source = UOp.param(1, dtypes.half, (3,))
   def selected(i):

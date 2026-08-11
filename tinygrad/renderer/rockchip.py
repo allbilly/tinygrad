@@ -264,6 +264,7 @@ _MAX_MAPPED_DOT_SCRATCH_BYTES = 352 << 20
 _MAX_GENERIC_UNROLL = 1024
 _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 64
 _MAX_GENERIC_EXPANDED_NODES = 65535
+_MAX_OPTIONAL_RECIPE_NODES = 4096
 _MAX_STATIC_LOCAL_STEPS = 1 << 20
 _MAX_STATIC_RANGE_ENVS = 1 << 18
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
@@ -6420,7 +6421,7 @@ def _lower_direct_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -
   """Materialize a bounds-masked typed LOAD addressed by one dynamic INT32 index."""
   _, out_param, count, out_index, load = output
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
-      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0): return None
+      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
   data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
   index_loads = [u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int]
   if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or
@@ -6541,7 +6542,7 @@ def _lower_dynamic_multi_index_typed_load(output:RKOutput, dtype:DType=dtypes.ha
   """Materialize one typed LOAD addressed by positive or negative-normalized dynamic INT32 axes."""
   _, out_param, count, out_index, load = output
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
-      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0): return None
+      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
   data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
   normalized = tuple((u, *parsed) for u in data_index.toposort() if (parsed:=_negative_normalized_index(u)) is not None)
   normalized_by_load = {load.key:(root, extent) for root,load,extent in normalized}
@@ -8851,14 +8852,16 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
 
 def _expand_math_uops(root:UOp) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  composite_math = _fold_inverse_hyperbolic(root)
-  if composite_math is None: composite_math = _fold_atan(root)
+  bounded_recipes = len(root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES
+  composite_math = _fold_inverse_hyperbolic(root) if bounded_recipes else None
+  if composite_math is None and bounded_recipes: composite_math = _fold_atan(root)
   cache:dict[UOp, UOp] = {}
   exact_static_selection = root.op is Ops.WHERE and _is_static_expr(root.src[0]) and not any(
     node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and not math.isfinite(float(node.arg))
     for node in root.toposort())
-  def physical_recipe(recipe:UOp) -> UOp:
-    rewritten = _fp16_rewrite(list(UOp(Ops.SINK, src=(recipe,)).toposort()))
+  def physical_recipe(recipe:UOp, opaque:tuple[UOp, ...]=()) -> UOp:
+    placeholders = {source:UOp.param(-index-1, source.dtype, ()) for index,source in enumerate(opaque)}
+    rewritten = _fp16_rewrite(list(UOp(Ops.SINK, src=(recipe.substitute(placeholders),)).toposort()))
     if not rewritten or rewritten[-1].op is not Ops.SINK or len(rewritten[-1].src) != 1: raise _RKGenericReject
     tagged:dict[UOp, UOp] = {}
     def tag_adds(u:UOp) -> UOp:
@@ -8867,15 +8870,17 @@ def _expand_math_uops(root:UOp) -> UOp:
                          arg=_NATIVE_PRECISE_ADD if u.op is Ops.ADD and u.arg is None else u.arg)
       tagged[u] = mapped
       return mapped
-    return tag_adds(rewritten[-1].src[0])
+    tagged_root = tag_adds(rewritten[-1].src[0])
+    return tagged_root.substitute({placeholder:source for source,placeholder in placeholders.items()})
   if composite_math is not None: root = physical_recipe(composite_math)
   def rewrite(u:UOp) -> UOp:
     if u in cache: return cache[u]
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
-      mapped = rewrite(physical_recipe(_dpu_sin(u.src[0].src[0]))) if u.src[0].op is Ops.SIN else _canonical_half_storage(u.src[0])
+      mapped = rewrite(physical_recipe(_dpu_sin(u.src[0].src[0]), (u.src[0].src[0],))) if u.src[0].op is Ops.SIN else \
+        _canonical_half_storage(u.src[0])
       cache[u] = mapped
       return mapped
-    if u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
+    if bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
       try:
         mapped = _accurate_add_recipe(u)
         cache[u] = mapped
@@ -8887,12 +8892,12 @@ def _expand_math_uops(root:UOp) -> UOp:
       mapped = minimum.replace(arg=_NATIVE_RAW_MIN)
     if mapped.op is Ops.SQRT:
       if (recipe:=_dpu_sqrt(mapped.src[0])) is None: raise _RKGenericReject
-      mapped = rewrite(physical_recipe(recipe))
-    elif mapped.op is Ops.EXP2: mapped = rewrite(physical_recipe(_dpu_exp2(mapped.src[0])))
+      mapped = rewrite(physical_recipe(recipe, (mapped.src[0],)))
+    elif mapped.op is Ops.EXP2: mapped = rewrite(physical_recipe(_dpu_exp2(mapped.src[0]), (mapped.src[0],)))
     elif mapped.op is Ops.LOG2:
       if mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
-      mapped = rewrite(physical_recipe(_dpu_log2(mapped.src[0])))
-    elif mapped.op is Ops.SIN: mapped = rewrite(physical_recipe(_dpu_sin(mapped.src[0])))
+      mapped = rewrite(physical_recipe(_dpu_log2(mapped.src[0]), (mapped.src[0],)))
+    elif mapped.op is Ops.SIN: mapped = rewrite(physical_recipe(_dpu_sin(mapped.src[0]), (mapped.src[0],)))
     cache[u] = mapped
     return mapped
   return rewrite(root)
@@ -9426,12 +9431,14 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
     root = _finite_int_max_neutrals(_finite_max_neutral_selectors(local_root))
     if not recipes_ready: root = _expand_math_uops(root)
-    if len(root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: return None
+    expanded_nodes = root.toposort()
+    if len(expanded_nodes) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
       if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool))) is None: return None
-    image = RKContext(output, accurate_adds=not recipes_ready and not _has_runtime_address(output[4]),
+    image = RKContext(output, accurate_adds=(not recipes_ready and len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
+                                             not _has_runtime_address(output[4])),
                       static_load_offsets=static_load_offsets).finish()
     if any(len(items) > _RKIMAGE_U16_MAX for items in
            (image.scratch, image.gathers, image.host_gathers, image.host_scatters, image.ew_ops, image.mid_gathers, image.post_gathers)):

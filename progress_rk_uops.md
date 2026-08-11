@@ -694,3 +694,27 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 67 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 35. Generic layout fills and opaque-source math recipes — complete
+
+- Made dynamic-address probes check a typed CONST for zero without coercing it through Python `int`. Guarded FP16
+  loads with `+inf`, `-inf`, NaN, or another nonzero fill now fall through to ordinary typed LOAD materialization
+  instead of raising before the generic executor can handle them.
+- Added a host-independent guarded `+inf` fill regression that verifies the exact `0x7c00` FP16 gather fill bits.
+- Bounded optional compensated-add and composite-math peepholes to 4,096-node graphs. Literal UOp execution remains
+  available up to the RKImage 65,535-stage limit, so a large correctness graph no longer incurs quadratic rewrite work.
+- Made each SQRT/EXP2/LOG2/SIN handler temporarily replace its source dependency with an opaque typed PARAM while its
+  small physical recipe is rewritten. The original UOp source is substituted back afterward, preventing one math UOp
+  from sending a 52,000-node reduction dependency through the whole legacy graph-rewrite catalog again.
+- The formerly aborting 52,498-node `std(axis=...)` program now compiles and passes through literal ADD/MUL/SQRT UOps.
+- Movement, triangular, concat, and padding classes pass in the contiguous strict census. The verified prefix extends
+  through collection index 357: 346 passed, 12 skipped, and 87 collected tests remain to be censused.
+
+Verification:
+
+- Strict `TestRockchipMovementOps`: 31 passed and 1 skipped in 6.88s.
+- Strict triangular, concat, and padding classes: 15 passed and 28 subtests passed in 10.92s.
+- Strict `TestRockchipReductionOps::test_std_axis`: 1 passed in 87.89s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 68 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
