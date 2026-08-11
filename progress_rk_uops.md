@@ -1017,3 +1017,29 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 46. Delete superseded unrolled integer selector catalog — complete
+
+- Removed seven unrolled integer/bool recovery handlers and their private byte-equality matrix representation. Generic
+  UOp replay now owns bool/int prefix counts and occurrence histograms instead of rediscovering those tensor programs.
+- Kept only the two structural address materializers still required by `nonzero`: bounded INT32 lookup and bounded
+  integer predicate coordinates. Removing either was tested independently and rejected by the corresponding strict
+  `nonzero` case; this is the current semantic boundary rather than dead catalog retention.
+- The deletion passed arg-extrema, sort, top-k, INT16 EW, cumulative ADD/MUL/extrema, WHERE, and both nonzero hardware
+  gates. No host numeric evaluator or NumPy fallback was added: host participation remains address calculation and raw
+  gather/scatter copies only.
+- Reduced the renderer from 5,918 to 5,638 executable lines, another 280 lines. From the 10,233-line pre-deletion
+  baseline, 4,595 executable lines are gone (44.9%). The physical renderer diff is 2 insertions and 300 deletions;
+  runtime remains 488 executable lines.
+- The focused duration report identifies cumulative extrema as the next compile/execution bottleneck: simple cummin
+  took 90.52s and simple cummax 69.43s. The next milestone will profile that generic structural path before deleting
+  another catalog block.
+
+Verification:
+
+- Strict arg-extrema/sort/top-k gate: 6 passed in 39.76s.
+- Strict `TestRockchipNonzeroOps`: 2 passed in 49.07s.
+- Strict INT16 EW/cumulative ADD/MUL/extrema/WHERE gate: 25 passed in 233.02s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
