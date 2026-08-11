@@ -2094,17 +2094,16 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType) -
   gathers.append(RKGather(source.arg.slot, fill_slot, count, values=(_int16_bits(fill_value),)*count))
   valid_delta, positive, valid, remaining = (scratch(count*2) for _ in range(4))
   selected, guarded, fill_part, result = (scratch(matrix_lanes*2) for _ in range(4))
-  int16 = dict(int16_input=True, int16_output=True)
-  ops.extend((RKEWOp(_scratch_arg(valid_delta), _scratch_arg(total_vector), _scratch_arg(output_coordinate), count, _EW_CFG[Ops.SUB], **int16),
-              RKEWOp(_scratch_arg(positive), _scratch_arg(valid_delta), _scratch_arg(zero), count, _EW_CFG[Ops.MAX], **int16),
-              RKEWOp(_scratch_arg(valid), _scratch_arg(positive), _scratch_arg(one), count, _EW_CFG_MIN, **int16),
-              RKEWOp(_scratch_arg(remaining), _scratch_arg(one), _scratch_arg(valid), count, _EW_CFG[Ops.SUB], **int16),
-              RKEWOp(_scratch_arg(selected), equal, _scratch_arg(coordinate_matrix), matrix_lanes, _EW_CFG[Ops.MUL], **int16)))
+  ops.extend((RKEWOp(_scratch_arg(valid_delta), _scratch_arg(total_vector), _scratch_arg(output_coordinate), count, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(_scratch_arg(positive), _scratch_arg(valid_delta), _scratch_arg(zero), count, _EW_CFG[Ops.MAX], **_INT16_EW),
+              RKEWOp(_scratch_arg(valid), _scratch_arg(positive), _scratch_arg(one), count, _EW_CFG_MIN, **_INT16_EW),
+              RKEWOp(_scratch_arg(remaining), _scratch_arg(one), _scratch_arg(valid), count, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(_scratch_arg(selected), equal, _scratch_arg(coordinate_matrix), matrix_lanes, _EW_CFG[Ops.MUL], **_INT16_EW)))
   selected_value = _reduce_rows(ops, [_scratch_arg(selected, row*vector_bytes) for row in range(coordinate_count)],
                                 count, _EW_CFG[Ops.ADD], int16=True)
-  ops.extend((RKEWOp(_scratch_arg(guarded), selected_value, _scratch_arg(valid), count, _EW_CFG[Ops.MUL], **int16),
-              RKEWOp(_scratch_arg(fill_part), _scratch_arg(fill_slot), _scratch_arg(remaining), count, _EW_CFG[Ops.MUL], **int16),
-              RKEWOp(_scratch_arg(result), _scratch_arg(guarded), _scratch_arg(fill_part), count, _EW_CFG[Ops.ADD], **int16),
+  ops.extend((RKEWOp(_scratch_arg(guarded), selected_value, _scratch_arg(valid), count, _EW_CFG[Ops.MUL], **_INT16_EW),
+              RKEWOp(_scratch_arg(fill_part), _scratch_arg(fill_slot), _scratch_arg(remaining), count, _EW_CFG[Ops.MUL], **_INT16_EW),
+              RKEWOp(_scratch_arg(result), _scratch_arg(guarded), _scratch_arg(fill_part), count, _EW_CFG[Ops.ADD], **_INT16_EW),
               RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), _scratch_arg(result), _scratch_arg(result), count, _EW_CFG[Ops.MAX],
                      int16_input=True, int32_output=True)))
   return RKImage(tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid)
@@ -4653,14 +4652,6 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
     return val.replace(src=(val.src[0], default, val.src[2]))
   return None
 
-def _fp32_alu_to_fp16(x:UOp) -> UOp|None:
-  return None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))
-
-def _fp32_where_to_fp16(x:UOp) -> UOp|None:
-  """Choose the backend's FP16 physical arithmetic representation for a dynamic float WHERE."""
-  return None if _is_static_expr(x) else \
-    UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg)
-
 def _fold_casted_relu(root:UOp) -> UOp|None:
   """Recover native half MAX from the float WHERE emitted for half ReLU inside a reduction."""
   if len(root.src) != 1 or (where:=root.src[0]).op is not Ops.WHERE or where.dtype.scalar() is not dtypes.float: return None
@@ -4671,11 +4662,6 @@ def _fold_casted_relu(root:UOp) -> UOp|None:
   if (gate.op is not Ops.CMPLT or gate.src[0].op is not Ops.CONST or float(gate.src[0].arg) != 0.0 or
       gate.src[1].key != val.key): return None
   return val.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
-
-def _fold_bool_to_half(predicate:UOp) -> UOp|None:
-  """Materialize an embedded boolean predicate as an FP16 DPU 0/1 mask."""
-  if (nonzero:=_fp16_nonzero_mask(predicate)) is not None: return nonzero
-  return _ieee_comparison_mask(predicate)
 
 def _replace_infinite_multiply(x:UOp) -> UOp|None:
   """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
@@ -4693,7 +4679,8 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
   return unit.alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
 
 _pm_storage_common = PatternMatcher([
-  (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
+  (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"),
+   lambda x:None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
   (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
@@ -4705,7 +4692,8 @@ _pm_storage_common = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
 ])
 _pm_fp32_to_fp16 = _pm_storage_common + PatternMatcher([
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)), _fold_bool_to_half),
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)),
+   lambda predicate:nonzero if (nonzero:=_fp16_nonzero_mask(predicate)) is not None else _ieee_comparison_mask(predicate)),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
@@ -4721,7 +4709,9 @@ _pm_fp32_to_fp16 = _pm_storage_common + PatternMatcher([
       x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
-_pm_generic_storage_precision = PatternMatcher([(UPat(Ops.WHERE, dtypes.float, name="x"), _fp32_where_to_fp16)]) + _pm_storage_common
+_pm_generic_storage_precision = PatternMatcher([(UPat(Ops.WHERE, dtypes.float, name="x"),
+  lambda x:None if _is_static_expr(x) else
+  UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg))]) + _pm_storage_common
 _pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
                           (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_where_abs)])
 _pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round)])

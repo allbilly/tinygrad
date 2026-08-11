@@ -2022,3 +2022,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 92. Inline single-use storage callbacks — complete
+
+- Removed the last local `int16_input/int16_output` dictionary and reused `_INT16_EW` in bounded predicate-coordinate
+  emission.
+- Inlined three one-use matcher callbacks for dynamic FP32 ALU conversion, float `WHERE` conversion, and bool-to-half
+  materialization into their owning storage-boundary pattern tables. The matcher order and returned UOps are unchanged;
+  these callbacks were not shared semantic APIs.
+- Compared milestone-91/current serialized images for bool-to-half conversion, FP32 storage algebra, and float
+  `WHERE`; all three were byte-identical.
+- Renderer executable size fell from 4,717 to 4,712 lines. From the 10,233-line baseline, 5,521 executable renderer
+  lines are gone (54.0%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 storage-boundary programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.35 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
