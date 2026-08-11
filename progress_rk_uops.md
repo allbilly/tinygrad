@@ -1672,3 +1672,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 76. Delete orphaned index declarations and gather modes — complete
+
+- The whole-repository symbol audit found an unused native `copysign` graph tag and two obsolete dynamic-index tuple
+  aliases. None had a producer, consumer, import, or annotation after the earlier recognizer deletions, so all three
+  declarations are gone.
+- Both runtime gather paths always requested scratch clearing. Removed the unused `clear_scratch` parameters and
+  conditional mode from `apply_gathers()` and `synchronized_gathers()`; the one-clear-per-physical-slot behavior is
+  unchanged. Also reused the existing checked `buffer()` resolver for DMA addresses and removed a redundant nonempty
+  guard after the method's early return.
+- Renderer executable size fell from 4,807 to 4,805 lines and runtime fell from 484 to 480 lines. From the 10,233-line
+  renderer baseline, 5,428 executable renderer lines are gone (53.0%). No host numeric evaluation or DPU behavior was
+  added or changed.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

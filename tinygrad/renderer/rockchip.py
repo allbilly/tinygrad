@@ -338,9 +338,9 @@ _BS_MUL_COMPARE = 0x40000000
 _BN_CFG_COMPARE = 0x40082
 _BN_MUL_COMPARE = 0x7c000000
 _BN_RELUX_COMPARE = 0x3f800000
-(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_COPYSIGN, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN,
+(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN,
  _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RAW_MIN, _NATIVE_RELU6, _NATIVE_SIGN) = (
-   "rockchip_abs", "rockchip_ceil", "rockchip_copysign", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
+   "rockchip_abs", "rockchip_ceil", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
    "rockchip_min", "rockchip_positive_mask", "rockchip_precise_add", "rockchip_raw_min", "rockchip_relu6", "rockchip_sign")
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
@@ -1169,7 +1169,6 @@ def _fp16_high_and_nan(ops:list[RKEWOp], allocate:Callable[[], RKArg], high:RKAr
   return canonical, nan
 
 
-RKIndexEquality = tuple[int, int, tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]
 RKCoordinateRows = tuple[tuple[int, ...], ...]
 
 def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:Callable[[int], RKArg],
@@ -1736,7 +1735,6 @@ def _lower_bounded_int32_lookup(output:RKOutput) -> RKImage|None:
   return _int32_index_selection_image(out_param.arg.slot, count, param.arg.slot, index_offsets, candidate_values)
 
 
-RKDynamicEquality = tuple[int, int, tuple[tuple[int, ...], ...], tuple[int, ...]]
 def _int32_less_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
                      lhs_components:list[RKArg], rhs_components:list[RKArg], lanes:int) -> RKArg:
   """Compare signed INT32 lanes represented as high-to-low widened bytes."""

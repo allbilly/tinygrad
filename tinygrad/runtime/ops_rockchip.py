@@ -212,7 +212,7 @@ class RockchipProgram(Program['RockchipDevice']):
   def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None, *, tile_groups:bool=True) -> None:
     ops = self.image.ew_ops if ops is None else ops
     if not ops: return
-    scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
+    scratch_int16 = all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
       op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
     if scratch_int16:
       if (cached:=self._scratch_ew_bodies.get(ops)) is None:
@@ -397,10 +397,10 @@ class RockchipProgram(Program['RockchipDevice']):
         else:
           dst[:op.count] = op.fill_bits
           dst[np.nonzero(valid)[0]] = src[idx[valid]]
-    def apply_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+    def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
       for gather in gathers:
         dest = buffer(gather.dst_kind, gather.dst_index)
-        if clear_scratch and gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
+        if gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
           ctypes.memset(int(dest.va_addr), 0, dest.size)
           cleared_scratch.add(gather.dst_index)
         lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
@@ -421,23 +421,19 @@ class RockchipProgram(Program['RockchipDevice']):
           index = np.full(gather.count, gather.base, dtype=np.intp)
           for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
           dst[dst_index] = src[index]
-    apply_gathers(self.image.gathers, True)
+    apply_gathers(self.image.gathers)
     apply_host_addresses(self.image.host_gathers, False)
     self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
-      if kind is RKBufferKind.ARG:
-        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
-        return self._dma(bufs[index])
-      if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
-      return self._dma(self.scratch[index])
+      return self._dma(buffer(kind, index))
     start = time.perf_counter()
     native_int16 = any(op.int16_input or op.int16_output for op in self.image.ew_ops)
     if self.image.ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
-    def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+    def synchronized_gathers(gathers:tuple[RKGather, ...]) -> None:
       touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
       touched.update((g.dst_kind, g.dst_index) for g in gathers)
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      apply_gathers(gathers, clear_scratch)
+      apply_gathers(gathers)
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}),
                              rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if self.image.mid_gathers:
@@ -447,7 +443,7 @@ class RockchipProgram(Program['RockchipDevice']):
         by_point.setdefault(gather.after, []).append(gather)
       for point,gathers in sorted(by_point.items()):
         self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:point])
-        synchronized_gathers(tuple(gathers), True)
+        synchronized_gathers(tuple(gathers))
         cursor = point
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
