@@ -4,7 +4,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
+  _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -17,6 +17,13 @@ def _program(dtype, value, count:int=4):
 def test_rkvalue_is_the_typed_physical_abi():
   value = RKValue(RKArg(RKBufferKind.ARG, 0), dtypes.half, 1, RKLayout.FP16)
   assert value.dtype is dtypes.half and value.count == 1 and value.layout is RKLayout.FP16
+
+
+def test_static_range_expressions_vectorize_in_output_order():
+  row, col = UOp.range(3, 0), UOp.range(4, 1)
+  out_index = col * 3 + row
+  value = (row < 2).where(col + row * 4, UOp.const(-1, dtypes.int))
+  assert _static_int_vector(out_index, value, 12) == (0, 4, -1, 1, 5, -1, 2, 6, -1, 3, 7, -1)
 
 
 def test_submit_retries_once_after_driver_timeout(monkeypatch):

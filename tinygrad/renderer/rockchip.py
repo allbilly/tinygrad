@@ -694,12 +694,15 @@ def _spaced_reduction_gathers(src_slot:int, dst_slot:int, rows:int, blocks:list[
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
   if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
+  envs = _iter_range_env(ranges)
+  vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
+  cache:dict[UOp, np.ndarray] = {}
+  dst_lanes = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
+  expr_lanes = np.broadcast_to(_eval_vector(expr, vector_env, cache), len(envs))
   values:list[int|None] = [None] * count
-  for env in _iter_range_env(ranges):
-    cache:dict[UOp, int|float|bool] = {}
-    dst = _eval_int(out_index, env, cache)
+  for dst,raw in zip(dst_lanes, expr_lanes):
     if not 0 <= dst < count: raise RuntimeError("RKPLAN_REJECT:static_index")
-    value = encode(_eval_expr(expr, env, cache))
+    value = encode(raw.item())
     if values[dst] not in (None, value): raise RuntimeError("RKPLAN_REJECT:static_index")
     values[dst] = value
   if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")

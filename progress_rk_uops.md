@@ -1043,3 +1043,27 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 47. Vectorize static UOp materialization — complete
+
+- Profiled the slowest known case, `test_max_unpool2d`, under cProfile. Of 190.52s total instrumented time, 171.80s
+  was `_static_values`; scalar static interpretation made 47.71 million cast calls and 73.92 million recursive UOp
+  evaluations. The hardware path itself issued 2,407 ioctls and spent only about 2s inside `ioctl`.
+- Reused the existing typed vector UOp evaluator for compile-time RANGE/SPECIAL/index expressions. Static destination
+  and value DAGs are now evaluated once over all lanes with shared subexpression caching, then validated and reordered
+  exactly as before. This is address/layout planning only; runtime tensor arithmetic remains on the NPU.
+- Added a unit contract covering multidimensional RANGE evaluation, WHERE, integer arithmetic, and nontrivial output
+  reordering. The wider gather/fancy-index/nonzero/arg-extrema/sort/top-k/WHERE hardware gate also passes.
+- `test_max_unpool2d` fell from about 108s to 20.58s (81% faster). The same generic change reduced simple cummin from
+  90.52s to 60.42s and simple cummax from 69.43s to 46.84s, both about one third faster.
+- This performance milestone adds three executable renderer lines, taking the renderer from 5,638 to 5,641 lines.
+  The next milestone resumes deletion from this baseline.
+
+Verification:
+
+- Strict `TestRockchipMaxUnpoolOps::test_max_unpool2d`: 1 passed in 20.58s call time.
+- Strict max-unpool plus simple cummin/cummax gate: 4 passed in 131.12s.
+- Strict gather/nonzero/fancy-index/arg-extrema/sort/top-k/WHERE gate: 22 passed in 138.67s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
