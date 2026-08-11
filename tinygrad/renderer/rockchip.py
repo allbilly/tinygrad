@@ -788,19 +788,19 @@ def _relu_operand(u:UOp) -> UOp|None:
 
 
 def _precise_add(lhs:UOp, rhs:UOp) -> UOp: return UOp(Ops.ADD, lhs.dtype, src=(lhs, rhs), arg=_NATIVE_PRECISE_ADD)
-def _sub_half(lhs:UOp, rhs:UOp, neg_one:UOp) -> UOp: return _precise_add(lhs, rhs.alu(Ops.MUL, neg_one))
+def _sub_half(lhs:UOp, rhs:UOp, neg_one:UOp) -> UOp: return _precise_add(lhs, UOp(Ops.MUL, dtypes.half, src=(rhs, neg_one)))
 
 def _split_half(x:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
-  scaled = x.alu(Ops.MUL, splitter)
+  scaled = UOp(Ops.MUL, dtypes.half, src=(x, splitter))
   high = _sub_half(scaled, _sub_half(scaled, x, neg_one), neg_one)
   return high, _sub_half(x, high, neg_one)
 
 def _two_product(term:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
   lhs_high, lhs_low = _split_half(term.src[0], neg_one, splitter)
   rhs_high, rhs_low = _split_half(term.src[1], neg_one, splitter)
-  error = _sub_half(lhs_high.alu(Ops.MUL, rhs_high), term, neg_one)
-  error = _precise_add(_precise_add(error, lhs_high.alu(Ops.MUL, rhs_low)), lhs_low.alu(Ops.MUL, rhs_high))
-  return term, _precise_add(error, lhs_low.alu(Ops.MUL, rhs_low))
+  error = _sub_half(UOp(Ops.MUL, dtypes.half, src=(lhs_high, rhs_high)), term, neg_one)
+  error = _precise_add(_precise_add(error, UOp(Ops.MUL, dtypes.half, src=(lhs_high, rhs_low))), UOp(Ops.MUL, dtypes.half, src=(lhs_low, rhs_high)))
+  return term, _precise_add(error, UOp(Ops.MUL, dtypes.half, src=(lhs_low, rhs_low)))
 
 def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
   total = _precise_add(lhs, rhs)

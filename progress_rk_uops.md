@@ -2266,3 +2266,26 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 104. Construct compensated FP16 products without dtype replay — complete
+
+- Reprofiled `test_dependent_reduction_range_preserves_vector_output_axis`. Compensated product construction still
+  created roughly 7,500 already-proven FP16 multiplications through generic `UOp.alu()`, causing Tinygrad to repeat
+  dtype promotion and inference for every physical recipe node.
+- Constructed those MUL UOps directly with canonical `dtypes.half` inside `_sub_half()`, `_split_half()`, and
+  `_two_product()`. This is limited to the compensated half recipe where both inputs and the result are structurally
+  guaranteed FP16; semantic UOps elsewhere retain ordinary dtype inference.
+- The complete profiled slow workload fell from 1,646,892 to 1,587,228 calls (3.6%) and from 1.204 to 1.151 seconds
+  (4.4%). `_precise_sum_parts()` fell from 0.229 to 0.171 seconds (25.4%). In a warmed alternating benchmark, isolated
+  128-term recipe construction improved from a 45.2 ms median to 26.2 ms (42.1%).
+- Two-, 64-, and 128-term recipe keys and scalar/vector/large dependent-reduction RKImages matched milestone 103
+  exactly. Renderer size remains 4,677 executable lines, 5,556 lines or 54.3% below baseline; runtime remains 480
+  lines. The optimization adds no CPU numeric semantics and changes no emitted hardware stage.
+
+Verification:
+
+- Old/current comparison: 3/3 compensated recipe keys and 3/3 dependent-reduction RKImages identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
