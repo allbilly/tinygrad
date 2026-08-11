@@ -407,6 +407,17 @@ class ElementwiseMixin(CreationMixin):
     """
     # NOTE: torch always return in float, we return based on the broadcasting rule.
     a, b = self._broadcasted(other)
+    if dtypes.is_float(a.dtype):
+      signed = {1:dtypes.int8, 2:dtypes.int16, 4:dtypes.int32, 8:dtypes.int64}[a.dtype.itemsize]
+      pa, pb = a._uop.param_like(0), b._uop.param_like(1)
+      body = ((pa.bitcast(signed) & signed.max) | (pb.bitcast(signed) & signed.min)).bitcast(a.dtype)
+      def grad_fxn(grad, call):
+        aa, bb = call.src[1:]
+        zero = aa.const_like(0)
+        asign = (aa < zero).where(aa.const_like(-1), (zero < aa).where(aa.const_like(1), zero))
+        bsign = ((bb < zero) | (bb.reciprocal() < zero)).where(bb.const_like(-1), bb.const_like(1))
+        return grad * asign * bsign, grad.const_like(0)
+      return self._wrap_uop(body.call(a._uop, b._uop, grad_fxn=grad_fxn, name="copysign").gettuple(0))
     return ((b < 0) | (b.reciprocal() < 0)).where(-(mag := a.abs()), mag)
 
   def logaddexp(self, other: Self | ConstType) -> Self:

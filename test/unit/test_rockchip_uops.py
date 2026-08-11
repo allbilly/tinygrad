@@ -66,6 +66,16 @@ def test_generic_where_owns_ternary_arity():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
 
 
+def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
+  magnitude, sign = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:
+    ((magnitude.index(i).load().bitcast(dtypes.int16) & UOp.const(dtypes.int16.max, dtypes.int16)) |
+     (sign.index(i).load().bitcast(dtypes.int16) & UOp.const(dtypes.int16.min, dtypes.int16))).bitcast(dtypes.half)))
+  assert image is not None and len(image.ew_ops) == 11 and len(image.mid_gathers) == 10
+  assert len(image.post_gathers) == 1 and image.post_gathers[0].itemsize == 2
+  assert decode_image(encode_image(image)) == image
+
+
 def test_generic_bool_where_uses_canonical_int16_ternary():
   lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
   def select(i):

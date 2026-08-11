@@ -588,3 +588,29 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 62 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 31. Exact raw-bit sign UOps with an explicit gradient — complete
+
+- Removed the generic executor's remaining `copysign` graph rejection. Tinygrad now states floating-point `copysign`
+  directly as `BITCAST`, integer `AND`/`OR`, and `BITCAST` UOps, so the semantic program preserves signed zero and NaN
+  payload bits without recovering a tensor-operation dialect in the renderer.
+- Wrapped that value-producing UOp body in a Tinygrad `FUNCTION` with an explicit derivative. The forward program stays
+  raw-bit exact while ordinary CPU autograd retains the magnitude gradient and the sign input receives zero gradient.
+- Added the physical half/INT16 raw-byte ABI to `RKContext`. Half-to-INT16 and INT16-to-half `BITCAST` are representation
+  changes over the same `RKValue`; mask-specific integer `AND`, disjoint-mask `OR`, and the general INT16 bitwise fallback
+  operate on explicit raw bytes and repack at the storage boundary.
+- Made a root raw `BITCAST` use an exact two-byte post-gather. A native FP16 copy canonicalizes NaNs and therefore cannot
+  implement a raw-bit storage boundary.
+- The unmodified generic path also passed sort, argsort, top-k, and elementwise extrema. The verified strict prefix now
+  extends through collection index 204: 199 passed, 6 skipped, and 240 collected tests remain to be censused.
+- Added a host-independent raw half/INT16 mask round-trip regression.
+
+Verification:
+
+- Strict `TestRockchipSortValueOps`, `TestRockchipSortIndexOps`, `TestRockchipTopKOps`, and
+  `TestRockchipElementwiseExtremaOps`: 5 passed.
+- Strict `TestRockchipSignOps`: 6 passed in 3.40s.
+- CPU `TestOps::test_copysign` and `TestOps::test_copysign_exact`: 2 passed in 15.58s, including backward checks.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 63 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

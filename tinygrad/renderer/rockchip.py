@@ -7711,6 +7711,9 @@ class RKContext:
     self.gather_slots:dict[tuple, RKValue] = {}
     self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
     self.int32_components:dict[RKArg, tuple[RKValue, ...]] = {}
+    self.int16_raw:dict[RKArg, tuple[RKValue, RKValue]] = {}
+    self.int16_masks:dict[RKArg, int] = {}
+    self.fp16_raw:dict[RKArg, tuple[RKValue, RKValue]] = {}
     self.fp16_components:dict[RKArg, tuple[RKValue, RKArg, RKArg]] = {}
     self.fp16_ordered:dict[RKArg, tuple[RKArg, RKArg]] = {}
     self.gathers:list[RKGather] = []
@@ -7912,6 +7915,41 @@ class RKContext:
     dst = self._dst(u, dtypes.half, RKLayout.FP16) if u is self.root else neg_lhs
     return self._emit(dst, zero, neg_lhs, _EW_CFG[Ops.SUB])
 
+  def _fp16_raw_bytes(self, value:RKValue) -> tuple[RKValue, RKValue]:
+    if value.layout is not RKLayout.FP16: raise _RKGenericReject
+    if value.arg in self.fp16_raw: return self.fp16_raw[value.arg]
+    low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
+    split_after = len(self.ew_ops)
+    for byte,part in enumerate((low, high)):
+      self.mid_gathers.append(RKGather(value.arg.index, part.arg.index, self.count,
+        base=value.arg.addend+byte, axes=((1, self.count, 2),), dst_stride=2,
+        src_kind=value.arg.kind, itemsize=1, after=split_after))
+    self.fp16_raw[value.arg] = low, high
+    return self.fp16_raw[value.arg]
+
+  def _int16_raw_bytes(self, value:RKValue) -> tuple[RKValue, RKValue]:
+    if value.layout is not RKLayout.INT16: raise _RKGenericReject
+    if value.arg in self.int16_raw: return self.int16_raw[value.arg]
+    low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
+    split_after = len(self.ew_ops)
+    for byte,part in enumerate((low, high)):
+      self.mid_gathers.append(RKGather(value.arg.index, part.arg.index, self.count,
+        base=value.arg.addend+byte, axes=((1, self.count, 2),), dst_stride=2,
+        src_kind=value.arg.kind, itemsize=1, after=split_after))
+    self.int16_raw[value.arg] = low, high
+    return self.int16_raw[value.arg]
+
+  def _pack_int16_bytes(self, u:UOp, low:RKValue, high:RKValue, mask:int|None=None) -> RKValue:
+    result = self._dst(u, dtypes.int16, RKLayout.INT16)
+    pack_after = len(self.ew_ops)
+    for byte,source in enumerate((low, high)):
+      self.mid_gathers.append(RKGather(source.arg.index, result.arg.index, self.count,
+        base=source.arg.addend, axes=((1, self.count, 2),), dst_stride=2, dst_addend=byte,
+        dst_kind=result.arg.kind, src_kind=source.arg.kind, itemsize=1, after=pack_after))
+    self.int16_raw[result.arg] = low, high
+    if mask is not None: self.int16_masks[result.arg] = mask
+    return result
+
   def _alu(self, u:UOp) -> RKValue:
     if u.op is Ops.RECIPROCAL:
       src = self.lower(u.src[0]); one = self.lower(UOp.const(1.0, dtypes.half))
@@ -8014,30 +8052,89 @@ class RKContext:
     raise _RKGenericReject
 
   def _integer_bitwise(self, u:UOp) -> RKValue:
-    if u.op is not Ops.XOR or len(u.src) != 2: raise _RKGenericReject
-    for marker, source in (u.src, u.src[::-1]):
-      if marker.op is not Ops.CONST or int(marker.arg) != -1: continue
-      dtype = u.dtype.scalar()
-      layout = RKLayout.INT16 if dtype is dtypes.int16 else self.int_layout if dtype is dtypes.int else None
-      if layout is None: raise _RKGenericReject
-      rhs = self.lower(source)
-      if rhs.layout is not layout: raise _RKGenericReject
-      if layout is RKLayout.INT32:
-        components = self._int32_bytes(rhs)
-        const255 = self._constant(UOp.const(255, dtypes.int16))
-        inverted = tuple(self._emit(self._scratch(dtypes.int16, RKLayout.INT16), const255, component, _EW_CFG[Ops.SUB])
-                         for component in components)
-        result = self._scratch(dtypes.int, RKLayout.INT32)
-        pack_after = len(self.ew_ops)
-        for byte,component in enumerate(inverted):
-          self.mid_gathers.append(RKGather(component.arg.index, result.arg.index, self.count,
-            base=component.arg.addend, axes=((1, self.count, 2),), dst_stride=4, dst_addend=byte,
-            src_kind=component.arg.kind, itemsize=1, after=pack_after))
-        self.int32_components[result.arg] = inverted
-        return result
-      lhs = self._constant(UOp.const(-1, dtype))
-      return self._emit(self._dst(u, dtype, layout), lhs, rhs, _EW_CFG[Ops.SUB])
-    raise _RKGenericReject
+    if len(u.src) != 2: raise _RKGenericReject
+    if u.dtype.scalar() is dtypes.int16 and u.op is Ops.AND:
+      for marker,source in (u.src, u.src[::-1]):
+        if marker.op is not Ops.CONST or (mask:=int(marker.arg)&0xffff) not in (0x7fff, 0x8000): continue
+        value = self.lower(source)
+        if value.layout is not RKLayout.INT16: raise _RKGenericReject
+        low, high = self._int16_raw_bytes(value)
+        zero, one, const127, const128 = (self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 127, 128))
+        delta, positive, sign, sign_scale = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(4))
+        self._emit(delta, high, const127, _EW_CFG[Ops.SUB])
+        self._emit(positive, delta, zero, _EW_CFG[Ops.MAX])
+        self._emit(sign, positive, one, _EW_CFG_MIN)
+        self._emit(sign_scale, sign, const128, _EW_CFG[Ops.MUL])
+        if mask == 0x7fff:
+          masked_high = self._scratch(dtypes.int16, RKLayout.INT16)
+          self._emit(masked_high, high, sign_scale, _EW_CFG[Ops.SUB])
+          return self._pack_int16_bytes(u, low, masked_high, mask)
+        return self._pack_int16_bytes(u, zero, sign_scale, mask)
+    if u.dtype.scalar() is dtypes.int16 and u.op is Ops.OR:
+      values = tuple(self.lower(source) for source in u.src)
+      masks = tuple(self.int16_masks.get(value.arg) for value in values)
+      if all(mask is not None for mask in masks) and typing_cast(int, masks[0]) & typing_cast(int, masks[1]) == 0:
+        parts = tuple(self._int16_raw_bytes(value) for value in values)
+        low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
+        self._emit(low, parts[0][0], parts[1][0], _EW_CFG[Ops.ADD])
+        self._emit(high, parts[0][1], parts[1][1], _EW_CFG[Ops.ADD])
+        return self._pack_int16_bytes(u, low, high, typing_cast(int, masks[0]) | typing_cast(int, masks[1]))
+    if u.op is Ops.XOR:
+      for marker, source in (u.src, u.src[::-1]):
+        if marker.op is not Ops.CONST or int(marker.arg) != -1: continue
+        dtype = u.dtype.scalar()
+        layout = RKLayout.INT16 if dtype is dtypes.int16 else self.int_layout if dtype is dtypes.int else None
+        if layout is None: raise _RKGenericReject
+        rhs = self.lower(source)
+        if rhs.layout is not layout: raise _RKGenericReject
+        if layout is RKLayout.INT32:
+          components = self._int32_bytes(rhs)
+          const255 = self._constant(UOp.const(255, dtypes.int16))
+          inverted = tuple(self._emit(self._scratch(dtypes.int16, RKLayout.INT16), const255, component, _EW_CFG[Ops.SUB])
+                           for component in components)
+          result = self._scratch(dtypes.int, RKLayout.INT32)
+          pack_after = len(self.ew_ops)
+          for byte,component in enumerate(inverted):
+            self.mid_gathers.append(RKGather(component.arg.index, result.arg.index, self.count,
+              base=component.arg.addend, axes=((1, self.count, 2),), dst_stride=4, dst_addend=byte,
+              src_kind=component.arg.kind, itemsize=1, after=pack_after))
+          self.int32_components[result.arg] = inverted
+          return result
+        lhs = self._constant(UOp.const(-1, dtype))
+        return self._emit(self._dst(u, dtype, layout), lhs, rhs, _EW_CFG[Ops.SUB])
+    if u.dtype.scalar() is not dtypes.int16 or u.op not in (Ops.AND, Ops.OR, Ops.XOR): raise _RKGenericReject
+    values = tuple(self.lower(source) for source in u.src)
+    if any(value.layout is not RKLayout.INT16 for value in values): raise _RKGenericReject
+    lanes = self.count*2
+    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16, _scratch_bytes(lanes)).arg
+    raw:list[RKArg] = []
+    for value in values:
+      expanded = allocate(); raw.append(expanded)
+      self.mid_gathers.append(RKGather(value.arg.index, expanded.index, lanes, base=value.arg.addend,
+        axes=((1, lanes, 1),), dst_stride=2, src_kind=value.arg.kind, itemsize=1, after=len(self.ew_ops)))
+    constants:dict[int, RKArg] = {}
+    for number in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128):
+      constants[number] = constant = allocate()
+      self.gathers.append(RKGather(self.out_param.arg.slot, constant.index, lanes, values=(number,)*lanes))
+    lhs_bits, rhs_bits = (_int16_byte_bits(self.ew_ops, allocate, constants, value, lanes) for value in raw)
+    integer = dict(int16_input=True, int16_output=True)
+    weighted:list[RKArg] = []
+    for bit,(left,right) in enumerate(zip(lhs_bits, rhs_bits)):
+      combined = allocate()
+      if u.op is Ops.XOR:
+        self.ew_ops.extend((RKEWOp(combined, left, right, lanes, _EW_CFG[Ops.SUB], **integer),
+                            RKEWOp(combined, combined, combined, lanes, _EW_CFG_ABS, **integer)))
+      else:
+        self.ew_ops.append(RKEWOp(combined, left, right, lanes,
+          _EW_CFG_MIN if u.op is Ops.AND else _EW_CFG[Ops.MAX], **integer))
+      if bit: self.ew_ops.append(RKEWOp(combined, combined, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **integer))
+      weighted.append(combined)
+    combined = _reduce_rows(self.ew_ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True)
+    result = self._dst(u, dtypes.int16, RKLayout.INT16)
+    self.mid_gathers.append(RKGather(combined.index, result.arg.index, lanes, base=combined.addend,
+      axes=((1, lanes, 2),), dst_stride=1, dst_kind=result.arg.kind,
+      src_kind=RKBufferKind.SCRATCH, itemsize=1, after=len(self.ew_ops)))
+    return result
 
   def _compare(self, u:UOp) -> RKValue:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
@@ -8140,12 +8237,7 @@ class RKContext:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
     if value.arg in self.fp16_components: return self.fp16_components[value.arg]
-    low, high = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(2))
-    split_after = len(self.ew_ops)
-    for byte,part in enumerate((low, high)):
-      self.mid_gathers.append(RKGather(value.arg.index, part.arg.index, self.count,
-        base=value.arg.addend+byte, axes=((1, self.count, 2),), dst_stride=2,
-        src_kind=value.arg.kind, itemsize=1, after=split_after))
+    low, high = self._fp16_raw_bytes(value)
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 123, 124, 127, 128)}
     def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
     clean_high,nan = _fp16_high_and_nan(self.ew_ops, allocate, high.arg, low.arg,
@@ -8447,6 +8539,18 @@ class RKContext:
           not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
       value = self._static(u)
     elif u.op is Ops.LOAD: value = self._load(u)
+    elif u.op is Ops.BITCAST and len(u.src) == 1:
+      source = self.lower(u.src[0])
+      if dtype is dtypes.int16 and u.src[0].dtype.scalar() is dtypes.half and source.layout is RKLayout.FP16:
+        value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
+      elif dtype is dtypes.half and u.src[0].dtype.scalar() is dtypes.int16 and source.layout is RKLayout.INT16:
+        value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
+      else: raise _RKGenericReject(f"bitcast {u.src[0].dtype.scalar()}->{dtype}")
+      if u is self.root and value.arg != self.out:
+        self.post_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count,
+          base=value.arg.addend//2, axes=((1, self.count, 1),), dst_kind=RKBufferKind.ARG,
+          src_kind=value.arg.kind, itemsize=2))
+        value = RKValue(self.out, dtype, self.count, value.layout)
     elif u.op is Ops.CAST and len(u.src) == 1:
       if dtype is dtypes.half and u.src[0].dtype.scalar() is dtypes.float:
         recipe = _fp32_expr_to_half(u.src[0])
@@ -9113,7 +9217,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (predicate_prefix:=_lower_loop_fp16_prefix_count(uops, output)) is not None: return predicate_prefix
     if (equality_add:=_lower_loop_int32_equality_add(uops, output)) is not None: return equality_add
     if (prefix_add:=_lower_loop_int32_prefix_add(uops, output)) is not None: return prefix_add
-  if _fold_copysign(output[4]) is not None: return None
   try:
     if (_contiguous_output_samples(output[3], output[2]) is None and
         _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
