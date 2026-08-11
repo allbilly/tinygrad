@@ -868,3 +868,23 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 83 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 41. Complete IncrementalOps UOp-only replay — complete
+
+- Completed the final 51 collected IncrementalOps methods under `ROCKCHIP_UOPS_ONLY=1`. The segmented strict census
+  now accounts for all 445 collected cases: 433 passed, 12 explicit contract skips, and zero failures.
+- Added the missing physical boundary for a root FP32 CONST. The semantic value is represented in the canonical FP16
+  RKValue layout and the existing terminal FP32 conversion owns the 32-bit output, matching FP32 LOAD behavior without
+  host numeric conversion.
+- `full_like` with an FP32 destination now passes through CONST, RANGE, STORE, and the typed output boundary. The other
+  50 IncrementalOps methods needed no renderer change, which is the intended per-UOp architecture metric.
+- The legacy catalog remains in place until a single-process full census confirms that segmented replay did not hide
+  state or ordering interactions. Renderer size therefore remains 10,217 executable lines and runtime size remains 488.
+
+Verification:
+
+- Strict `TestRockchipIncrementalOps`: 51 passed in 13.72s.
+- Strict `TestRockchipIncrementalOps::test_full_like`: 1 passed in 5.21s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

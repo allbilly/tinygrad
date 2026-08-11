@@ -66,6 +66,13 @@ def test_fp32_load_materializes_through_canonical_fp16_physical_abi():
   assert decode_image(encode_image(image)) == image
 
 
+def test_fp32_constant_uses_canonical_half_value_before_output_conversion():
+  image = _lower_uop_program(_program(dtypes.float, lambda _i:UOp.const(4.0, dtypes.float), count=6))
+  assert image is not None and image.constants == struct.pack("<e", 4.0)
+  assert [op.count for op in image.ew_ops] == [4, 2]
+  assert all(op.ew_cfg & _EW_STAGE_FP32_OUT for op in image.ew_ops)
+
+
 def test_infinite_numerator_fdiv_preserves_dynamic_denominator_sign():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:

@@ -8069,7 +8069,7 @@ class RKContext:
         self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4))
         self.static_slots[key] = value
       return self.static_slots[key]
-    if dtype is dtypes.half: bits, layout = struct.pack("<e", float(u.arg)), RKLayout.FP16
+    if dtype in (dtypes.half, dtypes.float): bits, layout = struct.pack("<e", float(u.arg)), RKLayout.FP16
     elif dtype is dtypes.int16: bits, layout = struct.pack("<H", _int16_bits(int(u.arg))), RKLayout.INT16
     elif dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
       bits, layout = struct.pack("<e", float(u.arg)), self.int_layout
