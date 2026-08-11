@@ -434,7 +434,7 @@ def test_fp32_pure_add_tree_uses_compensated_half_expansion_at_output_boundary()
   value = terms[0]
   for term in terms[1:]: value = value + term
   image = _lower_uop_program(_program(dtypes.half, lambda _i:value.cast(dtypes.half), count=1))
-  assert image is not None and len(image.ew_ops) > 64
+  assert image is not None and 64 < len(image.ew_ops) < 2000
 
 
 def test_fp32_math_uop_converts_at_half_storage_boundary():

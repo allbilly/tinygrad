@@ -8850,7 +8850,7 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
       (terms[-1:] if len(terms) & 1 else [])
   return terms[0]
 
-def _expand_math_uops(root:UOp) -> UOp:
+def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
   bounded_recipes = len(root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES
   composite_math = _fold_inverse_hyperbolic(root) if bounded_recipes else None
@@ -8880,7 +8880,7 @@ def _expand_math_uops(root:UOp) -> UOp:
         _canonical_half_storage(u.src[0])
       cache[u] = mapped
       return mapped
-    if bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
+    if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
       try:
         mapped = _accurate_add_recipe(u)
         cache[u] = mapped
@@ -9430,14 +9430,15 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
     root = _finite_int_max_neutrals(_finite_max_neutral_selectors(local_root))
-    if not recipes_ready: root = _expand_math_uops(root)
+    if not recipes_ready: root = _expand_math_uops(root, accurate_adds=storage_uops is None)
     expanded_nodes = root.toposort()
     if len(expanded_nodes) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
       if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool))) is None: return None
-    image = RKContext(output, accurate_adds=(not recipes_ready and len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
+    image = RKContext(output, accurate_adds=(not recipes_ready and storage_uops is None and
+                                             len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
                                              not _has_runtime_address(output[4])),
                       static_load_offsets=static_load_offsets).finish()
     if any(len(items) > _RKIMAGE_U16_MAX for items in

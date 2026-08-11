@@ -718,3 +718,26 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 68 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 36. Single-owner FP32 storage precision and complete generic reductions — complete
+
+- Made the FP32-to-FP16 storage boundary the single owner of its compensated ADD recipe. Generic math expansion still
+  lowers any nested SQRT/EXP2/LOG2/SIN UOps, but it no longer treats already-physical storage ADDs as fresh expressions
+  and recursively compensates them a second time.
+- Disabled `RKContext`'s optional accurate-ADD discovery after a storage recipe has been materialized. Each semantic
+  boundary is therefore lowered once, while ordinary non-storage UOp graphs retain the existing precision discovery.
+- A six-term row sum fell from 18,662 physical EW stages to 108 and now matches the FP16 reference. The 64-term unit
+  regression caps its physical recipe below 2,000 stages so recursive precision expansion cannot silently return.
+- The complete reduction class now passes through ordinary CONST/LOAD/CAST, ADD/MUL/MAX, structural reduction, and
+  math-handler composition. No sum, mean, variance, std, product, or normalization lowerer was added in this milestone.
+- The verified strict prefix extends through collection index 393: 382 passed, 12 skipped, and the final 51 collected
+  IncrementalOps tests remain to be censused.
+
+Verification:
+
+- Strict first half of `TestRockchipReductionOps`: 18 passed and 18 deselected in 111.89s.
+- Strict sum/variance half of `TestRockchipReductionOps`: 18 passed and 18 deselected in 89.79s.
+- Strict `TestRockchipReductionOps::test_sum`: 1 passed in 3.82s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 68 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
