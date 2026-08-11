@@ -546,11 +546,8 @@ def _eval_vector(u:UOp, env:dict[UOp, np.ndarray], cache:dict[UOp, np.ndarray]) 
 
 _STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.SPECIAL, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.TRUNC, Ops.WHERE,
                Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.XOR, Ops.MAX}
-def _is_static_expr(u:UOp, cache:dict[UOp, bool]|None=None) -> bool:
-  if cache is not None and u in cache: return cache[u]
-  ret = u.op in _STATIC_OPS and all(_is_static_expr(x, cache) for x in u.src)
-  if cache is not None: cache[u] = ret
-  return ret
+def _is_static_expr(u:UOp) -> bool:
+  return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
 
 def _index_ranges(index:UOp) -> list[UOp]:
   """Ranges used as index values, excluding AFTER/END ordering dependencies attached to a RANGE."""

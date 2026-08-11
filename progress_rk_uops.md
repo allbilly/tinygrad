@@ -2448,3 +2448,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 113. Delete the unused static-expression cache contract — complete
+
+- Audited every `_is_static_expr()` call site. Its optional memo dictionary was never supplied, so the cache lookup,
+  recursive cache threading, and cache write were unreachable in every renderer execution.
+- Removed the unused parameter and reduced the helper to its actual recursive predicate. Static constants, ranges,
+  comparisons, selectors, loads, and dynamic arithmetic produced the same seven predicate results as milestone 112;
+  representative static-selector and dynamic-load RKImages were byte-identical.
+- Renderer executable size fell from 4,656 to 4,653 lines. From the 10,233-line baseline, 5,580 lines are gone (54.5%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 7/7 static predicates and 2/2 RKImages identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.14 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
