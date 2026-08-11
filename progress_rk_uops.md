@@ -2563,3 +2563,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 119. Make finite-MAX materialization a normal operand boundary — complete
+
+- Rewrote milestone 118's conditional nested function as `_max_operand()`. `_alu()` now selects one bound operand
+  implementation and invokes it at the true binary arity, keeping ordinary arithmetic on the direct typed path while
+  making the exceptional MAX boundary independently readable and reusable.
+- The refactor removes two of milestone 118's three added executable lines. Direct cProfile remained within run noise
+  (1.078 versus 1.082 seconds, identical 1,523,475 calls), and scalar/vector/large reductions plus both finite-MAX
+  normalization forms remained byte-identical.
+- Renderer executable size fell from 4,638 to 4,636 lines. From the 10,233-line baseline, 5,597 lines are gone (54.7%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 5/5 reduction/MAX RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.74 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
