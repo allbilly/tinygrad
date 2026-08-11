@@ -743,25 +743,40 @@ def _divided_affine_index(u:UOp) -> tuple[int, dict[tuple[UOp, int], int]]|None:
     elif term in terms: del terms[term]
   return lhs[0]+sign*rhs[0], terms
 
+class RKStaticIndexEvaluator:
+  """Share one compile-time output RANGE materialization across related static gather plans."""
+  def __init__(self, out_index:UOp, count:int):
+    self.out_index, self.count, self.ranges = out_index, count, _index_ranges(out_index)
+    self._vectors:tuple[dict[UOp, np.ndarray], np.ndarray]|None = None
+
+  def _prepare(self) -> tuple[dict[UOp, np.ndarray], np.ndarray]:
+    if self._vectors is not None: return self._vectors
+    envs = _iter_range_env(self.ranges)
+    vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in self.ranges}
+    if (out_affine:=_affine_index(self.out_index)) is None:
+      dst = np.broadcast_to(_eval_vector(self.out_index, vector_env, {}), len(envs)).astype(np.int64)
+    else:
+      dst = np.full(len(envs), out_affine[0], dtype=np.int64)
+      for r,stride in out_affine[1].items(): dst += vector_env[r]*stride
+    if np.any((dst < 0) | (dst >= self.count)): raise RuntimeError("RKPLAN_REJECT:gather_index")
+    self._vectors = vector_env, dst
+    return self._vectors
+
+  def offsets(self, load_index:UOp, gate:UOp|None) -> tuple[int, ...]:
+    if any(r not in self.ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
+      raise RuntimeError("RKPLAN_REJECT:gather_index")
+    vector_env, dst = self._prepare()
+    cache:dict[UOp, np.ndarray] = {}
+    src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(dst)).astype(np.int64)
+    values = src if gate is None else np.where(np.broadcast_to(_eval_vector(gate, vector_env, cache), len(dst)), src, -1)
+    if np.any(values < -1): raise RuntimeError("RKPLAN_REJECT:gather_index")
+    offsets = np.full(self.count, -2, dtype=np.int64)
+    offsets[dst] = values
+    if np.any(offsets == -2): raise RuntimeError("RKPLAN_REJECT:gather_index")
+    return tuple(int(x) for x in offsets)
+
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
-  ranges = _index_ranges(out_index)
-  if any(r not in ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
-    raise RuntimeError("RKPLAN_REJECT:gather_index")
-  envs = _iter_range_env(ranges)
-  vector_env = {r: np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
-  cache:dict[UOp, np.ndarray] = {}
-  out_affine = _affine_index(out_index)
-  if out_affine is None: dst = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
-  else:
-    dst = np.full(len(envs), out_affine[0], dtype=np.int64)
-    for r,stride in out_affine[1].items(): dst += vector_env[r]*stride
-  src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(envs)).astype(np.int64)
-  values = src if gate is None else np.where(np.broadcast_to(_eval_vector(gate, vector_env, cache), len(envs)), src, -1)
-  if np.any((dst < 0) | (dst >= count)) or np.any(values < -1): raise RuntimeError("RKPLAN_REJECT:gather_index")
-  offsets = np.full(count, -2, dtype=np.int64)
-  offsets[dst] = values
-  if np.any(offsets == -2): raise RuntimeError("RKPLAN_REJECT:gather_index")
-  return tuple(int(x) for x in offsets)
+  return RKStaticIndexEvaluator(out_index, count).offsets(load_index, gate)
 
 def _contiguous_output_samples(out_index:UOp, count:int) -> list[dict[UOp, int]]|None:
   """Prove a contiguous affine output index and return bounded range samples for large matcher validation."""
@@ -789,7 +804,8 @@ def _typed_load_offsets(load:UOp, dtype:DType, out_index:UOp, count:int, allow_f
   if any(offset < (-1 if allow_fill else 0) or offset >= int(param.src[0].arg) for offset in offsets): return None
   return param, offsets
 
-def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
+def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0,
+                 index_evaluator:RKStaticIndexEvaluator|None=None) -> RKGather:
   out_affine, load_affine = _affine_index(out_index), _affine_index(load_index)
   if gate is None and out_affine is not None and load_affine is not None and out_affine[0] == 0:
     expected = 1
@@ -815,7 +831,8 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
         divided_axes = tuple((out_affine[1][r]*divisor, (int(r.src[0].arg)+divisor-1)//divisor, stride)
                              for (r,divisor),stride in load_divided[1].items() if stride)
         return RKGather(src_index, dst_index, count, load_divided[0], divided_axes)
-  return RKGather(src_index, dst_index, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
+  offsets = (index_evaluator or RKStaticIndexEvaluator(out_index, count)).offsets(load_index, gate)
+  return RKGather(src_index, dst_index, count, offsets=offsets, fill_bits=fill_bits)
 
 def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
   if plan.offsets: low, high = min(plan.offsets, default=0), max(plan.offsets, default=-1)
@@ -1144,6 +1161,7 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   if groups != 8 and (groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or groups < 256 and rows <= _MAX_EW_ELEMS_FP16) or \
      8*_scratch_bytes(lanes)+_scratch_bytes(min(chunk_lanes, lanes)) > _MAX_MAPPED_DOT_SCRATCH_BYTES: return None
 
+  index_evaluator = RKStaticIndexEvaluator(out_index, rows)
   parsed:list[tuple[tuple[UOp, RKGather], tuple[UOp, RKGather]]] = []
   for term in terms:
     if term.op is not Ops.MUL or term.arg is not None: return None
@@ -1156,7 +1174,7 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
       gate = load.src[2] if len(load.src) > 2 else None
       fill_bits = _fp16_bits(load.src[1].arg if len(load.src) > 1 else 0)
       try:
-        plan = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, rows, fill_bits)
+        plan = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, rows, fill_bits, index_evaluator)
         _validate_gather_bounds(plan, int(param.src[0].arg))
       except RuntimeError: return None
       operands.append((param, plan))
@@ -1199,7 +1217,7 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
     if bias.op is Ops.LOAD:
       bias_param = _root_param(bias.src[0]) if bias.src and bias.src[0].op is Ops.INDEX else None
       if bias_param is None or bias_param.src[0].op is not Ops.CONST: return None
-      try: bias_offsets = _gather_offsets(out_index, bias.src[0].src[1], bias.src[2] if len(bias.src) > 2 else None, rows)
+      try: bias_offsets = index_evaluator.offsets(bias.src[0].src[1], bias.src[2] if len(bias.src) > 2 else None)
       except RuntimeError: return None
       if any(not 0 <= offset < int(bias_param.src[0].arg) for offset in bias_offsets): return None
       if int(bias_param.src[0].arg) == rows and bias_offsets == tuple(range(rows)):

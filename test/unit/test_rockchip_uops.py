@@ -1,7 +1,8 @@
 import math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKTarget, RKValue,
+  RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
@@ -24,6 +25,20 @@ def test_static_range_expressions_vectorize_in_output_order():
   out_index = col * 3 + row
   value = (row < 2).where(col + row * 4, UOp.const(-1, dtypes.int))
   assert _static_int_vector(out_index, value, 12) == (0, 4, -1, 1, 5, -1, 2, 6, -1, 3, 7, -1)
+
+
+def test_static_gather_rows_share_output_range_materialization(monkeypatch):
+  row, col = UOp.range(3, 0), UOp.range(4, 1)
+  calls, original = 0, _iter_range_env
+  def counted(ranges):
+    nonlocal calls
+    calls += 1
+    return original(ranges)
+  monkeypatch.setattr("tinygrad.renderer.rockchip._iter_range_env", counted)
+  evaluator = RKStaticIndexEvaluator(col * 3 + row, 12)
+  assert evaluator.offsets(row * 4 + col, None) == (0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11)
+  assert evaluator.offsets(11 - (row * 4 + col), None) == (11, 7, 3, 10, 6, 2, 9, 5, 1, 8, 4, 0)
+  assert calls == 1
 
 
 def test_submit_retries_once_after_driver_timeout(monkeypatch):

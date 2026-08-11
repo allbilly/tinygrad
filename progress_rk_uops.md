@@ -1113,3 +1113,26 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 50. Share static gather planning across reduction operands — complete
+
+- Profiled the slowest recorded remaining case, `test_large_input_conv2d`. Of 112.08s instrumented time, 93.64s was
+  the residual-preserving MUL+ADD reducer and 87.42s was `_gather_offsets`. Its 320 non-affine plans rebuilt the same
+  90,720-lane output RANGE environment, causing 174.18 million generator calls.
+- Added one lazy `RKStaticIndexEvaluator` per related gather-plan set. It materializes static output RANGE vectors and
+  destination lanes once, while each operand retains a fresh expression cache to bound memory. The evaluator only
+  handles compile-time INDEX/gate expressions; it never reads or computes runtime tensor values.
+- Reused the evaluator for residual MUL+ADD operands and optional bias. Added a unit contract proving two distinct
+  gather rows invoke RANGE materialization exactly once and retain correct nontrivial output ordering.
+- `test_large_input_conv2d` fell from 67.15s to 18.34–18.62s, about 72% faster. Big GEMM, nested convolution, and biased
+  convolution also retain strict numerical output through the same residual-preserving path.
+- This performance milestone adds 14 executable renderer lines, taking the renderer from 5,208 to 5,222 lines. The
+  next milestone resumes catalog deletion from this baseline.
+
+Verification:
+
+- Strict large-input convolution: 1 passed in 18.62s call time.
+- Strict big-GEMM/nested/biased/large-input reduction gate: 4 passed in 31.69s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 86 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
