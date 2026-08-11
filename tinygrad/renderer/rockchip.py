@@ -3093,6 +3093,7 @@ class RKContext:
     return result
 
   def _compare(self, u:UOp) -> RKValue:
+    if len(u.src) != 2: raise _RKGenericReject
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
     if u.op in (Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_equality(u)
     if u.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_less(u)
@@ -3163,8 +3164,6 @@ class RKContext:
 
   def _fp16_equality(self, u:UOp) -> RKValue:
     """Evaluate IEEE FP16 equality through raw bytes and native INT16 arithmetic, without reset-heavy compare stages."""
-    if u.op not in (Ops.CMPNE, Ops.CMPEQ) or len(u.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in u.src):
-      raise _RKGenericReject
     values = tuple(self._operand(src, dtypes.half) for src in u.src)
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
@@ -3221,8 +3220,6 @@ class RKContext:
 
   def _fp16_less(self, u:UOp) -> RKValue:
     """Evaluate IEEE FP16 less-than as an ordered raw-byte comparison without reset-heavy compare stages."""
-    if u.op is not Ops.CMPLT or len(u.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in u.src):
-      raise _RKGenericReject
     values = tuple(self._operand(src, dtypes.half) for src in u.src)
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}

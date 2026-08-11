@@ -2503,3 +2503,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 116. Centralize comparison arity validation — complete
+
+- FP16 equality and less-than handlers repeated binary arity plus op/dtype checks after `_compare()` had already
+  selected their exact semantic family. Moved the true two-source comparison rule to `_compare()` once and deleted the
+  unreachable private-handler checks. Bool, integer, FP16, and IEEE fallback comparisons now share the same arity
+  boundary.
+- FP16 `CMPLT`, `CMPNE`, and `CMPEQ` programs produced RKImages byte-identical to milestone 115.
+- Renderer executable size fell from 4,646 to 4,643 lines. From the 10,233-line baseline, 5,590 lines are gone (54.6%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 FP16 comparison RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.20 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
