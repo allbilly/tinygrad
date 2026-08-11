@@ -2751,3 +2751,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 129. Delete the duplicate static-local arithmetic interpreter — complete
+
+- `_static_local_load_offsets()` carried a second scalar/NumPy implementation of CAST, ADD, SUB, MUL, MAX,
+  comparisons, boolean ALU, integer division/remainder, NEG, and WHERE. Extended the shared static UOp evaluator with
+  structural `AFTER`, unary `NEG`, and an optional local-LOAD resolver, then routed local address materialization
+  through it.
+- Extracted one shared typed binary evaluator for both ordinary static indices and bounded local address programs.
+  Host execution remains restricted to compile-time index/address calculation; runtime tensor numeric semantics still
+  execute on the DPU.
+- Renderer executable size fell from 4,601 to 4,575 lines. From the 10,233-line baseline, 5,658 lines are gone (55.3%);
+  runtime remains 480 lines.
+
+Verification:
+
+- Old/current static evaluator comparison: 30/30 scalar/vector opcode cases identical.
+- Old/current nested local-address program: RKImage byte-identical, including `(0, 0, 0, 0)` gathered offsets.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.55 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
