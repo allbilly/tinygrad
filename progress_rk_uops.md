@@ -1380,3 +1380,25 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 61. Delete the boolean cast image wrapper — complete
+
+- Moved FP16-to-bool `CAST` into the typed UOp handler. It now composes the existing native ABS and positive-mask
+  recipes for any FP16 expression, producing the canonical BOOL_MASK physical value before the normal terminal bool
+  conversion.
+- Deleted `_typed_int_image` and the early direct-load boolean dispatch. The old wrapper rebuilt the output store and
+  retargeted the terminal image; the generic context already owns both scratch placement and bool output conversion.
+- Added coverage for a reversed, composed `(load + 1).cast(bool)` program, not only the direct-load spelling. The same
+  expression passes on hardware for zeros, signs, infinities, and NaN.
+- Renderer executable size fell from 4,984 to 4,971 lines, another 13 lines. From the 10,233-line pre-deletion
+  baseline, 5,262 executable lines are gone (51.4%); runtime remains 489 lines.
+- No CPU numeric semantics were introduced. ABS, comparison-mask generation, and bool output conversion execute on
+  DPU.
+
+Verification:
+
+- Cold `TestRockchipCastOps::test_cast`: 1 passed in 6.29s.
+- Composed FP16-expression-to-bool hardware boundary check: pass.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

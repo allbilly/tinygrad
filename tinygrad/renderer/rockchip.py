@@ -2476,24 +2476,6 @@ def _lower_grouped_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|No
   offsets = tuple(tuple(int(value) for value in matrix[:, group]) for group in range(groups))
   return (_stored_bool_reduction_image if stored_bool else _bool_reduction_image)(out_param.arg.slot, count, source.arg.slot, offsets, op)
 
-def _typed_int_image(output:RKOutput, value:UOp, bool_output:bool=False) -> RKImage:
-  """Lower an exact FP16 integer expression and expose its DPU-converted INT32 lanes."""
-  store, out_param, count, _, _ = output
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  out_slot = out_param.arg.slot
-  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
-  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
-  image = _lower_composed_uops(list(store.replace(src=(half_index, value, *store.src[2:])).toposort()))
-  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
-  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.mid_gathers or image.post_gathers:
-    raise RuntimeError("RKPLAN_REJECT:predicate_terminal")
-  result_slot, tiles_slot = len(image.scratch), len(image.scratch)+1
-  result, tiles = RKArg(RKBufferKind.SCRATCH, result_slot), RKArg(RKBufferKind.SCRATCH, tiles_slot)
-  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
-         RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, tiles, count, _EW_CFG[Ops.MAX],
-                stateful=True, int32_output=True, bool_output=bool_output))
-  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_int32_tiles_bytes(count))), ew_ops=ops)
-
 def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
   """Recover isclose's original operands, equal_nan mode, and its exact-equality FP16 tolerance range."""
   nodes = root.toposort()
@@ -3790,6 +3772,11 @@ class RKContext:
         converted, value = self.lower(recipe), self._scratch(dtype, RKLayout.INT16)
         self.ew_ops.append(RKEWOp(value.arg, converted.arg, converted.arg, self.count, _EW_CFG[Ops.MAX],
                                   submit_barrier=True, stateful=True, int16_output=True))
+      elif dtype is dtypes.bool and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
+        magnitude = UOp(Ops.MAX, dtypes.half, src=(u.src[0], u.src[0]), arg=_NATIVE_ABS)
+        recipe = _positive_mask(magnitude)
+        self._register_graph(recipe)
+        value = self.lower(recipe)
       elif dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
       elif dtype is dtypes.float and source_dtype is dtypes.int and source.layout is RKLayout.INT32:
@@ -4509,8 +4496,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if (int_output:=_output_store(uops, dtypes.int)) is not None:
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
     if (division:=_lower_int32_division(int_output)) is not None: return division
-  if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
-     (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, nonzero, bool_output=True)
   if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
      (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):

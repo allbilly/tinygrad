@@ -533,9 +533,11 @@ def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():
   source = UOp.param(1, dtypes.half, (9,))
   integer = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load().cast(dtypes.int), count=9))
   boolean = _lower_uop_program(_program(dtypes.bool, lambda i:source.index(i).load().cast(dtypes.bool), count=9))
+  composed = _lower_uop_program(_program(dtypes.bool, lambda i:(source.index(8-i).load()+1.0).cast(dtypes.bool), count=9))
   assert integer is not None and integer.ew_ops[-1].int32_output
-  assert boolean is not None and boolean.ew_ops[-1].bool_output
-  assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
+  assert boolean is not None and boolean.ew_ops[-1].bool_output and composed is not None and composed.ew_ops[-1].bool_output
+  assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean and \
+    decode_image(encode_image(composed)) == composed
 
 
 def test_terminal_uint8_cast_and_where_use_int16_physical_values():
