@@ -1653,3 +1653,22 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 75. Finish the single gather timeline and static materializer — complete
+
+- Removed the last renderer-internal `terminal_gathers` side list. Final raw output copies now enter the same
+  `mid_gathers` timeline with its existing negative terminal sentinel, and `finish()` resolves that sentinel to the
+  final EW boundary once the complete physical program is known. Runtime behavior and the serialized ABI are
+  unchanged; this completes the phase collapse started in milestone 70.
+- Proved `_static_int32()` duplicated `_static()`'s canonical INT32 branch. Its sole caller is an integer comparison
+  containing a runtime INT32 load, which already selects `RKLayout.INT32` for the context, so the general static
+  materializer creates the identical vector, cache key, scratch slot, and gather. Deleted the duplicate helper.
+- Renderer executable size fell from 4,815 to 4,807 lines. From the 10,233-line baseline, 5,426 executable lines are
+  gone (53.0%); runtime remains 484 lines. No CPU numeric semantics or DPU arithmetic changed.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

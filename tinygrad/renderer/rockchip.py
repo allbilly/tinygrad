@@ -52,7 +52,7 @@ class RKGather:
   dst_kind: RKBufferKind = RKBufferKind.SCRATCH
   itemsize: int = 2
   src_kind: RKBufferKind = RKBufferKind.ARG
-  after: int = -1  # EW-op split for a mid-program gather; unused for initial/post gathers
+  after: int = -1  # EW-op split; -1 schedules the gather after the final stage
 
 @dataclass(frozen=True)
 class RKHostAddress:
@@ -2686,7 +2686,6 @@ class RKContext:
     self.gathers:list[RKGather] = []
     self.host_gathers:list[RKHostAddress] = []
     self.mid_gathers:list[RKGather] = []
-    self.terminal_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
     self.mask_program = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort())
     nodes = self.root.toposort()
@@ -2785,15 +2784,6 @@ class RKContext:
       self.static_slots[key] = value
     cached = self.static_slots[key]
     return RKValue(cached.arg, dtype, self.count, layout)
-
-  def _static_int32(self, u:UOp) -> RKValue:
-    vector = tuple(value & 0xffffffff for value in _static_values(self.out_index, u, self.count, int))
-    key = (RKLayout.INT32, vector)
-    if key not in self.static_slots:
-      value = self._scratch(dtypes.int, RKLayout.INT32)
-      self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4))
-      self.static_slots[key] = value
-    return self.static_slots[key]
 
   def _load(self, u:UOp, fill_override:int|None=None) -> RKValue:
     dtype = u.dtype.scalar()
@@ -3219,7 +3209,7 @@ class RKContext:
 
   def _int32_compare(self, u:UOp) -> RKValue:
     def operand(src:UOp) -> RKValue:
-      value = self._static_int32(src) if src in self.static_nodes else self.lower(src)
+      value = self._static(src) if src in self.static_nodes else self.lower(src)
       if value.layout is not RKLayout.INT32: raise _RKGenericReject
       return value
     lhs, rhs = (operand(src) for src in u.src)
@@ -3433,7 +3423,7 @@ class RKContext:
         value = exact_operand(leaf)
         if value.layout is not expected: raise _RKGenericReject
         offsets = tuple(value.arg.addend//itemsize+i if take else -1 for i,take in enumerate(mask))
-        self.terminal_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count, offsets=offsets,
+        self.mid_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count, offsets=offsets,
           partial=bool(partial), dst_kind=RKBufferKind.ARG, src_kind=value.arg.kind, itemsize=itemsize))
       return RKValue(self.out, dtype, self.count, expected)
     condition_uop = _strip_cast(u.src[0])
@@ -3583,7 +3573,7 @@ class RKContext:
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
       else: raise _RKGenericReject(f"bitcast {u.src[0].dtype.scalar()}->{dtype}")
       if u is self.root and value.arg != self.out:
-        self.terminal_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count,
+        self.mid_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count,
           base=value.arg.addend//2, axes=((1, self.count, 1),), dst_kind=RKBufferKind.ARG,
           src_kind=value.arg.kind, itemsize=2))
         value = RKValue(self.out, dtype, self.count, value.layout)
@@ -3684,16 +3674,16 @@ class RKContext:
     elif dtype is dtypes.int16 and result.layout is RKLayout.INT16:
       if result.arg != self.out: self._emit(RKValue(self.out, dtype, self.count, RKLayout.INT16), result, result, _EW_CFG[Ops.MAX])
     elif dtype is dtypes.uchar and result.layout is RKLayout.INT16:
-      self.terminal_gathers.append(_int16_low_bytes(result.arg, self.out_param.arg.slot, self.count))
+      self.mid_gathers.append(_int16_low_bytes(result.arg, self.out_param.arg.slot, self.count))
     elif dtype is dtypes.bool and result.layout is RKLayout.BOOL_MASK:
       tiles = self._scratch(dtypes.int, RKLayout.INT32, _int32_tiles_bytes(self.count))
       self.ew_ops.append(RKEWOp(self.out, result.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX],
         stateful=True, int32_output=True, bool_output=True))
     elif dtype is dtypes.bool and result.layout is RKLayout.BOOL_INT16:
-      self.terminal_gathers.append(_int16_low_bytes(result.arg, self.out_param.arg.slot, self.count))
+      self.mid_gathers.append(_int16_low_bytes(result.arg, self.out_param.arg.slot, self.count))
     elif dtype is dtypes.int and result.layout is RKLayout.INT32:
       if result.arg != self.out:
-        self.terminal_gathers.append(RKGather(result.arg.index, self.out_param.arg.slot, self.count,
+        self.mid_gathers.append(RKGather(result.arg.index, self.out_param.arg.slot, self.count,
           base=result.arg.addend//4, axes=((1, self.count, 1),), dst_kind=RKBufferKind.ARG,
           src_kind=result.arg.kind, itemsize=4))
     elif dtype is dtypes.int and result.layout is RKLayout.INT_FP16: self._widen_exact_int(result)
@@ -3716,7 +3706,8 @@ class RKContext:
       by_slot = {slot:bits for bits,slot in self.constants.items()}
       constants = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot)+1))
     image = RKImage(tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops),
-                    mid_gathers=tuple(self.mid_gathers)+tuple(replace(gather, after=len(self.ew_ops)) for gather in self.terminal_gathers),
+                    mid_gathers=tuple(replace(gather, after=len(self.ew_ops)) if gather.after < 0 else gather
+                                      for gather in self.mid_gathers),
                     host_gathers=tuple(self.host_gathers))
     return _reuse_linear_scratch(image, self.constants)
 
