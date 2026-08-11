@@ -2901,3 +2901,26 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 137. Collapse and accelerate the physical EW record — complete
+
+- Profiling the remaining slowest unit case showed that its 3,951 ordinary MUL/ADD stages spent 69 ms under cProfile
+  in `decode_image()`. The 40-byte EW record was decoded with three struct formats and encoded with three packs even
+  though it is one contiguous physical ABI record. Replaced the fragments with one authoritative struct.
+- Decode now reuses the two canonical `RKBufferKind` instances rather than performing 11,853 enum constructions for
+  that image. The unsigned-byte flags field also made its `op_flags & ~0xff` validation dead code, so it was deleted.
+- Controlled alternating measurements on the slowest 163,352-byte image improved median decode from 0.031153 to
+  0.024846 seconds (20.2%) and encode from 0.007261 to 0.005462 seconds (24.8%). The complete image remained
+  byte-identical. The math-recipe guard now scans one shared UOp DAG instead of separately traversing every term.
+- Renderer executable size fell from 4,526 to 4,522 lines. From the 10,233-line baseline, 5,711 lines are gone (55.8%);
+  runtime remains 460 lines. The non-affine case remains literal UOp execution; no graph dialect or CPU numeric
+  semantics were introduced.
+
+Verification:
+
+- Old/current slowest-case RKImage: 3,951 stages and 163,352/163,352 serialized bytes identical.
+- Old/current EW record matrix: 6/6 flag, buffer-kind, and addend variants; 338/338 bytes identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.94 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

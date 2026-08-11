@@ -18,14 +18,14 @@ RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 36
 _HEADER = struct.Struct("<4sHHHHHIII")  # magic/version, scratch/gather/host counts, ops/constants, mid-gather count
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<I"), struct.Struct("<HHIBBBBBiIIii"), struct.Struct("<IIi")
 _HOST_ADDRESS = struct.Struct("<BBBBBHHHIIIIIiiiiii")
-_EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
-_EWOP2 = struct.Struct("<II")  # count, ew_cfg
+_EWOP = struct.Struct("<BBHIIIIIIiii")  # buffer fields, count/config, byte addends
 _ITEM_FORMAT = {1:"B", 2:"H", 4:"I"}
 _RKIMAGE_U16_MAX = (1 << 16) - 1
 
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 class RKLayout(IntEnum): FP16 = 0; INT16 = 1; BOOL_MASK = 2; INT32 = 3; BOOL_INT16 = 4; INT_FP16 = 5
 class RKExecutionClass(IntEnum): NATIVE = 0; HOST_ADDRESS = 1
+_BUFFER_KINDS = RKBufferKind.ARG, RKBufferKind.SCRATCH
 
 @dataclass(frozen=True, slots=True)
 class RKArg: kind: RKBufferKind; index: int; addend: int = 0
@@ -216,9 +216,8 @@ def encode_image(image:RKImage) -> bytes:
       raise ValueError("conflicting integer precision")
     op_flags = (int(op.submit_barrier) | int(op.compare)<<1 | int(op.stateful)<<2 | int(op.int32_output)<<3 |
                 int(op.int32_input)<<4 | int(op.bool_output)<<5 | int(op.int16_output)<<6 | int(op.int16_input)<<7)
-    out += _EWOP.pack(int(op.dst.kind), op_flags, op.dst.index,
-                      int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
-    out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
+    out += _EWOP.pack(int(op.dst.kind), op_flags, op.dst.index, int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index,
+                      op.count, op.ew_cfg, op.dst.addend, op.lhs.addend, op.rhs.addend)
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
@@ -239,7 +238,7 @@ def decode_image(blob:bytes) -> RKImage:
     elif kind in (1, 3): offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
     else: axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
     gathers.append(RKGather(src_index, dst_index, count, base if kind == 0 else 0, axes, offsets, fill_bits, values, kind == 3,
-      dst_stride, dst_addend, RKBufferKind(dst_kind), itemsize, RKBufferKind(src_kind), after))
+      dst_stride, dst_addend, _BUFFER_KINDS[dst_kind], itemsize, _BUFFER_KINDS[src_kind], after))
   host_addresses:list[RKHostAddress] = []
   for _ in range(nhost_gather+nhost_scatter):
     src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \
@@ -249,20 +248,17 @@ def decode_image(blob:bytes) -> RKImage:
     if (src_kind not in (0, 1) or index_kind not in (0, 1) or dst_kind not in (0, 1) or itemsize not in _ITEM_FORMAT or
         index_itemsize not in (2, 4) or min(count, src_count, dst_count, index_limit) < 0):
       raise ValueError("invalid RKHostAddress")
-    host_addresses.append(RKHostAddress(RKArg(RKBufferKind(src_kind), src_index, src_addend),
-      RKArg(RKBufferKind(index_kind), index_index, index_addend), RKArg(RKBufferKind(dst_kind), dst_index, dst_addend),
+    host_addresses.append(RKHostAddress(RKArg(_BUFFER_KINDS[src_kind], src_index, src_addend),
+      RKArg(_BUFFER_KINDS[index_kind], index_index, index_addend), RKArg(_BUFFER_KINDS[dst_kind], dst_index, dst_addend),
       count, src_count, dst_count, itemsize, index_itemsize, fill_bits, index_limit, base, index_scale, lane_stride))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
-    dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
+    dk, op_flags, di, lk, li, rk_, ri, count, ew_cfg, da, la, ra = _EWOP.unpack_from(blob, off); off += _EWOP.size
     int16_to_int32 = op_flags & 0x88 == 0x88 and not op_flags & 0x50
-    if op_flags & ~0xff or op_flags & 0x20 and not op_flags & 0x08 or \
+    if dk not in (0, 1) or lk not in (0, 1) or rk_ not in (0, 1) or op_flags & 0x20 and not op_flags & 0x08 or \
        op_flags & 0xc0 and op_flags & 0x18 and not int16_to_int32:
       raise ValueError("invalid RKEWOp flags")
-    count, ew_cfg = _EWOP2.unpack_from(blob, off); off += _EWOP2.size
-    da, la, ra = struct.unpack_from("<iii", blob, off); off += 12
-    ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
-                         RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg,
+    ew_ops.append(RKEWOp(RKArg(_BUFFER_KINDS[dk], di, da), RKArg(_BUFFER_KINDS[lk], li, la), RKArg(_BUFFER_KINDS[rk_], ri, ra), count, ew_cfg,
                          bool(op_flags & 1), bool(op_flags & 2), bool(op_flags & 4), bool(op_flags & 8), bool(op_flags & 16),
                          bool(op_flags & 32), bool(op_flags & 64), bool(op_flags & 128)))
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
@@ -2573,7 +2569,7 @@ def _accurate_add_recipe(u:UOp) -> UOp:
       terms.extend(_fp32_add_terms(x.src[0]))
     else: terms.append(x)
   if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
-  if any(any(node.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) for node in term.toposort()) for term in terms):
+  if any(node.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) for node in UOp(Ops.SINK, src=tuple(terms)).toposort()):
     raise _RKGenericReject
   return _precise_mul_sum(terms)
 
