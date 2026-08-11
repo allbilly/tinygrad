@@ -1077,7 +1077,7 @@ class TestRockchipBooleanReductionOps(unittest.TestCase):
     self._check("all", values, axis=(1,2))
 
   def test_all_large(self):
-    with Context(DEV="ROCKCHIP:BOOL"): _test_ops.TestOps.test_all_large(self)
+    _test_ops.TestOps.test_all_large(self)
   test_any_zero_axis = _test_ops.TestOps.test_any_zero_axis
   test_all_zero_axis = _test_ops.TestOps.test_all_zero_axis
 

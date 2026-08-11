@@ -1094,3 +1094,22 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 49. Delete scalar loop boolean reduction recovery — complete
+
+- Disconnected both pre-generic boolean reduction handlers. Ordinary scalar/axis `any` and `all` passed through generic
+  RANGE/local UOps, proving the scalar loop recognizer and its integer-predicate image were superseded.
+- Retained the grouped boolean structural executor after `test_all_large` demonstrated its distinct SPECIAL/BARRIER/IF
+  program is not yet accepted generically. This preserves a proven semantic boundary instead of deleting required code.
+- Removed the stale `ROCKCHIP:BOOL` test selector left after milestone 44 deleted the alternate renderer. The large test
+  now exercises the sole canonical Rockchip renderer and passes through the retained grouped executor.
+- Reduced the renderer from 5,254 to 5,208 executable lines, another 46 lines. From the 10,233-line pre-deletion
+  baseline, 5,025 executable lines are gone (49.1%). The physical renderer diff is 2 insertions and 50 deletions;
+  runtime remains 488 executable lines.
+
+Verification:
+
+- Strict logical-predicate and boolean-reduction gate: 11 passed in 13.54s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
