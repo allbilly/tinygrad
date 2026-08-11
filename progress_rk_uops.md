@@ -555,3 +555,36 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 60 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 30. Dependent scalar extrema through generic structural UOps — complete
+
+- Generalized scalar local definitions from one `RANGE` to an ordered tuple of nested ranges. The same structural
+  executor now interprets multiple dependent local buffers, recursively materializes their dependencies, and leaves
+  mixed-use local loads for semantic execution instead of forcing them through the address-only evaluator.
+- Added a bounded vectorization rule for two dependent scalar `MAX` accumulators. It validates the actual local
+  `LOAD`/`STORE`, comparison, cast, coordinate, and affine-output UOps, materializes the candidate expression through
+  the ordinary typed executor, and then performs the two physical reductions. It does not identify softmax, argmax,
+  or another tensor operation.
+- Preserved true UOp arity and dependency semantics across the nested 45-by-65 and flat 2,925-iteration forms emitted
+  by Tinygrad. Both forms stay under RKImage's 16-bit stage fields without expanding the two local loops into a
+  44,000-node expression and a 400,000-stage image.
+- Gave one-lane physical reductions a 64-byte-spaced scratch ABI. The DPU writes an aligned scalar footprint even when
+  the semantic stage count is one, so reducing contiguous two-byte lanes corrupts neighbors. Static gathers now space
+  the candidates before the FP16 maximum and the INT16 coordinate maximum.
+- Made embedded `CAST(bool -> int)` widen through the canonical `BOOL_INT16` ABI, and implemented embedded INT32
+  bitwise-not as four exact raw-byte `255 - byte` stages followed by explicit repacking. This covers the ordinary UOps
+  used by arg-extrema without relying on saturating signed INT32 subtraction at `INT32_MIN`.
+- Reset the NPU once when a Rockchip device is opened. Precision state survives process exit, so initializing only the
+  software mode flag produced nondeterministic first-program results even though the hardware health check passed.
+- Added host-independent regressions for embedded exact INT32 not and the dependent scalar-local extrema structure.
+
+Verification:
+
+- Strict `TestRockchipArgExtremaOps`: 3 passed in 7.45s.
+- Strict `TestRockchipArgExtremaOps::test_softmax_argmax`: 1 passed in 35.43s, covering both softmax axes.
+- The verified strict prefix through collection index 193 is now 188 passed and 6 skipped; 251 collected tests remain
+  to be censused in strict mode.
+- Independent RK3588 health check: all ADD/MUL/SUB/MAX/NEG/FDIV sizes through 131,072 lanes passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 62 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

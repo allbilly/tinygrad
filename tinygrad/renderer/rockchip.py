@@ -8020,8 +8020,22 @@ class RKContext:
       dtype = u.dtype.scalar()
       layout = RKLayout.INT16 if dtype is dtypes.int16 else self.int_layout if dtype is dtypes.int else None
       if layout is None: raise _RKGenericReject
-      lhs, rhs = self._constant(UOp.const(-1, dtype)), self.lower(source)
+      rhs = self.lower(source)
       if rhs.layout is not layout: raise _RKGenericReject
+      if layout is RKLayout.INT32:
+        components = self._int32_bytes(rhs)
+        const255 = self._constant(UOp.const(255, dtypes.int16))
+        inverted = tuple(self._emit(self._scratch(dtypes.int16, RKLayout.INT16), const255, component, _EW_CFG[Ops.SUB])
+                         for component in components)
+        result = self._scratch(dtypes.int, RKLayout.INT32)
+        pack_after = len(self.ew_ops)
+        for byte,component in enumerate(inverted):
+          self.mid_gathers.append(RKGather(component.arg.index, result.arg.index, self.count,
+            base=component.arg.addend, axes=((1, self.count, 2),), dst_stride=4, dst_addend=byte,
+            src_kind=component.arg.kind, itemsize=1, after=pack_after))
+        self.int32_components[result.arg] = inverted
+        return result
+      lhs = self._constant(UOp.const(-1, dtype))
       return self._emit(self._dst(u, dtype, layout), lhs, rhs, _EW_CFG[Ops.SUB])
     raise _RKGenericReject
 
@@ -8387,10 +8401,13 @@ class RKContext:
     return self._raw_where(u, selector, yes, no)
 
   def _widen_int16(self, u:UOp, source:RKValue) -> RKValue:
-    if u is not self.root or self.out_param.dtype.scalar() is not dtypes.int or source.layout is not RKLayout.INT16:
+    if source.layout not in (RKLayout.INT16, RKLayout.BOOL_INT16) or \
+       (u is not self.root and self.int_layout is not RKLayout.INT32) or \
+       (u is self.root and self.out_param.dtype.scalar() is not dtypes.int):
       raise _RKGenericReject
     zero = self._constant(UOp.const(0, dtypes.int16))
-    value = RKValue(self.out, dtypes.int, self.count, RKLayout.INT32)
+    value = RKValue(self.out if u is self.root else self._scratch(dtypes.int, RKLayout.INT32).arg,
+                    dtypes.int, self.count, RKLayout.INT32)
     self.ew_ops.append(RKEWOp(value.arg, source.arg, zero.arg, self.count, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
     return value
 
@@ -8654,7 +8671,35 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   local_loads = [load for u in root.toposort() if (load:=_local_load(u)) is not None]
   buffers = {_local_buffer(load) for load in local_loads}
   if not local_loads: return root
-  if len(buffers) != 1 or (buffer:=next(iter(buffers))) is None: raise _RKGenericReject
+  if None in buffers: raise _RKGenericReject
+  typed_buffers = typing_cast(set[UOp], buffers)
+  if len(typed_buffers) > 1:
+    definitions = _static_local_defs(uops, typed_buffers)
+    expanded:dict[UOp, UOp] = {}
+    active:set[UOp] = set()
+    def expand_dependencies(expr:UOp, owner:UOp) -> UOp:
+      substitutions = {load:expand_buffer(buffer) for node in expr.toposort() if (load:=_local_load(node)) is not None and
+                       (buffer:=_local_buffer(load)) is not None and buffer is not owner}
+      return _substitute_static_ranges(expr, substitutions)
+    def expand_buffer(buffer:UOp) -> UOp:
+      if buffer in expanded: return expanded[buffer]
+      if buffer in active: raise _RKGenericReject
+      active.add(buffer)
+      definition = definitions[buffer]
+      if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
+                                     for loop in definition.loops):
+        raise _RKGenericReject
+      terms = [expand_dependencies(definition.initial, buffer)]
+      for env in _iter_selected_range_env(list(definition.loops)):
+        term = _substitute_static_ranges(definition.term, {loop:loop.const_like(env[loop]) for loop in definition.loops})
+        terms.append(expand_dependencies(term, buffer))
+      expanded[buffer] = _structural_reduce(definition.update_op, buffer.dtype, terms)
+      active.remove(buffer)
+      if len(expanded[buffer].toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
+      return expanded[buffer]
+    substitutions = {load:expand_buffer(typing_cast(UOp, _local_buffer(load))) for load in local_loads}
+    return _substitute_static_ranges(root, substitutions)
+  buffer = next(iter(typed_buffers))
   stores = [u for u in uops if u.op is Ops.STORE and _local_buffer(u) is buffer]
   out_ranges = set(_index_ranges(output[3]))
   updates:list[tuple[UOp, UOp, list[UOp]]] = []
@@ -8684,7 +8729,7 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
 
 @dataclass(frozen=True)
 class _RKStaticLocalDef:
-  initial:UOp; update_op:Ops; term:UOp; loop:UOp
+  initial:UOp; update_op:Ops; term:UOp; loops:tuple[UOp, ...]
 
 def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticLocalDef]:
   """Parse scalar local accumulators without assigning tensor-operation meaning to their loops."""
@@ -8693,7 +8738,7 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
     if buffer.src[0].op is not Ops.CONST or int(buffer.src[0].arg) != 1: raise _RKGenericReject
     stores = [u for u in uops if u.op is Ops.STORE and _local_buffer(u) is buffer]
     initializers:list[UOp] = []
-    updates:list[tuple[Ops, UOp, UOp]] = []
+    updates:list[tuple[Ops, UOp, tuple[UOp, ...]]] = []
     for store in stores:
       value = _strip_cast(store.src[1])
       accumulator = [(i, _local_load(src)) for i,src in enumerate(value.src)] if value.op in (Ops.ADD, Ops.MAX, Ops.MUL) else []
@@ -8703,9 +8748,9 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
         if any(_local_buffer(load) is buffer for node in term.toposort() if (load:=_local_load(node)) is not None):
           raise _RKGenericReject
         base = store.src[0].src[0] if store.src and store.src[0].op is Ops.INDEX else None
-        loops = [src for src in base.src[1:] if src.op is Ops.RANGE] if base is not None and base.op is Ops.AFTER else []
-        if len(loops) != 1: raise _RKGenericReject
-        updates.append((value.op, term, loops[0]))
+        loops = tuple(src for src in base.src[1:] if src.op is Ops.RANGE) if base is not None and base.op is Ops.AFTER else ()
+        if not loops: raise _RKGenericReject
+        updates.append((value.op, term, loops))
       elif not any(_local_buffer(load) is buffer for node in value.toposort() if (load:=_local_load(node)) is not None):
         initializers.append(store.src[1])
     if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
@@ -8722,7 +8767,7 @@ def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dic
   if not global_loads: return {}
   covered = {load for node in global_loads for expr in (node.src[0].src[1], node.src[2] if len(node.src) > 2 else UOp.const(True, dtypes.bool))
              for x in expr.toposort() if (load:=_local_load(x)) is not None}
-  if covered != local_loads: raise _RKGenericReject
+  if covered != local_loads: return {}
   buffers = {_local_buffer(load) for load in local_loads}
   if None in buffers: raise _RKGenericReject
   definitions = _static_local_defs(uops, typing_cast(set[UOp], buffers))
@@ -8741,7 +8786,7 @@ def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dic
     if buffer in visiting: raise _RKGenericReject
     visiting.add(buffer)
     definition = definitions[buffer]
-    result = (semantic_ranges(definition.initial, buffer) | semantic_ranges(definition.term, buffer)) - {definition.loop}
+    result = (semantic_ranges(definition.initial, buffer) | semantic_ranges(definition.term, buffer)) - set(definition.loops)
     visiting.remove(buffer); free_cache[buffer] = result
     return result
   for buffer in definitions: free_ranges(buffer)
@@ -8784,14 +8829,15 @@ def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dic
     if cacheable and key in local_cache: return local_cache[key]
     if buffer in active: raise _RKGenericReject
     definition = definitions[buffer]
-    if definition.loop.src[0].op is not Ops.CONST or not 0 <= (bound:=int(definition.loop.src[0].arg)) <= _MAX_GENERIC_UNROLL:
+    if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
+                                   for loop in definition.loops):
       raise _RKGenericReject
     active.add(buffer)
     accumulator = evaluate(definition.initial, env)
-    for i in range(bound):
+    for loop_env in _iter_selected_range_env(list(definition.loops)):
       budget[0] -= 1
       if budget[0] < 0: raise _RKGenericReject
-      term = evaluate(definition.term, {**env, definition.loop:i})
+      term = evaluate(definition.term, {**env, **loop_env})
       accumulator = binary(definition.update_op, buffer.dtype, accumulator, term)
     active.remove(buffer)
     if cacheable: local_cache[key] = accumulator
@@ -8831,6 +8877,154 @@ def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dic
       index = np.where(gate, index, -1)
     offsets[load] = tuple(int(value) for value in index[order])
   return offsets
+
+def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> RKImage|None:
+  """Vectorize two dependent scalar local MAX accumulators without assigning meaning to their tensor source."""
+  _, out_param, count, _, root = output
+  if count != 1 or out_param.dtype.scalar() is not dtypes.int: return None
+  buffers = {buffer for u in uops if u.op is Ops.BUFFER and (buffer:=_local_buffer(u)) is not None}
+  try: definitions = _static_local_defs(uops, buffers)
+  except _RKGenericReject: return None
+  value_buffers = [buffer for buffer,definition in definitions.items() if buffer.dtype.scalar() is dtypes.half and
+                   definition.update_op is Ops.MAX]
+  index_buffers = [buffer for buffer,definition in definitions.items() if buffer.dtype.scalar() is dtypes.int and
+                   definition.update_op is Ops.MAX]
+  if len(definitions) != 2 or len(value_buffers) != 1 or len(index_buffers) != 1: return None
+  value_buffer, index_buffer = value_buffers[0], index_buffers[0]
+  value_def, index_def = definitions[value_buffer], definitions[index_buffer]
+  if (value_def.initial.op is not Ops.CONST or not math.isinf(float(value_def.initial.arg)) or float(value_def.initial.arg) >= 0 or
+      index_def.initial.op is not Ops.CONST or int(index_def.initial.arg) != dtypes.int.min or
+      len(value_def.loops) != len(index_def.loops) or not value_def.loops): return None
+  extents = tuple(int(loop.src[0].arg) for loop in value_def.loops if loop.src[0].op is Ops.CONST)
+  if len(extents) != len(value_def.loops) or any(not 1 <= extent <= min(32767, _MAX_EW_ELEMS_FP16) for extent in extents): return None
+  total = math.prod(extents)
+  if not 2 <= total <= min(32767, _MAX_EW_ELEMS_FP16): return None
+  if tuple(int(loop.src[0].arg) for loop in index_def.loops) != extents: return None
+
+  weighted_terms = _flatten_binary(index_def.term, Ops.MUL)
+  casts = [term for term in weighted_terms if term.op is Ops.CAST and term.dtype.scalar() is dtypes.int and
+           term.src[0].dtype.scalar() is dtypes.bool]
+  if len(casts) != 1 or len(weighted_terms) != 2: return None
+  coordinate = weighted_terms[1 if weighted_terms[0] is casts[0] else 0]
+  predicate = casts[0].src[0]
+  inverted = False
+  if predicate.op is Ops.CMPNE:
+    for inner,marker in (predicate.src, predicate.src[::-1]):
+      if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg):
+        predicate, inverted = inner, True
+        break
+  if not inverted or predicate.op is not Ops.CMPNE or len(predicate.src) != 2 or \
+     any(src.dtype.scalar() is not dtypes.half for src in predicate.src): return None
+  current = next((src for src in predicate.src if (load:=_local_load(src)) is not None and
+                  _local_buffer(load) is value_buffer), None)
+  candidate = next((src for src in predicate.src if src is not current), None)
+  if current is None or candidate is None: return None
+  loop_map = dict(zip(index_def.loops, value_def.loops))
+  mapped_candidate = _substitute_static_ranges(candidate, loop_map)
+  if _strip_cast(mapped_candidate).key != _strip_cast(value_def.term).key: return None
+  try:
+    index_envs = _iter_selected_range_env(list(index_def.loops))
+    coordinates = tuple(_eval_int(coordinate, env) for env in index_envs)
+  except RuntimeError: return None
+  if len(coordinates) != total or any(not 0 <= value <= 32767 for value in coordinates): return None
+
+  def semantic_local_loads(expr:UOp) -> list[UOp]:
+    if (load:=_local_load(expr)) is not None: return [load]
+    return [load for src in expr.src for load in semantic_local_loads(src)]
+  final_loads = list(dict.fromkeys(load for load in semantic_local_loads(root) if _local_buffer(load) is index_buffer))
+  if len(final_loads) != 1: return None
+  final_load = final_loads[0]
+  try: mapped_outputs = tuple(_eval_int(root.substitute({final_load:final_load.const_like(value)}), {}) for value in coordinates)
+  except RuntimeError: return None
+  if len(coordinates) < 2: return None
+  second = next((i for i in range(1, len(coordinates)) if coordinates[i] != coordinates[0]), None)
+  if second is None: return None
+  coordinate_delta, output_delta = coordinates[second]-coordinates[0], mapped_outputs[second]-mapped_outputs[0]
+  if output_delta % coordinate_delta: return None
+  slope = output_delta//coordinate_delta
+  baseline = mapped_outputs[0]-slope*coordinates[0]
+  if any(result != baseline+slope*value for value,result in zip(coordinates, mapped_outputs)) or \
+     not all(-32768 <= value <= 32767 for value in (*mapped_outputs, slope, baseline)): return None
+
+  global_slots = [u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None]
+  fake_slot = max(global_slots, default=out_param.arg.slot)+1
+  fake_out = UOp.param(fake_slot, dtypes.half, (total,))
+  linear = UOp.const(0, dtypes.int)
+  for axis,loop in enumerate(value_def.loops):
+    stride = math.prod(extents[axis+1:])
+    linear = linear.alu(Ops.ADD, loop.alu(Ops.MUL, UOp.const(stride, dtypes.int)))
+  fake_store = fake_out.index(linear).store(value_def.term).end(*value_def.loops)
+  child = _lower_uop_program(list(fake_store.sink().toposort()), vectorize_reductions=False)
+  if child is None or child.fill is not None or child.host_gathers or child.host_scatters: return None
+
+  scratch = list(child.scratch)
+  def allocate(lanes:int=total) -> RKArg:
+    scratch.append(RKScratch(_scratch_bytes(lanes)))
+    return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
+  values = allocate()
+  def map_arg(arg:RKArg) -> RKArg:
+    return RKArg(RKBufferKind.SCRATCH, values.index, arg.addend) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
+  def map_gather(gather:RKGather, *, after:int|None=None) -> RKGather:
+    src, dst = map_arg(RKArg(gather.src_kind, gather.src_index)), map_arg(RKArg(gather.dst_kind, gather.dst_index))
+    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index,
+                   after=gather.after if after is None else after)
+  ops = [replace(op, dst=map_arg(op.dst), lhs=map_arg(op.lhs), rhs=map_arg(op.rhs)) for op in child.ew_ops]
+  gathers = [map_gather(gather) for gather in child.gathers]
+  mid = [map_gather(gather) for gather in child.mid_gathers]
+  mid.extend(map_gather(gather, after=len(ops)) for gather in child.post_gathers)
+
+  scalar_stride = _reduction_stride(1)
+  reduction_values = allocate(total*scalar_stride//2)
+  mid.append(RKGather(values.index, reduction_values.index, total, axes=((1, total, 1),), dst_stride=scalar_stride//2,
+                      src_kind=RKBufferKind.SCRATCH, after=len(ops)))
+  best = _reduce_rows(ops, [RKArg(reduction_values.kind, reduction_values.index, lane*scalar_stride) for lane in range(total)],
+                      1, _EW_CFG[Ops.MAX])
+  equality_after = len(ops)
+  best_values = allocate()
+  mid.append(RKGather(best.index, best_values.index, total, offsets=(best.addend//2,)*total,
+                      src_kind=RKBufferKind.SCRATCH, after=equality_after))
+  raw = tuple((allocate(), allocate()) for _ in range(2))
+  for source,parts in ((values, raw[0]), (best_values, raw[1])):
+    for byte,part in enumerate(parts):
+      mid.append(RKGather(source.index, part.index, total, base=source.addend+byte, axes=((1, total, 2),), dst_stride=2,
+                          src_kind=RKBufferKind.SCRATCH, itemsize=1, after=equality_after))
+  constants = {number:allocate() for number in (0, 1, 123, 124, 127, 128)}
+  for number,dst in constants.items(): gathers.append(RKGather(out_param.arg.slot, dst.index, total, values=(number,)*total))
+  def alloc() -> RKArg: return allocate()
+  lhs_high,lhs_nan = _fp16_high_and_nan(ops, alloc, raw[0][1], raw[0][0], constants[0], constants[1],
+    constants[123], constants[124], constants[127], constants[128], total)
+  rhs_high,rhs_nan = _fp16_high_and_nan(ops, alloc, raw[1][1], raw[1][0], constants[0], constants[1],
+    constants[123], constants[124], constants[127], constants[128], total)
+  low_equal = _ew_native_int16_eq_mask(ops, alloc, raw[0][0], raw[1][0], constants[1], total)
+  high_equal = _ew_native_int16_eq_mask(ops, alloc, lhs_high, rhs_high, constants[1], total)
+  integer = dict(int16_input=True, int16_output=True)
+  either_nan, numeric, bits_equal, equal = (alloc() for _ in range(4))
+  ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, total, _EW_CFG[Ops.MAX], **integer),
+              RKEWOp(numeric, constants[1], either_nan, total, _EW_CFG[Ops.SUB], **integer),
+              RKEWOp(bits_equal, low_equal, high_equal, total, _EW_CFG[Ops.MUL], **integer),
+              RKEWOp(equal, bits_equal, numeric, total, _EW_CFG[Ops.MUL], **integer)))
+  coordinate_values, weighted = allocate(), allocate()
+  gathers.append(RKGather(out_param.arg.slot, coordinate_values.index, total, values=coordinates))
+  ops.append(RKEWOp(weighted, equal, coordinate_values, total, _EW_CFG[Ops.MUL], **integer))
+  weighted_spaced = allocate(total*scalar_stride//2)
+  mid.append(RKGather(weighted.index, weighted_spaced.index, total, axes=((1, total, 1),), dst_stride=scalar_stride//2,
+                      src_kind=RKBufferKind.SCRATCH, after=len(ops)))
+  selected = _reduce_rows(ops, [RKArg(weighted_spaced.kind, weighted_spaced.index, lane*scalar_stride) for lane in range(total)],
+                          1, _EW_CFG[Ops.MAX], int16=True)
+  result = selected
+  if slope != 1:
+    scale = allocate(1); gathers.append(RKGather(out_param.arg.slot, scale.index, 1, values=(_int16_bits(slope),)))
+    scaled = allocate(1); ops.append(RKEWOp(scaled, result, scale, 1, _EW_CFG[Ops.MUL], **integer)); result = scaled
+  if baseline:
+    offset = allocate(1); gathers.append(RKGather(out_param.arg.slot, offset.index, 1, values=(_int16_bits(baseline),)))
+    translated = allocate(1); ops.append(RKEWOp(translated, result, offset, 1, _EW_CFG[Ops.ADD], **integer)); result = translated
+  zero = allocate(1); gathers.append(RKGather(out_param.arg.slot, zero.index, 1, values=(0,)))
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, zero, 1, _EW_CFG[Ops.ADD],
+                    int16_input=True, int32_output=True))
+  image = RKImage(RKTarget.RK3588, tuple(scratch), child.constants, gathers=tuple(gathers), ew_ops=tuple(ops),
+                  mid_gathers=tuple(mid), gather_after=child.gather_after)
+  return image if all(len(items) <= _RKIMAGE_U16_MAX for items in
+                      (image.scratch, image.gathers, image.ew_ops, image.mid_gathers)) else None
 
 def _lower_host_scatter(uops:list[UOp]) -> RKImage|None:
   """Lower a direct dynamic STORE as raw last-writer host address materialization."""
@@ -8872,6 +9066,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if ((gated_load:=_output_store(uops, dtype)) is not None and
         (image:=_lower_dynamic_load_with_bool_total_gate(gated_load, dtype)) is not None): return image
   if (indexed:=dynamic_index_accumulation(uops)) is not None: return indexed
+  if vectorize_reductions and (local_output:=_output_store(uops, dtypes.int, allow_local=True)) is not None and \
+     (local_extrema:=_lower_vectorized_scalar_local_extrema(uops, local_output)) is not None: return local_extrema
   storage_uops:list[UOp]|None = None
   if any(u.dtype.scalar() is dtypes.float for u in uops):
     sink = next((u for u in uops if u.op is Ops.SINK), None)

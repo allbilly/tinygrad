@@ -447,6 +447,35 @@ def test_static_local_accumulator_is_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
 
 
+def test_dependent_scalar_local_extrema_is_vectorized_from_uop_structure():
+  count = 4
+  out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))
+  value_buffer = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG)
+  value_init = value_buffer.index(0).store(UOp.const(-math.inf, dtypes.half))
+  value_axis = UOp.range(count, 0, AxisType.REDUCE)
+  value_ptr = value_buffer.after(value_init, value_axis).index(0)
+  value_candidate = source.index(value_axis).load()
+  value_update = value_ptr.store(value_ptr.load().maximum(value_candidate))
+  value_end = value_update.end(value_axis)
+  best = value_buffer.after(value_end).index(0).load()
+
+  index_buffer = UOp.placeholder((1,), dtypes.int, 1, addrspace=AddrSpace.REG)
+  index_init = index_buffer.after(value_end).index(0).store(UOp.const(dtypes.int.min, dtypes.int))
+  index_axis = UOp.range(count, 1, AxisType.REDUCE, src=(value_end,))
+  index_ptr = index_buffer.after(index_init, index_axis).index(0)
+  index_candidate = source.index(index_axis).load()
+  equal = (index_candidate != best) != UOp.const(True, dtypes.bool)
+  coordinate = UOp.const(count, dtypes.int)-index_axis
+  index_update = index_ptr.store(index_ptr.load().maximum(equal.cast(dtypes.int)*coordinate))
+  index_end = index_update.end(index_axis)
+  selected = index_buffer.after(index_end).index(0).load()
+  output = out.index(0).store(UOp.const(count, dtypes.int)-selected)
+
+  image = _lower_uop_program(list(UOp.sink(value_init, value_update, index_init, index_update, output).toposort()))
+  assert image is not None and len(image.ew_ops) < 100 and len(image.mid_gathers) == 7
+  assert any(gather.dst_stride == 32 for gather in image.mid_gathers)
+
+
 def test_nested_static_local_accumulators_materialize_load_addresses():
   count = 4
   out, source = UOp.param(0, dtypes.half, (count,)), UOp.param(1, dtypes.half, (count,))
@@ -533,6 +562,14 @@ def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   assert image.post_gathers[0].count == 16 and all(op.int16_input and op.int16_output for op in image.ew_ops)
 
 
+def test_embedded_int32_not_preserves_all_raw_bytes_before_wide_arithmetic():
+  source = UOp.param(1, dtypes.int, (4,))
+  image = _lower_uop_program(_program(dtypes.int, lambda i:
+    UOp(Ops.XOR, dtypes.int, src=(source.index(i).load(), UOp.const(-1, dtypes.int)))+1))
+  assert image is not None and len(image.ew_ops) == 6 and len(image.mid_gathers) == 8
+  assert sum(op.int32_input and op.int32_output for op in image.ew_ops) == 2
+
+
 def test_int32_shift_uop_executes_with_byte_plane_barrel_recipe():
   source = UOp.param(1, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load() << UOp.const(2, dtypes.int)))
@@ -570,8 +607,8 @@ def test_dependent_reduction_range_preserves_vector_output_axis():
 
 
 def test_static_structural_expansion_is_bounded():
-  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (513,))
-  lane, axis = UOp.range(1, 0), UOp.range(513, 1, AxisType.REDUCE)
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (1025,))
+  lane, axis = UOp.range(1, 0), UOp.range(1025, 1, AxisType.REDUCE)
   reduced = UOp(Ops.REDUCE, dtypes.half, src=(source.index(axis).load(), axis), arg=(Ops.ADD,))
   uops = list(out.index(lane).store(reduced).end(lane, axis).sink().toposort())
   assert _lower_uop_program(uops) is None
