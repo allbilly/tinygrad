@@ -1148,11 +1148,19 @@ def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   store, update, reduce_range, groups = loop.store, loop.update, loop.reduce_range, loop.groups
   if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None: return None
   product = _strip_cast(update.src[1 if update.src[0] is acc else 0])
-  if product.op is not Ops.MUL or product.dtype.scalar() is not dtypes.half: return None
+  if product.op is not Ops.MUL or product.arg is not None or product.dtype.scalar() is not dtypes.half: return None
   for operand in product.src:
     operand = _strip_cast(operand)
     param = _root_param(operand.src[0]) if operand.op is Ops.LOAD and operand.src and operand.src[0].op is Ops.INDEX else None
     if param is None or operand.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST: return None
+  terms = [product.substitute({reduce_range:reduce_range.const_like(r)}) for r in range(groups)]
+  if groups >= _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS:
+    try: return lower_ew([store.replace(src=(store.src[0], _precise_mul_sum(terms), *store.src[2:]))])
+    except RuntimeError: pass
+  summed = terms[0]
+  for term in terms[1:]: summed = summed.alu(Ops.ADD, term)
+  precise_store = store.replace(src=(store.src[0], summed, *store.src[2:]))
+  if (precise:=_lower_vectorized_mul_add_reduction(list(UOp(Ops.SINK, src=(precise_store,)).toposort()))) is not None: return precise
   # Materialize bounded dot domains so the arena reduction preserves a real balanced tree instead of a rewritten ADD chain.
   lanes, out_index = loop.rows*groups, store.src[0].src[1]
   if lanes <= _MAX_EW_ELEMS_FP16*(_reduction_stride(1)//2):
@@ -1164,7 +1172,6 @@ def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
     except RuntimeError: mapped = None
     if mapped is not None and (finished:=_finish_mapped_add_reduction(mapped, loop.out.arg.slot, loop.rows, groups, 1.0)) is not None:
       return finished
-  terms = [product.substitute({reduce_range:reduce_range.const_like(r)}) for r in range(groups)]
   while len(terms) > 1:
     terms = [terms[i].alu(Ops.ADD, terms[i+1]) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
   return lower_ew([store.replace(src=(store.src[0], terms[0], *store.src[2:]))])
@@ -1332,9 +1339,11 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   reduce_ops = {u.op for u in update_nodes if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}
   negate_inputs = reduce_ops == {Ops.MUL, Ops.MAX} and any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.half and
                                                             float(u.arg) == -1.0 for u in update_nodes)
+  accumulator = next((x for x in update.src if _local_load(x) is not None), None)
+  term = next((x for x in update.src if x is not accumulator), None)
+  if not negate_inputs and (term is None or _strip_cast(term).op is not Ops.LOAD): return None
   if negate_inputs: reduce_op = Ops.MAX
-  elif len(reduce_ops) == 1: reduce_op = next(iter(reduce_ops))
-  elif not reduce_ops and update.op in (Ops.ADD, Ops.MUL, Ops.MAX): reduce_op = update.op
+  elif update.op in (Ops.ADD, Ops.MUL, Ops.MAX) and reduce_ops in (set(), {update.op}): reduce_op = update.op
   else: return None
   if reduce_op not in _EW_CFG: return None
   try:
@@ -1919,7 +1928,7 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   terms = tuple(_strip_cast(term) for term in _flatten_binary(summed, Ops.ADD))
   groups, lanes = len(terms), rows*len(terms)
   chunk_lanes = _MAX_EW_ELEMS_FP16*(_reduction_stride(1)//2)
-  if groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or groups < 256 and rows <= _MAX_EW_ELEMS_FP16 or \
+  if groups != 8 and (groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or groups < 256 and rows <= _MAX_EW_ELEMS_FP16) or \
      8*_scratch_bytes(lanes)+_scratch_bytes(min(chunk_lanes, lanes)) > _MAX_MAPPED_DOT_SCRATCH_BYTES: return None
 
   parsed:list[tuple[tuple[UOp, RKGather], tuple[UOp, RKGather]]] = []
@@ -1971,16 +1980,21 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
     (RKScratch(_scratch_bytes(min(chunk_lanes, lanes))), *(RKScratch(_scratch_bytes(lanes)) for _ in range(4))),
     struct.pack("<e", 65.0), gathers=gathers, ew_ops=tuple(mapped_ops))
   finished = _finish_mapped_add_reduction(mapped, out.arg.slot, rows, groups*2, post_scale,
-                                           op_barriers=True, compensated_limit=groups*2)
+                                           op_barriers=True, compensated_limit=groups*2, kahan=groups == 8)
   if finished is None: return None
   if bias is not None:
     if bias.op is Ops.LOAD:
       bias_param = _root_param(bias.src[0]) if bias.src and bias.src[0].op is Ops.INDEX else None
-      if bias_param is None or bias_param.src[0].op is not Ops.CONST or int(bias_param.src[0].arg) != rows: return None
+      if bias_param is None or bias_param.src[0].op is not Ops.CONST: return None
       try: bias_offsets = _gather_offsets(out_index, bias.src[0].src[1], bias.src[2] if len(bias.src) > 2 else None, rows)
       except RuntimeError: return None
-      if bias_offsets != tuple(range(rows)): return None
-      bias_arg = RKArg(RKBufferKind.ARG, bias_param.arg.slot)
+      if any(not 0 <= offset < int(bias_param.src[0].arg) for offset in bias_offsets): return None
+      if int(bias_param.src[0].arg) == rows and bias_offsets == tuple(range(rows)):
+        bias_arg = RKArg(RKBufferKind.ARG, bias_param.arg.slot)
+      else:
+        bias_arg = RKArg(RKBufferKind.SCRATCH, len(finished.scratch))
+        finished = replace(finished, scratch=(*finished.scratch, RKScratch(_scratch_bytes(rows))),
+                           gathers=(*finished.gathers, RKGather(bias_param.arg.slot, bias_arg.index, rows, offsets=bias_offsets)))
     else:
       try: values = _static_values(out_index, bias, rows, _fp16_bits)
       except RuntimeError: return None
@@ -9733,9 +9747,11 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
                                         name="rockchip generic storage precision").toposort())
       if (indexed:=dynamic_index_accumulation(storage_uops)) is not None: return indexed
   if vectorize_reductions and (mul_add:=_lower_vectorized_mul_add_reduction(uops)) is not None: return mul_add
-  if vectorize_reductions and (scalar_loop:=_loop_reduction_match(uops)) is not None and not (
-      scalar_loop.post_sqrt or scalar_loop.post_reciprocal or scalar_loop.post_cuberoot) and \
-      (scalar_reduction:=_lower_scalar_loop_reduction(scalar_loop)) is not None: return scalar_reduction
+  if vectorize_reductions and (scalar_loop:=_loop_reduction_match(uops)) is not None:
+    if (dot_reduction:=_lower_dot_loop_reduction(scalar_loop)) is not None: return dot_reduction
+    if not (scalar_loop.post_sqrt or scalar_loop.post_reciprocal or scalar_loop.post_cuberoot) and \
+       (scalar_reduction:=_lower_scalar_loop_reduction(scalar_loop)) is not None:
+      return scalar_reduction
   mapped_loop = _lower_mapped_add_loop_reduction(uops, generic_only=True) if vectorize_reductions else None
   if mapped_loop is not None: return mapped_loop
   if vectorize_reductions and (reduction:=_lower_vectorized_unrolled_add_reduction(uops, generic_only=True)) is not None:

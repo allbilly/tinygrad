@@ -888,3 +888,34 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 42. Clean single-process UOp replay and generic product-reduction precision — complete
+
+- Completed the authoritative single-process replay under `ROCKCHIP_UOPS_ONLY=1`. All 445 collected cases are now
+  accounted for together: 433 passed, 12 explicit backend-contract skips, zero failures, and 154 parameterized
+  subtests passed. There are no remaining unreplayed cases.
+- Used the combined replay to expose deterministic FP16 accumulation gaps that segmented execution had hidden. An
+  eight-term product sum now uses the existing two-product physical expansion with Kahan accumulation, and a static
+  broadcast bias is materialized through the ordinary gather ABI. The biased two-layer convolution passes without a
+  convolution lowerer.
+- Routed structural ADD loops whose semantic term is an ordinary MUL through the generic dot reducer before the plain
+  scalar reducer. Large loop dots expand their bounded product UOps into the existing precise product/add recipe;
+  `broadcastdot` now passes without recognizing matmul.
+- Tightened the plain scalar reduction rule so the accumulator update owns ADD/MUL/MAX semantics and only direct LOAD
+  terms are reduced by that path. Transformed terms such as ABS and nonzero predicates fall through to the generic
+  mapped-term executor. All normalization variants, including `p=1` and `p=0`, now compose correctly.
+- The legacy catalog is still present and deletion has not started. `sz.py` reports 10,233 executable renderer lines
+  and 488 runtime lines, so no line saving is claimed yet. The clean 445-case replay is the safety gate for the next
+  milestone: remove superseded operation-specific paths and measure the actual reduction.
+
+Verification:
+
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP RUN_SLOW=1 ROCKCHIP_UOPS_ONLY=1 .venv/bin/python -m pytest
+  test/backend/test_rockchip.py -q -n0 -x -rs`: 433 passed, 12 skipped, and 154 subtests passed in 1,400.50s.
+- Strict `TestRockchipConvOps::test_biased_conv2d`, `TestRockchipConvOps::test_conv1d`, and
+  `TestRockchipDotOps::test_broadcastdot`: 3 passed and 14 subtests passed in 8.70s.
+- Strict `TestRockchipDotOps` plus `TestRockchipEinsumOps`: 13 passed in 56.34s.
+- Strict `TestRockchipReductionOps`: all 36 methods passed in 100.41s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
