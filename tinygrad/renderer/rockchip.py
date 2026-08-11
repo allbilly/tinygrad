@@ -351,6 +351,7 @@ _EW_CFG = {
   Ops.MAX: _EW_CFG_COMMON | _EW_RELU_BYPASS,
   Ops.FDIV: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_ALU_FDIV,
 }
+_INT16_EW = dict(int16_input=True, int16_output=True)
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _reduction_stride(count:int) -> int: return round_up(count*2, 64)
@@ -1130,41 +1131,39 @@ def _ew_native_int16_eq_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], lhs
                              one:RKArg, lanes:int) -> RKArg:
   """Compare native INT16 lanes whose subtraction is proven not to overflow."""
   diff, magnitude, unequal, equal = (allocate() for _ in range(4))
-  integer = dict(int16_input=True, int16_output=True)
-  ops.extend((RKEWOp(diff, lhs, rhs, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(magnitude, diff, diff, lanes, _EW_CFG_ABS, **integer),
-              RKEWOp(unequal, magnitude, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(equal, one, unequal, lanes, _EW_CFG[Ops.SUB], **integer)))
+  ops.extend((RKEWOp(diff, lhs, rhs, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(magnitude, diff, diff, lanes, _EW_CFG_ABS, **_INT16_EW),
+              RKEWOp(unequal, magnitude, one, lanes, _EW_CFG_MIN, **_INT16_EW),
+              RKEWOp(equal, one, unequal, lanes, _EW_CFG[Ops.SUB], **_INT16_EW)))
   return equal
 
 def _fp16_high_and_nan(ops:list[RKEWOp], allocate:Callable[[], RKArg], high:RKArg, low:RKArg,
                        zero:RKArg, one:RKArg, const123:RKArg, const124:RKArg, const127:RKArg, const128:RKArg,
                        lanes:int) -> tuple[RKArg, RKArg]:
   """Canonicalize signed zero's FP16 high byte and classify NaNs with native INT16 byte arithmetic."""
-  integer = dict(int16_input=True, int16_output=True)
   sign_delta, sign_positive, sign, sign_scale, magnitude = (allocate() for _ in range(5))
-  ops.extend((RKEWOp(sign_delta, high, const127, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(sign_positive, sign_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(sign, sign_positive, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(sign_scale, sign, const128, lanes, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(magnitude, high, sign_scale, lanes, _EW_CFG[Ops.SUB], **integer)))
+  ops.extend((RKEWOp(sign_delta, high, const127, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(sign_positive, sign_delta, zero, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+              RKEWOp(sign, sign_positive, one, lanes, _EW_CFG_MIN, **_INT16_EW),
+              RKEWOp(sign_scale, sign, const128, lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
+              RKEWOp(magnitude, high, sign_scale, lanes, _EW_CFG[Ops.SUB], **_INT16_EW)))
   high_zero = _ew_native_int16_eq_mask(ops, allocate, magnitude, zero, one, lanes)
   low_zero = _ew_native_int16_eq_mask(ops, allocate, low, zero, one, lanes)
   zero_value, zero_sign, canonical = (allocate() for _ in range(3))
   exponent_delta, exponent_positive, exponent_all = (allocate() for _ in range(3))
   mantissa_delta, mantissa_positive, mantissa_high, mantissa_low, mantissa, nan = (allocate() for _ in range(6))
-  ops.extend((RKEWOp(zero_value, high_zero, low_zero, lanes, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(zero_sign, sign_scale, zero_value, lanes, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(canonical, high, zero_sign, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(exponent_delta, magnitude, const123, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(exponent_positive, exponent_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(exponent_all, exponent_positive, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(mantissa_delta, magnitude, const124, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(mantissa_positive, mantissa_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(mantissa_high, mantissa_positive, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(mantissa_low, low, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(mantissa, mantissa_high, mantissa_low, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(nan, exponent_all, mantissa, lanes, _EW_CFG[Ops.MUL], **integer)))
+  ops.extend((RKEWOp(zero_value, high_zero, low_zero, lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
+              RKEWOp(zero_sign, sign_scale, zero_value, lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
+              RKEWOp(canonical, high, zero_sign, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(exponent_delta, magnitude, const123, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(exponent_positive, exponent_delta, zero, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+              RKEWOp(exponent_all, exponent_positive, one, lanes, _EW_CFG_MIN, **_INT16_EW),
+              RKEWOp(mantissa_delta, magnitude, const124, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(mantissa_positive, mantissa_delta, zero, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+              RKEWOp(mantissa_high, mantissa_positive, one, lanes, _EW_CFG_MIN, **_INT16_EW),
+              RKEWOp(mantissa_low, low, one, lanes, _EW_CFG_MIN, **_INT16_EW),
+              RKEWOp(mantissa, mantissa_high, mantissa_low, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+              RKEWOp(nan, exponent_all, mantissa, lanes, _EW_CFG[Ops.MUL], **_INT16_EW)))
   return canonical, nan
 
 
@@ -1315,24 +1314,23 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
     constants[constant_value] = dst = allocate()
     gathers.append(RKGather(sources[0].arg.slot, 0, count, values=(constant_value,)*count,
                             dst_addend=dst.addend//2, itemsize=2))
-  integer = dict(int16_input=True, int16_output=True)
   ops:list[RKEWOp] = []
 
   def clamp_one(value:RKArg) -> RKArg:
     positive, result = allocate(), allocate()
-    ops.extend((RKEWOp(positive, value, constants[0], count, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(result, positive, constants[1], count, _EW_CFG_MIN, **integer)))
+    ops.extend((RKEWOp(positive, value, constants[0], count, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(result, positive, constants[1], count, _EW_CFG_MIN, **_INT16_EW)))
     return result
 
   def positive_over(value:RKArg, threshold:int) -> RKArg:
     delta = allocate()
-    ops.append(RKEWOp(delta, value, constants[threshold], count, _EW_CFG[Ops.SUB], **integer))
+    ops.append(RKEWOp(delta, value, constants[threshold], count, _EW_CFG[Ops.SUB], **_INT16_EW))
     return clamp_one(delta)
 
   def xor_bit(lhs_bit:RKArg, rhs_bit:RKArg) -> RKArg:
     result = allocate()
-    ops.extend((RKEWOp(result, lhs_bit, rhs_bit, count, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(result, result, result, count, _EW_CFG_ABS, **integer)))
+    ops.extend((RKEWOp(result, lhs_bit, rhs_bit, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                RKEWOp(result, result, result, count, _EW_CFG_ABS, **_INT16_EW)))
     return result
 
   def twos_complement(raw:tuple[RKArg, ...], sign:RKArg) -> tuple[RKArg, ...]:
@@ -1340,15 +1338,15 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
     carry, result = sign, []
     for byte in raw:
       doubled, invert_delta, selected, total = allocate(), allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(doubled, byte, byte, count, _EW_CFG[Ops.ADD], **integer),
-                  RKEWOp(invert_delta, constants[255], doubled, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(invert_delta, invert_delta, sign, count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(selected, byte, invert_delta, count, _EW_CFG[Ops.ADD], **integer),
-                  RKEWOp(total, selected, carry, count, _EW_CFG[Ops.ADD], **integer)))
+      ops.extend((RKEWOp(doubled, byte, byte, count, _EW_CFG[Ops.ADD], **_INT16_EW),
+                  RKEWOp(invert_delta, constants[255], doubled, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                  RKEWOp(invert_delta, invert_delta, sign, count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                  RKEWOp(selected, byte, invert_delta, count, _EW_CFG[Ops.ADD], **_INT16_EW),
+                  RKEWOp(total, selected, carry, count, _EW_CFG[Ops.ADD], **_INT16_EW)))
       carry = positive_over(total, 255)
       scaled, value = allocate(), allocate()
-      ops.extend((RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(value, total, scaled, count, _EW_CFG[Ops.SUB], **integer)))
+      ops.extend((RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                  RKEWOp(value, total, scaled, count, _EW_CFG[Ops.SUB], **_INT16_EW)))
       result.append(value)
     return tuple(result)
 
@@ -1369,50 +1367,50 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
     for byte_arg in remainder:
       carry = positive_over(byte_arg, 127)
       doubled, scaled, wrapped, out_value = allocate(), allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(doubled, byte_arg, byte_arg, count, _EW_CFG[Ops.ADD], **integer),
-                  RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(wrapped, doubled, scaled, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(out_value, wrapped, incoming, count, _EW_CFG[Ops.ADD], **integer)))
+      ops.extend((RKEWOp(doubled, byte_arg, byte_arg, count, _EW_CFG[Ops.ADD], **_INT16_EW),
+                  RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                  RKEWOp(wrapped, doubled, scaled, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                  RKEWOp(out_value, wrapped, incoming, count, _EW_CFG[Ops.ADD], **_INT16_EW)))
       shifted.append(out_value); incoming = carry
     remainder = shifted
 
     greater, equal = constants[0], constants[1]
     for left,right in zip(reversed(remainder), reversed(denominator)):
       diff, positive, candidate = allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(diff, left, right, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(positive, diff, constants[0], count, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(positive, positive, constants[1], count, _EW_CFG_MIN, **integer),
-                  RKEWOp(candidate, equal, positive, count, _EW_CFG_MIN, **integer)))
+      ops.extend((RKEWOp(diff, left, right, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                  RKEWOp(positive, diff, constants[0], count, _EW_CFG[Ops.MAX], **_INT16_EW),
+                  RKEWOp(positive, positive, constants[1], count, _EW_CFG_MIN, **_INT16_EW),
+                  RKEWOp(candidate, equal, positive, count, _EW_CFG_MIN, **_INT16_EW)))
       next_greater = allocate()
-      ops.append(RKEWOp(next_greater, greater, candidate, count, _EW_CFG[Ops.MAX], **integer)); greater = next_greater
+      ops.append(RKEWOp(next_greater, greater, candidate, count, _EW_CFG[Ops.MAX], **_INT16_EW)); greater = next_greater
       magnitude, unequal, byte_equal, next_equal = allocate(), allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(magnitude, diff, diff, count, _EW_CFG_ABS, **integer),
-                  RKEWOp(unequal, magnitude, constants[1], count, _EW_CFG_MIN, **integer),
-                  RKEWOp(byte_equal, constants[1], unequal, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(next_equal, equal, byte_equal, count, _EW_CFG_MIN, **integer)))
+      ops.extend((RKEWOp(magnitude, diff, diff, count, _EW_CFG_ABS, **_INT16_EW),
+                  RKEWOp(unequal, magnitude, constants[1], count, _EW_CFG_MIN, **_INT16_EW),
+                  RKEWOp(byte_equal, constants[1], unequal, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                  RKEWOp(next_equal, equal, byte_equal, count, _EW_CFG_MIN, **_INT16_EW)))
       equal = next_equal
     ge = allocate()
-    ops.extend((RKEWOp(ge, greater, equal, count, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(ge, ge, denominator_nonzero, count, _EW_CFG_MIN, **integer)))
+    ops.extend((RKEWOp(ge, greater, equal, count, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(ge, ge, denominator_nonzero, count, _EW_CFG_MIN, **_INT16_EW)))
 
     borrow, reduced = constants[0], []
     for left,right in zip(remainder, denominator):
       masked, partial, delta = allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(masked, right, ge, count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(partial, left, masked, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(delta, partial, borrow, count, _EW_CFG[Ops.SUB], **integer)))
+      ops.extend((RKEWOp(masked, right, ge, count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                  RKEWOp(partial, left, masked, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                  RKEWOp(delta, partial, borrow, count, _EW_CFG[Ops.SUB], **_INT16_EW)))
       negative = allocate()
-      ops.append(RKEWOp(negative, constants[0], delta, count, _EW_CFG[Ops.SUB], **integer))
+      ops.append(RKEWOp(negative, constants[0], delta, count, _EW_CFG[Ops.SUB], **_INT16_EW))
       borrow = clamp_one(negative)
       scaled, out_value = allocate(), allocate()
-      ops.extend((RKEWOp(scaled, borrow, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(out_value, delta, scaled, count, _EW_CFG[Ops.ADD], **integer)))
+      ops.extend((RKEWOp(scaled, borrow, constants[256], count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                  RKEWOp(out_value, delta, scaled, count, _EW_CFG[Ops.ADD], **_INT16_EW)))
       reduced.append(out_value)
     remainder = reduced
     byte_index, weight = bit_index >> 3, 1 << (bit_index&7)
     weighted, out_value = allocate(), allocate()
-    ops.extend((RKEWOp(weighted, ge, constants[weight], count, _EW_CFG[Ops.MUL], **integer),
-                RKEWOp(out_value, quotient[byte_index], weighted, count, _EW_CFG[Ops.ADD], **integer)))
+    ops.extend((RKEWOp(weighted, ge, constants[weight], count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                RKEWOp(out_value, quotient[byte_index], weighted, count, _EW_CFG[Ops.ADD], **_INT16_EW)))
     quotient[byte_index] = out_value
 
   quotient_sign = xor_bit(signs[0], signs[1])
@@ -1422,14 +1420,14 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
     if mode == "floormod":
       remainder_nonzero = _reduce_rows(ops, [clamp_one(byte) for byte in remainder], count, _EW_CFG[Ops.MAX], int16=True)
       correction = allocate()
-      ops.append(RKEWOp(correction, quotient_sign, remainder_nonzero, count, _EW_CFG_MIN, **integer))
+      ops.append(RKEWOp(correction, quotient_sign, remainder_nonzero, count, _EW_CFG_MIN, **_INT16_EW))
       corrected = []
       for rem,denom in zip(remainder, denominator):
         doubled, delta, selected, out_value = allocate(), allocate(), allocate(), allocate()
-        ops.extend((RKEWOp(doubled, rem, rem, count, _EW_CFG[Ops.ADD], **integer),
-                    RKEWOp(delta, denom, doubled, count, _EW_CFG[Ops.SUB], **integer),
-                    RKEWOp(selected, delta, correction, count, _EW_CFG[Ops.MUL], **integer),
-                    RKEWOp(out_value, rem, selected, count, _EW_CFG[Ops.ADD], **integer)))
+        ops.extend((RKEWOp(doubled, rem, rem, count, _EW_CFG[Ops.ADD], **_INT16_EW),
+                    RKEWOp(delta, denom, doubled, count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                    RKEWOp(selected, delta, correction, count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                    RKEWOp(out_value, rem, selected, count, _EW_CFG[Ops.ADD], **_INT16_EW)))
         corrected.append(out_value)
       result_magnitude, result_sign = tuple(corrected), signs[1]
     result = twos_complement(result_magnitude, result_sign)
@@ -1437,14 +1435,14 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
     if mode == "floor":
       remainder_nonzero = _reduce_rows(ops, [clamp_one(byte) for byte in remainder], count, _EW_CFG[Ops.MAX], int16=True)
       correction = allocate()
-      ops.append(RKEWOp(correction, quotient_sign, remainder_nonzero, count, _EW_CFG_MIN, **integer))
+      ops.append(RKEWOp(correction, quotient_sign, remainder_nonzero, count, _EW_CFG_MIN, **_INT16_EW))
       carry, corrected = correction, []
       for byte_arg in quotient:
-        total = allocate(); ops.append(RKEWOp(total, byte_arg, carry, count, _EW_CFG[Ops.ADD], **integer))
+        total = allocate(); ops.append(RKEWOp(total, byte_arg, carry, count, _EW_CFG[Ops.ADD], **_INT16_EW))
         carry = positive_over(total, 255)
         scaled, out_value = allocate(), allocate()
-        ops.extend((RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                    RKEWOp(out_value, total, scaled, count, _EW_CFG[Ops.SUB], **integer)))
+        ops.extend((RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                    RKEWOp(out_value, total, scaled, count, _EW_CFG[Ops.SUB], **_INT16_EW)))
         corrected.append(out_value)
       quotient = corrected
     result = twos_complement(tuple(quotient), quotient_sign)
@@ -1457,16 +1455,15 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
 def _int16_byte_bits(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
                      value:RKArg, lanes:int) -> tuple[RKArg, ...]:
   """Split unsigned byte lanes into eight exact native INT16 0/1 planes."""
-  integer = dict(int16_input=True, int16_output=True)
   result:list[RKArg|None] = [None]*8
   remainder = value
   for bit in range(7, 0, -1):
     delta, positive, flag, scaled, next_remainder = (allocate() for _ in range(5))
-    ops.extend((RKEWOp(delta, remainder, constants[(1<<bit)-1], lanes, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(positive, delta, constants[0], lanes, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(flag, positive, constants[1], lanes, _EW_CFG_MIN, **integer),
-                RKEWOp(scaled, flag, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **integer),
-                RKEWOp(next_remainder, remainder, scaled, lanes, _EW_CFG[Ops.SUB], **integer)))
+    ops.extend((RKEWOp(delta, remainder, constants[(1<<bit)-1], lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                RKEWOp(positive, delta, constants[0], lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(flag, positive, constants[1], lanes, _EW_CFG_MIN, **_INT16_EW),
+                RKEWOp(scaled, flag, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
+                RKEWOp(next_remainder, remainder, scaled, lanes, _EW_CFG[Ops.SUB], **_INT16_EW)))
     result[bit], remainder = flag, next_remainder
   result[0] = remainder
   return typing_cast(tuple[RKArg, ...], tuple(result))
@@ -1506,7 +1503,6 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
     constants[constant_value] = slot = allocate()
     gathers.append(RKGather(sources[0].arg.slot, 0, lanes, values=(constant_value,)*lanes,
                             dst_addend=slot.addend//2, itemsize=2))
-  integer = dict(int16_input=True, int16_output=True)
   ops:list[RKEWOp] = []
   lhs, rhs = _int16_byte_bits(ops, allocate, constants, values[0], lanes), \
              _int16_byte_bits(ops, allocate, constants, values[1], lanes)
@@ -1514,10 +1510,10 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
   for bit,(left,right) in enumerate(zip(lhs, rhs)):
     combined = allocate()
     if root.op is Ops.XOR:
-      ops.extend((RKEWOp(combined, left, right, lanes, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(combined, combined, combined, lanes, _EW_CFG_ABS, **integer)))
-    else: ops.append(RKEWOp(combined, left, right, lanes, _EW_CFG_MIN if root.op is Ops.AND else _EW_CFG[Ops.MAX], **integer))
-    if bit: ops.append(RKEWOp(combined, combined, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **integer))
+      ops.extend((RKEWOp(combined, left, right, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                  RKEWOp(combined, combined, combined, lanes, _EW_CFG_ABS, **_INT16_EW)))
+    else: ops.append(RKEWOp(combined, left, right, lanes, _EW_CFG_MIN if root.op is Ops.AND else _EW_CFG[Ops.MAX], **_INT16_EW))
+    if bit: ops.append(RKEWOp(combined, combined, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
     weighted.append(combined)
   result = _reduce_rows(ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True)
   return RKImage((RKScratch(rows*vector_bytes),), gathers=tuple(gathers), ew_ops=tuple(ops),
@@ -1593,7 +1589,6 @@ def _lower_int32_shift(output:RKOutput) -> RKImage|None:
   mid.append(RKGather(source.arg.slot, weights.index, matrix_lanes, values=weight_values,
                       dst_addend=weights.addend//2, dst_kind=RKBufferKind.SCRATCH))
 
-  integer = dict(int16_input=True, int16_output=True)
   ops = list(pre_ops)
   current = bits
   for bit,amount in enumerate((1, 2, 4, 8, 16)):
@@ -1607,31 +1602,31 @@ def _lower_int32_shift(output:RKOutput) -> RKImage|None:
     normal_count, normal_addend = normal_rows*vector_lanes, normal_dst*vector_bytes
     ops.extend((RKEWOp(RKArg(temp.kind, temp.index, temp.addend+normal_addend),
                           RKArg(current.kind, current.index, current.addend+shifted_src*vector_bytes),
-                          RKArg(current.kind, current.index, current.addend+normal_addend), normal_count, _EW_CFG[Ops.SUB], **integer),
+                          RKArg(current.kind, current.index, current.addend+normal_addend), normal_count, _EW_CFG[Ops.SUB], **_INT16_EW),
                 RKEWOp(RKArg(temp.kind, temp.index, temp.addend+normal_addend),
                           RKArg(temp.kind, temp.index, temp.addend+normal_addend),
                           RKArg(masks[bit].kind, masks[bit].index, masks[bit].addend+normal_addend),
-                          normal_count, _EW_CFG[Ops.MUL], **integer),
+                          normal_count, _EW_CFG[Ops.MUL], **_INT16_EW),
                 RKEWOp(RKArg(result.kind, result.index, result.addend+normal_addend),
                           RKArg(current.kind, current.index, current.addend+normal_addend),
-                          RKArg(temp.kind, temp.index, temp.addend+normal_addend), normal_count, _EW_CFG[Ops.ADD], **integer)))
+                          RKArg(temp.kind, temp.index, temp.addend+normal_addend), normal_count, _EW_CFG[Ops.ADD], **_INT16_EW)))
     boundary_addend = boundary_dst*vector_bytes
     fill = sign if root.op is Ops.SHR and dtype is dtypes.int else zero
     ops.extend((RKEWOp(RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
                           RKArg(fill.kind, fill.index, fill.addend+boundary_addend),
                           RKArg(current.kind, current.index, current.addend+boundary_addend),
-                          boundary_rows*vector_lanes, _EW_CFG[Ops.SUB], **integer),
+                          boundary_rows*vector_lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
                 RKEWOp(RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
                           RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
                           RKArg(masks[bit].kind, masks[bit].index, masks[bit].addend+boundary_addend),
-                          boundary_rows*vector_lanes, _EW_CFG[Ops.MUL], **integer),
+                          boundary_rows*vector_lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
                 RKEWOp(RKArg(result.kind, result.index, result.addend+boundary_addend),
                           RKArg(current.kind, current.index, current.addend+boundary_addend),
                           RKArg(temp.kind, temp.index, temp.addend+boundary_addend),
-                          boundary_rows*vector_lanes, _EW_CFG[Ops.ADD], **integer)))
+                          boundary_rows*vector_lanes, _EW_CFG[Ops.ADD], **_INT16_EW)))
     current = result
   weighted = post_allocate()
-  ops.append(RKEWOp(weighted, current, weights, matrix_lanes, _EW_CFG[Ops.MUL], **integer))
+  ops.append(RKEWOp(weighted, current, weights, matrix_lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
   byte_results = tuple(_reduce_rows(ops,
     [RKArg(weighted.kind, weighted.index, weighted.addend+(byte*8+bit)*vector_bytes) for bit in range(8)],
     vector_lanes, _EW_CFG[Ops.ADD], int16=True) for byte in range(4))
@@ -1737,30 +1732,29 @@ def _lower_bounded_int32_lookup(output:RKOutput) -> RKImage|None:
 def _int32_less_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
                      lhs_components:list[RKArg], rhs_components:list[RKArg], lanes:int) -> RKArg:
   """Compare signed INT32 lanes represented as high-to-low widened bytes."""
-  integer = dict(int16_input=True, int16_output=True)
   def biased_sign(value:RKArg) -> RKArg:
     delta, positive, high, scaled, biased = (allocate() for _ in range(5))
-    ops.extend((RKEWOp(delta, value, constants[127], lanes, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(positive, delta, constants[0], lanes, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(high, positive, constants[1], lanes, _EW_CFG_MIN, **integer),
-                RKEWOp(scaled, high, constants[256], lanes, _EW_CFG[Ops.MUL], **integer),
-                RKEWOp(biased, value, constants[128], lanes, _EW_CFG[Ops.ADD], **integer),
-                RKEWOp(biased, biased, scaled, lanes, _EW_CFG[Ops.SUB], **integer)))
+    ops.extend((RKEWOp(delta, value, constants[127], lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                RKEWOp(positive, delta, constants[0], lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(high, positive, constants[1], lanes, _EW_CFG_MIN, **_INT16_EW),
+                RKEWOp(scaled, high, constants[256], lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
+                RKEWOp(biased, value, constants[128], lanes, _EW_CFG[Ops.ADD], **_INT16_EW),
+                RKEWOp(biased, biased, scaled, lanes, _EW_CFG[Ops.SUB], **_INT16_EW)))
     return biased
   lhs_components[0], rhs_components[0] = biased_sign(lhs_components[0]), biased_sign(rhs_components[0])
   less, equal = constants[0], constants[1]
   for lhs,rhs in zip(lhs_components, rhs_components):
     maximum, lhs_delta, rhs_delta, lhs_less, rhs_less, unequal, same, selected, next_less, next_equal = (allocate() for _ in range(10))
-    ops.extend((RKEWOp(maximum, lhs, rhs, lanes, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(lhs_delta, maximum, lhs, lanes, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(rhs_delta, maximum, rhs, lanes, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(lhs_less, lhs_delta, constants[1], lanes, _EW_CFG_MIN, **integer),
-                RKEWOp(rhs_less, rhs_delta, constants[1], lanes, _EW_CFG_MIN, **integer),
-                RKEWOp(unequal, lhs_less, rhs_less, lanes, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(same, constants[1], unequal, lanes, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(selected, equal, lhs_less, lanes, _EW_CFG[Ops.MUL], **integer),
-                RKEWOp(next_less, less, selected, lanes, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(next_equal, equal, same, lanes, _EW_CFG[Ops.MUL], **integer)))
+    ops.extend((RKEWOp(maximum, lhs, rhs, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(lhs_delta, maximum, lhs, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                RKEWOp(rhs_delta, maximum, rhs, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                RKEWOp(lhs_less, lhs_delta, constants[1], lanes, _EW_CFG_MIN, **_INT16_EW),
+                RKEWOp(rhs_less, rhs_delta, constants[1], lanes, _EW_CFG_MIN, **_INT16_EW),
+                RKEWOp(unequal, lhs_less, rhs_less, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(same, constants[1], unequal, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                RKEWOp(selected, equal, lhs_less, lanes, _EW_CFG[Ops.MUL], **_INT16_EW),
+                RKEWOp(next_less, less, selected, lanes, _EW_CFG[Ops.MAX], **_INT16_EW),
+                RKEWOp(next_equal, equal, same, lanes, _EW_CFG[Ops.MUL], **_INT16_EW)))
     less, equal = next_less, next_equal
   return less
 
@@ -3107,17 +3101,16 @@ class RKContext:
       constants[number] = constant = allocate()
       self.gathers.append(RKGather(self.out_param.arg.slot, constant.index, lanes, values=(number,)*lanes))
     lhs_bits, rhs_bits = (_int16_byte_bits(self.ew_ops, allocate, constants, value, lanes) for value in raw)
-    integer = dict(int16_input=True, int16_output=True)
     weighted:list[RKArg] = []
     for bit,(left,right) in enumerate(zip(lhs_bits, rhs_bits)):
       combined = allocate()
       if u.op is Ops.XOR:
-        self.ew_ops.extend((RKEWOp(combined, left, right, lanes, _EW_CFG[Ops.SUB], **integer),
-                            RKEWOp(combined, combined, combined, lanes, _EW_CFG_ABS, **integer)))
+        self.ew_ops.extend((RKEWOp(combined, left, right, lanes, _EW_CFG[Ops.SUB], **_INT16_EW),
+                            RKEWOp(combined, combined, combined, lanes, _EW_CFG_ABS, **_INT16_EW)))
       else:
         self.ew_ops.append(RKEWOp(combined, left, right, lanes,
-          _EW_CFG_MIN if u.op is Ops.AND else _EW_CFG[Ops.MAX], **integer))
-      if bit: self.ew_ops.append(RKEWOp(combined, combined, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **integer))
+          _EW_CFG_MIN if u.op is Ops.AND else _EW_CFG[Ops.MAX], **_INT16_EW))
+      if bit: self.ew_ops.append(RKEWOp(combined, combined, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
       weighted.append(combined)
     combined = _reduce_rows(self.ew_ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True)
     result = self._dst(u, dtypes.int16, RKLayout.INT16)
@@ -3211,14 +3204,13 @@ class RKContext:
     low_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_low.arg, rhs_low.arg, constants[1].arg, self.count)
     high_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_high, rhs_high, constants[1].arg, self.count)
     either_nan, numeric, bits_equal, equal = (allocate() for _ in range(4))
-    integer = dict(int16_input=True, int16_output=True)
-    self.ew_ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, self.count, _EW_CFG[Ops.MAX], **integer),
-                        RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **integer),
-                        RKEWOp(bits_equal, low_equal, high_equal, self.count, _EW_CFG[Ops.MUL], **integer),
-                        RKEWOp(equal, bits_equal, numeric, self.count, _EW_CFG[Ops.MUL], **integer)))
+    self.ew_ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
+                        RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                        RKEWOp(bits_equal, low_equal, high_equal, self.count, _EW_CFG[Ops.MUL], **_INT16_EW),
+                        RKEWOp(equal, bits_equal, numeric, self.count, _EW_CFG[Ops.MUL], **_INT16_EW)))
     if u.op is Ops.CMPNE:
       unequal = allocate()
-      self.ew_ops.append(RKEWOp(unequal, constants[1].arg, equal, self.count, _EW_CFG[Ops.SUB], **integer))
+      self.ew_ops.append(RKEWOp(unequal, constants[1].arg, equal, self.count, _EW_CFG[Ops.SUB], **_INT16_EW))
       equal = unequal
     return RKValue(equal, dtypes.bool, self.count, RKLayout.BOOL_INT16)
 
@@ -3241,23 +3233,22 @@ class RKContext:
     low, clean_high, _ = self._fp16_component_values(value)
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 127, 128, 255)}
     def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-    integer = dict(int16_input=True, int16_output=True)
     sign_delta, sign_positive, sign = (allocate() for _ in range(3))
     positive_high, negative_high, high_delta, high_selected, ordered_high = (allocate() for _ in range(5))
     negative_low, low_delta, low_selected, ordered_low = (allocate() for _ in range(4))
     self.ew_ops.extend((
-      RKEWOp(sign_delta, clean_high, constants[127].arg, self.count, _EW_CFG[Ops.SUB], **integer),
-      RKEWOp(sign_positive, sign_delta, constants[0].arg, self.count, _EW_CFG[Ops.MAX], **integer),
-      RKEWOp(sign, sign_positive, constants[1].arg, self.count, _EW_CFG_MIN, **integer),
-      RKEWOp(positive_high, clean_high, constants[128].arg, self.count, _EW_CFG[Ops.ADD], **integer),
-      RKEWOp(negative_high, constants[255].arg, clean_high, self.count, _EW_CFG[Ops.SUB], **integer),
-      RKEWOp(high_delta, negative_high, positive_high, self.count, _EW_CFG[Ops.SUB], **integer),
-      RKEWOp(high_selected, sign, high_delta, self.count, _EW_CFG[Ops.MUL], **integer),
-      RKEWOp(ordered_high, positive_high, high_selected, self.count, _EW_CFG[Ops.ADD], **integer),
-      RKEWOp(negative_low, constants[255].arg, low.arg, self.count, _EW_CFG[Ops.SUB], **integer),
-      RKEWOp(low_delta, negative_low, low.arg, self.count, _EW_CFG[Ops.SUB], **integer),
-      RKEWOp(low_selected, sign, low_delta, self.count, _EW_CFG[Ops.MUL], **integer),
-      RKEWOp(ordered_low, low.arg, low_selected, self.count, _EW_CFG[Ops.ADD], **integer)))
+      RKEWOp(sign_delta, clean_high, constants[127].arg, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+      RKEWOp(sign_positive, sign_delta, constants[0].arg, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
+      RKEWOp(sign, sign_positive, constants[1].arg, self.count, _EW_CFG_MIN, **_INT16_EW),
+      RKEWOp(positive_high, clean_high, constants[128].arg, self.count, _EW_CFG[Ops.ADD], **_INT16_EW),
+      RKEWOp(negative_high, constants[255].arg, clean_high, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+      RKEWOp(high_delta, negative_high, positive_high, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+      RKEWOp(high_selected, sign, high_delta, self.count, _EW_CFG[Ops.MUL], **_INT16_EW),
+      RKEWOp(ordered_high, positive_high, high_selected, self.count, _EW_CFG[Ops.ADD], **_INT16_EW),
+      RKEWOp(negative_low, constants[255].arg, low.arg, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+      RKEWOp(low_delta, negative_low, low.arg, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+      RKEWOp(low_selected, sign, low_delta, self.count, _EW_CFG[Ops.MUL], **_INT16_EW),
+      RKEWOp(ordered_low, low.arg, low_selected, self.count, _EW_CFG[Ops.ADD], **_INT16_EW)))
     self.fp16_ordered[value.arg] = ordered_high, ordered_low
     return self.fp16_ordered[value.arg]
 
@@ -3269,28 +3260,27 @@ class RKContext:
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
     def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-    integer = dict(int16_input=True, int16_output=True)
     ordered = tuple(self._fp16_ordered_values(value) for value in values)
     nan = tuple(self._fp16_component_values(value)[2] for value in values)
     less, equal = constants[0].arg, constants[1].arg
     for lhs,rhs in zip(ordered[0], ordered[1]):
       maximum, lhs_delta, rhs_delta, lhs_less, rhs_less, unequal, same, selected, next_less, next_equal = \
         (allocate() for _ in range(10))
-      self.ew_ops.extend((RKEWOp(maximum, lhs, rhs, self.count, _EW_CFG[Ops.MAX], **integer),
-        RKEWOp(lhs_delta, maximum, lhs, self.count, _EW_CFG[Ops.SUB], **integer),
-        RKEWOp(rhs_delta, maximum, rhs, self.count, _EW_CFG[Ops.SUB], **integer),
-        RKEWOp(lhs_less, lhs_delta, constants[1].arg, self.count, _EW_CFG_MIN, **integer),
-        RKEWOp(rhs_less, rhs_delta, constants[1].arg, self.count, _EW_CFG_MIN, **integer),
-        RKEWOp(unequal, lhs_less, rhs_less, self.count, _EW_CFG[Ops.MAX], **integer),
-        RKEWOp(same, constants[1].arg, unequal, self.count, _EW_CFG[Ops.SUB], **integer),
-        RKEWOp(selected, equal, lhs_less, self.count, _EW_CFG[Ops.MUL], **integer),
-        RKEWOp(next_less, less, selected, self.count, _EW_CFG[Ops.MAX], **integer),
-        RKEWOp(next_equal, equal, same, self.count, _EW_CFG[Ops.MUL], **integer)))
+      self.ew_ops.extend((RKEWOp(maximum, lhs, rhs, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
+        RKEWOp(lhs_delta, maximum, lhs, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+        RKEWOp(rhs_delta, maximum, rhs, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+        RKEWOp(lhs_less, lhs_delta, constants[1].arg, self.count, _EW_CFG_MIN, **_INT16_EW),
+        RKEWOp(rhs_less, rhs_delta, constants[1].arg, self.count, _EW_CFG_MIN, **_INT16_EW),
+        RKEWOp(unequal, lhs_less, rhs_less, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
+        RKEWOp(same, constants[1].arg, unequal, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+        RKEWOp(selected, equal, lhs_less, self.count, _EW_CFG[Ops.MUL], **_INT16_EW),
+        RKEWOp(next_less, less, selected, self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
+        RKEWOp(next_equal, equal, same, self.count, _EW_CFG[Ops.MUL], **_INT16_EW)))
       less, equal = next_less, next_equal
     either_nan, numeric, result = (allocate() for _ in range(3))
-    self.ew_ops.extend((RKEWOp(either_nan, nan[0], nan[1], self.count, _EW_CFG[Ops.MAX], **integer),
-                       RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **integer),
-                       RKEWOp(result, less, numeric, self.count, _EW_CFG[Ops.MUL], **integer)))
+    self.ew_ops.extend((RKEWOp(either_nan, nan[0], nan[1], self.count, _EW_CFG[Ops.MAX], **_INT16_EW),
+                       RKEWOp(numeric, constants[1].arg, either_nan, self.count, _EW_CFG[Ops.SUB], **_INT16_EW),
+                       RKEWOp(result, less, numeric, self.count, _EW_CFG[Ops.MUL], **_INT16_EW)))
     return RKValue(result, dtypes.bool, self.count, RKLayout.BOOL_INT16)
 
   def _raw_where(self, u:UOp, selector:RKValue, yes:RKValue, no:RKValue) -> RKValue:
@@ -4204,15 +4194,14 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
     constants[123], constants[124], constants[127], constants[128], total)
   low_equal = _ew_native_int16_eq_mask(ops, alloc, raw[0][0], raw[1][0], constants[1], total)
   high_equal = _ew_native_int16_eq_mask(ops, alloc, lhs_high, rhs_high, constants[1], total)
-  integer = dict(int16_input=True, int16_output=True)
   either_nan, numeric, bits_equal, equal = (alloc() for _ in range(4))
-  ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, total, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(numeric, constants[1], either_nan, total, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(bits_equal, low_equal, high_equal, total, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(equal, bits_equal, numeric, total, _EW_CFG[Ops.MUL], **integer)))
+  ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, total, _EW_CFG[Ops.MAX], **_INT16_EW),
+              RKEWOp(numeric, constants[1], either_nan, total, _EW_CFG[Ops.SUB], **_INT16_EW),
+              RKEWOp(bits_equal, low_equal, high_equal, total, _EW_CFG[Ops.MUL], **_INT16_EW),
+              RKEWOp(equal, bits_equal, numeric, total, _EW_CFG[Ops.MUL], **_INT16_EW)))
   coordinate_values, weighted = allocate(), allocate()
   gathers.append(RKGather(out_param.arg.slot, coordinate_values.index, total, values=coordinates))
-  ops.append(RKEWOp(weighted, equal, coordinate_values, total, _EW_CFG[Ops.MUL], **integer))
+  ops.append(RKEWOp(weighted, equal, coordinate_values, total, _EW_CFG[Ops.MUL], **_INT16_EW))
   weighted_spaced = allocate(total*scalar_stride//2)
   mid.append(RKGather(weighted.index, weighted_spaced.index, total, axes=((1, total, 1),), dst_stride=scalar_stride//2,
                       src_kind=RKBufferKind.SCRATCH, after=len(ops)))
@@ -4221,10 +4210,10 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   result = selected
   if slope != 1:
     scale = allocate(1); gathers.append(RKGather(out_param.arg.slot, scale.index, 1, values=(_int16_bits(slope),)))
-    scaled = allocate(1); ops.append(RKEWOp(scaled, result, scale, 1, _EW_CFG[Ops.MUL], **integer)); result = scaled
+    scaled = allocate(1); ops.append(RKEWOp(scaled, result, scale, 1, _EW_CFG[Ops.MUL], **_INT16_EW)); result = scaled
   if baseline:
     offset = allocate(1); gathers.append(RKGather(out_param.arg.slot, offset.index, 1, values=(_int16_bits(baseline),)))
-    translated = allocate(1); ops.append(RKEWOp(translated, result, offset, 1, _EW_CFG[Ops.ADD], **integer)); result = translated
+    translated = allocate(1); ops.append(RKEWOp(translated, result, offset, 1, _EW_CFG[Ops.ADD], **_INT16_EW)); result = translated
   zero = allocate(1); gathers.append(RKGather(out_param.arg.slot, zero.index, 1, values=(0,)))
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, zero, 1, _EW_CFG[Ops.ADD],
                     int16_input=True, int32_output=True))

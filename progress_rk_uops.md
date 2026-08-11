@@ -1880,3 +1880,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 85. Canonicalize native INT16 EW flags — complete
+
+- Twelve physical recipe blocks independently allocated the same `int16_input=True, int16_output=True` keyword
+  bundle. Replaced those local aliases with one shared `_INT16_EW` physical configuration and removed eleven
+  executable renderer lines. The recipes retain their true UOp ownership and no tensor-operation dispatch was added.
+- Compared milestone-84/current serialized images for IEEE FP16 comparison, raw FP16 bitcast, INT32 bitwise, and
+  INT32 shift programs; all four were byte-identical. This is a constructor-only cleanup and changes neither scratch
+  layout nor DPU scheduling.
+- Renderer executable size fell from 4,754 to 4,743 lines. From the 10,233-line baseline, 5,490 executable renderer
+  lines are gone (53.6%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 4/4 representative native-INT16 programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.11 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
