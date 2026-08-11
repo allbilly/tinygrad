@@ -7510,6 +7510,12 @@ def _exact_int_range(root:UOp) -> tuple[int, int]|None:
       for marker, source in (u.src, u.src[::-1]):
         if marker.op is Ops.CONST and int(marker.arg) == -1 and (source_bounds:=bounds(source)) is not None:
           result = (-1-source_bounds[1], -1-source_bounds[0])
+    elif u.op is Ops.CMOD and len(u.src) == 2:
+      left, right = bounds(u.src[0]), bounds(u.src[1])
+      if right is not None and right[0] == right[1] and right[0] != 0:
+        extent = abs(right[0])-1
+        result = (-extent, extent) if left is None else \
+                 (0, extent) if left[0] >= 0 else (-extent, 0) if left[1] <= 0 else (-extent, extent)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX) and len(u.src) == 2:
       left, right = bounds(u.src[0]), bounds(u.src[1])
       if left is not None and right is not None:
@@ -7931,7 +7937,9 @@ class RKContext:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
     if all(src.dtype.scalar() is dtypes.int for src in u.src):
       bounds = tuple(_exact_int_range(src) for src in u.src)
-      if all(bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds):
+      if self.int_layout is RKLayout.INT_FP16 or all(
+        bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds
+      ):
         recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in u.src), arg=u.arg)
         self._register_graph(recipe)
         value = self.lower(recipe)
@@ -8674,6 +8682,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if output[1].dtype.scalar() is dtypes.bool:
     if (bounds_mask:=_lower_int32_bounds_mask(output)) is not None: return bounds_mask
   if output[1].dtype.scalar() is dtypes.int:
+    if (bitwise:=_lower_int32_byte_logic(output)) is not None: return bitwise
+    if (shift:=_lower_int32_shift(output)) is not None: return shift
     if (predicate_total:=_lower_unrolled_fp16_predicate_total(output)) is not None: return predicate_total
     if (predicate_prefix:=_lower_unrolled_fp16_prefix_count(output)) is not None: return predicate_prefix
     if (bool_prefix:=_lower_unrolled_bool_prefix_count(output)) is not None: return bool_prefix

@@ -491,6 +491,31 @@ def test_direct_dynamic_int32_load_selects_all_raw_bytes():
   assert decode_image(encode_image(image)) == image
 
 
+def test_int32_bitwise_uop_executes_over_raw_byte_planes():
+  lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
+  image = _lower_uop_program(_program(dtypes.int, lambda i:lhs.index(i).load() & rhs.index(i).load()))
+  assert image is not None and len(image.post_gathers) == 1
+  assert image.post_gathers[0].count == 16 and all(op.int16_input and op.int16_output for op in image.ew_ops)
+
+
+def test_int32_shift_uop_executes_with_byte_plane_barrel_recipe():
+  source = UOp.param(1, dtypes.int, (4,))
+  image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load() << UOp.const(2, dtypes.int)))
+  assert image is not None and len(image.post_gathers) == 4
+  assert {gather.dst_addend for gather in image.post_gathers} == {0, 1, 2, 3}
+
+
+def test_cmod_range_keeps_expanded_parity_arithmetic_in_exact_fp16_lanes():
+  source = UOp.param(1, dtypes.half, (4,))
+  def parity(i):
+    value = source.index(i).load().cast(dtypes.int)
+    remainder = UOp(Ops.CMOD, dtypes.int, src=(value, UOp.const(2, dtypes.int)))
+    negative = UOp(Ops.CMPLT, dtypes.bool, src=(remainder, UOp.const(0, dtypes.int)))
+    return remainder + negative.where(UOp.const(2, dtypes.int), UOp.const(0, dtypes.int))
+  image = _lower_uop_program(_program(dtypes.int, parity))
+  assert image is not None and any(op.int32_output for op in image.ew_ops)
+
+
 def test_dependent_reduction_range_preserves_vector_output_axis():
   def lower(rows:int, depth:int=65):
     out = UOp.param(0, dtypes.half, (rows,))

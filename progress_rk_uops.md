@@ -442,3 +442,28 @@ Verification:
   148-pass/39-failure prefix; the four scatter failures reported by that census are now fixed by this milestone.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 25. Strict INT32 bitwise and expanded power semantics — complete
+
+- Routed root INT32 `AND`, `OR`, and `XOR` UOps to the existing exact raw-byte physical recipe. Each canonical INT32
+  lane is split into byte bit-planes, the semantic boolean operation is evaluated with native INT16 arithmetic, and the
+  four result bytes are repacked at the output boundary.
+- Routed `SHL` and signed/unsigned `SHR` UOps to the exact five-stage byte-plane barrel recipe. Constant and runtime
+  shift counts share the same physical implementation; this is a UOp handler, not recognition of a tensor operation.
+- Added conservative `CMOD` range semantics. A remainder by a known nonzero constant is now proven bounded even when
+  its dividend is data-dependent, allowing later small `ADD`/`WHERE` nodes to choose an exact physical layout.
+- Allowed integer comparisons to consume the canonical `INT_FP16` ABI directly. Integers produced by truncating FP16
+  values retain exact ordering in those lanes, so Tinygrad's expanded power parity/sign graph composes without a POW
+  graph lowerer.
+- Added host-independent regressions for byte-plane INT32 logic, the barrel-shift recipe, and expanded `CMOD` parity
+  arithmetic.
+
+Verification:
+
+- Strict `TestRockchipBitwiseOps`: 10 passed in 6.22s.
+- Strict `TestRockchipTensorPowerOps`: 7 passed in 94.30s.
+- Strict broadcast full/partial coverage: 2 passed and 30 subtests passed in 46.72s, including all six POW subfailures
+  from the latest census.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0`: 53 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
