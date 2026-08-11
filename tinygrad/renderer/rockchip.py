@@ -2670,7 +2670,7 @@ def _accurate_add_recipe(u:UOp) -> UOp:
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
   def __init__(self, output:RKOutput, *, accurate_adds:bool=True, static_load_offsets:dict[UOp, tuple[int, ...]]|None=None):
-    self.store, self.out_param, self.count, self.out_index, self.root = output
+    _, self.out_param, self.count, self.out_index, self.root = output
     self.out = RKArg(RKBufferKind.ARG, self.out_param.arg.slot)
     self.values:dict[UOp, RKValue] = {}
     self.scratch:list[RKScratch] = []
@@ -2720,14 +2720,6 @@ class RKContext:
     return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
 
   def _dst(self, u:UOp, dtype:DType, layout:RKLayout) -> RKValue:
-    if (u is self.root and self.out_param.dtype.scalar() is dtype and
-        (dtype is dtypes.half and layout is RKLayout.FP16 or dtype is dtypes.int16 and layout is RKLayout.INT16 or
-         dtype is dtypes.int and layout is RKLayout.INT32)):
-      return RKValue(self.out, dtype, self.count, layout)
-    return self._scratch(dtype, layout)
-
-  def _alu_dst(self, u:UOp, dtype:DType, layout:RKLayout, operands:tuple[tuple[UOp, RKValue], ...]) -> RKValue:
-    del operands
     if (u is self.root and self.out_param.dtype.scalar() is dtype and
         (dtype is dtypes.half and layout is RKLayout.FP16 or dtype is dtypes.int16 and layout is RKLayout.INT16 or
          dtype is dtypes.int and layout is RKLayout.INT32)):
@@ -2987,7 +2979,7 @@ class RKContext:
       return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), one, src, _EW_CFG[Ops.FDIV])
     if u.op is Ops.NEG:
       src = self.lower(u.src[0])
-      dst = self._alu_dst(u, u.dtype.scalar(), src.layout, ((u.src[0], src),))
+      dst = self._dst(u, u.dtype.scalar(), src.layout)
       return self._emit(dst, src, src, _EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
     if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None:
@@ -3022,10 +3014,10 @@ class RKContext:
       return self._emit(self._dst(u, dtypes.half, RKLayout.FP16), positive_mask, negative_mask, _EW_CFG[Ops.SUB])
     if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
       if expected is RKLayout.FP16: return self._native_min(u, lhs, rhs)
-      dst = self._alu_dst(u, dtype, RKLayout.INT16, ((u.src[0], lhs), (u.src[1], rhs)))
+      dst = self._dst(u, dtype, RKLayout.INT16)
       return self._emit(dst, lhs, rhs, _EW_CFG_MIN)
     if u.op is Ops.MAX and u.arg == _NATIVE_RAW_MIN:
-      dst = self._alu_dst(u, dtype, expected, ((u.src[0], lhs), (u.src[1], rhs)))
+      dst = self._dst(u, dtype, expected)
       return self._emit(dst, lhs, rhs, _EW_CFG_MIN)
     cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else \
       _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else \
@@ -3035,7 +3027,7 @@ class RKContext:
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
     layout = RKLayout.BOOL_MASK if compare else expected
     out_dtype = dtypes.bool if compare else dtype
-    dst = self._alu_dst(u, out_dtype, layout, ((u.src[0], lhs), (u.src[1], rhs)))
+    dst = self._dst(u, out_dtype, layout)
     return self._emit(dst, lhs, rhs, cfg, compare=compare)
 
   def _accurate_add(self, u:UOp) -> RKValue:

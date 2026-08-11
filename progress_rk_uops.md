@@ -1636,3 +1636,20 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `.venv/bin/python ~/rk3588/examples/elementwise.py`: timed out in `DRM_IOCTL_RKNPU_SUBMIT` (device still needs reboot).
+
+### 74. Collapse the orphaned ALU destination allocator — complete
+
+- Removing graph use counts exposed `_alu_dst` as an exact duplicate of `_dst`: its operand tuple was immediately
+  discarded, and both methods applied the same root-output ABI check before allocating scratch.
+- Routed NEG and binary ALU handlers through `_dst`, deleted `_alu_dst`, stopped constructing four unused operand
+  tuples, and removed the never-read `RKContext.store` field.
+- Renderer executable size fell from 4,822 to 4,815 lines. From the 10,233-line baseline, 5,418 executable lines are
+  gone (52.9%); runtime remains 484 lines.
+- No CPU numeric semantics or generated hardware behavior changed. This deletes residual allocation scaffolding whose
+  only former purpose was semantic use-count tracking.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
