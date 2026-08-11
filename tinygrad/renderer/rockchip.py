@@ -3513,11 +3513,10 @@ class RKContext:
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
-    elif dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR) and \
-         all(src.dtype.scalar() is dtypes.bool for src in u.src): value = self._bool_binary(u)
-    elif (dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR) and
-          (ieee_recipe:=_ieee_comparison_mask(u)) is not None): value = self._ieee_bool(ieee_recipe)
-    elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
+    elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool:
+      if all(src.dtype.scalar() is dtypes.bool for src in u.src): value = self._bool_binary(u)
+      elif (ieee_recipe:=_ieee_comparison_mask(u)) is not None: value = self._ieee_bool(ieee_recipe)
+      else: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
       value = RKValue(self.lower(_int_fp16_expr(u)).arg, dtype, self.count, self.int_layout)

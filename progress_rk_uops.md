@@ -2690,3 +2690,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 126. Give boolean ALU UOps one semantic dispatcher — complete
+
+- After comparisons moved to `_compare()`, three overlapping `AND/OR/XOR` branches remained. Collapsed them into one
+  boolean-ALU block: canonical bool operands lower directly, noncanonical operands may use the existing IEEE mask
+  recipe, and unmatched forms retain the ordinary `_bool_binary()` rejection/handling path.
+- Direct bool and noncanonical half-backed `AND`, `OR`, and `XOR` programs produced the same six accepted/rejected
+  results and byte-identical RKImages as milestone 125.
+- Renderer executable size fell from 4,614 to 4,613 lines. From the 10,233-line baseline, 5,620 lines are gone (54.9%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 6/6 boolean dispatch results identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.90 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
