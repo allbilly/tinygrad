@@ -2890,6 +2890,13 @@ class RKContext:
     self.mask_program |= compare
     return dst
 
+  def _masked_where(self, u:UOp, dtype:DType, layout:RKLayout, selector:RKValue, yes:RKValue, no:RKValue, one:RKValue) -> RKValue:
+    selected_yes, inverse, selected_no = (self._scratch(one.dtype, one.layout) for _ in range(3))
+    self._emit(selected_yes, selector, yes, _EW_CFG[Ops.MUL])
+    self._emit(inverse, one, selector, _EW_CFG[Ops.SUB])
+    self._emit(selected_no, inverse, no, _EW_CFG[Ops.MUL])
+    return self._emit(self._dst(u, dtype, layout), selected_yes, selected_no, _EW_CFG[Ops.ADD])
+
   def _native_min(self, u:UOp, lhs:RKValue, rhs:RKValue) -> RKValue:
     zero = self.lower(UOp.const(0.0, dtypes.half))
     neg_lhs, neg_rhs = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
@@ -3306,15 +3313,9 @@ class RKContext:
       values = [self._static(src, preferred) if value is None else self._coerce_bool(value, preferred)
                 for src,value in zip(u.src, dynamic)]
       selector, yes, no = values
-      data_dtype, data_layout = ((dtypes.int16, RKLayout.INT16) if preferred is RKLayout.BOOL_INT16 else
-                                 (dtypes.half, RKLayout.FP16))
+      data_dtype = dtypes.int16 if preferred is RKLayout.BOOL_INT16 else dtypes.half
       one = self._constant(UOp.const(1, data_dtype))
-      selected_yes, inverse, selected_no = (self._scratch(data_dtype, data_layout) for _ in range(3))
-      self._emit(selected_yes, selector, yes, _EW_CFG[Ops.MUL])
-      self._emit(inverse, one, selector, _EW_CFG[Ops.SUB])
-      self._emit(selected_no, inverse, no, _EW_CFG[Ops.MUL])
-      result = self._emit(self._dst(u, dtypes.bool, preferred), selected_yes, selected_no, _EW_CFG[Ops.ADD])
-      return RKValue(result.arg, dtypes.bool, self.count, preferred)
+      return self._masked_where(u, dtypes.bool, preferred, selector, yes, no, one)
     if u is self.root and u.dtype.scalar() is dtypes.int and all(
       arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.int for arm in u.src[1:]
     ):
@@ -3438,11 +3439,7 @@ class RKContext:
     dtype = dtypes.half if yes.layout is RKLayout.FP16 else dtypes.int16 if yes.layout is RKLayout.INT16 else dtypes.int
     if dtype is dtypes.int16:
       one = self._constant(UOp.const(1, dtypes.int16))
-      selected_yes, inverse, selected_no = (self._scratch(dtype, yes.layout) for _ in range(3))
-      self._emit(selected_yes, selector, yes, _EW_CFG[Ops.MUL])
-      self._emit(inverse, one, selector, _EW_CFG[Ops.SUB])
-      self._emit(selected_no, inverse, no, _EW_CFG[Ops.MUL])
-      return self._emit(self._dst(u, dtype, yes.layout), selected_yes, selected_no, _EW_CFG[Ops.ADD])
+      return self._masked_where(u, dtype, yes.layout, selector, yes, no, one)
     return self._raw_where(u, selector, yes, no)
 
   def _widen_int16(self, u:UOp, source:RKValue) -> RKValue:

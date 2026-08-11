@@ -2202,3 +2202,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 101. Share canonical masked ternary emission — complete
+
+- BOOL `WHERE` and INT16 `WHERE` separately allocated the same three intermediate values and emitted the same
+  `selector*yes`, `1-selector`, inverse-times-no, and final ADD stages. Added one `_masked_where()` physical primitive
+  whose arguments retain true ternary arity and whose destination is still allocated after the intermediates.
+- Removed BOOL `WHERE`'s redundant reconstruction of the `RKValue` already returned by `_emit()`. The helper derives
+  intermediate dtype/layout from the canonical physical `one` value, so `BOOL_MASK`, `BOOL_INT16`, and INT16 retain
+  their existing representations.
+- Compared milestone-100/current images for root and nested BOOL and INT16 selections; all four were byte-identical,
+  including scratch numbering and stage order. Renderer executable size fell from 4,686 to 4,682 lines. From the
+  10,233-line baseline, 5,551 lines are gone (54.2%); runtime remains 480 lines. No CPU numeric semantics were added.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 4/4 root/nested typed selections byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.30 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
