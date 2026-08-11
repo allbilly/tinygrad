@@ -1294,3 +1294,24 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 89 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 57. Delete direct integer-to-FP32 cast recovery — complete
+
+- Disconnected the 36-line direct INT32/bool-to-FP32 image. The typed executor already owned INT32-to-FP16 narrowing
+  and FP16-to-FP32 output conversion; composing those two physical value boundaries passed the cold cast census.
+- Added generic CAST ownership for INT32 values and native BOOL_INT16 values. Boolean conversion remains an ordinary
+  DPU WHERE selecting FP16 zero or one, followed by the same terminal FP32 conversion; no host value inspection is
+  involved.
+- Extended unit coverage to reversed/remapped INT32 and boolean loads, proving the generic path is not limited to a
+  contiguous direct-load spelling. The generic INT32 image uses four EW stages where the deleted image used six.
+- Removed the complete now-unreachable direct cast function and dispatch. Reduced the renderer from 5,043 to 5,014
+  executable lines, another 29 lines. From the 10,233-line pre-deletion baseline, 5,219 executable lines are gone
+  (51.0%). The physical renderer diff is 6 insertions and 38 deletions; runtime remains 488 executable lines.
+- No CPU numeric semantics were introduced.
+
+Verification:
+
+- Cold complete `TestRockchipCastOps`: 2 passed in 5.84s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 90 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

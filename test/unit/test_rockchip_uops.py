@@ -517,9 +517,16 @@ def test_terminal_half_to_float_cast_uses_chunked_dpu_output_conversion():
 def test_terminal_int_to_float_cast_composes_integer_and_fp32_converters():
   source = UOp.param(1, dtypes.int, (9,))
   image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
-  assert image is not None and len(image.ew_ops) == 6
+  assert image is not None and len(image.ew_ops) == 4
   assert sum(bool(op.ew_cfg & _EW_STAGE_FP32_OUT) for op in image.ew_ops) == 3
   assert decode_image(encode_image(image)) == image
+
+
+def test_remapped_integer_and_bool_to_float_casts_use_generic_typed_values():
+  for dtype,stages in ((dtypes.int, 4), (dtypes.bool, 9)):
+    source = UOp.param(1, dtype, (9,))
+    image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(8-i).load().cast(dtypes.float), count=9))
+    assert image is not None and len(image.ew_ops) == stages and decode_image(encode_image(image)) == image
 
 
 def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():

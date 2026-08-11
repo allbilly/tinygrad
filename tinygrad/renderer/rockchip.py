@@ -1369,42 +1369,6 @@ def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   remainder = truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))
   return _typed_int16_byte_image(output, remainder)
 
-def _lower_integer_fp32_cast(output:RKOutput) -> RKImage|None:
-  """Compose the DPU INT32-to-FP16 and FP16-to-FP32 converters for integer and boolean inputs."""
-  _, out_param, count, out_index, root = output
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.float or len(root.src) != 1 or
-      (load:=root.src[0]).op is not Ops.LOAD or load.dtype.scalar() not in (dtypes.int, dtypes.bool) or
-      len(load.src) != 1 or load.src[0].op is not Ops.INDEX or
-      (source:=_root_param(load.src[0])) is None or source.src[0].op is not Ops.CONST): return None
-  try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
-  except RuntimeError: return None
-  if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
-  fp16_slot, tiles_slot = 0, 1
-  groups = tuple(range(0, count, _EW_ELEMS_32BIT))
-  scratch_sizes = [max(64, len(groups)*16), _int32_tiles_bytes(_EW_ELEMS_32BIT)]
-  gathers:tuple[RKGather, ...] = ()
-  input_arg = RKArg(RKBufferKind.ARG, source.arg.slot)
-  if load.dtype.scalar() is dtypes.bool or offsets != tuple(range(count)):
-    raw_slot = len(scratch_sizes)
-    scratch_sizes.append(max(64, count*4))
-    gathers = (RKGather(source.arg.slot, raw_slot, count, offsets=offsets,
-                        dst_stride=4 if load.dtype.scalar() is dtypes.bool else 1,
-                        itemsize=1 if load.dtype.scalar() is dtypes.bool else 4),)
-    input_arg = RKArg(RKBufferKind.SCRATCH, raw_slot)
-  ops:list[RKEWOp] = []
-  for group,start in enumerate(groups):
-    lanes = min(_EW_ELEMS_32BIT, count-start)
-    ops.append(RKEWOp(RKArg(RKBufferKind.SCRATCH, fp16_slot, group*16), replace(input_arg, addend=start*4),
-                      RKArg(RKBufferKind.SCRATCH, tiles_slot), lanes, _EW_CFG[Ops.MAX], int32_input=True))
-  for group,start in enumerate(groups):
-    lanes = min(_EW_ELEMS_32BIT, count-start)
-    value = RKArg(RKBufferKind.SCRATCH, fp16_slot, group*16)
-    ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot, group*16), value, value, lanes,
-                        _EW_CFG[Ops.MAX] | _EW_STAGE_FP32_OUT))
-  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=gathers, ew_ops=tuple(ops))
-
-
 def _int32_division_root(root:UOp) -> tuple[str, UOp, UOp]|None:
   """Recognize truncating quotient/remainder and Tinygrad's canonical floor corrections."""
   if root.op is Ops.CDIV and root.dtype.scalar() is dtypes.int: return "trunc", root.src[0], root.src[1]
@@ -3863,6 +3827,12 @@ class RKContext:
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
+      elif dtype is dtypes.float and source_dtype is dtypes.int and source.layout is RKLayout.INT32:
+        value = self._narrow_int32(source)
+      elif dtype is dtypes.float and source_dtype is dtypes.bool and source.layout is RKLayout.BOOL_INT16:
+        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
+        self._register_graph(recipe)
+        value = self.lower(recipe)
       elif dtype is dtypes.half and source.layout is RKLayout.BOOL_INT16:
         recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
         self._register_graph(recipe)
@@ -4569,8 +4539,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     return combined
   if vectorize_reductions and (multi_local:=_lower_multi_scalar_local_reductions(uops)) is not None: return multi_local
   if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
-  if (float_output:=_output_store(uops, dtypes.float)) is not None and \
-     (integer_cast:=_lower_integer_fp32_cast(float_output)) is not None: return integer_cast
   if (int_output:=_output_store(uops, dtypes.int)) is not None:
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
     if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
