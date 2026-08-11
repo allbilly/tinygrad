@@ -3469,14 +3469,10 @@ class RKContext:
       source_dtype = u.src[0].dtype.scalar()
       int_range = _exact_int_range(u.src[0]) if source_dtype is dtypes.int else None
       if dtype is dtypes.half and source_dtype is dtypes.float:
-        if u.src[0].op is Ops.LOAD: source = self._load(u.src[0])
-        else:
-          recipe = _fp32_expr_to_half(u.src[0])
-          source = self.lower(recipe)
+        source = self._load(u.src[0]) if u.src[0].op is Ops.LOAD else self.lower(_fp32_expr_to_half(u.src[0]))
       elif dtype is dtypes.half and source_dtype is dtypes.int and int_range is not None and \
            -_FP16_EXACT_INTEGER <= int_range[0] <= int_range[1] <= _FP16_EXACT_INTEGER:
-        recipe = _int_fp16_expr(u.src[0])
-        source = self.lower(recipe)
+        source = self.lower(_int_fp16_expr(u.src[0]))
       else: source = self.lower(u.src[0])
       if dtype is dtypes.uchar and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
         cast_source = u.src[0]

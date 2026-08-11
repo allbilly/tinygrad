@@ -2618,3 +2618,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 122. Delete single-use CAST recipe temporaries — complete
+
+- FP32→half and exact-int→half preconversion assigned local `recipe` values only to pass them immediately back to
+  `RKContext.lower()`. Removed those dead temporaries and materialized the corresponding UOp recipes at their single
+  use, while retaining the direct FP32 LOAD boundary.
+- Direct FP32 LOAD→half, composed FP32 expression→half, and bounded semantic INT→half programs produced RKImages
+  byte-identical to milestone 121.
+- Renderer executable size fell from 4,628 to 4,624 lines. From the 10,233-line baseline, 5,609 lines are gone (54.8%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 preconverted CAST RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.65 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
