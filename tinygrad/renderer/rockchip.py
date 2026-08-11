@@ -1087,7 +1087,12 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   return finished
 
 def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
-  return _flatten_binary(root.src[0], op)+_flatten_binary(root.src[1], op) if root.op is op else [root]
+  leaves, stack = [], [root]
+  while stack:
+    node = stack.pop()
+    if node.op is op: stack.extend(reversed(node.src))
+    else: leaves.append(node)
+  return leaves
 
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64
@@ -2596,15 +2601,9 @@ def _fp32_add_terms(u:UOp) -> list[UOp]:
 
 def _fp32_add_has_product_terms(u:UOp) -> bool:
   """Whether a floating ADD tree contains a direct floating or cast-half product term."""
-  terms:list[UOp] = []
-  stack = [u]
-  while stack:
-    node = stack.pop()
-    if node.op is Ops.ADD and node.dtype.scalar() is dtypes.float: stack.extend(node.src)
-    else: terms.append(node)
   return any((term.op is Ops.MUL and term.dtype.scalar() is dtypes.float) or
              (term.op is Ops.CAST and len(term.src) == 1 and term.src[0].op is Ops.MUL and
-              term.src[0].dtype.scalar() is dtypes.half) for term in terms)
+              term.src[0].dtype.scalar() is dtypes.half) for term in _flatten_binary(u, Ops.ADD))
 
 def _fp32_ratio_to_half(u:UOp) -> UOp|None:
   """Divide two FP32 ADD boundaries while retaining their high/low half expansions through FDIV."""

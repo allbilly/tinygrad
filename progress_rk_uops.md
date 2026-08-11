@@ -2350,3 +2350,23 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 108. Reuse one iterative binary flattener — complete
+
+- `_fp32_add_has_product_terms()` maintained a private iterative ADD-tree traversal while `_flatten_binary()` already
+  owned the same semantic recursively. Made the shared helper iterative and order-preserving, then reused it in the
+  product predicate. This deletes the duplicate traversal and makes all shared ADD/MUL/AND flattening safe for deep
+  trees.
+- ADD, MUL, and AND leaf ordering matched milestone 107 exactly. Floating-product detection also matched for direct
+  FP32 products, cast-FP16 products, non-product trees, and a 4,096-deep ADD tree. Representative sum and nested
+  product RKImages were byte-identical.
+- Renderer executable size fell from 4,668 to 4,667 lines. From the 10,233-line baseline, 5,566 lines are gone (54.4%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 binary leaf orders, 4/4 product predicates, and 2/2 product RKImages identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.11 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
