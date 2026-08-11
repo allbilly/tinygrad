@@ -1899,3 +1899,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 86. Stream scratch lifetime spans — complete
+
+- Profiled `test_dependent_reduction_range_preserves_vector_output_axis`, still the suite's slowest case. Scratch
+  coloring retained every physical touch in a Python list and then rescanned 16,467 histories with `min()`/`max()`.
+  Physical events are visited monotonically, so the allocator now stores only each virtual slot's first and latest
+  event and keeps slots in first-touch order. This preserves the same linear-scan coloring order without the sort.
+- Precompute remapped zero-offset `RKArg` values once instead of reconstructing the same argument for every source and
+  destination occurrence. Nonzero byte offsets retain exact per-use reconstruction.
+- The scratch-coloring cProfile cost fell from 0.591 to 0.393 seconds. Alternating the complete scalar/vector/large
+  workload between milestone 85 and current code reduced its median from 1.006 to 0.893 seconds (11.2%); the slowest
+  full-suite case measured 1.24 seconds, down from 1.40 seconds before profiling.
+- Compared milestone-85/current serialized images for scalar, vector, and large dependent reductions; all three were
+  byte-identical. Renderer executable size is 4,747 lines (four lines added for the faster lifetime representation),
+  still 5,486 lines or 53.6% below the 10,233-line baseline. Runtime remains 480 lines and no CPU numeric semantics
+  were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 profiled dependent reductions byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=3`: 91 passed in 5.05 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
