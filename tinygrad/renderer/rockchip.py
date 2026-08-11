@@ -3491,14 +3491,9 @@ class RKContext:
         magnitude = UOp(Ops.MAX, dtypes.half, src=(u.src[0], u.src[0]), arg=_NATIVE_ABS)
         recipe = _positive_mask(magnitude)
         value = self.lower(recipe)
-      elif dtype is dtypes.half and source.layout is RKLayout.INT32:
+      elif source.layout is RKLayout.INT32 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.int):
         value = self._narrow_int32(source)
-      elif dtype is dtypes.float and source_dtype is dtypes.int and source.layout is RKLayout.INT32:
-        value = self._narrow_int32(source)
-      elif dtype is dtypes.float and source_dtype is dtypes.bool and source.layout is RKLayout.BOOL_INT16:
-        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        value = self.lower(recipe)
-      elif dtype is dtypes.half and source.layout is RKLayout.BOOL_INT16:
+      elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.bool):
         recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
         value = self.lower(recipe)
       elif dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16):

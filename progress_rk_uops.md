@@ -2582,3 +2582,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 120. Merge identical physical CAST branches — complete
+
+- The generic CAST handler separately dispatched INT32-backed values to the same narrowing recipe for half and float
+  outputs. It also duplicated the identical BOOL_INT16 selection recipe for half and float outputs. Merged each pair
+  around its canonical source layout while retaining the prior source/destination dtype guards.
+- INT32→half, INT32→float, BOOL_INT16→half, and BOOL_INT16→float programs produced RKImages byte-identical to milestone
+  119. No additional conversion pair is accepted.
+- Renderer executable size fell from 4,636 to 4,631 lines. From the 10,233-line baseline, 5,602 lines are gone (54.7%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 4/4 merged CAST RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.05 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
