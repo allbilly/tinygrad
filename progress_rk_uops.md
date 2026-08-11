@@ -1357,3 +1357,26 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 90 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 60. Delete the uint8 cast image catalog — complete
+
+- Disconnected the mapped ADD-loop recognizer first. Small mean/variance/std axis cases passed through the literal
+  executor, but full 15x25x35 variance and std reached a roughly 13k-deep expanded accumulator and hit Python's
+  recursion limit. Restored that block unchanged: it remains the generic large static ADD-loop executor, not dead
+  operation-specific code.
+- Moved uint8 into the physical value ABI instead. A half-to-uint8 `CAST` now emits its truncation/modulo recipe through
+  ordinary typed UOps, materializes canonical INT16 scratch, and exposes the low byte at the terminal STORE boundary.
+  A uint8 `WHERE` composes the same INT16 values and canonical constants without recognizing the surrounding graph.
+- Deleted both `_lower_fp16_uint8_cast` and `_typed_int16_byte_image`, plus their early dispatch. Renderer executable
+  size fell from 5,009 to 4,984 lines, another 25 lines. From the
+  10,233-line pre-deletion baseline, 5,249 executable lines are gone (51.3%); runtime remains 489 lines.
+- No CPU numeric semantics were introduced. Truncation, modulo, WHERE, and FP16-to-INT16 conversion all execute on DPU;
+  the terminal gather only materializes the selected low byte.
+
+Verification:
+
+- Cold complete `TestRockchipCastOps`: 2 passed in 6.10s.
+- Cold upstream `TestOpsUint8::test_cast`: 1 passed in 2.74s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

@@ -538,6 +538,16 @@ def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():
   assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
 
 
+def test_terminal_uint8_cast_and_where_use_int16_physical_values():
+  source = UOp.param(1, dtypes.half, (9,))
+  for value in (lambda i:source.index(i).load().cast(dtypes.uchar),
+                lambda i:(UOp.const(0.0, dtypes.half) < source.index(i).load()).where(
+                  source.index(i).load().cast(dtypes.uchar), UOp.const(0, dtypes.uchar))):
+    image = _lower_uop_program(_program(dtypes.uchar, value, count=9))
+    assert image is not None and image.ew_ops[-1].int16_output and image.post_gathers[-1].itemsize == 1
+    assert decode_image(encode_image(image)) == image
+
+
 def test_bounded_sums_of_native_half_comparisons_stay_int16_until_output():
   out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (4,))
   terms = [(source.index(i).load() < UOp.const(0.5, dtypes.half)).cast(dtypes.int) for i in range(4)]

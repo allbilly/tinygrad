@@ -1343,25 +1343,6 @@ def _kahan_add(ops:list[RKEWOp], active:list[int], count:int, arena:Callable[[in
   emit(out, total, total, Ops.MAX)
   return out
 
-def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
-  """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
-  root = output[4]
-  zero = UOp.const(0.0, dtypes.half)
-  if root.op is Ops.CAST and root.dtype.scalar() is dtypes.uchar and len(root.src) == 1 and \
-     root.src[0].dtype.scalar() is dtypes.half: source = root.src[0]
-  elif (root.op is Ops.WHERE and root.dtype.scalar() is dtypes.uchar and len(root.src) == 3 and
-        root.src[0].op is Ops.CMPLT and root.src[0].src[0].op is Ops.CONST and float(root.src[0].src[0].arg) == 0.0 and
-        root.src[1].op is Ops.CAST and root.src[1].dtype.scalar() is dtypes.uchar and len(root.src[1].src) == 1 and
-        root.src[1].src[0].dtype.scalar() is dtypes.half and root.src[0].src[1].key == root.src[1].src[0].key and
-        root.src[2].op is Ops.CONST and int(root.src[2].arg) == 0):
-    source = root.src[1].src[0].alu(Ops.MAX, zero)
-  else: return None
-  if (relu:=_relu_operand(source)) is not None: source = relu.alu(Ops.MAX, zero)
-  truncated = _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(source,)))
-  quotient = _native_floor(truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half)))
-  remainder = truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))
-  return _typed_int16_byte_image(output, remainder)
-
 def _int32_division_root(root:UOp) -> tuple[str, UOp, UOp]|None:
   """Recognize truncating quotient/remainder and Tinygrad's canonical floor corrections."""
   if root.op is Ops.CDIV and root.dtype.scalar() is dtypes.int: return "trunc", root.src[0], root.src[1]
@@ -2513,26 +2494,6 @@ def _typed_int_image(output:RKOutput, value:UOp, bool_output:bool=False) -> RKIm
                 stateful=True, int32_output=True, bool_output=bool_output))
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_int32_tiles_bytes(count))), ew_ops=ops)
 
-def _typed_int16_byte_image(output:RKOutput, value:UOp) -> RKImage:
-  """Lower an exact FP16 integer expression through native INT16 output and gather its low bytes."""
-  store, out_param, count, _, _ = output
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  out_slot = out_param.arg.slot
-  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
-  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
-  replacement = store.replace(src=(half_index, value, *store.src[2:]))
-  image = _lower_composed_uops(_fp16_rewrite(list(UOp(Ops.SINK, src=(replacement,)).toposort())), recipes_ready=True)
-  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
-  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.mid_gathers or image.post_gathers:
-    raise RuntimeError("RKPLAN_REJECT:uint8_terminal")
-  half_slot, int_slot = len(image.scratch), len(image.scratch)+1
-  half_result, int_result = RKArg(RKBufferKind.SCRATCH, half_slot), RKArg(RKBufferKind.SCRATCH, int_slot)
-  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=half_result),
-         RKEWOp(int_result, half_result, half_result, count, _EW_CFG[Ops.MAX], submit_barrier=True,
-                stateful=True, int16_output=True))
-  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=ops,
-                 post_gathers=(_int16_low_bytes(int_result, out_slot, count),))
-
 def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
   """Recover isclose's original operands, equal_nan mode, and its exact-equality FP16 tolerance range."""
   nodes = root.toposort()
@@ -2933,7 +2894,7 @@ class RKContext:
         self.static_slots[key] = value
       return self.static_slots[key]
     if dtype in (dtypes.half, dtypes.float): bits, layout = struct.pack("<e", float(u.arg)), RKLayout.FP16
-    elif dtype is dtypes.int16: bits, layout = struct.pack("<H", _int16_bits(int(u.arg))), RKLayout.INT16
+    elif dtype in (dtypes.int16, dtypes.uchar): bits, layout = struct.pack("<H", _int16_bits(int(u.arg))), RKLayout.INT16
     elif dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
       bits, layout = struct.pack("<e", float(u.arg)), self.int_layout
     elif dtype is dtypes.int and self.int_layout is RKLayout.INT16:
@@ -3819,7 +3780,17 @@ class RKContext:
         self._register_graph(recipe)
         source = self.lower(recipe)
       else: source = self.lower(u.src[0])
-      if dtype is dtypes.half and source.layout is RKLayout.INT32:
+      if dtype is dtypes.uchar and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
+        cast_source = u.src[0]
+        if (relu:=_relu_operand(cast_source)) is not None: cast_source = relu.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
+        truncated = _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(cast_source,)))
+        quotient = _native_floor(truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half)))
+        recipe = truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))
+        self._register_graph(recipe)
+        converted, value = self.lower(recipe), self._scratch(dtype, RKLayout.INT16)
+        self.ew_ops.append(RKEWOp(value.arg, converted.arg, converted.arg, self.count, _EW_CFG[Ops.MAX],
+                                  submit_barrier=True, stateful=True, int16_output=True))
+      elif dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
       elif dtype is dtypes.float and source_dtype is dtypes.int and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
@@ -3894,6 +3865,8 @@ class RKContext:
       if result.arg != self.out: self._emit(RKValue(self.out, dtype, self.count, RKLayout.FP16), result, result, _EW_CFG[Ops.MAX])
     elif dtype is dtypes.int16 and result.layout is RKLayout.INT16:
       if result.arg != self.out: self._emit(RKValue(self.out, dtype, self.count, RKLayout.INT16), result, result, _EW_CFG[Ops.MAX])
+    elif dtype is dtypes.uchar and result.layout is RKLayout.INT16:
+      self.post_gathers.append(_int16_low_bytes(result.arg, self.out_param.arg.slot, self.count))
     elif dtype is dtypes.bool and result.layout is RKLayout.BOOL_MASK:
       tiles = self._scratch(dtypes.int, RKLayout.INT32, _int32_tiles_bytes(self.count))
       self.ew_ops.append(RKEWOp(self.out, result.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX],
@@ -4538,8 +4511,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (division:=_lower_int32_division(int_output)) is not None: return division
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
      (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, nonzero, bool_output=True)
-  if (byte_output:=_output_store(uops, dtypes.uchar)) is not None and \
-     (fp16_byte_cast:=_lower_fp16_uint8_cast(byte_output)) is not None: return fp16_byte_cast
   if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
      (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):
@@ -4592,7 +4563,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   mapped_loop = _lower_mapped_add_loop_reduction(uops) if vectorize_reductions else None
   if mapped_loop is not None: return mapped_loop
   if storage_uops is not None: uops = storage_uops
-  if (output:=_output_store(uops, (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool), allow_local=True)) is None or \
+  if (output:=_output_store(uops, (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool, dtypes.uchar), allow_local=True)) is None or \
      len(output[0].src) != 2:
     if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject("output store")
     return None
