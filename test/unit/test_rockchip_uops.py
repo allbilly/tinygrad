@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
-  _canonical_half_storage, _fp32_expr_to_half, _gather_plan, _iter_range_env,
+  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -48,6 +48,13 @@ def test_generic_fp16_uops_lower_in_dependency_order():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
 
 
+def test_physical_half_recipe_materializes_strong_float_constant_at_boundary():
+  source = UOp.param(1, dtypes.half, (4,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:
+    UOp(Ops.ADD, dtypes.half, src=(source.index(i).load(), UOp.const(0.25, dtypes.float)))))
+  assert image is not None and struct.pack("<e", 0.25) in image.constants
+
+
 def test_fp32_load_materializes_through_canonical_fp16_physical_abi():
   source = UOp.param(1, dtypes.float, (9,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:source.index(i).load().cast(dtypes.half), count=9))
@@ -77,6 +84,17 @@ def test_generic_where_owns_ternary_arity():
   assert image is not None
   assert any(op.compare or op.ew_cfg == _EW_CFG[Ops.MAX] for op in image.ew_ops)
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
+
+
+def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
+  fallback, selected = UOp.param(1, dtypes.half, (6,)), UOp.param(2, dtypes.half, (6,))
+  image = _lower_uop_program(_program(dtypes.half, lambda i:
+    selected.index(i).load(fallback.index(i).load(), i < UOp.const(3, dtypes.int)), count=6))
+  assert image is not None and len(image.gathers) == 2
+  assert not image.gathers[0].partial and image.gathers[1].partial
+  assert image.gathers[0].src_index == 1 and image.gathers[1].src_index == 2
+  assert image.gathers[1].offsets == (0, 1, 2, -1, -1, -1)
+  assert decode_image(encode_image(image)) == image
 
 
 def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
@@ -725,12 +743,45 @@ def test_dependent_reduction_range_preserves_vector_output_axis():
   assert len(vector.ew_ops) == len(scalar.ew_ops)
 
 
+def test_mapped_loop_reduction_composes_generic_post_uops():
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (65,))
+  axis = UOp.range(65, 0, AxisType.REDUCE)
+  local = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG).index(0)
+  initialize = local.store(UOp.const(0.0, dtypes.float))
+  value = source.index(axis).load()
+  update = local.store(local.load() + (value*value).cast(dtypes.float))
+  post = (local.load().cast(dtypes.half)*UOp.const(1/65, dtypes.half)).sqrt()
+  output = out.index(0).store(post)
+  image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
+  assert image is not None and image.gather_after < len(image.ew_ops)
+  assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG, 0)
+
+
+def test_multiple_output_stores_execute_sequentially():
+  first, second = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (4,))
+  source, lane = UOp.param(2, dtypes.half, (4,)), UOp.range(4, 0)
+  program = list(UOp.sink(first.index(lane).store(source.index(lane).load()+1.0),
+                          second.index(lane).store(first.index(lane).load()*2.0)).toposort())
+  image = _lower_uop_program(program)
+  assert image is not None and len(image.ew_ops) == 2
+  assert image.ew_ops[1].lhs == RKArg(RKBufferKind.ARG, 0)
+  assert image.ew_ops[1].submit_barrier and image.ew_ops[1].stateful
+
+
 def test_static_structural_expansion_is_bounded():
-  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (1025,))
-  lane, axis = UOp.range(1, 0), UOp.range(1025, 1, AxisType.REDUCE)
+  limit = (1 << 14) + 1
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (limit,))
+  lane, axis = UOp.range(1, 0), UOp.range(limit, 1, AxisType.REDUCE)
   reduced = UOp(Ops.REDUCE, dtypes.half, src=(source.index(axis).load(), axis), arg=(Ops.ADD,))
   uops = list(out.index(lane).store(reduced).end(lane, axis).sink().toposort())
   assert _lower_uop_program(uops) is None
+
+
+def test_deep_generic_graph_canonicalization_is_iterative():
+  value = UOp.const(0, dtypes.int)
+  for _ in range(4096): value = value + UOp.const(1, dtypes.int)
+  rewritten = _finite_int_max_neutrals(value)
+  assert rewritten.key == value.key
 
 
 def test_static_range_environment_allocation_is_bounded():

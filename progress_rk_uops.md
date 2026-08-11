@@ -833,3 +833,38 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 78 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 40. Generic memory composition and complete structural-reduction replay — complete
+
+- Completed strict UOps-only replay of movement, triangular, concat, padding, and all 36 reduction methods. The
+  authoritative prefix now extends through collection index 393: 382 passed, 12 explicit contract skips, and the final
+  51 IncrementalOps cases remain. There is no failing case in the completed prefix.
+- Made static LOAD materialization composable when its default is another typed value. The default is copied first and
+  the gated source is overlaid as a partial gather, so concat and padding require no graph or tensor-operation lowerer.
+- Extended the mapped ADD-loop executor to materialize one reduction and then run arbitrary ordinary post UOps. CAST,
+  MUL, SQRT, WHERE, and other handlers now compose after the accumulator rather than forcing literal loop expansion.
+- Added generic sequential output-store execution and generic independent scalar-local reduction staging. Multiple
+  reductions are materialized into canonical scratch values, then their shared output UOps execute normally; stacked
+  std/mean passes without a std/mean recognizer.
+- Made RANGE discovery semantic by excluding AFTER/END ordering sources attached to range nodes. Structural execution
+  still respects program order, while index enumeration no longer mistakes completed reduction loops for output axes.
+- Routed plain ADD/MAX/MUL local loops through the generic reduction arena before mapped materialization. A 16,384-lane
+  full sum now gathers directly into the arena and completes in one ioctl as required by the backend contract.
+- Kept large math UOps owned by their handlers. Programs above the eager-recipe threshold defer expansion, and the
+  handler registers one tagged physical recipe. A correction-equals-count std edge fell from a 230,619-node eager graph
+  to 373 nodes and from minutes of compilation to a few seconds.
+- Replaced quadratic scratch lifetime coloring with a heap-based allocator. It preserves pinned mid-gather state and
+  interval safety while avoiding a full physical-slot scan for every virtual UOp value.
+- The legacy correctness catalog is still present, so no line saving is claimed yet: `sz.py` reports 10,217 executable
+  renderer lines and 488 runtime lines. The final 51-case replay remains the gate before deleting superseded paths.
+
+Verification:
+
+- Strict movement/triangular/concat/padding continuation: 46 passed and 1 skipped cumulatively.
+- Strict `TestRockchipReductionOps`: all 36 methods passed across resumed segments; the final 11-method segment passed
+  in 46.02s, and `test_sum_full` separately passed in 4.20s with exactly one submit.
+- Strict `TestRockchipReductionOps::test_std_mean`: 1 passed in 19.13s.
+- Strict `TestRockchipReductionOps::test_std_one_in_axis`: 1 passed in 4.76s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 83 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
