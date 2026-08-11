@@ -1829,3 +1829,28 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 83. Skip no-op semantic graph rebuilds — complete
+
+- Reprofiled `test_dependent_reduction_range_preserves_vector_output_axis` after materialization cleanup. The largest
+  avoidable semantic cost was `_finite_int_max_neutrals()`: it rebuilt every node of 4k/8k-stage FP16 arithmetic
+  graphs even though they contained no `INT32_MIN`, the only constant that pass can change. Added an exact no-op guard.
+- Large graphs already disable optional accurate/composite recipes, but `_expand_math_uops()` still rebuilt an 8,696
+  node ADD/MUL/load graph containing no transformable math. It now returns the original UOps when a large graph has no
+  WHERE, SQRT, EXP2, LOG2, SIN, TRUNC, or float→half storage boundary. All those semantic cases retain the full pass.
+- Deleted the renderer's private recursive `_substitute_static_ranges()` graph walker and delegated exact UOp
+  replacement to `UOp.substitute()`, Tinygrad's existing bottom-up substitution mechanism. This removes duplicate
+  graph infrastructure and retains the generic local/RANGE executor.
+- Compared milestone-82/current serialized images for scalar 65-term, vector 65-term, and large 128-term dependent
+  reductions; all three were byte-identical. Profiled process time fell from 3.511 to 3.295 seconds, and isolated test
+  call time fell from roughly 1.20 to 1.08 seconds.
+- Renderer executable size fell from 4,759 to 4,756 lines. From the 10,233-line baseline, 5,477 executable renderer
+  lines are gone (53.5%); runtime remains 480 lines. No CPU numeric semantics or generated DPU stages changed.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 3/3 dependent reduction programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=6`: 91 passed in 5.16 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

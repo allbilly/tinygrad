@@ -3688,7 +3688,10 @@ def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  bounded_recipes = len(root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES
+  nodes = root.toposort()
+  bounded_recipes = len(nodes) <= _MAX_OPTIONAL_RECIPE_NODES
+  if not bounded_recipes and not any(u.op in (Ops.WHERE, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.TRUNC) or
+    u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and u.src[0].dtype.scalar() is dtypes.float for u in nodes): return root
   composite_math = _fold_inverse_hyperbolic(root) if bounded_recipes else None
   if composite_math is None and bounded_recipes: composite_math = _fold_atan(root)
   cache:dict[UOp, UOp] = {}
@@ -3751,6 +3754,7 @@ def _finite_max_neutral_selectors(root:UOp) -> UOp:
 
 def _finite_int_max_neutrals(root:UOp) -> UOp:
   """Canonicalize INT32_MIN only while it acts as a structural MAX neutral in exact scratch arithmetic."""
+  if not any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min for u in root.toposort()): return root
   cache:dict[tuple[UOp, bool], UOp] = {}
   stack:list[tuple[UOp, bool, bool]] = [(root, False, False)]
   while stack:
@@ -3768,14 +3772,7 @@ def _finite_int_max_neutrals(root:UOp) -> UOp:
   return cache[(root, False)]
 
 def _substitute_static_ranges(root:UOp, replacements:dict[UOp, UOp]) -> UOp:
-  cache:dict[UOp, UOp] = {}
-  def rewrite(u:UOp) -> UOp:
-    if u in replacements: return replacements[u]
-    if u in cache: return cache[u]
-    mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
-    cache[u] = mapped
-    return mapped
-  return rewrite(root)
+  return root.substitute(replacements)
 
 def _unroll_static_reduces(root:UOp) -> UOp:
   """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
