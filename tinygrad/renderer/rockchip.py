@@ -1099,6 +1099,11 @@ def _stripe_gathers(src_slot:int, dst_slot:int, count:int, rows:Iterable[Iterabl
   return tuple(RKGather(src_slot, dst_slot, count, offsets=() if values else tuple(row), values=tuple(row) if values else (),
                         dst_addend=i*vector_lanes, itemsize=itemsize) for i,row in enumerate(rows))
 
+def _physical_lists(minimum:int=0) -> tuple[list[int], Callable[[int], int], list[RKGather], list[RKEWOp]]:
+  scratch_sizes:list[int] = []; gathers:list[RKGather] = []; ops:list[RKEWOp] = []
+  def scratch(size:int) -> int: scratch_sizes.append(max(minimum, size)); return len(scratch_sizes)-1
+  return scratch_sizes, scratch, gathers, ops
+
 def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
   first = True
@@ -1673,10 +1678,7 @@ def _int32_index_selection_image(out_slot:int, count:int, index_slot:int, index_
   if not rows or any(len(values) != count or any(not -32768 <= value <= 32767 for value in values) for values in candidate_values): return None
   vector_bytes, vector_lanes, _ = _stripe_layout(count, 1)
   block_rows = max(1, _MAX_EW_ELEMS_FP16//vector_lanes)
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
   partials:list[RKArg] = []
   for start in range(0, rows, block_rows):
     op_start = len(ops)
@@ -1778,10 +1780,7 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
   grouped_gate = None if gate is None else (gate[0], gate[1], gate[2][::repeat])
   vector_lanes = _stripe_layout(group_count, 2)[1] if len(plans) > 1 else group_count
   block_rows = max(1, _MAX_EW_ELEMS_FP16//vector_lanes)
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(size); return len(scratch_sizes)-1
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists()
   block_values:list[list[tuple[RKArg, ...]]] = []
   for start in range(0, len(plans), block_rows):
     stop = min(len(plans), start+block_rows)
@@ -1960,10 +1959,7 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
 
   layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_ in axes)
   if any(matrix_lanes > _MAX_EW_ELEMS_FP16 for _,_,matrix_lanes,_ in layouts): return None
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(size); return len(scratch_sizes)-1
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists()
   valid_axes:list[RKArg] = []
   for (param,_,_,offsets,extent,wrapped),(_,vector_lanes,_,_) in zip(axes, layouts):
     positive = tuple((coordinate,)*count for coordinate in range(extent))
@@ -2056,10 +2052,7 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType) -
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
 
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
   _, source_vector_lanes, _ = _stripe_layout(1, source_count)
   source_rows = tuple((lane,) for lane in range(source_count))
   if (source_mask:=_native_integer_nonzero_mask(ops, gathers, scratch, source.arg.slot, source_rows, 1,

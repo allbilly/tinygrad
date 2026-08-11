@@ -2521,3 +2521,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 117. Share bounded physical-image working lists — complete
+
+- Four bounded integer/address recipes independently created the same scratch-size list, slot allocator closure,
+  gather list, and EW-stage list. Added `_physical_lists(minimum)` as one physical construction helper; candidate and
+  predicate-coordinate recipes retain their exact 64-byte minimum, while dynamic gather and bounds-mask recipes keep
+  exact requested sizes.
+- Candidate INT32 selection, dynamic typed loading, bounded FP16 predicate coordinates, and normalized INT32 bounds
+  programs produced RKImages byte-identical to milestone 116.
+- Renderer executable size fell from 4,643 to 4,635 lines. From the 10,233-line baseline, 5,598 lines are gone (54.7%);
+  runtime remains 480 lines. The helper owns allocation bookkeeping only; no CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 4/4 affected physical-builder RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.69 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
