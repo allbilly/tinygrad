@@ -2830,3 +2830,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 133. Give every runtime EW tile one offset-argument boundary — complete
+
+- The runtime's scratch-INT16, spatial, INT16→INT32, native-integer, comparison, and ordinary FP16 execution branches
+  each rebuilt destination/lhs/rhs `RKArg` offsets independently. Added `_offset_ew_args()` and routed all six tiling
+  paths through the same physical argument calculation.
+- Twelve combinations of destination and shared input offsets matched the removed constructors exactly. This changes
+  neither DPU stage flags nor host behavior and introduces no CPU numeric semantics.
+- Runtime executable size fell from 480 to 470 lines. Renderer remains 4,535 executable lines, 5,698 lines below its
+  10,233-line baseline (55.7%).
+
+Verification:
+
+- Offset-argument comparison: 12/12 cases identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.53 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
