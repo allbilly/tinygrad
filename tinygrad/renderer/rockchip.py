@@ -315,7 +315,6 @@ _MAX_STATIC_LOCAL_STEPS = 1 << 20
 _MAX_STATIC_RANGE_ENVS = 1 << 18
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
 _FP16_EXACT_INTEGER = 1 << 11
-_POOL_INDEX_DIGIT_BITS = 4
 _EW_DATA_MODE_FP16 = 1 << 28
 _EW_EDATA_SIZE_FP16 = 2 << 22
 _EW_ALU_MIN = 1 << 16
@@ -523,8 +522,7 @@ def _eval_expr(u:UOp, env:dict[UOp, int], cache:dict[UOp, int|float|bool]) -> in
   cache[u] = ret
   return ret
 
-def _eval_int(u:UOp, env:dict[UOp, int], cache:dict[UOp, int|float|bool]|None=None) -> int:
-  return int(_eval_expr(u, env, {} if cache is None else cache))
+def _eval_int(u:UOp, env:dict[UOp, int]) -> int: return int(_eval_expr(u, env, {}))
 
 def _vector_cast(value, dtype:DType) -> np.ndarray:
   return np.asarray(value, dtype=np.dtype(dtype.scalar().fmt) if dtype.scalar().fmt is not None else None)
@@ -585,12 +583,12 @@ def _index_ranges(index:UOp) -> list[UOp]:
   return ranges
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
-def _output_store(uops:list[UOp], dtype:DType|tuple[DType, ...], *, allow_local:bool=False, reject_reduce:bool=False) \
+def _output_store(uops:list[UOp], dtype:DType|tuple[DType, ...], *, allow_local:bool=False) \
                   -> RKOutput|None:
   """Return the single statically-sized output store shared by specialized graph matchers."""
   stores = [u for u in uops if u.op is Ops.STORE]
   outputs = [(store, root) for store in stores if (root:=_root_param(store.src[0])) is not None]
-  if (len(outputs) != 1 or not allow_local and len(stores) != 1 or reject_reduce and any(u.op is Ops.REDUCE for u in uops)):
+  if len(outputs) != 1 or not allow_local and len(stores) != 1:
     return None
   store, out_param = outputs[0]
   accepted = dtype if isinstance(dtype, tuple) else (dtype,)
@@ -1131,16 +1129,14 @@ def _stripe_gathers(src_slot:int, dst_slot:int, count:int, rows:Iterable[Iterabl
   return tuple(RKGather(src_slot, dst_slot, count, offsets=() if values else tuple(row), values=tuple(row) if values else (),
                         dst_addend=i*vector_lanes, itemsize=itemsize) for i,row in enumerate(rows))
 
-def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False, int32:bool=False) -> RKArg:
+def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
-  if int16 and int32: raise ValueError("conflicting integer reduction precision")
-  integer = int16 or int32
   first = True
   while len(active) > 1:
     reduced = []
     for i in range(0, len(active)-1, 2):
-      ops.append(RKEWOp(active[i], active[i], active[i+1], count, cfg, submit_barrier=first and not integer,
-                        stateful=first and not integer, int32_input=int32, int32_output=int32,
+      ops.append(RKEWOp(active[i], active[i], active[i+1], count, cfg, submit_barrier=first and not int16,
+                        stateful=first and not int16,
                         int16_input=int16, int16_output=int16))
       first = False; reduced.append(active[i])
     if len(active) & 1: reduced.append(active[-1])
@@ -1149,11 +1145,11 @@ def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16
 
 
 def _ew_eq_mask(ops:list[RKEWOp], arg:Callable[[int], RKArg], lhs:int, rhs:int, temps:tuple[int, int, int, int], one:int,
-                lanes:int, barriers:tuple[bool, bool]=(False, True)) -> RKArg:
+                lanes:int) -> RKArg:
   """Append SUB, ABS, nonzero comparison, and inversion for an FP16 equality mask."""
   diff, magnitude, unequal, equal = temps
-  ops.extend((RKEWOp(arg(diff), arg(lhs), arg(rhs), lanes, _EW_CFG[Ops.SUB], submit_barrier=barriers[0], stateful=barriers[0]),
-              RKEWOp(arg(magnitude), arg(diff), arg(diff), lanes, _EW_CFG_ABS, submit_barrier=barriers[1], stateful=barriers[1]),
+  ops.extend((RKEWOp(arg(diff), arg(lhs), arg(rhs), lanes, _EW_CFG[Ops.SUB]),
+              RKEWOp(arg(magnitude), arg(diff), arg(diff), lanes, _EW_CFG_ABS, submit_barrier=True, stateful=True),
               RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), lanes, _EW_CFG[Ops.MAX], compare=True),
               RKEWOp(arg(equal), arg(one), arg(unequal), lanes, _EW_CFG[Ops.SUB], stateful=True)))
   return arg(equal)
@@ -1205,20 +1201,15 @@ RKIndexEquality = tuple[int, int, tuple[tuple[int, ...], ...], tuple[tuple[int, 
 RKCoordinateRows = tuple[tuple[int, ...], ...]
 
 def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:Callable[[int], RKArg],
-                  out:RKArg|None=None, fp32_out:bool=False, int16:bool=False, level_barriers:bool=False,
-                  op_barriers:bool=False) -> RKArg:
+                  out:RKArg|None=None, op_barriers:bool=False) -> RKArg:
   """Append a balanced in-place arena reduction and optionally write its final stage directly to output."""
   while len(active) > 1:
-    reduced, first = [], True
+    reduced = []
     for i in range(0, len(active)-1, 2):
       lhs, rhs, final = active[i], active[i+1], len(active) == 2 and out is not None
       dst = out if final and out is not None else arena(lhs)
-      ops.append(RKEWOp(dst, arena(lhs), arena(rhs), count,
-                        cfg | (_EW_STAGE_FP32_OUT if fp32_out and final else 0),
-                        int16_input=int16, int16_output=int16,
-                        submit_barrier=(op_barriers or level_barriers and first) and bool(ops),
-                        stateful=op_barriers or level_barriers and first))
-      first = False
+      ops.append(RKEWOp(dst, arena(lhs), arena(rhs), count, cfg,
+                        submit_barrier=op_barriers and bool(ops), stateful=op_barriers))
       reduced.append(lhs)
     if len(active) & 1: reduced.append(active[-1])
     active = reduced

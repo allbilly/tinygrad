@@ -1465,3 +1465,23 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 65. Delete dormant reduction-helper modes — complete
+
+- Audited all repository callers of the private row and arena reducers, equality-mask builder, scalar evaluator, and
+  output-store parser. Deleted configuration state that no caller supplied: INT32 row reduction, FP32/INT16 arena
+  output, per-level arena barriers, configurable equality barriers, scalar-evaluator cache injection, and explicit
+  REDUCE rejection.
+- Kept the only live physical behavior unchanged: FP16/INT16 balanced rows, optional per-operation barriers for
+  precision reducers, and the fixed SUB/ABS/compare equality sequence. Removed the final pool-index constant that
+  became unreferenced with the stale radix in milestone 64.
+- Renderer executable size fell from 4,900 to 4,891 lines. From the 10,233-line pre-deletion baseline, 5,342
+  executable lines are gone (52.2%); runtime remains 491 executable lines.
+- No CPU numeric semantics or lowering behavior were introduced. This is a private dead-mode deletion validated by
+  serialized-image unit contracts and static checks; hardware remains unavailable pending reboot.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
