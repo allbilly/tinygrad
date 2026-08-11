@@ -896,13 +896,13 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   """Evaluate one fused FP16 map over the whole reduction domain, then reduce its materialized lanes."""
   if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
   store, out, rows, out_index, root = output
-  nodes, out_ranges = list(root.toposort()), _index_ranges(out_index)
-  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
+  out_ranges = _index_ranges(out_index)
+  reduce_ranges = [u for u in uops if u.op is Ops.RANGE and u not in out_ranges]
   if not reduce_ranges or any(r.src[0].op is not Ops.CONST or int(r.src[0].arg) <= 0 for r in reduce_ranges): return None
   try: envs = _iter_range_env(out_ranges)
   except RuntimeError: return None
   if len(envs) != rows or tuple(_eval_int(out_index, env) for env in envs) != tuple(range(rows)): return None
-  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and any(r in u.toposort() for r in reduce_ranges)]
+  updates = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None and any(r in u.toposort() for r in reduce_ranges)]
   if len(updates) != 1: return None
   value, post_root, post_local = root, None, None
   if _local_load(value) is not None: post_scale = 1.0
@@ -917,7 +917,8 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
     post_root, post_scale = root, 1.0
   if not math.isfinite(post_scale): return None
   update = _strip_cast(updates[0].src[1])
-  if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None:
+  if update.dtype.scalar() is not dtypes.float or update.op is not Ops.ADD or \
+     (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None:
     return None
   term = update.src[1 if update.src[0] is acc else 0]
   groups, flat = 1, UOp.const(0, out_index.dtype)
@@ -2612,6 +2613,7 @@ class RKContext:
     self.out = RKArg(RKBufferKind.ARG, self.out_param.arg.slot)
     self.values:dict[UOp, RKValue] = {}
     self.scratch:list[RKScratch] = []
+    self.scratch_specs = RKScratch(_scratch_bytes(self.count)), RKScratch(self.count*4)
     self.constants:dict[bytes, int] = {}
     self.materialized_slots:dict[tuple, RKValue] = {}
     self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
@@ -2651,8 +2653,7 @@ class RKContext:
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
-    self.scratch.append(RKScratch(self.count*4 if size is None and layout is RKLayout.INT32 else
-                                  _scratch_bytes(self.count) if size is None else size))
+    self.scratch.append(self.scratch_specs[layout is RKLayout.INT32] if size is None else RKScratch(size))
     return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
 
   def _int16_arg(self) -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
@@ -2918,6 +2919,8 @@ class RKContext:
     lhs, rhs = operand(u.src[0], dtype), operand(u.src[1], dtype)
     compatible = (RKLayout.FP16, RKLayout.BOOL_MASK) if expected is RKLayout.FP16 else (expected,)
     if lhs.layout not in compatible or rhs.layout not in compatible: raise _RKGenericReject
+    if dtype is dtypes.half and (u.arg is None or u.op is Ops.ADD and u.arg == _NATIVE_PRECISE_ADD):
+      return self._emit(self._dst(u, dtype, expected), lhs, rhs, _EW_CFG[u.op])
     if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:
       if expected is not RKLayout.FP16 or lhs.layout is not RKLayout.FP16: raise _RKGenericReject
       zero = self._constant(UOp.const(0.0, dtypes.half))

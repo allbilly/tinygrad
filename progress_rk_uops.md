@@ -2727,3 +2727,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 128. Restore generic mapped execution for FP32 local reductions — complete
+
+- Profiled the serial Rockchip UOp suite. `test_dependent_reduction_range_preserves_vector_output_axis` was the
+  slowest case at 0.66 seconds because the mapped `RANGE`/local `LOAD`/`STORE` executor searched only the final value
+  DAG; current stateful UOps keep the accumulator update as a sibling program node, so it fell through to literal
+  expansion of thousands of compensated EW stages.
+- Made the existing structural reducer discover reduction ranges and local stores from the complete UOp program.
+  The fast path is limited to FP32 local accumulators; FP16 ADD/MAX/MUL loops retain their literal generic behavior.
+  This is structural UOp execution, not tensor-operation recognition and not host numeric evaluation.
+- Cached the two canonical immutable scratch specifications and bypassed special-ALU dispatch for ordinary physical
+  FP16 arithmetic. The three profiled shapes now lower in a 0.0109-second median instead of 0.6338 seconds (58.1x),
+  with 66/66/129 EW stages instead of 4,012/4,012/7,918. The former slowest test is now 0.03 seconds, and the serial
+  91-test suite fell from 2.60 to 1.82 seconds.
+- Renderer executable size rose from 4,598 to 4,601 lines for the repaired structural boundary. From the 10,233-line
+  baseline, 5,632 lines remain deleted (55.0%); runtime remains 480 lines.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.66 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0 --durations=15`: 91 passed in 1.82 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
