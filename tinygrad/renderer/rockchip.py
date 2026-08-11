@@ -4843,14 +4843,12 @@ def _dpu_sin(source:UOp) -> UOp:
   if source.dtype.scalar() is dtypes.float:
     terms:list[UOp] = []
     residuals:list[UOp] = []
-    def flatten(u:UOp) -> None:
-      if u.op is Ops.ADD and u.dtype.scalar() is dtypes.float: flatten(u.src[0]); flatten(u.src[1])
-      elif u.op is Ops.CONST:
+    for u in _flatten_binary(source, Ops.ADD):
+      if u.op is Ops.CONST:
         high = struct.unpack("<e", struct.pack("<e", float(u.arg)))[0]
         terms.append(UOp.const(high, dtypes.half))
         if (low:=float(u.arg)-high) != 0.0: residuals.append(UOp.const(low, dtypes.half))
       else: terms.append(_fp32_expr_to_half(u))
-    flatten(source)
     reduced_parts = [_dpu_periodic_reduce_parts(term, 1/(2*math.pi), period_split, math.pi) for term in terms]
     reduced_terms = [part[0] for part in reduced_parts]
     residuals.extend(part[1] for part in reduced_parts)

@@ -2388,3 +2388,22 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 110. Reuse iterative ADD flattening for FP32 SIN — complete
+
+- FP32 SIN range reduction contained another recursive ADD closure for splitting phase terms and constant residuals.
+  Replaced only its traversal with `_flatten_binary()` while retaining the existing per-term conversion and split-half
+  residual logic unchanged.
+- Left-, right-, and mixed-nested phase expressions produced identical term/residual sequences, and the representative
+  shifted-SIN RKImage was byte-identical to milestone 109. Deep additive phase expressions no longer depend on Python
+  recursion depth.
+- Renderer executable size fell from 4,661 to 4,659 lines. From the 10,233-line baseline, 5,574 lines are gone (54.5%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 3/3 phase term/residual sequences and 1/1 shifted-SIN RKImage identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.16 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
