@@ -355,7 +355,6 @@ def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _reduction_stride(count:int) -> int: return round_up(count*2, 64)
 def _int32_tiles_bytes(count:int) -> int: return ceildiv(count, 4) * 64
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
-def _fp32_bits(value:float|int) -> int: return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
 def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKGather:
   return RKGather(source.index, out_slot, count, base=source.addend, axes=((1, count, stride),),
@@ -616,9 +615,6 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
     values[dst] = value
   if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")
   return tuple(x for x in values if x is not None)
-
-def _static_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
-  return _static_values(out_index, expr, count, _fp16_bits)
 
 def _static_int_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   """Evaluate a compile-time integer expression in compact output order."""
@@ -2069,7 +2065,7 @@ def _bounded_predicate_coordinate_plan(output:RKOutput, dtype:DType, predicate:C
 def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
   """Execute bounded integer predicate coordinates through native INT16 byte masks."""
   _, out_param, count, _, _ = output
-  if (plan:=_bounded_predicate_coordinate_plan(output, dtype, lambda u:_integer_nonzero_load(u, dtype),
+  if (plan:=_bounded_predicate_coordinate_plan(output, dtype, lambda u:_nonzero_load(u, dtype),
                                                lambda value:-32768 <= value <= 32767)) is None: return None
   source, rank, index_param, index_offsets, coordinate_rows, fill_value = plan
   source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows)
@@ -2288,18 +2284,11 @@ def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot
   return RKImage((RKScratch(_scratch_bytes(source_count)),), gathers=gathers, ew_ops=tuple(ops),
                  mid_gathers=tuple(replace(gather, after=len(ops)) for gather in post))
 
-def _nonzero_load(term:UOp) -> UOp|None:
-  term = _unwrap_condition(term)
-  if term.op is not Ops.CMPNE: return None
-  candidates = [load for load,zero in (term.src, term.src[::-1]) if load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and
-                load.src[0].op is Ops.INDEX and zero.op is Ops.CONST and float(zero.arg) == 0.0]
-  return candidates[0] if len(candidates) == 1 else None
-
-def _integer_nonzero_load(term:UOp, dtype:DType=dtypes.int) -> UOp|None:
+def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
   term = _unwrap_condition(term)
   if term.op is not Ops.CMPNE: return None
   candidates = [load for load,zero in (term.src, term.src[::-1]) if load.op is Ops.LOAD and load.dtype.scalar() is dtype and
-                load.src[0].op is Ops.INDEX and zero.op is Ops.CONST and int(zero.arg) == 0]
+                load.src[0].op is Ops.INDEX and zero.op is Ops.CONST and zero.arg == 0]
   return candidates[0] if len(candidates) == 1 else None
 
 
@@ -2792,7 +2781,7 @@ class RKContext:
         value = self._constant(UOp.const(int(bool(scalar)), dtypes.int16))
         return RKValue(value.arg, dtype, self.count, bool_layout)
       return self._constant(UOp.const(scalar, dtype))
-    if dtype is dtypes.half: vector, layout = _static_vector(self.out_index, u, self.count), RKLayout.FP16
+    if dtype is dtypes.half: vector, layout = _static_values(self.out_index, u, self.count, _fp16_bits), RKLayout.FP16
     elif dtype is dtypes.int16: vector, layout = _static_values(self.out_index, u, self.count, _int16_bits), RKLayout.INT16
     elif dtype is dtypes.int:
       values = _static_values(self.out_index, u, self.count, int)
@@ -2853,7 +2842,7 @@ class RKContext:
     if dtype is dtypes.float:
       if any(x.op is Ops.LOAD for x in index.toposort()) or gate is not None and any(x.op is Ops.LOAD for x in gate.toposort()):
         raise _RKGenericReject
-      fill_bits = _fp32_bits(0 if default is None else default.arg)
+      fill_bits = struct.unpack("<I", struct.pack("<f", float(0 if default is None else default.arg)))[0]
       plan = _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
       _validate_gather_bounds(plan, int(param.src[0].arg))
       groups = tuple(range(0, self.count, _EW_ELEMS_32BIT))

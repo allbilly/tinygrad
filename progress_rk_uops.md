@@ -1579,3 +1579,22 @@ Verification:
   terminal raw-bit layout contracts.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 71. Unify typed nonzero parsing and remove encoding wrappers — complete
+
+- Built a fresh private-component reference inventory across the renderer and runtime. No remaining large recognizer
+  is provably superseded without hardware replay: the grouped boolean, bounded dynamic-address, INT32, and precision
+  components each still have a distinct live dispatch or previously recorded failure boundary.
+- Replaced the duplicated FP16 and integer `LOAD != 0` graph parsers with one dtype-parameterized UOp matcher. Both
+  grouped boolean reduction and FP16 boolean-cast rewriting now consume the same semantic rule.
+- Inlined the two remaining single-use static FP16-vector and FP32-bit encoding wrappers at their physical consumers.
+  Renderer executable size fell from 4,869 to 4,860 lines. From the 10,233-line baseline, 5,373 executable lines are
+  gone (52.5%); runtime remains 484 lines.
+- No CPU numeric semantics were introduced. The consolidated matcher only classifies UOps; comparison, reduction, and
+  cast execution remain DPU operations.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
