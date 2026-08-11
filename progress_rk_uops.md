@@ -2185,3 +2185,20 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 100. Unify the IEEE BOOL physical boundary — complete
+
+- `_compare()`'s mixed-type IEEE fallback and `_ieee_bool()` independently lowered the same mask recipe, accepted the
+  same `FP16`/`BOOL_MASK` physical layouts, and retyped the result as canonical `BOOL_MASK`. Routed the comparison
+  fallback through `_ieee_bool()` so one typed boundary owns that conversion.
+- Compared milestone-99/current images for mixed FP16/FP32 `CMPNE` and `CMPEQ`; both were byte-identical.
+- Renderer executable size fell from 4,688 to 4,686 lines. From the 10,233-line baseline, 5,547 executable renderer
+  lines are gone (54.2%); runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current `encode_image()` comparison: 2/2 mixed IEEE comparison programs byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.07 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

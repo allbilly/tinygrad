@@ -3131,9 +3131,7 @@ class RKContext:
     predicate = UOp(Ops.CMPNE, src=u.src) if u.op is Ops.CMPEQ else u
     if (ieee_recipe:=_ieee_comparison_mask(predicate)) is None: raise _RKGenericReject
     if u.op is Ops.CMPEQ: ieee_recipe = UOp.const(1.0, dtypes.half).alu(Ops.SUB, ieee_recipe)
-    value = self.lower(ieee_recipe)
-    if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
-    return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
+    return self._ieee_bool(ieee_recipe)
 
   def _ieee_bool(self, recipe:UOp) -> RKValue:
     value = self.lower(recipe)
