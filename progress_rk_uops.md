@@ -774,3 +774,28 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 69 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 38. Default host-address ABI and whole-schedule scratch reuse — complete
+
+- Made raw host address materialization the correctness default for runtime-dependent LOAD and STORE addresses. It
+  remains explicitly classified as `HOST_ADDRESS`, performs only index/address calculation and raw byte movement, and
+  can be disabled with `ROCKCHIP_HOST_GATHER=0` for native-only audits.
+- Fixed the strict UOp-only NLL program without adding an NLL lowerer: its runtime integer index now feeds the generic
+  host gather, after which ordinary LOAD/ADD/MUL and reduction UOps execute normally.
+- Extended physical scratch lifetime coloring across initial gathers, host gathers, EW stages, mid-program gathers,
+  post-gathers, and host scatter. Mid-gather destinations remain pinned because partial materializations carry state
+  across phases; all ordinary expression values can reuse the surrounding arena.
+- Removed the incorrect 65,535 limit on EW stage count. RKImage already stores that count as 32-bit; only scratch,
+  combined gather, and host-address counts use 16-bit header fields.
+- The 20,642-UOp NLL3D program previously rejected with 111,474 virtual scratch values and 103,682 EW stages. It now
+  fits the physical ABI and passes by literal UOp execution. No tensor-operation recognizer was introduced.
+- A fresh strict census reached 249 passed, 6 skipped, and 126 passing subtests before exposing NLL3D. Its focused fix
+  passes; the remaining cases still need a resumed strict census before legacy deletion begins.
+
+Verification:
+
+- Strict `TestRockchipLossOps::test_nll_loss`: 1 passed in 4.14s.
+- Strict `TestRockchipLossOps::test_nll_loss_3d`: 1 passed in 171.29s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 70 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

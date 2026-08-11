@@ -1,8 +1,9 @@
 import math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKLayout, RKValue, _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _NATIVE_SIGN,
-  _MAX_EW_ELEMS_FP16, _canonical_half_storage, _gather_plan, _iter_range_env, _lower_uop_program, decode_image, encode_image)
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _canonical_half_storage, _gather_plan, _iter_range_env,
+  _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -690,6 +691,20 @@ def test_generic_ew_chain_reuses_dead_scratch_values():
   assert image is not None and len(image.ew_ops) == 128 and len(image.scratch) <= 4
 
 
+def test_scratch_reuse_spans_mid_gathers_without_aliasing_their_state():
+  scratch = tuple(RKScratch(64) for _ in range(5))
+  arg, slots = RKArg(RKBufferKind.ARG, 0), tuple(RKArg(RKBufferKind.SCRATCH, i) for i in range(5))
+  image = RKImage(RKTarget.RK3588, scratch, gathers=(RKGather(0, 0, 1, values=(0,)),), ew_ops=(
+    RKEWOp(slots[1], slots[0], slots[0], 1, _EW_CFG[Ops.ADD]),
+    RKEWOp(slots[2], slots[1], slots[0], 1, _EW_CFG[Ops.ADD]),
+    RKEWOp(slots[4], slots[3], slots[3], 1, _EW_CFG[Ops.ADD]),),
+    mid_gathers=(RKGather(arg.index, slots[3].index, 1, offsets=(0,), partial=True, after=2),))
+  colored = _reuse_linear_scratch(image, {})
+  assert len(colored.scratch) <= 4
+  assert colored.mid_gathers[0].dst_index not in {colored.ew_ops[0].dst.index, colored.ew_ops[1].dst.index, colored.ew_ops[2].dst.index}
+  assert decode_image(encode_image(colored)) == colored
+
+
 def test_large_divided_range_address_uses_compact_gather_axes():
   outer = UOp.range(16384, 1)
   inner = UOp.range(64, 4, src=(outer,))
@@ -700,8 +715,8 @@ def test_large_divided_range_address_uses_compact_gather_axes():
   assert set(plan.axes) == {(1, 64, 1), (4096, 256, 1024)}
 
 
-def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):
-  monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "1")
+def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_out(monkeypatch):
+  monkeypatch.delenv("ROCKCHIP_HOST_GATHER", raising=False)
   indices = UOp.param(2, dtypes.int, (4,))
   axis = UOp.range(4, 0)
 
@@ -721,7 +736,7 @@ def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_in(monkeypatch):
   assert len(scatter_image.host_scatters) == 1 and not scatter_image.host_gathers
   assert decode_image(encode_image(scatter_image)) == scatter_image
 
-  monkeypatch.delenv("ROCKCHIP_HOST_GATHER")
+  monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "0")
   assert _lower_uop_program(gather_uops) is None and _lower_uop_program(scatter_uops) is None
 
 

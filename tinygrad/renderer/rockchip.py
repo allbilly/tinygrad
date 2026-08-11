@@ -98,42 +98,60 @@ class RKImage:
     return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
 
 def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKImage:
-  """Color scratch lifetimes for the common pre-materialization followed by EW execution schedule."""
-  if image.mid_gathers or image.post_gathers or image.host_gathers or image.host_scatters or image.fill is not None: return image
+  """Color virtual scratch lifetimes across the complete physical execution schedule."""
   events:dict[int, list[int]] = {}
   def touch(arg:RKArg, event:int) -> None:
     if arg.kind is RKBufferKind.SCRATCH: events.setdefault(arg.index, []).append(event)
-  for slot in constant_slots.values(): touch(RKArg(RKBufferKind.SCRATCH, slot), 0)
-  event = 1
-  for gather in image.gathers:
+  def touch_gather(gather:RKGather, event:int) -> None:
     if not gather.values: touch(RKArg(gather.src_kind, gather.src_index), event)
     touch(RKArg(gather.dst_kind, gather.dst_index), event)
-    event += 1
-  for op in image.ew_ops:
+  def touch_host(host:RKHostAddress, event:int) -> None:
+    touch(host.src, event); touch(host.index, event); touch(host.dst, event)
+  for slot in constant_slots.values(): touch(RKArg(RKBufferKind.SCRATCH, slot), 0)
+  event = 1
+  for gather in image.gathers: touch_gather(gather, event); event += 1
+  for host in image.host_gathers: touch_host(host, event); event += 1
+  mid_by_point:dict[int, list[RKGather]] = {}
+  for gather in image.mid_gathers:
+    mid_by_point.setdefault(gather.after if gather.after >= 0 else image.gather_after, []).append(gather)
+  for index,op in enumerate(image.ew_ops):
+    for gather in mid_by_point.get(index, ()): touch_gather(gather, event); event += 1
     touch(op.lhs, event); touch(op.rhs, event); touch(op.dst, event)
     event += 1
+  for gather in mid_by_point.get(len(image.ew_ops), ()): touch_gather(gather, event); event += 1
+  for gather in image.post_gathers: touch_gather(gather, event); event += 1
+  for host in image.host_scatters: touch_host(host, event); event += 1
+  if image.fill is not None: touch(image.fill.dst, event)
   if not events: return replace(image, scratch=(), constants=b"")
   if any(not 0 <= slot < len(image.scratch) for slot in events): raise ValueError("invalid virtual scratch slot")
+  # Mid-program gathers may populate one logical slot in several partial phases. The runtime clears a
+  # destination once per physical slot, so these stateful materialization slots must not alias.
+  pinned = {gather.dst_index for gather in image.mid_gathers if gather.dst_kind is RKBufferKind.SCRATCH}
   intervals = sorted(((min(points), max(points), slot) for slot,points in events.items()), key=lambda item:(item[0], item[2]))
   remap:dict[int, int] = {}
   physical:list[RKScratch] = []
   physical_end:list[int] = []
+  physical_reusable:list[bool] = []
   for start,end,slot in intervals:
     spec = image.scratch[slot]
-    available = [index for index,last in enumerate(physical_end) if last < start]
+    available = [index for index,last in enumerate(physical_end) if physical_reusable[index] and last < start] if slot not in pinned else []
     if available:
       target = min(available, key=lambda index:(max(physical[index].size, spec.size), index))
       physical[target] = RKScratch(max(physical[target].size, spec.size), max(physical[target].alignment, spec.alignment))
       physical_end[target] = end
     else:
       target = len(physical)
-      physical.append(spec); physical_end.append(end)
+      physical.append(spec); physical_end.append(end); physical_reusable.append(slot not in pinned)
     remap[slot] = target
   def remap_arg(arg:RKArg) -> RKArg:
     return replace(arg, index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg
-  gathers = tuple(replace(gather,
+  def remap_gather(gather:RKGather) -> RKGather:
+    return replace(gather,
     src_index=remap[gather.src_index] if not gather.values and gather.src_kind is RKBufferKind.SCRATCH else gather.src_index,
-    dst_index=remap[gather.dst_index] if gather.dst_kind is RKBufferKind.SCRATCH else gather.dst_index) for gather in image.gathers)
+    dst_index=remap[gather.dst_index] if gather.dst_kind is RKBufferKind.SCRATCH else gather.dst_index)
+  def remap_host(host:RKHostAddress) -> RKHostAddress:
+    return replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
+  gathers = tuple(remap_gather(gather) for gather in image.gathers)
   ew_ops = tuple(replace(op, dst=remap_arg(op.dst), lhs=remap_arg(op.lhs), rhs=remap_arg(op.rhs)) for op in image.ew_ops)
   by_slot:dict[int, bytes] = {}
   for bits,slot in constant_slots.items():
@@ -141,7 +159,12 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
     if target in by_slot and by_slot[target] != bits: raise ValueError("overlapping scratch constants")
     by_slot[target] = bits
   constants = b"" if not by_slot else b"".join(by_slot.get(slot, b"\0\0") for slot in range(max(by_slot)+1))
-  return replace(image, scratch=tuple(physical), constants=constants, gathers=gathers, ew_ops=ew_ops)
+  return replace(image, scratch=tuple(physical), constants=constants, gathers=gathers, ew_ops=ew_ops,
+    mid_gathers=tuple(remap_gather(gather) for gather in image.mid_gathers),
+    post_gathers=tuple(remap_gather(gather) for gather in image.post_gathers),
+    host_gathers=tuple(remap_host(host) for host in image.host_gathers),
+    host_scatters=tuple(remap_host(host) for host in image.host_scatters),
+    fill=None if image.fill is None else replace(image.fill, dst=remap_arg(image.fill.dst)))
 
 @dataclass(frozen=True)
 class RKReloc: word: int; arg: RKArg
@@ -8042,7 +8065,7 @@ class RKContext:
     if u not in self.static_load_offsets and (any(x.op is Ops.LOAD for x in index.toposort()) or
                                               gate is not None and any(x.op is Ops.LOAD for x in gate.toposort())):
       runtime_index = _runtime_affine_index(index, self.out_index, self.count)
-      if os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or runtime_index is None: raise _RKGenericReject
+      if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1" or runtime_index is None: raise _RKGenericReject
       runtime_load, index_param, index_itemsize, index_offset, base, index_scale, lane_stride = runtime_index
       index_limit = int(param.src[0].arg)
       if gate is not None:
@@ -9345,7 +9368,7 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
 
 def _lower_host_scatter(uops:list[UOp]) -> RKImage|None:
   """Lower a direct dynamic STORE as raw last-writer host address materialization."""
-  if os.getenv("ROCKCHIP_HOST_GATHER", "0") != "1" or \
+  if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1" or \
      (output:=_output_store(uops, (dtypes.half, dtypes.int16))) is None or len(output[0].src) != 2: return None
   store, out_param, out_count, dynamic_index, value = output
   if (index_info:=_runtime_index(dynamic_index)) is None: return None
@@ -9416,6 +9439,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     return reduction
   if storage_uops is not None: uops = storage_uops
   if (output:=_output_store(uops, (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool), allow_local=True)) is None or len(output[0].src) != 2:
+    if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject("output store")
     return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
   if output[1].dtype.scalar() is dtypes.bool:
@@ -9451,7 +9475,9 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     root = _finite_int_max_neutrals(_finite_max_neutral_selectors(local_root))
     if not recipes_ready: root = _expand_math_uops(root, accurate_adds=storage_uops is None or storage_product_adds)
     expanded_nodes = root.toposort()
-    if len(expanded_nodes) > _MAX_GENERIC_EXPANDED_NODES: return None
+    if len(expanded_nodes) > _MAX_GENERIC_EXPANDED_NODES:
+      if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject(f"expanded nodes {len(expanded_nodes)}")
+      return None
     if root is not output[4]:
       store = output[0].replace(src=(output[0].src[0], root))
       uops = list(UOp(Ops.SINK, src=(store,)).toposort())
@@ -9460,8 +9486,11 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
                                              len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
                                              not _has_runtime_address(output[4])),
                       static_load_offsets=static_load_offsets).finish()
-    if any(len(items) > _RKIMAGE_U16_MAX for items in
-           (image.scratch, image.gathers, image.host_gathers, image.host_scatters, image.ew_ops, image.mid_gathers, image.post_gathers)):
+    image_u16_counts = (len(image.scratch), len(image.gathers)+len(image.mid_gathers)+len(image.post_gathers),
+                        len(image.host_gathers), len(image.host_scatters))
+    if any(count > _RKIMAGE_U16_MAX for count in image_u16_counts):
+      if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1":
+        raise _RKGenericReject("image u16 counts " + repr(image_u16_counts) + f", ew_ops={len(image.ew_ops)}")
       return None
     return image
   except (_RKGenericReject, RuntimeError, ValueError, KeyError):
