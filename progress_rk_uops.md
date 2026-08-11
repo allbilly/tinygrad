@@ -1161,3 +1161,29 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 86 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 52. Materialize masked loads before neutral rewrites — complete
+
+- Profiled the current slowest simple cumulative-extrema case, `test_simple_cummin`. The instrumented 101.71s run
+  spent 42.79s executing 66,231 ioctls; 10,738 synchronized gather calls consumed 12.68s, while static-value recovery
+  consumed another 14.36s. The value and index images contained 2,044 and 1,537 synchronization points respectively.
+- Moved generic masked-LOAD materialization ahead of the nonfinite reduction-neutral rewrite, and taught that generic
+  fold to commute a finite nonzero scalar multiply through the mask. This preserves the LOAD default directly instead
+  of expanding the selector into thousands of alternating gather/EW stages.
+- The 512-lane value image fell from 8,177 to 1,030 EW stages and from 2,044 to 2 synchronization points. Strict
+  `test_simple_cummin` fell from 58.38s to 42.16s (28% faster), while `test_simple_cummax` fell from 47.36s to 40.24s.
+- A trial that forced large FP16 equality chains entirely onto the DPU removed another 4,098 materializations but took
+  longer than two minutes, so it was reverted. The retained change addresses the measured bottleneck without trading
+  synchronization for a slower physical recipe.
+- No CPU numeric semantics were introduced. The host still performs only static index/default materialization; the
+  multiply, comparison, selection, and cumulative extrema remain NPU execution.
+- This performance milestone adds 16 executable renderer lines, taking the renderer from 5,140 to 5,156 lines. The
+  following milestone resumes deletion from this measured baseline; runtime remains 488 executable lines.
+
+Verification:
+
+- Strict simple cumulative minimum: 1 passed in 42.16s call time.
+- Strict simple cumulative maximum: 1 passed in 40.24s call time.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 87 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

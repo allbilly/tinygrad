@@ -4773,7 +4773,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
     local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
-    root = _finite_int_max_neutrals(_finite_max_neutral_selectors(local_root))
+    root = graph_rewrite(local_root, _pm_masked_loads, name="rockchip masked load materialization")
+    root = _finite_int_max_neutrals(_finite_max_neutral_selectors(root))
     root_nodes = root.toposort()
     defer_nodes = storage_uops if storage_uops is not None else root_nodes
     defer_math = len(defer_nodes) > 256
@@ -5073,11 +5074,27 @@ def _fold_masked_load(gate:UOp, load:UOp, default:UOp) -> UOp|None:
   if not same_default and not outer_implies_inner: return None
   return load.replace(src=(load.src[0], default, gate.alu(Ops.AND, load_gate) if same_default else gate))
 
+_pm_masked_loads = PatternMatcher([
+  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
+  (UPat(Ops.WHERE, src=(UPat.var("gate"), UPat(Ops.LOAD, name="load"), UPat.cvar("default"))),
+   lambda gate,load,default: _fold_masked_load(gate, load, default)),
+  (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat.var("val"), UPat.cvar("default"))),
+   lambda gate,val,default: _fold_masked_max(gate, default, val, False)),
+  (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat.cvar("default"), UPat.var("val"))),
+   lambda gate,default,val: _fold_masked_max(gate, default, val, True)),
+])
+
 def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
   if val.op is Ops.MAX:
     lhs = _fold_masked_max(gate, default, val.src[0], opposite)
     rhs = _fold_masked_max(gate, default, val.src[1], opposite)
     return None if lhs is None or rhs is None else val.replace(src=(lhs, rhs))
+  if val.op is Ops.MUL:
+    for source,factor in (val.src, val.src[::-1]):
+      if factor.op is not Ops.CONST or not math.isfinite(scale:=float(factor.arg)) or scale == 0.0 or math.isnan(float(default.arg)):
+        continue
+      folded = _fold_masked_max(gate, default.const_like(float(default.arg)/scale), source, opposite)
+      if folded is not None: return val.replace(src=(folded, factor))
   if val.op is not Ops.LOAD or len(val.src) <= 2 or val.src[1].op is not Ops.CONST: return None
   def matches(condition:UOp) -> bool: return _opposite_condition(gate, condition) if opposite else _same_condition(gate, condition)
   condition_matches = matches(val.src[2]) or (val.src[2].op is Ops.AND and any(matches(x) for x in val.src[2].src))

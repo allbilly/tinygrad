@@ -126,6 +126,17 @@ def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
   assert decode_image(encode_image(image)) == image
 
 
+def test_masked_scaled_load_materializes_before_nonfinite_neutral_rewrite():
+  source = UOp.param(1, dtypes.half, (4,))
+  def selected(i:UOp) -> UOp:
+    gate = i < UOp.const(2, dtypes.int)
+    load = source.index(i-2).load(UOp.const(0.0, dtypes.half), gate != UOp.const(True, dtypes.bool))
+    return gate.where(UOp.const(-math.inf, dtypes.half), gate.where(UOp.const(0.0, dtypes.half), load * -1.0))
+  image = _lower_uop_program(_program(dtypes.half, selected))
+  assert image is not None and not image.mid_gathers and len(image.ew_ops) == 1
+  assert decode_image(encode_image(image)) == image
+
+
 def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
   magnitude, sign = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:
