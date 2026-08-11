@@ -1446,3 +1446,22 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 64. Delete stale physical-value and rejection scaffolding — complete
+
+- Removed the unused `RKMultiGather` and `RKStatic` placeholder types and their `RKLeaf` aliases. No live lowering,
+  serialization, runtime, or test path referenced them; physical values are represented directly by the current typed
+  `RKValue`/`RKArg` machinery.
+- Removed two diagnostic-only `reject` closures from the generic mapped and multi-local reduction executors. Their
+  reason strings were never observed, so each branch now returns the same `None` result directly. Also deleted two
+  unreferenced EW/pool constants.
+- Renderer executable size fell from 4,910 to 4,900 lines. From the 10,233-line pre-deletion baseline, 5,333
+  executable lines are gone (52.1%); runtime remains 491 executable lines.
+- No CPU numeric semantics or lowering behavior were introduced. This milestone is semantics-neutral dead-code
+  removal, so it does not require the currently unavailable NPU for behavioral validation.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
