@@ -1315,3 +1315,23 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 90 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 58. Delete direct FP16-to-INT32 cast recovery — complete
+
+- Disconnected the remaining seven-line direct FP16-to-INT32 wrapper. The first generic replay exposed that a root
+  cast from FP16 has no statically provable integer range, so the context selected INT32 before reaching its existing
+  half-valued truncation recipe.
+- Made the physical ABI rule explicit: an integer program rooted in an embedded FP16 cast uses INT_FP16 scratch unless
+  a true dynamic INT32 load already requires INT32. Generic CAST then executes the ordinary DPU truncation recipe and
+  the existing terminal INT32 widening.
+- Deleted the wrapper and dispatch after cold cast, integral rounding, modulo, and division-rounding tests passed.
+  Reduced the renderer from 5,014 to 5,009 executable lines, another 5 lines; runtime remains 488 executable lines.
+- No CPU numeric semantics were introduced.
+
+Verification:
+
+- Cold complete `TestRockchipCastOps`: 2 passed in 5.24s.
+- Cold integral-rounding/modulo/division-rounding gate: 9 passed in 29.31s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 90 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

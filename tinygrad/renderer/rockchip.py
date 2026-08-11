@@ -1343,13 +1343,6 @@ def _kahan_add(ops:list[RKEWOp], active:list[int], count:int, arena:Callable[[in
   emit(out, total, total, Ops.MAX)
   return out
 
-def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
-  """Truncate a direct FP16 load on DPU before the terminal INT32 conversion."""
-  root = output[4]
-  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.int or len(root.src) != 1 or
-      root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
-  return _typed_int_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)))
-
 def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
   root = output[4]
@@ -2886,6 +2879,7 @@ class RKContext:
     self.int_layout = (RKLayout.INT32 if self.root.dtype.scalar() is dtypes.int and dynamic_int_load else
                        RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and (packed_bool_load or native_bool) and int_range is not None and
                        -32768 <= int_range[0] <= int_range[1] <= 32767 else
+                       RKLayout.INT_FP16 if self.root.dtype.scalar() is dtypes.int and embedded_half_int else
                        RKLayout.INT_FP16 if self.root.dtype.scalar() is dtypes.int and int_range is not None and
                        -2048 <= int_range[0] <= int_range[1] <= 2048 else
                        RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and int_range is not None and
@@ -4541,7 +4535,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
   if (int_output:=_output_store(uops, dtypes.int)) is not None:
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
-    if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
     if (division:=_lower_int32_division(int_output)) is not None: return division
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
      (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, nonzero, bool_output=True)
