@@ -989,3 +989,31 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 45. Reject non-index DAGs early and delete dynamic accumulation recovery — complete
+
+- Profiled the new slowest case, `test_nested_conv2d`. Of 186.48s call time under cProfile, 172.51s was spent in
+  `_flatten_binary`: the dynamic-index accumulation recognizer recursively visited an ordinary shared convolution ADD
+  DAG 97.55 million times before discovering that no runtime index tensor existed.
+- Added a linear-time semantic precondition before flattening: the candidate must contain both a `WHERE` and a runtime
+  INT `LOAD`. This is a guard on the address-selection rule, not a convolution fast path. `nested_conv2d` fell from
+  150.42s to 5.47s call time (96.4% faster), and `large_input_conv2d` fell from 100.05s to 67.15s.
+- Removed the dynamic-index accumulation entry points entirely after the performance diagnosis. Deleted the unrolled
+  selector recovery, the local-loop selector recovery, affine-load parsing, and three custom accumulation images.
+  Direct runtime addresses continue through host gather; expanded selector graphs execute their ordinary UOps.
+- The pool/unpool, fancy-index, cumulative-extrema, arg-extrema, sort, and top-k hardware gate passes without the custom
+  accumulation path. This confirms that the deleted graph dialect was an optimization/catalog layer, not required
+  semantics.
+- Reduced the renderer from 6,159 to 5,918 executable lines, another 241 lines. From the 10,233-line pre-deletion
+  baseline, 4,315 executable lines are gone (42.2%). The physical renderer diff is 1 insertion and 260 deletions;
+  runtime remains 488 executable lines.
+
+Verification:
+
+- Strict `TestRockchipConvOps::test_nested_conv2d`: 1 passed in 5.47s call time, versus 150.42s before the guard.
+- Strict `TestRockchipConvOps::test_large_input_conv2d`: 1 passed in 67.15s call time, versus 100.05s.
+- Strict pool/unpool/gather/fancy-index/cumulative-extrema/arg-extrema/sort/top-k gate:
+  40 passed and 33 subtests passed in 424.82s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
