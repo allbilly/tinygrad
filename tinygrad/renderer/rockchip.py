@@ -822,16 +822,18 @@ def _precise_sum_parts(terms:list[UOp]) -> tuple[UOp, UOp]:
   products, errors = tuple(x[0] for x in pairs), tuple(x[1] for x,term in zip(pairs, terms) if term.op is Ops.MUL)
   return _precise_add_parts(products + errors)
 
+def _tag_precise_adds(root:UOp) -> UOp:
+  """Mark additions inside an already compensated physical recipe so they are not expanded again."""
+  tagged:dict[UOp, UOp] = {}
+  for node in root.toposort():
+    tagged[node] = node.replace(src=tuple(tagged[src] for src in node.src),
+      arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD and node.arg is None else node.arg)
+  return tagged[root]
+
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
   """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
   high, middle = _precise_sum_parts(terms)
-  root = high.alu(Ops.ADD, middle)
-  cache:dict[UOp, UOp] = {}
-  for u in root.toposort():
-    tagged = u.replace(src=tuple(cache[src] for src in u.src))
-    if tagged.op is Ops.ADD: tagged = tagged.replace(arg=_NATIVE_PRECISE_ADD)
-    cache[u] = tagged
-  return cache[root]
+  return _tag_precise_adds(high.alu(Ops.ADD, middle))
 
 def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float,
                                  op_barriers:bool=False, compensated_limit:int=_reduction_stride(1)//2, kahan:bool=False) -> RKImage|None:
@@ -2603,7 +2605,7 @@ def _canonical_half_storage(source:UOp) -> UOp:
   if len(source.toposort()) > 64: return converted
   simplified = graph_rewrite(converted, _pm_half_storage_algebra+sym,
                              name="rockchip half storage algebra")
-  return graph_rewrite(simplified, pm_commit_weak, name="rockchip commit storage constants")
+  return _tag_precise_adds(graph_rewrite(simplified, pm_commit_weak, name="rockchip commit storage constants"))
 
 def _fp32_add_terms(u:UOp) -> list[UOp]:
   terms:list[UOp] = []
@@ -2643,12 +2645,7 @@ def _fp32_ratio_to_half(u:UOp) -> UOp|None:
   residual = _sub_half(numerator_high, quotient.alu(Ops.MUL, denominator_high), neg_one).alu(Ops.ADD,
     _sub_half(numerator_low, quotient.alu(Ops.MUL, denominator_low), neg_one))
   root = quotient.alu(Ops.ADD, residual.alu(Ops.FDIV, denominator))
-  cache:dict[UOp, UOp] = {}
-  for node in root.toposort():
-    tagged = node.replace(src=tuple(cache[src] for src in node.src))
-    if tagged.op is Ops.ADD: tagged = tagged.replace(arg=_NATIVE_PRECISE_ADD)
-    cache[node] = tagged
-  return cache[root]
+  return _tag_precise_adds(root)
 
 def _accurate_add_recipe(u:UOp) -> UOp:
   terms:list[UOp] = []
@@ -3544,11 +3541,7 @@ class RKContext:
     elif u.op is Ops.LOG2: recipe = _dpu_log2(u.src[0])
     elif u.op is Ops.SIN: recipe = _dpu_sin(u.src[0])
     else: raise _RKGenericReject
-    tagged:dict[UOp, UOp] = {}
-    for node in recipe.toposort():
-      tagged[node] = node.replace(src=tuple(tagged[src] for src in node.src),
-        arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD and node.arg is None else node.arg)
-    recipe = tagged[recipe]
+    recipe = _tag_precise_adds(recipe)
     value = self.lower(recipe)
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
     if u is self.root and value.arg != self.out:
@@ -3732,14 +3725,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
     placeholders = {source:UOp.param(-index-1, source.dtype, ()) for index,source in enumerate(opaque)}
     rewritten = _fp16_rewrite(list(UOp(Ops.SINK, src=(recipe.substitute(placeholders),)).toposort()))
     if not rewritten or rewritten[-1].op is not Ops.SINK or len(rewritten[-1].src) != 1: raise _RKGenericReject
-    tagged:dict[UOp, UOp] = {}
-    def tag_adds(u:UOp) -> UOp:
-      if u in tagged: return tagged[u]
-      mapped = u.replace(src=tuple(tag_adds(src) for src in u.src),
-                         arg=_NATIVE_PRECISE_ADD if u.op is Ops.ADD and u.arg is None else u.arg)
-      tagged[u] = mapped
-      return mapped
-    tagged_root = tag_adds(rewritten[-1].src[0])
+    tagged_root = _tag_precise_adds(rewritten[-1].src[0])
     return tagged_root.substitute({placeholder:source for source,placeholder in placeholders.items()})
   if composite_math is not None: root = physical_recipe(composite_math)
   def rewrite(u:UOp) -> UOp:

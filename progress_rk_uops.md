@@ -1692,3 +1692,28 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 77. Stop recursive compensated-recipe expansion — complete
+
+- Profiled the slowest static lowering test, `test_nested_fp32_product_sum_is_committed_before_outer_half_add`.
+  A four-product expression took 3.49 seconds and produced 31,281 EW stages. The profile attributed 2.01 seconds to
+  21 `_accurate_add_recipe()` calls, with the same already-compensated storage graph expanded at 19 overlapping ADD
+  subgraphs; scratch coloring then spent another 1.83 seconds walking the inflated physical program.
+- Added one canonical `_tag_precise_adds()` walker and apply it after half-storage algebra/constant rewriting. Algebraic
+  simplification can no longer erase the marker that says a compensated physical recipe is complete, so generic ADD
+  lowering executes that recipe rather than recursively compensating it again.
+- Reused the same walker for product sums, FP32 ratio correction, math recipes, and physical recipe expansion, deleting
+  four duplicated graph-tagging blocks. The profiled expression now emits 103 EW stages and takes 0.42 seconds in the
+  full static suite (88% faster); the 91-test suite fell from 7.23 to 6.03 seconds.
+- Renderer executable size fell from 4,805 to 4,789 lines. From the 10,233-line baseline, 5,444 executable renderer
+  lines are gone (53.2%); runtime remains 480 lines. This changes only compile-time UOp recipe ownership and removes
+  redundant DPU work—there is no CPU numeric evaluation.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12 --durations=10`: 91 passed in 6.03 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py::test_nested_fp32_product_sum_is_committed_before_outer_half_add -q -n0`:
+  1 passed in 0.81 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
