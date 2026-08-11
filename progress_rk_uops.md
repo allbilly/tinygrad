@@ -2636,3 +2636,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 123. Delete remaining one-use generic recipe locals — complete
+
+- Continued the local-use census through generic CAST and CMOD lowering. Removed recipe variables used exactly once
+  for half→uchar truncation, half→bool nonzero conversion, BOOL_INT16 selection, FP16-backed INT conversion, and
+  INT_FP16 remainder. Each UOp recipe is now constructed directly at its sole `lower()` boundary.
+- Half→uchar, half→bool, packed-bool→half, half→INT_FP16, and INT_FP16 CMOD programs produced RKImages byte-identical
+  to milestone 122.
+- Renderer executable size fell from 4,624 to 4,618 lines. From the 10,233-line baseline, 5,615 lines are gone (54.9%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 5/5 single-use recipe RKImages byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 4.77 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

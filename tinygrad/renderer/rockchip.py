@@ -3479,20 +3479,16 @@ class RKContext:
         if (relu:=_relu_operand(cast_source)) is not None: cast_source = relu.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
         truncated = _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(cast_source,)))
         quotient = _native_floor(truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half)))
-        recipe = truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))
-        converted, value = self.lower(recipe), self._scratch(dtype, RKLayout.INT16)
+        converted, value = self.lower(truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.,dtypes.half)))), self._scratch(dtype,RKLayout.INT16)
         self.ew_ops.append(RKEWOp(value.arg, converted.arg, converted.arg, self.count, _EW_CFG[Ops.MAX],
                                   submit_barrier=True, stateful=True, int16_output=True))
       elif dtype is dtypes.bool and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
-        magnitude = UOp(Ops.MAX, dtypes.half, src=(u.src[0], u.src[0]), arg=_NATIVE_ABS)
-        recipe = _positive_mask(magnitude)
-        value = self.lower(recipe)
+        value = self.lower(_positive_mask(UOp(Ops.MAX, dtypes.half, src=(u.src[0], u.src[0]), arg=_NATIVE_ABS)))
       elif source.layout is RKLayout.INT32 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.int):
         value = self._narrow_int32(source)
       elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.bool or
                                                      dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16):
-        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        value = self.lower(recipe)
+        value = self.lower(u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half)))
         if dtype is dtypes.int:
           if value.layout is not RKLayout.FP16: raise _RKGenericReject
           value = RKValue(value.arg, dtype, self.count, RKLayout.INT_FP16)
@@ -3506,8 +3502,7 @@ class RKContext:
         if self.int_layout is RKLayout.INT_FP16:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
           else:
-            recipe = _int_fp16_expr(u)
-            converted = self.lower(recipe)
+            converted = self.lower(_int_fp16_expr(u))
             value = RKValue(converted.arg, dtype, self.count, self.int_layout)
         elif self.int_layout is RKLayout.INT16:
           value = self._scratch(dtype, self.int_layout)
@@ -3528,8 +3523,7 @@ class RKContext:
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
-      recipe = _int_fp16_expr(u)
-      converted = self.lower(recipe)
+      converted = self.lower(_int_fp16_expr(u))
       value = RKValue(converted.arg, dtype, self.count, self.int_layout)
     elif u.op is Ops.WHERE: value = self._where(u)
     elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)
