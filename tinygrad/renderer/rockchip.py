@@ -2591,13 +2591,7 @@ def _canonical_half_storage(source:UOp) -> UOp:
   return _tag_precise_adds(graph_rewrite(simplified, pm_commit_weak, name="rockchip commit storage constants"))
 
 def _fp32_add_terms(u:UOp) -> list[UOp]:
-  terms:list[UOp] = []
-  def flatten(x:UOp) -> None:
-    if x.op is Ops.ADD and x.dtype.scalar() is dtypes.float:
-      flatten(x.src[0]); flatten(x.src[1])
-    else: terms.append(_fp32_expr_to_half(x))
-  flatten(u)
-  return terms
+  return [_fp32_expr_to_half(term) for term in _flatten_binary(u, Ops.ADD)]
 
 def _fp32_add_has_product_terms(u:UOp) -> bool:
   """Whether a floating ADD tree contains a direct floating or cast-half product term."""

@@ -2370,3 +2370,21 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 109. Delete the remaining private FP32 ADD walker — complete
+
+- `_fp32_add_terms()` still recursively traversed the same FP32 ADD tree now owned by `_flatten_binary()`. Replaced its
+  local list, closure, recursive descent, and final mutation with one conversion over the shared order-preserving
+  flattener.
+- Four representative term lists matched milestone 108 exactly, including left- and right-nested trees. Pure-add and
+  product-sum storage RKImages were byte-identical, while a 4,096-deep tree now flattens without Python recursion.
+- Renderer executable size fell from 4,667 to 4,661 lines. From the 10,233-line baseline, 5,572 lines are gone (54.4%);
+  runtime remains 480 lines. No CPU numeric semantics were introduced.
+
+Verification:
+
+- Old/current comparison: 4/4 term lists and 2/2 storage RKImages identical; 4,096-deep tree accepted.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 91 passed in 5.21 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
