@@ -948,3 +948,44 @@ Verification:
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+
+### 44. One physical executor, compact local codegen, and profiled deletion — complete
+
+- Routed every internally composed EW/reduction subprogram back through `_lower_uop_program(...,
+  vectorize_reductions=False)` and deleted the old `lower_ew()` physical emitter plus its five private helpers. There is
+  now one typed physical expression executor, `RKContext`, rather than a generic path that recursively called an older
+  binary-only emitter.
+- Made the FP16 output boundary accept the canonical FP16-backed `BOOL_MASK` and `INT_FP16` layouts. This closed the one
+  physical-ABI gap exposed when BOOL-to-INT output conversion moved from `lower_ew()` to `RKContext`.
+- Enabled compact local/RANGE codegen on the default renderer with a 16-byte local-state limit and removed the separate
+  `RockchipBoolRenderer` mode. Added `SPECIAL` to generic static materialization so stacked multi-local outputs such as
+  `std_mean` compose through their ordinary lane-id UOp.
+- Profiled the historical slowest case, `test_nll_loss_3d`, with cProfile and Tinygrad PROFILE events. The old default
+  spent 55.54s in its largest `do_to_program`, including 21.72s in Rockchip rendering, then executed 149,903 physical
+  EW stages. Compact local codegen reduced the test call from 83.72s to 42.26s, a 49.5% improvement.
+- Deleted the 195-line vectorized-unrolled ADD reduction path. Direct unrolled UOp programs now pass through the same
+  executor, and the unit contracts check accepted/serializable images instead of requiring that removed optimization's
+  gather layout.
+- Tested deletion of the remaining 108-line vectorized MUL+ADD residual reducer. A biased two-layer convolution exposed
+  a real 0.0127 precision regression, so that path and its strict unit contract were restored. It remains the next
+  precision recipe to absorb into the generic RANGE reducer; no tolerance was weakened.
+- Removed obsolete `ROCKCHIP_UOPS=0` branches and task-count assertions from the authoritative tests. Submission counts
+  now describe only the permanent generic renderer.
+- Reduced the renderer from 6,658 to 6,159 executable lines in this milestone, another 499 lines. From the 10,233-line
+  pre-deletion baseline, 4,074 executable lines are gone (39.8%). Runtime remains 488 executable lines. The physical
+  renderer diff for this milestone is 17 insertions and 526 deletions.
+- Stopped repeating the 23-minute full replay at the user's request. The attempted run was clean through 114 passed,
+  6 expected skips, and 96 subtests before interruption; focused numerical gates below cover the changed executor,
+  local reductions, product precision, and convolution surfaces. A full `/445` replay remains required at the next
+  large checkpoint.
+
+Verification:
+
+- Profiled strict `TestRockchipLossOps::test_nll_loss_3d`: 1 passed in 42.26s call time after the change, versus 83.72s.
+- Strict `TestRockchipReductionOps`: 36 passed in 134.98s.
+- Strict `TestRockchipConvOps`: 42 passed, 6 skipped, and 37 subtests passed in 311.48s.
+- Strict dot/einsum plus NLL3D/std-mean/variance precision gate: 16 passed in 115.18s.
+- Strict RKContext-only dot/reduction/cast/classification/comparison/logical/bool/WHERE gate: 67 passed in 145.29s.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 84 passed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.

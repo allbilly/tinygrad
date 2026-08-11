@@ -10,7 +10,7 @@ Reduction via ROCKCHIP_EW_REDUCE=sequential|kahan|twoproduct (default sequential
 Each program uses one PC chain sized from its actual register-command and task-descriptor bytes.
 """
 from __future__ import annotations
-import math, os, unittest
+import math, unittest
 import numpy as np
 import torch
 from tinygrad import Tensor, Device, dtypes
@@ -355,7 +355,7 @@ class TestRockchipIntegerPowerOps(unittest.TestCase):
       _fp16_test_op([()], lambda x,exponent=exponent:x**exponent, forward_only=True)
     _fp16_test_op([(45,65)], lambda x:x**3, forward_only=True, low=-30, high=-27)
     _fp16_test_op([()], lambda x:x**3, forward_only=True, low=-30, high=-27)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 5 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 7)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 7)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipTensorPowerOps(unittest.TestCase):
@@ -540,31 +540,26 @@ class TestRockchipInt16EWOps(unittest.TestCase):
   """Bounded signed INT16 arithmetic and exact comparisons on the native DPU integer EW pipeline."""
 
   def _check(self, expected, op, *values, output_dtype=np.int16, expected_tasks=None, expected_submits=1):
-    before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    before = Device["ROCKCHIP"].submit_count
     got = op(*(Tensor(np.asarray(value, dtype=np.int16)) for value in values)).realize().numpy()
     self.assertEqual(got.dtype, output_dtype)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
-    if expected_tasks is not None and os.getenv("ROCKCHIP_UOPS", "1") == "0":
-      self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_bool(self, op, *values, expected=None, expected_tasks=None, expected_submits=1):
     arrays = tuple(np.asarray(value, dtype=np.int16) for value in values)
-    before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    before = Device["ROCKCHIP"].submit_count
     got = op(*(Tensor(value) for value in arrays)).realize().numpy()
     self.assertEqual(got.dtype, np.bool_)
     np.testing.assert_array_equal(got, op(*arrays) if expected is None else expected)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
-    if expected_tasks is not None and os.getenv("ROCKCHIP_UOPS", "1") == "0":
-      self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_index(self, expected, op, values, submits, tasks):
-    before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    before = Device["ROCKCHIP"].submit_count
     got = op(Tensor(np.asarray(values, dtype=np.int16))).realize().numpy()
     self.assertEqual(got.dtype, np.int32)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=np.int32))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, submits)
-    if os.getenv("ROCKCHIP_UOPS", "1") == "0": self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, tasks)
 
   def _check_cumsum(self, shape, axis, tasks):
     values = (np.arange(np.prod(shape), dtype=np.uint32)*7919).astype(np.uint16).view(np.int16).reshape(shape)
@@ -633,7 +628,7 @@ class TestRockchipDotOps(unittest.TestCase):
     for got,expected in zip(outputs, (np.full((2,4), 3, dtype=np.float16), np.full(4, 6, dtype=np.float16),
                                       np.full((1,3), 2, dtype=np.float16))):
       np.testing.assert_array_equal(got.numpy(), expected)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 3)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
   test_matvecmat = _test_ops.TestOps.test_matvecmat
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
@@ -1106,7 +1101,7 @@ class TestRockchipWhereOps(unittest.TestCase):
     values = [[math.nan, math.inf, -math.inf], [-0., 0., 1.]]
     _fp16_test_op(None, lambda x: torch.where(x > .5, 4, 2).type(torch.int32).permute((1,0)),
                   lambda x: (x > .5).where(4, 2).clone().permute((1,0)), vals=[values], forward_only=True)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 24 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 4)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
