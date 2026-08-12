@@ -3417,3 +3417,36 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 156. Compose signed and unsigned INT32 shift UOps — WIP checkpoint
+
+- Removed the root-only 32-bit shift planner, its early dispatch, and the private INT16 arena that only that planner
+  used. `SHL` and `SHR` now lower at their own UOp boundary inside `RKContext`, so shifts can consume and feed ordinary
+  INT32 arithmetic and bitwise UOps without recovering a root graph shape.
+- The physical recipe keeps the five-stage byte-plane barrel shifter: canonical four-byte `RKValue` operands are split
+  into exact native-INT16 bit planes, batched across 32 rows, shifted according to the low five amount bits, and packed
+  back to the canonical INT32 ABI. Signed `SHR` replicates the sign plane; unsigned `SHR` inserts zero. A minimal raw
+  UINT32 load/constant/static and UINT32-to-INT32 cast bridge preserves upstream logical-shift behavior while leaving
+  unrelated UINT32 ALU unsupported and fail-closed.
+- Replaced the old terminal-gather shape assertion with physical semantics across signed and unsigned `SHL`/`SHR`,
+  constant and tensor amounts `0/7/8/15/16/31/32`, random and edge values, nested shift consumers, and shifts whose
+  value is itself another shift. All images are `NATIVE`, have no host gather/scatter, and round-trip through RKImage
+  serialization. Shift amount 32 retains the existing raw modulo-32 behavior.
+- Independent adversarial verification exercised 92 physical cases plus aligned stripe boundaries: 1,984 values
+  lower successfully, while 1,985 reject at the 64,000-native-lane limit. Signed arithmetic right shift, unsigned
+  logical right shift, left-shift wrapping, and nested composition matched exact 32-bit reference results.
+- Representative direct codegen grows only by the generic raw-value copy: signed constant `SHL` changes from 94 to 95
+  EW stages, and tensor `SHR` from 94 to 96 stages. No CPU/GPU numeric path or runtime host arithmetic was added.
+- Renderer executable size fell from **4,131 to 4,095 lines** (net -36); runtime remains **507** lines and total tree
+  size is **29,669**. The renderer is 95 lines above the first 4,000-line target.
+- Hardware validation remains pending the required manual power cycle. This checkpoint did not open `/dev/dri` and
+  does not claim that the 445-case census passes.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 113 passed.
+- Adversarial verification: `VERIFIED` with no load-bearing defect.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `test/backend/test_rockchip.py --collect-only`: 445 tests collected.
+- `git diff --check`: pass.

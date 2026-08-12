@@ -5642,3 +5642,21 @@ offline and finite image sampling cannot prove every possible graph.
 Renderer size is now **4,131 executable lines**, down 81 from the preceding WIP; runtime remains **507** and total tree
 size is **29,705**. Hardware and the all-445 replay remain pending the required manual power cycle, so this checkpoint
 does not claim backend completion.
+
+## 2026-08-13 — compose signed and unsigned 32-bit shift UOps
+
+The root-only `SHL`/`SHR` catalog and its private arena are gone. Shifts now lower compositionally in `RKContext` by
+splitting canonical four-byte values into native-INT16 bit planes, running a batched five-stage barrel shift, and
+packing the result back into the shared INT32 ABI. Signed right shift replicates the sign plane; unsigned right shift
+inserts zero. A narrowly scoped raw UINT32 load/static/cast bridge preserves the upstream unsigned-shift contract
+without enabling unrelated UINT32 arithmetic or adding host numeric execution.
+
+Physical tests cover signed and unsigned left/right shifts, constant and tensor amounts including 32, random and edge
+values, nested consumers, and shift results used as another shift's input. Independent review ran 92 semantic cases
+and the aligned capacity boundary: 1,984 values lower natively and 1,985 fail closed. The full Rockchip unit file still
+passes 113 tests with `-n12`; repository-wide Ruff and mypy pass, collection remains 445 cases, and the adversarial
+verdict is `VERIFIED`. Direct images pay only one or two additional generic copy stages versus the deleted specializer.
+
+Renderer size is now **4,095 executable lines**, down 36 from the prior WIP; runtime remains **507** and total tree size
+is **29,669**. Hardware and the all-445 replay remain pending the required manual power cycle, so this is a WIP
+checkpoint rather than a passing-backend claim.
