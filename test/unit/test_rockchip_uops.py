@@ -670,7 +670,7 @@ def test_static_local_accumulator_is_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
 
 
-def test_dependent_scalar_local_extrema_is_vectorized_from_uop_structure():
+def test_dependent_scalar_local_extrema_executes_as_ordinary_uops():
   count = 4
   out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))
   value_buffer = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG)
@@ -695,8 +695,9 @@ def test_dependent_scalar_local_extrema_is_vectorized_from_uop_structure():
   output = out.index(0).store(UOp.const(count, dtypes.int)-selected)
 
   image = _lower_uop_program(list(UOp.sink(value_init, value_update, index_init, index_update, output).toposort()))
-  assert image is not None and len(image.ew_ops) < 100 and len(image.mid_gathers) == 7
-  assert any(gather.dst_stride == 32 for gather in image.mid_gathers)
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert any(op.int32_input or op.int32_output for op in image.ew_ops)
+  assert decode_image(encode_image(image)) == image
 
 
 def test_nested_static_local_accumulators_materialize_load_addresses():

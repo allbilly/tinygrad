@@ -3096,3 +3096,38 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 145. Delete scalar extrema recovery and profile the complete census bottleneck — complete
+
+- Completed the timed 445-test `test/backend/test_rockchip.py` census (not `test_rockchip2.py`): 428 passed, 5 failed,
+  12 skipped, and 154 subtests passed in 17:44. One failure was the deliberately disconnected bounded-coordinate probe,
+  which proved the large `nonzero` `IF/STORE` form is not yet generic and was restored. Cross-entropy `sum` remains the
+  known precision failure. Scatter-`inf`, causal-attention NaNs, and cumulative `EINVAL` appeared only in the long shared
+  device run and remain pending clean replay after NPU recovery.
+- Deleted the 141-line dependent scalar-local extrema recognizer and its dispatch. The literal RANGE/local
+  `LOAD`/`STORE` unit program now selects canonical INT32 for an unknown integer range and executes as 203 ordinary native
+  stages instead of asserting the removed fast-path shape. The complete upstream argmax method passes in 2.00 seconds;
+  softmax+argmax also passes without the recognizer in 136.14 seconds.
+- The census identified softmax+argmax as the actual slowest method at 143.18 seconds. Both axes cost roughly the same:
+  64.71 and 66.49 seconds when measured independently. cProfile of one axis recorded 247 million calls, 122.5 seconds
+  in rendering, 93.7 seconds repeatedly expanding 2,925 math recipes, 403,743 EW stages, 26,325 physical barriers, and
+  29,630 PC-chain submissions under instrumentation.
+- Large-root math deferral now keys off the post-structural root actually given to `RKContext`, rather than the smaller
+  pre-unroll storage graph. This reduces one strict axis from 64.71 to 49.30 seconds (23.8%) while preserving the literal
+  UOp execution and all native arithmetic.
+- Tested coalescing stateful FLOOR/FDIV barriers after four focused division/transcendental methods passed. A single
+  unbounded 403k-task chain exceeded the driver limit with `EINVAL`, so that experiment and its runtime cap were reverted;
+  no unverified batching change remains. The oversized submit left health checks returning `EINVAL` despite reset flags
+  6 and 1→6→1, so further hardware replay requires an external platform reset or reboot.
+- Renderer executable size fell from 4,400 to 4,262 lines, 5,971 lines below its 10,233-line baseline (58.4%); runtime
+  remains 454 lines.
+
+Verification:
+
+- Generic argmax and softmax+argmax hardware gate: 2 passed in 141.58 seconds.
+- Large-root guard, one softmax+argmax axis: passed in 49.30 seconds, down from 64.71 seconds.
+- Stateful-chain semantic probe before the oversized submission: sqrt, exp2, log2, and division-rounding all passed.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 96 passed in 4.51 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
