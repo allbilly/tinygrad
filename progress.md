@@ -5605,3 +5605,21 @@ confirmation is blocked until a manual power cycle: the mandatory vendor health 
 4 MiB CMA allocation and non-contiguous mmap fallback failed, followed by a DRM GEM refcount-underflow warning. No
 further NPU submission was attempted. Current renderer/runtime size is **4,340/507 executable lines** (29,914 total),
 so both the all-445 gate and the final 4,000-line target remain open.
+
+## 2026-08-13 — make wide INT32 division composable
+
+The renderer no longer recognizes complete truncating/floor division graphs before generic execution. `CDIV` and
+`CMOD` now own one cached byte-restoring physical recipe in the typed `RKContext`: arbitrary ordinary INT32 operands
+lower first, one native-INT16 restoring core produces reusable quotient/remainder byte lanes, and subsequent
+comparison, `WHERE`, ADD, and floor-correction UOps execute compositionally. Bounded exact-FP16 integer recipes remain
+unchanged. Production code performs no CPU/GPU numeric work and contains no division tensor-operation recognizer.
+
+A test-only RKImage executor now verifies the emitted raw gathers, native integer EW stages, INT16-to-INT32 conversion,
+and terminal packing against exact signed semantics over random values, zero divisors, `INT_MIN/-1`, nested operands,
+and floor/floormod graphs. The complete Rockchip unit file passes 113 tests with `-n12`; repository-wide Ruff and mypy
+pass, and the backend still collects all 445 cases. An adversarial recheck returned `VERIFIED` after requiring and then
+observing physical floor/floormod execution rather than serialization-only assertions.
+
+Renderer size is now **4,212 executable lines**, down 128 from the preceding WIP; runtime remains **507** and total tree
+size is **29,786**. Hardware and the full 445 replay remain deliberately pending the required manual power cycle, so
+this is a WIP checkpoint rather than a passing-backend claim.

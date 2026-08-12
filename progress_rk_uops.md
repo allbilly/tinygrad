@@ -3352,3 +3352,36 @@ Verification at this WIP boundary:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
 - Full Rockchip census: not passed; the partial result above is retained as the exact current boundary.
+
+### 154. Compose wide INT32 division as ordinary UOps — WIP checkpoint
+
+- Removed the 49-line whole-root division/floor-dialect recognizer and its 155-line physical lowering catalog. Wide
+  `CDIV` and `CMOD` now lower at their true UOp boundary inside `RKContext`, so nested operands, sibling quotient and
+  remainder consumers, comparisons, `WHERE`, and Tinygrad's ordinary floor corrections compose without recovering a
+  tensor or root-graph operation.
+- The handler keeps one byte-restoring divider state per ordered operand pair. It splits canonical INT32 values into
+  widened unsigned-byte lanes, executes sign/magnitude conversion and restoring division with native INT16 DPU EW,
+  caches quotient and remainder byte components, and packs only the requested results back into canonical INT32.
+  Sibling `CDIV`/`CMOD` UOps therefore share the 32-step restoring core rather than duplicating it.
+- The proven-bounded `INT_FP16` path remains separate and unchanged. Division by zero keeps the existing Tinygrad
+  contract (`quotient=0`, `remainder=lhs`), while `INT_MIN/-1` and other overflow cases wrap at the canonical 32-bit
+  pack boundary. There is no host tensor arithmetic, graph-dialect recovery, or CPU/GPU fallback in production code.
+- Added a test-only physical RKImage interpreter for raw gathers and the exact signed INT16/INT32 EW subset used by the
+  divider. It executes direct and composed `CDIV`/`CMOD`, the legal INT16-to-INT32 boundary, and ordinary floor/floormod
+  correction graphs over 100 deterministic random and edge-case lanes. This is verification code only; production
+  arithmetic remains entirely on the DPU.
+- Renderer executable size fell from **4,340 to 4,212 lines** (net -128); runtime remains **507** lines and total tree
+  size is **29,786**. The renderer remains 212 lines above the first 4,000-line target.
+- Hardware validation remains pending the already-required manual power cycle. This checkpoint did not open `/dev/dri`
+  and does not claim the 445-case census passes.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 113 passed.
+- Test-only physical semantics: direct and composed CDIV/CMOD plus floor/floormod passed signed, zero-divisor,
+  `INT_MIN/-1`, and randomized cases.
+- Adversarial verification: `VERIFIED` after the physical floor/floormod coverage gap was closed.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `test/backend/test_rockchip.py --collect-only`: 445 tests collected.
+- `git diff --check`: pass.

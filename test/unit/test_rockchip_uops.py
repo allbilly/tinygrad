@@ -1,10 +1,12 @@
 import ctypes, math, struct
+import numpy as np
+from collections.abc import Callable
 from types import SimpleNamespace
 from tinygrad.codegen import line_rewrite, pm_linearize_cleanups
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
-  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
   _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
@@ -15,6 +17,83 @@ from tinygrad.uop.ops import AxisType, Ops, UOp
 def _program(dtype, value, count:int=4):
   out, axis = UOp.param(0, dtype, (count,)), UOp.range(count, 0)
   return list(out.index(axis).store(value(axis)).end(axis).sink().toposort())
+
+def _int32_binary_program(value:Callable[[UOp, UOp], UOp], count:int=4) -> list[UOp]:
+  out, lhs, rhs = (UOp.param(slot, dtypes.int, (count,)) for slot in range(3))
+  axis = UOp.range(count, 0)
+  return list(out.index(axis).store(value(lhs.index(axis).load(), rhs.index(axis).load())).end(axis).sink().toposort())
+
+def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
+  """Test-only physical executor for raw gathers and the signed integer EW subset used by INT32 division."""
+  count = len(inputs[0])
+  args = [bytearray(count*4), *(bytearray(value.astype("<i4").tobytes()) for value in inputs)]
+  scratch = [bytearray(spec.size) for spec in image.scratch]
+  for slot in range(len(image.constants)//2):
+    lane = image.constants[slot*2:slot*2+2]
+    scratch[slot][:] = lane*(len(scratch[slot])//2)
+  def buffer(kind:RKBufferKind, index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
+  linear:dict[int, np.ndarray] = {}
+  def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
+    for gather in gathers:
+      dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
+      dst = np.frombuffer(buffer(gather.dst_kind, gather.dst_index), dtype=dtype)
+      lanes = linear.setdefault(gather.count, np.arange(gather.count, dtype=np.intp))
+      dst_index = gather.dst_addend + lanes*gather.dst_stride
+      if gather.values: dst[dst_index] = gather.values
+      elif gather.offsets:
+        src = np.frombuffer(buffer(gather.src_kind, gather.src_index), dtype=dtype)
+        index = np.asarray(gather.offsets, dtype=np.intp)
+        valid = index >= 0
+        if not gather.partial: dst[dst_index] = gather.fill_bits
+        dst[dst_index[valid]] = src[index[valid]]
+      else:
+        src = np.frombuffer(buffer(gather.src_kind, gather.src_index), dtype=dtype)
+        index = np.full(gather.count, gather.base, dtype=np.intp)
+        for divisor,limit,stride in gather.axes: index += (lanes//divisor%limit)*stride
+        dst[dst_index] = src[index]
+  def view(arg:RKArg, dtype, lanes:int) -> np.ndarray:
+    return np.frombuffer(buffer(arg.kind, arg.index), dtype=dtype, count=lanes, offset=arg.addend)
+  def execute(op:RKEWOp) -> None:
+    if op.int16_input and op.int16_output and not (op.int32_input or op.int32_output):
+      source_dtype = destination_dtype = np.dtype("<i2")
+    elif op.int32_input and op.int32_output and not (op.int16_input or op.int16_output):
+      source_dtype = destination_dtype = np.dtype("<i4")
+    elif op.int16_input and op.int32_output and not (op.int16_output or op.int32_input):
+      source_dtype, destination_dtype = np.dtype("<i2"), np.dtype("<i4")
+    else: raise AssertionError(f"unsupported integer EW precision {op}")
+    lhs = view(op.lhs, source_dtype, op.count).astype(np.int64)
+    rhs = view(op.rhs, source_dtype, op.count).astype(np.int64)
+    if op.ew_cfg == _EW_CFG[Ops.ADD]: result = lhs+rhs
+    elif op.ew_cfg == _EW_CFG[Ops.SUB]: result = lhs-rhs
+    elif op.ew_cfg == _EW_CFG[Ops.MUL]: result = lhs*rhs
+    elif op.ew_cfg == _EW_CFG[Ops.MAX]: result = np.maximum(lhs, rhs)
+    elif op.ew_cfg == _EW_CFG_MIN: result = np.minimum(lhs, rhs)
+    elif op.ew_cfg == _EW_CFG_ABS: result = np.abs(lhs)
+    else: raise AssertionError(f"unsupported integer EW config {op.ew_cfg:#x}")
+    if destination_dtype.itemsize == 2: result = np.clip(result, -32768, 32767)
+    else: result = (result+(1<<31)) % (1<<32) - (1<<31)
+    view(op.dst, destination_dtype, op.count)[:] = result.astype(destination_dtype)
+  apply_gathers(image.gathers)
+  mid:dict[int, list[RKGather]] = {}
+  for gather in image.mid_gathers: mid.setdefault(gather.after, []).append(gather)
+  for index in range(len(image.ew_ops)+1):
+    apply_gathers(tuple(mid.get(index, ())))
+    if index < len(image.ew_ops): execute(image.ew_ops[index])
+  return np.frombuffer(args[0], dtype="<i4").copy()
+
+def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
+  rng = np.random.default_rng(0x3588)
+  lhs = rng.integers(-(1<<31), 1<<31, 100, dtype=np.int64).astype(np.int32)
+  rhs = rng.integers(-(1<<31), 1<<31, 100, dtype=np.int64).astype(np.int32)
+  lhs[:12] = (-(1<<31), -(1<<31), (1<<31)-1, -7, -7, 7, 0, 7, -1, 1, -(1<<31), (1<<31)-1)
+  rhs[:12] = (-1, 1, -1, 3, -3, -3, 3, 0, 0, 0, -(1<<31), -(1<<31))
+  return lhs, rhs
+
+def _wrap_int32(value:int) -> int: return (value+(1<<31)) % (1<<32) - (1<<31)
+
+def _trunc_divmod_int32(lhs:int, rhs:int) -> tuple[int, int]:
+  quotient = 0 if rhs == 0 else abs(lhs)//abs(rhs) * (-1 if (lhs < 0) != (rhs < 0) else 1)
+  return _wrap_int32(quotient), _wrap_int32(lhs-quotient*rhs)
 
 def _terminal_gathers(image:RKImage) -> tuple[RKGather, ...]:
   return tuple(gather for gather in image.mid_gathers if gather.after == len(image.ew_ops))
@@ -591,6 +670,63 @@ def test_native_int32_mul_uses_the_canonical_wide_layout():
   image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load() * source.index(i).load()))
   assert image is not None and len(image.ew_ops) == 1
   assert image.ew_ops[0].int32_input and image.ew_ops[0].int32_output
+
+
+def test_wide_int32_cdiv_cmod_are_composable_uops():
+  for op in (Ops.CDIV, Ops.CMOD):
+    image = _lower_uop_program(_int32_binary_program(lambda lhs,rhs,op=op:UOp(op, dtypes.int, src=(lhs, rhs))))
+    assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+    assert len(image.ew_ops) > 3000 and len(_terminal_gathers(image)) == 4
+    assert decode_image(encode_image(image)) == image
+
+
+def test_wide_int32_cdiv_cmod_physical_semantics():
+  lhs, rhs = _int32_division_samples()
+  for op in (Ops.CDIV, Ops.CMOD):
+    image = _lower_uop_program(_int32_binary_program(lambda left,right,op=op:UOp(op, dtypes.int, src=(left, right)), len(lhs)))
+    assert image is not None
+    expected = [_trunc_divmod_int32(left, right)[op is Ops.CMOD] for left,right in zip(lhs.tolist(), rhs.tolist())]
+    np.testing.assert_array_equal(_execute_integer_image(image, lhs, rhs), np.asarray(expected, dtype=np.int32))
+
+
+def test_sibling_int32_cdiv_cmod_share_one_restoring_core():
+  direct = _lower_uop_program(_int32_binary_program(lambda lhs,rhs:UOp(Ops.CDIV, dtypes.int, src=(lhs, rhs))))
+  combined = _lower_uop_program(_int32_binary_program(lambda lhs,rhs:
+    UOp(Ops.CDIV, dtypes.int, src=(lhs, rhs)) + UOp(Ops.CMOD, dtypes.int, src=(lhs, rhs))))
+  assert direct is not None and combined is not None
+  assert len(direct.ew_ops) < len(combined.ew_ops) < len(direct.ew_ops)+100
+  assert decode_image(encode_image(combined)) == combined
+
+
+def test_int32_division_accepts_composed_operands():
+  lhs, rhs = _int32_division_samples()
+  image = _lower_uop_program(_int32_binary_program(lambda lhs,rhs:
+    UOp(Ops.CDIV, dtypes.int, src=(lhs+1, rhs*3)), len(lhs)))
+  assert image is not None and any(op.int32_input and op.int32_output for op in image.ew_ops)
+  assert decode_image(encode_image(image)) == image
+  expected = [_trunc_divmod_int32(_wrap_int32(left+1), _wrap_int32(right*3))[0]
+              for left,right in zip(lhs.tolist(), rhs.tolist())]
+  np.testing.assert_array_equal(_execute_integer_image(image, lhs, rhs), np.asarray(expected, dtype=np.int32))
+
+
+def test_int32_floor_division_and_modulo_execute_ordinary_uops():
+  lhs_values, rhs_values = _int32_division_samples()
+  zero = UOp.const(0, dtypes.int)
+  def expressions(lhs:UOp, rhs:UOp) -> tuple[UOp, UOp]:
+    quotient, remainder = UOp(Ops.CDIV, dtypes.int, src=(lhs, rhs)), UOp(Ops.CMOD, dtypes.int, src=(lhs, rhs))
+    correction = (remainder != zero) & ((lhs < zero) != (rhs < zero))
+    return quotient + correction.cast(dtypes.int)*-1, remainder + correction.where(rhs, zero)
+  for select in (0, 1):
+    image = _lower_uop_program(_int32_binary_program(
+      lambda lhs,rhs,select=select:expressions(lhs, rhs)[select], len(lhs_values)))
+    assert image is not None and len(image.ew_ops) < 4000
+    assert decode_image(encode_image(image)) == image
+    expected = []
+    for lhs,rhs in zip(lhs_values.tolist(), rhs_values.tolist()):
+      quotient, remainder = _trunc_divmod_int32(lhs, rhs)
+      correction = remainder != 0 and (lhs < 0) != (rhs < 0)
+      expected.append(_wrap_int32(quotient-int(correction) if select == 0 else remainder+(rhs if correction else 0)))
+    np.testing.assert_array_equal(_execute_integer_image(image, lhs_values, rhs_values), np.asarray(expected, dtype=np.int32))
 
 
 def test_int32_where_constants_convert_at_the_output_boundary():
