@@ -279,7 +279,8 @@ class RockchipProgram(Program['RockchipDevice']):
                 RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
                 RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
                 stateful=op.stateful or i == 0), address) for i,op in enumerate(group)]
-              self._submit_pcchain(tile_bodies)
+              for start in range(0, len(tile_bodies), _MAX_EW_GROUP_OPS):
+                self._submit_pcchain(tile_bodies[start:start+_MAX_EW_GROUP_OPS])
         return
     bodies:list[tuple[int, ...]] = []
     body_precision = 0

@@ -128,6 +128,20 @@ def test_mixed_precision_path_bounds_native_pc_chains(monkeypatch):
   assert submitted == [48, 6, 1]
 
 
+def test_spatially_tiled_path_bounds_native_pc_chains(monkeypatch):
+  scratch = RKArg(RKBufferKind.SCRATCH, 0)
+  ops = (RKEWOp(scratch, scratch, scratch, _MAX_EW_ELEMS_FP16+1, _EW_CFG[Ops.ADD], stateful=True),) + \
+        (RKEWOp(scratch, scratch, scratch, _MAX_EW_ELEMS_FP16+1, _EW_CFG[Ops.ADD]),)*48
+  program = object.__new__(rockchip_runtime.RockchipProgram)
+  program.dev = SimpleNamespace(_forget_program=lambda _program:None)
+  submitted = []
+  monkeypatch.setattr(rockchip_runtime, "emit_ew_stage", lambda *_args, **_kwargs:(1,))
+  monkeypatch.setattr(rockchip_runtime, "patch_stage", lambda stage,_address:stage)
+  monkeypatch.setattr(program, "_submit_pcchain", lambda bodies:submitted.append(len(bodies)))
+  program._run_ew_ops(lambda *_args:0, lambda *_args:None, ops)
+  assert submitted == [48, 1, 48, 1]
+
+
 def test_changed_pcchains_use_fresh_buffers_and_rearm_first_body(monkeypatch):
   events, freed = [], []
   class FakeBuffer:
