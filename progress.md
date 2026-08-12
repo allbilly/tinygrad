@@ -5623,3 +5623,22 @@ observing physical floor/floormod execution rather than serialization-only asser
 Renderer size is now **4,212 executable lines**, down 128 from the preceding WIP; runtime remains **507** and total tree
 size is **29,786**. Hardware and the full 445 replay remain deliberately pending the required manual power cycle, so
 this is a WIP checkpoint rather than a passing-backend claim.
+
+## 2026-08-13 — unify typed raw components and compose wide bitwise UOps
+
+Wide INT32 `AND`, `OR`, and `XOR` no longer use a root-graph lowering catalog. They now execute compositionally in the
+typed `RKContext` over the same DPU byte-plane ABI used by comparison, `WHERE`, `NOT`, and division. Separate FP16,
+INT16, and INT32 raw split/pack implementations were replaced by typed shared helpers, and the identical ordered-byte
+less-than loops now share one physical core. Production execution remains entirely native: no host tensor arithmetic,
+CPU/GPU fallback, or tensor-operation recognition was added.
+
+The physical unit interpreter verifies direct and nested bitwise operations over deterministic random and signed edge
+values, plus constant operands and the 64,000-byte-lane admission boundary. All tested non-migrated comparison,
+packing, raw-`WHERE`, `NOT`, `CDIV`, and `CMOD` images remained byte-identical; the migrated bitwise images passed exact
+semantic execution and encoder round-trip checks. The complete Rockchip unit file passes 113 tests with `-n12`, full
+Ruff and mypy pass, and adversarial review returned `VERIFIED WITH CAVEATS` only because hardware is intentionally
+offline and finite image sampling cannot prove every possible graph.
+
+Renderer size is now **4,131 executable lines**, down 81 from the preceding WIP; runtime remains **507** and total tree
+size is **29,705**. Hardware and the all-445 replay remain pending the required manual power cycle, so this checkpoint
+does not claim backend completion.

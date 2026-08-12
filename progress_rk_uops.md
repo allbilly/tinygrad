@@ -3385,3 +3385,35 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `test/backend/test_rockchip.py --collect-only`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 155. Unify typed raw components and compose INT32 bitwise UOps — WIP checkpoint
+
+- Removed the root-only wide-INT32 `AND`/`OR`/`XOR` lowerer and its early dispatch. These operations now lower at
+  their own UOp boundary through `RKContext`, so direct and nested operands share the same physical byte-plane ABI as
+  comparisons, `WHERE`, `NOT`, division, and later consumers. Production code emits only static gathers and DPU EW;
+  it adds no host tensor arithmetic, CPU/GPU fallback, or recovered tensor-operation dialect.
+- Consolidated the separate FP16, INT16, and INT32 raw split/pack paths into typed `_raw_parts` and `_pack_raw`
+  helpers. The wide-INT32 pre-copy and raw-`WHERE` scheduling rules are preserved, and FP16 and INT32 less-than now
+  reuse one ordered-byte comparison core. The superseded raw caches/helpers and legacy bitwise dispatch have no
+  remaining references.
+- Added physical semantic coverage for direct and nested `AND`, `OR`, and `XOR` across deterministic random lanes and
+  edge values including `INT_MIN`, `INT_MAX`, `-1`, zero, one, and alternating masks. The emitted images remain
+  `NATIVE`, contain no host gather/scatter, and round-trip through the RKImage encoder. The 64,000-byte-lane hardware
+  limit is admitted while 64,004 byte lanes fail closed.
+- Representative non-migrated images across FP16/INT16 comparison and packing, INT32 comparison and `NOT`, raw
+  `WHERE`, `CDIV`, and `CMOD` remained byte-identical. The migrated root bitwise images have the expected small
+  synchronization-layout change and passed the physical interpreter.
+- Renderer executable size fell from **4,212 to 4,131 lines** (net -81); runtime remains **507** lines and total tree
+  size is **29,705**. The renderer is still 131 lines above the first 4,000-line target.
+- Hardware validation remains pending the required manual power cycle. This checkpoint did not open `/dev/dri` and
+  does not claim that the 445-case census passes.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 113 passed.
+- Independent constant-operand and maximum-lane bitwise matrices: passed.
+- Adversarial verification: `VERIFIED WITH CAVEATS`; the caveats are deferred hardware validation and the finite
+  scope of serialized-image sampling, with no contradictory image found.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
