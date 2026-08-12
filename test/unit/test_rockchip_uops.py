@@ -167,6 +167,15 @@ def _cumulative_index_image(kind:str) -> RKImage:
       return decode_image(base64.b64decode(renderer.render(uops)))
   raise AssertionError("cumulative index kernel not found")
 
+def _first_tensor_image(tensor:Tensor) -> tuple[list[UOp], RKImage, bytes]:
+  renderer = RockchipRenderer(Target("ROCKCHIP"))
+  for call in tensor.schedule_linear().src:
+    if not call.src or call.src[0].op is not Ops.SINK: continue
+    uops = line_rewrite(linearize(full_rewrite_to_sink(call.src[0], renderer)), pm_linearize_cleanups)
+    binary = base64.b64decode(renderer.render(uops))
+    return uops, decode_image(binary), binary
+  raise AssertionError("tensor kernel not found")
+
 def _repeated_max_uops(count:int, mode:str="valid") -> list[UOp]:
   out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))
   terms:list[UOp] = []
@@ -208,6 +217,15 @@ def _bounded_int32_narrowing_program(tautological:bool=True) -> tuple[list[UOp],
 def test_rkvalue_is_the_typed_physical_abi():
   value = RKValue(RKArg(RKBufferKind.ARG, 0), dtypes.half, 1, RKLayout.FP16)
   assert value.dtype is dtypes.half and value.count == 1 and value.layout is RKLayout.FP16
+
+def test_generic_first_pass_owns_cosine_and_tangent_images():
+  expected = (("cos", "3abfdeaaa95cb4870eafc473a042f37b4f9138144fefc8f16bf7d74627f0d481"),
+              ("tan", "8d13f00a5a02668d76c892cbc23b718289fbdb186ce8cc7ffc1a08ca2643d7e7"))
+  for method,digest in expected:
+    tensor = getattr(Tensor.empty(64, dtype=dtypes.half, device="ROCKCHIP"), method)()
+    uops,image,binary = _first_tensor_image(tensor)
+    assert _lower_uop_program(uops) is not None
+    assert image.execution_class is RKExecutionClass.NATIVE and hashlib.sha256(binary).hexdigest() == digest
 
 
 def test_static_range_expressions_vectorize_in_output_order():

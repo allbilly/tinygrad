@@ -5747,3 +5747,24 @@ Renderer size stays at **3,799 executable lines**; runtime is **508** and the to
 gate passes 126 tests with `-n12`, full Ruff and mypy pass, and exactly 445 backend tests collect. Independent review
 matched 2,396,745 old/new scheduler event traces and returned `VERIFIED`. This remains a WIP checkpoint, not an all-445
 hardware-pass claim.
+
+## 2026-08-13 — retire superseded fallback recipes and cross 3,600 lines
+
+Generic typed-UOp lowering now owns the real cosine, tangent, rounding, sign, inverse-hyperbolic, gradient, and remaining
+math/storage shapes before the fallback rewrite is reached. The renderer therefore drops the closed recipe catalog that
+predated that first-pass architecture, while retaining the one observed bool-to-half rewrite and the storage callbacks
+still required for absolute value and infinite multiplication. Direct compositional math helpers remain where the typed
+executor calls them; no runtime tensor arithmetic, CPU/GPU fallback, CMAC path, or tensor-operation recognizer was added.
+
+The cleanup removes 201 executable renderer lines: 54 from obsolete cosine/tangent recipes, 82 from unused
+round/floor/sign/inverse/gradient registrations and their private helpers, 55 from the rest of the bypassed fallback
+catalog, and 10 from byte-identical EW-stage and Boolean-scope consolidation. A focused regression proves cosine and
+tangent compile in the generic first pass and retain their exact native image hashes. Independent old/current replay
+found all 40 representative images byte-identical across 402,474 encoded bytes; randomized differentials also matched
+20,000 EW stages, 50,000 Boolean proofs, and 5,000 structured STORE scopes plus malformed cases.
+
+Renderer size is now **3,598 executable lines**, down 201 from the preceding WIP and below the requested 3,600-line
+checkpoint; runtime remains **508** and total tree size is **29,173**. The Rockchip unit gate passes 127 tests with
+`-n12`, full Ruff and mypy pass, and exactly 445 backend tests collect. Independent adversarial review returned
+`VERIFIED WITH CAVEATS`: the sole caveat is that hardware execution remains deliberately pending the required manual
+power cycle. This is a WIP checkpoint, not an all-445 hardware-pass claim.

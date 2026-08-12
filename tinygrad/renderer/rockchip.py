@@ -360,13 +360,11 @@ def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKG
                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
 
 def _finish_ew_stage(regs:tuple[tuple[int, int, int], ...], dst:RKArg, lhs:RKArg, rhs:RKArg, rdma_feature:int) -> RKStage:
-  commands = [_cmd(*x) for x in regs]
-  bindings = ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
-              (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs))
+  commands = tuple(_cmd(*x) for x in regs)
+  bindings = ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),(_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs))
   relocs = tuple(RKReloc(len(commands)+i, arg) for i,(_,_,arg) in enumerate(bindings))
-  commands.extend(_cmd(target, reg, 0) for target,reg,_ in bindings)
-  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature))
-  return RKStage(tuple(commands), relocs)
+  return RKStage(commands+tuple(_cmd(target, reg, 0) for target,reg,_ in bindings)+
+                 (_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature),), relocs)
 
 def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                          int32_output:bool=False, int32_input:bool=False,
@@ -1376,13 +1374,8 @@ def _bool_tautology(root:UOp, max_atoms:int=8) -> bool:
     if u.op is Ops.CONST and u.dtype is dtypes.bool: return bool(u.arg)
     if len(u.src) == 2 and all(src.dtype is dtypes.bool for src in u.src):
       lhs, rhs = evaluate(u.src[0], assignment), evaluate(u.src[1], assignment)
-      if u.op is Ops.AND: return lhs and rhs
-      if u.op is Ops.OR: return lhs or rhs
-      if u.op is Ops.XOR: return lhs ^ rhs
-      if u.op is Ops.CMPNE: return lhs != rhs
-      if u.op is Ops.CMPEQ: return lhs == rhs
-    if u not in atoms: atoms[u] = len(atoms)
-    return bool(assignment & (1 << atoms[u]))
+      if u.op in (Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ): return bool(python_alu[u.op](lhs, rhs))
+    return bool(assignment & (1 << atoms.setdefault(u, len(atoms))))
   evaluate(root, 0)
   return len(atoms) <= max_atoms and all(evaluate(root, assignment) for assignment in range(1 << len(atoms)))
 
@@ -1390,14 +1383,11 @@ def _tautological_store_scope(uops:list[UOp], store:UOp) -> bool:
   """Accept a STORE only when every enclosing structured IF is unconditionally true."""
   stack:list[UOp] = []; gates:tuple[UOp, ...]|None = None
   for u in uops:
-    if u.op is Ops.IF:
-      if u.dtype is not dtypes.void or len(u.src) != 2 or u.src[0].dtype is not dtypes.bool: return False
-      stack.append(u)
-    elif u.op is Ops.ENDIF:
-      if len(u.src) != 1 or not stack or u.src[0].key != stack.pop().key: return False
-    elif u.op is Ops.STORE and u.key == store.key:
-      if gates is not None: return False
-      gates = tuple(scope.src[0] for scope in stack)
+    if u.op is Ops.IF and (u.dtype is not dtypes.void or len(u.src) != 2 or u.src[0].dtype is not dtypes.bool): return False
+    if u.op is Ops.IF: stack.append(u)
+    elif u.op is Ops.ENDIF and (len(u.src) != 1 or not stack or u.src[0].key != stack.pop().key): return False
+    elif u.op is Ops.STORE and u.key == store.key and gates is not None: return False
+    elif u.op is Ops.STORE and u.key == store.key: gates = tuple(scope.src[0] for scope in stack)
   return gates is not None and not stack and all(_bool_tautology(gate) for gate in gates)
 
 def _native_int16_byte_mask(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[int], int], index_slot:int,
@@ -3460,17 +3450,6 @@ def _opposite_condition(lhs:UOp, rhs:UOp) -> bool:
   return ((lhs_not is not None and _same_condition(lhs_not, rhs)) or
           (rhs_not is not None and _same_condition(lhs, rhs_not)))
 
-def _fold_scaled_negative(x:UOp) -> UOp|None:
-  """Map WHERE(base<0, base*scale, base) to native DPU EW PReLU."""
-  gate, negative, base = x.src
-  if (gate.op is not Ops.CMPLT or gate.src[0].key != base.key or gate.src[1].op is not Ops.CONST or
-      float(gate.src[1].arg) != 0.0 or negative.op is not Ops.MUL): return None
-  for value, factor in (negative.src, negative.src[::-1]):
-    if value.key != base.key or factor.op is not Ops.CONST: continue
-    scale = float(factor.arg)
-    if 0.0 <= scale <= 1.0: return UOp(Ops.MUL, x.dtype, src=(base, factor), arg=_NATIVE_LEAKY_RELU)
-  return None
-
 def _fold_masked_mul(x:UOp) -> UOp|None:
   """Push a WHERE through MUL so inactive factors become identities before native DPU multiplication."""
   gate, yes, no = x.src
@@ -3606,19 +3585,6 @@ def _fold_where_abs(x:UOp) -> UOp|None:
       x.src[2].key != condition.src[0].key or not negated): return None
   return UOp(Ops.MAX, x.dtype, src=(condition.src[0], condition.src[0]), arg=_NATIVE_ABS)
 
-def _fold_floor_ceil(x:UOp) -> UOp|None:
-  """Recognize Tinygrad's TRUNC-based floor/ceil expansions and select the native DPU ALU."""
-  if x.op is not Ops.WHERE or len(x.src) != 3: return None
-  condition, adjusted, truncated = x.src
-  if (truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or adjusted.op is not Ops.ADD or
-      truncated not in adjusted.src): return None
-  delta = next((float(u.arg) for u in adjusted.src if u.op is Ops.CONST), None)
-  source = truncated.src[0]
-  if delta == -1.0 and condition.src == (source, truncated): tag = _NATIVE_FLOOR
-  elif delta == 1.0 and condition.src == (truncated, source): tag = _NATIVE_CEIL
-  else: return None
-  return UOp(Ops.MAX, x.dtype, src=(source, source), arg=tag)
-
 def _fold_trunc(x:UOp) -> UOp:
   """Compose truncation from native floor/ceil without mask multiplication on infinities."""
   source, zero = x.src[0], UOp.const(0.0, dtypes.half)
@@ -3627,52 +3593,6 @@ def _fold_trunc(x:UOp) -> UOp:
   floor = UOp(Ops.MAX, x.dtype, src=(positive, positive), arg=_NATIVE_FLOOR)
   ceil = UOp(Ops.MAX, x.dtype, src=(negative, negative), arg=_NATIVE_CEIL)
   return floor.alu(Ops.ADD, ceil)
-
-def _fold_round(x:UOp) -> UOp|None:
-  """Recognize Tinygrad's round-to-even graph and compose it from native FLOOR/TRUNC and DPU masks."""
-  if x.op is not Ops.WHERE or len(x.src) != 3: return None
-  gate, yes, no = x.src
-  floor, ceil = _fold_floor_ceil(yes), _fold_floor_ceil(no)
-  if floor is None or ceil is None or floor.arg != _NATIVE_FLOOR or ceil.arg != _NATIVE_CEIL or gate.op is not Ops.CMPNE: return None
-  floor_shift, ceil_shift = _const_operand(floor.src[0], Ops.ADD, 0.5), _const_operand(ceil.src[0], Ops.ADD, -0.5)
-  source, ceil_source = (None, None) if floor_shift is None or ceil_shift is None else (floor_shift[0], ceil_shift[0])
-  if source is None or ceil_source is None or source.key != ceil_source.key: return None
-  positive = next((u for u in gate.src if u.op is Ops.CMPLT and u.src[1].key == source.key and
-                   u.src[0].op is Ops.CONST and float(u.src[0].arg) == 0.0), None)
-  parity = next((u for u in gate.src if u is not positive), None)
-  if positive is None or parity is None or parity.op is not Ops.CMPNE: return None
-  unequal = next((u for u in parity.src if u.op is Ops.CMPNE), None)
-  truth = next((u for u in parity.src if u.op is Ops.CONST and u.dtype.scalar() is dtypes.bool), None)
-  if unequal is None or truth is None or not bool(truth.arg): return None
-  truncated_half = next((u for u in unequal.src if u.op is Ops.TRUNC), None)
-  half_value = next((u for u in unequal.src if u is not truncated_half), None)
-  truncated = next((u for u in half_value.src if u.op is Ops.TRUNC), None) if half_value is not None and half_value.op is Ops.MUL else None
-  scale = next((u for u in half_value.src if u.op is Ops.CONST), None) if half_value is not None and half_value.op is Ops.MUL else None
-  if (truncated_half is None or half_value is None or truncated_half.src != (half_value,) or truncated is None or
-      truncated.src != (source,) or scale is None or float(scale.arg) != 0.5): return None
-  one, half = (UOp.const(v, dtypes.half) for v in (1.0, 0.5))
-  def native(value:UOp, tag:str) -> UOp: return UOp(Ops.MAX, dtypes.half, src=(value, value), arg=tag)
-  source_floor = native(source, _NATIVE_FLOOR)
-  tie_delta = source.alu(Ops.SUB, source_floor).alu(Ops.SUB, half)
-  tie = one.alu(Ops.SUB, _positive_mask(native(tie_delta, _NATIVE_ABS)))
-  greater = _positive_mask(tie_delta)
-  floor_half = source_floor.alu(Ops.MUL, half)
-  parity_delta = floor_half.alu(Ops.SUB, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(floor_half,))))
-  odd = _positive_mask(native(parity_delta, _NATIVE_ABS))
-  increment = greater.alu(Ops.MAX, _mask_mul(tie, odd))
-  return source_floor.alu(Ops.ADD, increment)
-
-def _fold_sign(x:UOp) -> UOp|None:
-  """Recognize WHERE(x!=0, WHERE(x<0, -1, 1), 0) before general WHERE lowering."""
-  nonzero, signed, zero = x.src
-  if (nonzero.op is not Ops.CMPNE or signed.op is not Ops.WHERE or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or
-      signed.src[0].op is not Ops.CMPLT or signed.src[1].op is not Ops.CONST or float(signed.src[1].arg) != -1.0 or
-      signed.src[2].op is not Ops.CONST or float(signed.src[2].arg) != 1.0): return None
-  source = next((u for u in nonzero.src if u.dtype.scalar() is dtypes.half and u.op is not Ops.CONST), None)
-  if (source is None or not any(u.op is Ops.CONST and float(u.arg) == 0.0 for u in nonzero.src) or
-      signed.src[0].src[0].key != source.key or signed.src[0].src[1].op is not Ops.CONST or
-      float(signed.src[0].src[1].arg) != 0.0): return None
-  return UOp(Ops.SUB, dtypes.half, src=(source, source), arg=_NATIVE_SIGN)
 
 def _fold_minimum(x:UOp) -> UOp|None:
   """Recognize -max(-x,-y); native ALU-MIN mishandles infinities, so lowering expands it through SUB and MAX."""
@@ -3722,17 +3642,6 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
     return val.replace(src=(val.src[0], default, val.src[2]))
   return None
 
-def _fold_casted_relu(root:UOp) -> UOp|None:
-  """Recover native half MAX from the float WHERE emitted for half ReLU inside a reduction."""
-  if len(root.src) != 1 or (where:=root.src[0]).op is not Ops.WHERE or where.dtype.scalar() is not dtypes.float: return None
-  gate, yes, no = where.src
-  if (yes.op is not Ops.CAST or len(yes.src) != 1 or yes.src[0].dtype.scalar() is not dtypes.half or
-      no.op is not Ops.CONST or float(no.arg) != 0.0): return None
-  val = yes.src[0]
-  if (gate.op is not Ops.CMPLT or gate.src[0].op is not Ops.CONST or float(gate.src[0].arg) != 0.0 or
-      gate.src[1].key != val.key): return None
-  return val.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
-
 def _replace_infinite_multiply(x:UOp) -> UOp|None:
   """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
   for value, factor in (x.src, x.src[::-1]):
@@ -3751,37 +3660,15 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 _pm_storage_common = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"),
    lambda x:None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
-  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
-  (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
   (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
-  (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
 ])
-_pm_fp32_to_fp16 = _pm_storage_common + PatternMatcher([
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)),
-   lambda predicate:nonzero if (nonzero:=_fp16_nonzero_mask(predicate)) is not None else _ieee_comparison_mask(predicate)),
-  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
-  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
-  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
-]) + _pm_masked_materialization + PatternMatcher([
-  # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.
-  (UPat(Ops.WHERE, dtypes.half, name="x"), lambda x: x.src[1].alu(Ops.MAX, x.src[2])
-   if x.src[0].op is Ops.CMPLT and x.src[0].src[0] is x.src[2] and x.src[0].src[1] is x.src[1] and
-      x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
-])
 _pm_generic_storage_precision = PatternMatcher([(UPat(Ops.WHERE, dtypes.float, name="x"),
   lambda x:None if _is_static_expr(x) else
   UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg))]) + _pm_storage_common
-_pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
-                          (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_where_abs)])
-_pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round)])
-_pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_floor_ceil)])
-_pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])
-_pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
 
 def _unit_ratio_source(root:UOp) -> UOp|None:
   """Match Tinygrad's x/sqrt(1+x*x) normalization."""
@@ -3818,8 +3705,6 @@ def _fold_atan(root:UOp) -> UOp|None:
   selected = angle.alu(Ops.ADD, large.alu(Ops.MUL, reflected.alu(Ops.SUB, angle)))
   sign = source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)))
   return selected.alu(Ops.MUL, sign)
-
-_pm_atan = PatternMatcher([(UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_atan)])
 
 def _hyperbolic_log_source(root:UOp) -> tuple[UOp, int]|None:
   """Match log(x + sqrt(x*x +/- 1)) after natural log expands to LOG2 times ln(2)."""
@@ -3872,33 +3757,6 @@ def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
   large = _hyperbolic_tail(safe, (-0.25, -3/32, -5/96))
   gate = _finite_positive_mask(source.alu(Ops.SUB, UOp.const(2.0, dtypes.half)))
   return small.alu(Ops.ADD, gate.alu(Ops.MUL, large.alu(Ops.SUB, small)))
-
-_pm_inverse_hyperbolic = PatternMatcher([
-  (UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_inverse_hyperbolic),
-])
-
-def _fold_alt_sigmoid_gradient(root:UOp) -> UOp|None:
-  """Recover the stable sigmoid derivative from exp(x)/(1+exp(x)) differentiation."""
-  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.half or len(root.src) != 1 or
-      (body:=root.src[0]).op is not Ops.MUL or body.dtype.scalar() is not dtypes.float): return None
-  exponential = next((u for u in body.src if u.op is Ops.EXP2), None)
-  correction = next((u for u in body.src if u is not exponential), None)
-  if exponential is None or correction is None or (scaled:=exponential.src[0]).op is not Ops.MUL: return None
-  factor = next((u for u in scaled.src if u.op is Ops.CONST and abs(float(u.arg)-1/math.log(2)) < 1e-12), None)
-  source = next((_strip_cast(u) for u in scaled.src if u is not factor), None)
-  nodes = correction.toposort()
-  if (factor is None or source is None or source.dtype.scalar() is not dtypes.half or
-      sum(u.op is Ops.FDIV for u in nodes) != 3 or
-      not any(u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and u.src[0].key == exponential.key for u in nodes) or
-      not all(any(u.op is Ops.CONST and float(u.arg) == value for u in nodes) for value in (-1.0, 1.0))): return None
-  one = UOp.const(1.0, dtypes.half)
-  denominator = one.alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(-1/math.log(2), dtypes.half)).alu(Ops.EXP2))
-  sigmoid = one.alu(Ops.FDIV, denominator)
-  return sigmoid.alu(Ops.MUL, one.alu(Ops.SUB, sigmoid))
-
-_pm_alt_sigmoid_gradient = PatternMatcher([
-  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_alt_sigmoid_gradient),
-])
 
 def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
   """Approximate FP16 sqrt/rsqrt with range-independent Babylonian iterations on DPU EW."""
@@ -3995,57 +3853,6 @@ def _dpu_sin(source:UOp) -> UOp:
     result = result.alu(Ops.ADD, residual.alu(Ops.MUL, cosine))
   return result.alu(Ops.ADD, invalid)
 
-def _dpu_cos(source:UOp) -> UOp:
-  """Approximate FP16 COS after reducing the original angle, preserving large-input phase."""
-  source = source.cast(dtypes.half)
-  one = UOp.const(1.0, dtypes.half)
-  _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
-  _, square, reflected = _dpu_reflected_angle(reduced, one)
-  polynomial = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320))
-  sign = one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
-  return polynomial.alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
-
-def _dpu_tan_magnitude(angle:UOp, pole_magnitude:UOp) -> UOp:
-  """Evaluate positive tangent magnitude directly or through reciprocal pole distance."""
-  one = UOp.const(1.0, dtypes.half)
-  near_pole = _positive_mask(angle.alu(Ops.SUB, UOp.const(0.75, dtypes.half)))
-  local = _mask_mul(angle, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, _mask_mul(pole_magnitude, near_pole))
-  square = local.alu(Ops.MUL, local)
-  polynomial = UOp.const(1382/155925, dtypes.half)
-  for coefficient in (62/2835, 17/315, 2/15, 1/3, 1.0):
-    polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
-  tangent = local.alu(Ops.MUL, polynomial)
-  safe_tangent = tangent.alu(Ops.ADD, one.alu(Ops.SUB, near_pole))
-  return _mask_mul(tangent, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, near_pole.alu(Ops.FDIV, safe_tangent))
-
-def _dpu_tan(source:UOp) -> UOp:
-  """Approximate FP16 TAN with precise near-pole and large-angle reductions."""
-  source = source.cast(dtypes.half)
-  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
-  bounded, multiple, reduced = _dpu_periodic_reduce(source, 1/math.pi,
-    (2.0, 1.0, 0.125, 0.015625, math.pi-3.140625), math.pi/2)
-  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  reduced_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
-  pole_index = multiple.alu(Ops.ADD, reduced_sign.alu(Ops.MUL, UOp.const(0.5, dtypes.half)))
-  distance = bounded
-  for coefficient in (3.0, 0.140625, math.pi-3.140625):
-    distance = distance.alu(Ops.SUB, pole_index.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
-  pole_magnitude = UOp(Ops.MAX, dtypes.half, src=(distance, distance), arg=_NATIVE_ABS)
-  small = _dpu_tan_magnitude(magnitude, pole_magnitude).alu(Ops.MUL, reduced_sign)
-
-  _, _, broad = _dpu_periodic_reduce(source, 1/(2*math.pi),
-    (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
-  angle, _, reflected = _dpu_reflected_angle(broad, one)
-  broad_pole = UOp.const(1.5703125, dtypes.half).alu(Ops.SUB, angle).alu(
-    Ops.ADD, UOp.const(math.pi/2-1.5703125, dtypes.half))
-  broad_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, broad)).alu(Ops.MUL, UOp.const(2.0, dtypes.half))).alu(
-    Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half))))
-  large = _dpu_tan_magnitude(angle, broad_pole).alu(Ops.MUL, broad_sign)
-  use_large = _finite_positive_mask(UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS).alu(
-    Ops.SUB, UOp.const(8.0, dtypes.half)))
-  result = small.alu(Ops.ADD, use_large.alu(Ops.MUL, large.alu(Ops.SUB, small)))
-  return result.alu(Ops.ADD, source.alu(Ops.MUL, zero))
-
 def _dpu_pow2_integer(exponent:UOp) -> UOp:
   """Build `2**exponent` for the FP16 exponent range with exact native DPU arithmetic."""
   zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
@@ -4079,24 +3886,6 @@ def _dpu_exp2(source:UOp) -> UOp:
   finite = _mask_mul(result, one.alu(Ops.SUB, below))
   return finite.alu(Ops.ADD, one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one))
 
-def _dpu_exp2_nonpositive(source:UOp) -> UOp:
-  """Approximate EXP2 for a known nonpositive finite-or-negative-infinite input without domain comparisons."""
-  source = source.cast(dtypes.half)
-  bounded = _native_min(source.alu(Ops.MAX, UOp.const(-24.0, dtypes.half)), UOp.const(0.0, dtypes.half))
-  return _dpu_exp2_bounded(bounded)
-
-def _fold_masked_exp2(x:UOp) -> UOp|None:
-  """Move a static `-inf` padding mask outside EXP2 so cumulative exponentials remain compact."""
-  exponent = x.src[0]
-  scaled, factor = next(((value, const) for value,const in (exponent.src, exponent.src[::-1]) if const.op is Ops.CONST), (None, None)) \
-    if exponent.op is Ops.MUL else (exponent, UOp.const(1.0, exponent.dtype))
-  if scaled is None or factor is None or scaled.op is not Ops.WHERE: return None
-  gate, yes, no = scaled.src
-  padded = tuple(arm.op is Ops.CONST and math.isinf(float(arm.arg)) and float(arm.arg) < 0 for arm in (yes, no))
-  if padded.count(True) != 1 or not _is_static_expr(gate): return None
-  value, mask = (no, UOp.const(1.0, dtypes.half).alu(Ops.SUB, gate.cast(dtypes.half))) if padded[0] else (yes, gate.cast(dtypes.half))
-  return _mask_mul(_dpu_exp2_nonpositive(value.cast(dtypes.half).alu(Ops.MUL, factor.cast(dtypes.half))), mask)
-
 def _dpu_log2(source:UOp) -> UOp:
   """Approximate FP16 LOG2 without LUTs using threshold exponent extraction and an atanh polynomial."""
   source = source.cast(dtypes.half)
@@ -4129,26 +3918,8 @@ def _dpu_log2(source:UOp) -> UOp:
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
   return result.alu(Ops.ADD, zero_correction).alu(Ops.ADD, negative_correction).alu(Ops.ADD, inf_correction)
 
-_pm_rsqrt = PatternMatcher([(UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float),
-  src=(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)),)), lambda source:_dpu_sqrt(source, True))])
-_pm_sqrt = PatternMatcher([(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sqrt(source))])
-_pm_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_exp2(source))])
-_pm_masked_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), name="x"), _fold_masked_exp2)])
-_pm_log2 = PatternMatcher([(UPat(Ops.LOG2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_log2(source))])
-_pm_sin = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sin(source))])
-def _cos_source(x:UOp) -> UOp|None:
-  """Recover x from Tinygrad's casted cos(x) = sin(pi/2-x)."""
-  x = _strip_cast(x)
-  if x.op is not Ops.SIN or len(x.src) != 1 or (phase:=_const_operand(_strip_cast(x.src[0]), Ops.ADD, math.pi/2)) is None: return None
-  negative = _const_operand(phase[0], Ops.MUL, -1.0)
-  return _strip_cast(negative[0]) if negative is not None else None
-_pm_cos = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), name="x"),
-  lambda x:_dpu_cos(source) if (source:=_cos_source(x)) is not None else None)])
-_pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"),
-  lambda x:_dpu_tan(source) if len(x.src) == 2 and (numerator:=_strip_cast(x.src[0])).op is Ops.SIN and
-  (cosine:=_cos_source(x.src[1])) is not None and (source:=_strip_cast(numerator.src[0])).key == cosine.key else None)])
-_pm_fp16_rewrite = _pm_alt_sigmoid_gradient + _pm_inverse_hyperbolic + _pm_atan + _pm_tan + _pm_cos + _pm_sin + \
-  _pm_masked_exp2 + _pm_exp2 + _pm_log2 + _pm_rsqrt + _pm_sqrt + _pm_round + _pm_floor_ceil + _pm_trunc + _pm_abs + _pm_sign + _pm_fp32_to_fp16
+_pm_fp16_rewrite = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)),
+  lambda predicate:nonzero if (nonzero:=_fp16_nonzero_mask(predicate)) is not None else _ieee_comparison_mask(predicate))])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   return list(graph_rewrite(next(u for u in uops if u.op is Ops.SINK), _pm_fp16_rewrite, name="rockchip fp16 recipes").toposort())
 

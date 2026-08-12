@@ -3612,3 +3612,34 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 162. Retire superseded fallback recipes and cross the 3,600-line target — WIP checkpoint
+
+- Removed the FP16 fallback recipes that the generic typed-UOp executor now bypasses for real cosine, tangent,
+  round/floor/ceil/trunc, sign, inverse-hyperbolic, gradient, and remaining math/storage graphs. The underlying
+  compositional helpers remain wherever generic execution calls them directly. The fallback pass now contains only
+  the observed bool-to-half conversion; generic storage lowering retains its required ABS and infinite-multiply
+  callbacks.
+- Added a focused first-pass ownership regression for cosine and tangent, including stable native image hashes. An
+  independent committed/current compiler replay compared 40 representative images and all 402,474 encoded bytes were
+  identical. Every current image was produced by the first generic lowering attempt rather than the deleted fallback
+  catalog.
+- Consolidated EW-stage tuple construction and the Boolean tautology/structured-STORE proof without changing their
+  contracts. Independent randomized comparison matched 20,000 EW stages, 50,000 Boolean DAGs, and 5,000 structured
+  scopes plus 11 malformed-scope cases exactly.
+- Renderer executable size fell from **3,799 to 3,598 lines** (net -201); runtime remains **508** lines and total tree
+  size is **29,173**. This crosses the requested 3,600-line checkpoint without deleting comments/docstrings, adding
+  host tensor arithmetic, restoring a tensor-operation catalog, or introducing CPU/GPU/CMAC execution.
+- Independent adversarial verification returned `VERIFIED WITH CAVEATS`. The only caveat is intentional: the NPU was
+  not accessed while the manual power cycle remains pending, so the complete 445-case hardware census has not run and
+  this checkpoint makes no all-pass backend claim.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 127 passed.
+- Committed/current real-image replay: 40/40 byte-identical images across 402,474 encoded bytes.
+- Structural differentials: 20,000 EW stages, 50,000 Boolean DAGs, 5,000 valid scopes, and 11 malformed scopes matched.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
+- `git diff --check`: pass.
