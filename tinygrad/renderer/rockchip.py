@@ -10,7 +10,7 @@ from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import Target, cdiv, ceildiv, cmod, floordiv, floormod, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, consumer_map_from_toposort, graph_rewrite
+from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, consumer_map_from_toposort, graph_rewrite
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
 
@@ -3525,65 +3525,36 @@ def _local_buffer(u:UOp) -> UOp|None:
   while u.op is Ops.AFTER: u = u.src[0]
   return u if u.op is Ops.BUFFER else None
 
-def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
-  """Execute one static local accumulator for ADD/MAX/MUL without recovering a tensor operation."""
+def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
+  """Execute static local accumulators for ADD/MAX/MUL without recovering a tensor operation."""
   local_loads = [load for u in root.toposort() if (load:=_local_load(u)) is not None]
   buffers = {_local_buffer(load) for load in local_loads}
   if not local_loads: return root
   if None in buffers: raise _RKGenericReject
   typed_buffers = typing_cast(set[UOp], buffers)
-  if len(typed_buffers) > 1:
-    definitions = _static_local_defs(uops, typed_buffers)
-    expanded:dict[UOp, UOp] = {}
-    active:set[UOp] = set()
-    def expand_dependencies(expr:UOp, owner:UOp) -> UOp:
-      substitutions = {load:expand_buffer(buffer) for node in expr.toposort() if (load:=_local_load(node)) is not None and
-                       (buffer:=_local_buffer(load)) is not None and buffer is not owner}
-      return _substitute_static_ranges(expr, substitutions)
-    def expand_buffer(buffer:UOp) -> UOp:
-      if buffer in expanded: return expanded[buffer]
-      if buffer in active: raise _RKGenericReject
-      active.add(buffer)
-      definition = definitions[buffer]
-      if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
-                                     for loop in definition.loops):
-        raise _RKGenericReject
-      terms = [expand_dependencies(definition.initial, buffer)]
-      for env in _iter_selected_range_env(list(definition.loops)):
-        term = _substitute_static_ranges(definition.term, {loop:loop.const_like(env[loop]) for loop in definition.loops})
-        terms.append(expand_dependencies(term, buffer))
-      expanded[buffer] = _structural_reduce(definition.update_op, buffer.dtype, terms)
-      active.remove(buffer)
-      if len(expanded[buffer].toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
-      return expanded[buffer]
-    substitutions = {load:expand_buffer(typing_cast(UOp, _local_buffer(load))) for load in local_loads}
-    return _substitute_static_ranges(root, substitutions)
-  buffer = next(iter(typed_buffers))
-  stores = [u for u in uops if u.op is Ops.STORE and _local_buffer(u) is buffer]
-  out_ranges = set(_index_ranges(output[3]))
-  updates:list[tuple[UOp, UOp, list[UOp]]] = []
-  initializers:list[UOp] = []
-  for store in stores:
-    value = _strip_cast(store.src[1])
-    accumulator = next((src for src in value.src if _local_load(src) is not None and _local_buffer(src) is buffer), None) \
-      if value.op in (Ops.ADD, Ops.MAX, Ops.MUL) else None
-    if accumulator is None:
-      if not any(r not in out_ranges for r in _index_ranges(value)): initializers.append(store.src[1])
-      continue
-    term = value.src[1 if value.src[0] is accumulator else 0]
-    ranges = [r for r in _index_ranges(term) if r not in out_ranges]
-    updates.append((value, term, ranges))
-  if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
-  update, term, ranges = updates[0]
-  if not ranges or any(r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
-  if any(node.op is Ops.WHERE and node.dtype.scalar() is dtypes.float for node in term.toposort()): raise _RKGenericReject
-  iterations = math.prod(int(r.src[0].arg) for r in ranges)
-  if iterations > _MAX_GENERIC_UNROLL or iterations*len(term.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
-  terms = [initializers[0]]
-  for env in _iter_selected_range_env(ranges):
-    terms.append(_substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges}))
-  reduced = _structural_reduce(update.op, update.dtype, terms)
-  substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
+  definitions = _static_local_defs(uops, typed_buffers)
+  expanded:dict[UOp, UOp] = {}
+  active:set[UOp] = set()
+  def expand_dependencies(expr:UOp, owner:UOp) -> UOp:
+    substitutions = {load:expand_buffer(buffer) for node in expr.toposort() if (load:=_local_load(node)) is not None and
+                     (buffer:=_local_buffer(load)) is not None and buffer is not owner}
+    return _substitute_static_ranges(expr, substitutions)
+  def expand_buffer(buffer:UOp) -> UOp:
+    if buffer in expanded: return expanded[buffer]
+    if buffer in active: raise _RKGenericReject
+    active.add(buffer)
+    definition = definitions[buffer]
+    if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
+                                   for loop in definition.loops): raise _RKGenericReject
+    terms = [expand_dependencies(definition.initial, buffer)]
+    for env in _iter_selected_range_env(list(definition.loops)):
+      term = _substitute_static_ranges(definition.term, {loop:loop.const_like(env[loop]) for loop in definition.loops})
+      terms.append(expand_dependencies(term, buffer))
+    expanded[buffer] = _structural_reduce(definition.update_op, buffer.dtype, terms)
+    active.remove(buffer)
+    if len(expanded[buffer].toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
+    return expanded[buffer]
+  substitutions = {load:expand_buffer(typing_cast(UOp, _local_buffer(load))) for load in local_loads}
   return _substitute_static_ranges(root, substitutions)
 
 @dataclass(frozen=True, slots=True)
@@ -3608,6 +3579,7 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
           raise _RKGenericReject
         base = store.src[0].src[0] if store.src and store.src[0].op is Ops.INDEX else None
         loops = tuple(src for src in base.src[1:] if src.op is Ops.RANGE) if base is not None and base.op is Ops.AFTER else ()
+        if not loops: loops = tuple(r for r in _index_ranges(term) if r.arg[1] is AxisType.REDUCE)
         if not loops: raise _RKGenericReject
         updates.append((value.op, term, loops))
       elif not any(_local_buffer(load) is buffer for node in value.toposort() if (load:=_local_load(node)) is not None):
@@ -3869,7 +3841,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
         _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
     static_load_offsets = _static_local_load_offsets(uops, output, reduced)
-    local_root = reduced if static_load_offsets else _unroll_static_local(uops, output, reduced)
+    local_root = reduced if static_load_offsets else _unroll_static_local(uops, reduced)
     root = graph_rewrite(local_root, _pm_masked_loads, name="rockchip masked load materialization")
     root_nodes = root.toposort()
     root,root_nodes = _finite_max_neutrals(root, root_nodes)

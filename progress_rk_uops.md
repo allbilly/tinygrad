@@ -3131,3 +3131,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 146. Give scalar local accumulators one structural parser — complete
+
+- Removed the separate 31-line single-buffer local-accumulator parser and its output-range heuristic. One or many
+  scalar local buffers now use `_static_local_defs` plus the same dependency expander for generic ADD/MAX/MUL RANGE
+  execution.
+- Hand-authored UOps do not always attach their reduction RANGE through `AFTER`; the shared parser now falls back to
+  the UOp's explicit `AxisType.REDUCE` classification. This is a structural UOp rule and introduces no tensor-operation
+  recovery or host numeric execution.
+- Compared milestone-145/current serialized images for literal scalar-local ADD, MAX, and MUL programs. All three are
+  byte-identical at 303 bytes, including gather, scratch, EW-stage, and output layout decisions.
+- Renderer executable size fell from 4,262 to 4,234 lines, 5,999 lines below its 10,233-line baseline (58.6%); runtime
+  remains 454 lines.
+- NPU replay remains unavailable: the mandatory health check passes through 4,096 lanes but times out at 131,072, and
+  a later driver interaction produced an RKNPU kernel trace. No further `/dev/dri` access was attempted in this
+  milestone; verification is deliberately limited to host-independent image construction and static checks.
+
+Verification:
+
+- Old/current scalar-local ADD/MAX/MUL images: 3/3 byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 96 passed in 4.47 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
