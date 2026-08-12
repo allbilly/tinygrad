@@ -2947,3 +2947,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 139. Delete root INT32-bounds graph recovery — complete
+
+- Disconnected the 54-line recognizer that recovered positive and negative-normalized INT32 bounds predicates as a
+  special native byte-mask image. The generic typed executor now accepts the same `LOAD`, `CMPLT`, `CMPNE`, `WHERE`,
+  and `AND` UOps directly, including conjunctions over independent index tensors.
+- Deleted the recognizer and its pre-generic dispatch. The generic path retains exact INT32 byte-plane comparisons,
+  native DPU boolean arithmetic, and raw one-byte output materialization; no host address or CPU numeric execution is
+  involved.
+- Added a two-axis negative-normalization regression. Compared current images with milestone 138 after disconnecting
+  only the obsolete recognizer: positive/normalized one-axis and two-axis programs were byte-identical in all four
+  cases, proving this exposes an already-existing generic path rather than introducing a replacement dialect.
+- Renderer executable size fell from 4,492 to 4,438 lines. From the 10,233-line baseline, 5,795 lines are gone (56.6%);
+  runtime remains 460 lines.
+
+Verification:
+
+- Milestone-138 generic/current comparison: 4/4 images byte-identical (110, 176, 219, and 351 ordinary EW stages).
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 93 passed in 4.69 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n0 --durations=10`: 93 passed in 1.95 seconds;
+  the literal non-affine UOp program remains the slowest at 0.21 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

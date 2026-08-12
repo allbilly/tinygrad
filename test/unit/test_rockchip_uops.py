@@ -774,6 +774,19 @@ def test_dynamic_index_materializer_composes_external_bool_gate():
   assert decode_image(encode_image(image)) == image
 
 
+def test_int32_bounds_predicates_execute_as_ordinary_uops():
+  out, lhs, rhs = UOp.param(0, dtypes.bool, (4,)), UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
+  lane = UOp.range(4, 0)
+  values = [source.index(lane).load() for source in (lhs, rhs)]
+  bounded = [(value < 0).where(value+5, value) for value in values]
+  valid = [((value < 0) != UOp.const(True, dtypes.bool)) & (value < 5) for value in bounded]
+  image = _lower_uop_program(list(out.index(lane).store(valid[0] & valid[1]).end(lane).sink().toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert any(op.int32_input and op.int32_output for op in image.ew_ops)
+  assert any(gather.dst_kind is RKBufferKind.ARG and gather.itemsize == 1 for gather in _terminal_gathers(image))
+  assert decode_image(encode_image(image)) == image
+
+
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:lhs.index(i).load() & rhs.index(i).load()))

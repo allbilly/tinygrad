@@ -1875,61 +1875,6 @@ def _native_integer_nonzero_mask(ops:list[RKEWOp], gathers:list[RKGather], scrat
     ops.append(RKEWOp(mask, mask, _scratch_arg(slot), matrix_lanes, _EW_CFG[Ops.MAX], int16_input=True, int16_output=True))
   return mask
 
-def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
-  """Lower canonical positive-only or negative-normalized INT32 index bounds to one exact bool mask."""
-  _, out_param, count, out_index, root = output
-  if count <= 0: return None
-  normalized = tuple((node, *parsed) for node in root.toposort() if (parsed:=_negative_normalized_index(node)) is not None)
-  normalized_by_load = {load.key:(bounded, extent) for bounded,load,extent in normalized}
-  loads = tuple({u.key:u for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
-  if not loads or len(normalized_by_load) != len(normalized): return None
-  specs:list[tuple[UOp, UOp, int, bool, UOp]] = []
-  for load in loads:
-    if load.key in normalized_by_load:
-      bounded, extent = normalized_by_load[load.key]; wrapped = True
-    else:
-      limits = {int(u.src[1].arg) for u in root.toposort() if u.op is Ops.CMPLT and u.src[0].key == load.key and
-                u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0}
-      if len(limits) != 1: return None
-      bounded, extent, wrapped = load, next(iter(limits)), False
-    gates = [node for node in root.toposort() if _bounded_index_gate(node, bounded, extent) and
-             {u.key for u in node.toposort() if u.op is Ops.LOAD} == {load.key}]
-    if len(gates) != 1: return None
-    specs.append((bounded, load, extent, wrapped, gates[0]))
-  terms = [term for *_,term in specs]
-  actual_leaves, expected_leaves = _flatten_binary(root, Ops.AND), tuple(x for term in terms for x in _flatten_binary(term, Ops.AND))
-  if len(actual_leaves) != len(expected_leaves) or \
-     {x.key for x in actual_leaves} != {x.key for x in expected_leaves}: return None
-  axes:list[tuple[UOp, int, UOp, tuple[int, ...], int, bool]] = []
-  for bounded,load,extent,wrapped,term in specs:
-    param = _root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None
-    if (not _bounded_index_gate(term, bounded, extent) or param is None or param.dtype.scalar() is not dtypes.int or
-        param.src[0].op is not Ops.CONST or {u.key for u in term.toposort() if u.op is Ops.LOAD} != {load.key}): return None
-    try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
-    except RuntimeError: return None
-    index_count = int(param.src[0].arg)
-    if any(not 0 <= offset < index_count for offset in offsets): return None
-    axes.append((param, index_count, load, offsets, extent, wrapped))
-  if {u.key for u in root.toposort() if u.op is Ops.LOAD} != {load.key for _,_,load,_,_,_ in axes}: return None
-
-  layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_ in axes)
-  if any(matrix_lanes > _MAX_EW_ELEMS_FP16 for _,_,matrix_lanes,_ in layouts): return None
-  scratch_sizes, scratch, gathers, ops = _physical_lists()
-  valid_axes:list[RKArg] = []
-  for (param,_,_,offsets,extent,wrapped),(_,vector_lanes,_,_) in zip(axes, layouts):
-    positive = tuple((coordinate,)*count for coordinate in range(extent))
-    negative = tuple((coordinate,)*count for coordinate in range(-extent, 0))
-    if (mask:=_native_int16_byte_mask(ops, gathers, scratch, param.arg.slot, offsets,
-                                      (positive, negative) if wrapped else (positive,), count, vector_lanes)) is None: return None
-    valid_axes.append(_reduce_rows(ops, [RKArg(mask.kind, mask.index, mask.addend+row*vector_lanes*2)
-                                        for row in range(extent)], count, _EW_CFG[Ops.MAX], int16=True))
-  result = valid_axes[0]
-  for valid in valid_axes[1:]:
-    dst = scratch(count*2); ops.append(RKEWOp(_scratch_arg(dst), result, valid, count, _EW_CFG[Ops.MUL],
-      int16_input=True, int16_output=True)); result = _scratch_arg(dst)
-  return RKImage(tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
-                 mid_gathers=(replace(_int16_low_bytes(result, out_param.arg.slot, count), after=len(ops)),))
-
 def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predicate:Callable[[UOp], UOp|None],
                           max_scale:int=1) -> tuple[UOp, int]|None:
   """Prove an unrolled sum covers every typed source predicate uniformly, possibly repeated or scaled."""
@@ -4101,8 +4046,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject("output store")
     return None
   if output[2] <= 0: return RKImage()
-  if output[1].dtype.scalar() is dtypes.bool:
-    if (bounds_mask:=_lower_int32_bounds_mask(output)) is not None: return bounds_mask
   if output[1].dtype.scalar() is dtypes.int:
     if (bitwise:=_lower_int32_byte_logic(output)) is not None: return bitwise
     if (shift:=_lower_int32_shift(output)) is not None: return shift
