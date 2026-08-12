@@ -77,7 +77,9 @@ class TestRockchip(unittest.TestCase):
     before, before_tasks = self.dev.submit_count, self.dev.task_count
     got = out.realize().numpy()
     submits, tasks = self.dev.submit_count-before, self.dev.task_count-before_tasks
-    if expected_submits is None: expected_submits = int(tasks > 0)
+    # The fail-closed runtime caps every PC chain at 48 physical tasks. Preserve the old one-chain contract as the
+    # minimum number of bounded chains; tests with an intentionally multi-submit recipe still use their exact count.
+    if expected_submits is None or expected_submits == 1 and tasks > 48: expected_submits = (tasks+47)//48
     print(f"  {self._testMethodName}: tasks={tasks} submits={submits} (expected {expected_submits})")
     np.testing.assert_allclose(got, ref, atol=atol, rtol=rtol, equal_nan=True)
     self.assertEqual(submits, expected_submits, f"{self._testMethodName}: submits={submits} expected={expected_submits}")

@@ -4,7 +4,7 @@ from dataclasses import replace
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
-from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
+from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_image, patch_stage, emit_ew_stage,
   RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
@@ -17,10 +17,20 @@ _MAX_EW_GROUP_OPS = 48
 _MAX_FP32_EW_GROUP_OPS = 16
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
+_TARGET_DPU, _TARGET_DPU_RDMA = 0x1001, 0x2001
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) & ~(alignment - 1)
 def _task_command_bytes(body_qwords:int) -> int: return _align_up(body_qwords + _PC_TAIL, 2) * 8
+def _rearm_body(body:tuple[int, ...]) -> tuple[int, ...]:
+  """Clear hidden DPU/RDMA ping-pong phase before an independent physical submission."""
+  return (_pc(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x30),
+          _pc(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30),
+          _pc(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, 0), *body)
+def _body_precision(body:tuple[int, ...]) -> tuple[int, int]|None:
+  value = next(((word >> 16) & 0xffffffff for word in body
+                if word >> 48 == _TARGET_DPU and word & 0xffff == rk.REG_DPU_DATA_FORMAT), None)
+  return None if value is None else (value & 7, value >> 29 & 7)
 def _pcchain_sizes(body_qwords:list[int]) -> tuple[int, int]:
   """Exact command and descriptor BO sizes for one PC-chain, including prefetch guard."""
   if not body_qwords or any(not 0 < amount <= _PC_DATA_AMOUNT_MAX for amount in body_qwords): raise ValueError("invalid EW PC-chain body")
@@ -46,7 +56,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self._scratch_offsets:list[int] = []
     self._scratch_size = 0
     for spec in self.image.scratch:
-      self._scratch_size = _align_up(self._scratch_size, spec.alignment)
+      self._scratch_size = _align_up(self._scratch_size, 4096)
       self._scratch_offsets.append(self._scratch_size)
       self._scratch_size += spec.size
     self._scratch_arena:HCQBuffer|None = None
@@ -56,6 +66,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self._task_buf:HCQBuffer|None = None
     self._standalone_cmd_buf:HCQBuffer|None = None
     self._standalone_task_buf:HCQBuffer|None = None
+    self._standalone_body:tuple[int, ...]|None = None
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
     dev._touch_program(self)
@@ -74,6 +85,7 @@ class RockchipProgram(Program['RockchipDevice']):
         setattr(self, attr, None)
         self.dev._gpu_free(buf)
     self._pcchain_bodies = None
+    self._standalone_body = None
     getattr(self, "_scratch_ew_bodies", {}).clear()
 
   @suppress_finalizing
@@ -83,8 +95,8 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
 
-  def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0) -> HCQBuffer:
-    if (buf:=getattr(self, attr)) is None or buf.size < size:
+  def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0, replace_buffer:bool=False) -> HCQBuffer:
+    if (buf:=getattr(self, attr)) is None or buf.size < size or replace_buffer:
       new = self.dev._gpu_alloc(max(size, minimum), flags)
       setattr(self, attr, new)
       if buf is not None: self.dev._gpu_free(buf)
@@ -110,9 +122,13 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _submit_pcchain(self, bodies:list[tuple[int, ...]]) -> None:
     """Submit contiguous FP16 EW tasks as one blocking PC chain."""
+    first, last = _body_precision(bodies[0]), _body_precision(bodies[-1])
+    if first is not None and (self.dev._ew_precision, first[0]) in ((4, 1), (4, 2)): self.dev.reset_npu()
+    bodies = [_rearm_body(bodies[0]), *bodies[1:]]
     packed_bodies, n = tuple(bodies), len(bodies)
     if self._pcchain_bodies == packed_bodies and self._cmd_buf is not None and self._task_buf is not None:
       self._submit(self._cmd_buf, self._task_buf, n)
+      if last is not None: self.dev._ew_precision = last[1]
       return
     cmd_size, task_need = _pcchain_sizes([len(body) for body in bodies])
     offsets:list[int] = []
@@ -122,8 +138,11 @@ class RockchipProgram(Program['RockchipDevice']):
       words += _align_up(len(body) + _PC_TAIL, 2)
     need = words * 8
     assert cmd_size == need+_CMD_PREFETCH_GUARD
-    cmd = self._ensure_buffer("_cmd_buf", cmd_size, _CMD_BUF_MIN)
-    task = self._ensure_buffer("_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
+    # The RKNPU submission path can retain object/address state after a blocking submit. Keep an identical chain cached,
+    # but never overwrite its command or descriptor GEM with different bytes.
+    replace_buffer = self._pcchain_bodies is not None
+    cmd = self._ensure_buffer("_cmd_buf", cmd_size, _CMD_BUF_MIN, replace_buffer=replace_buffer)
+    task = self._ensure_buffer("_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING, replace_buffer)
     ctypes.memset(int(cmd.va_addr), 0, cmd_size)
     base_dma = self._dma(cmd)
     for i, body in enumerate(bodies):
@@ -141,17 +160,24 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(task.va_addr) + i*_TASK_DESC_BYTES, ctypes.addressof(desc), _TASK_DESC_BYTES)
     self._pcchain_bodies = packed_bodies
     self._submit(cmd, task, n)
+    if last is not None: self.dev._ew_precision = last[1]
 
   def _submit_standalone(self, body:tuple[int, ...]) -> None:
     """Submit one stateful DPU stage with the direct PC tail used by the vendor examples."""
+    body = _rearm_body(body)
+    if self._standalone_body == body and self._standalone_cmd_buf is not None and self._standalone_task_buf is not None:
+      self._submit(self._standalone_cmd_buf, self._standalone_task_buf, 1, standalone=True)
+      return
     commands = body + (_pc(rk.TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18),)
     cmd_size, task_need = len(commands)*8+_CMD_PREFETCH_GUARD, _TASK_DESC_BYTES
-    cmd = self._ensure_buffer("_standalone_cmd_buf", cmd_size, _CMD_BUF_MIN)
-    task = self._ensure_buffer("_standalone_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
+    replace_buffer = self._standalone_body is not None and self._standalone_body != body
+    cmd = self._ensure_buffer("_standalone_cmd_buf", cmd_size, _CMD_BUF_MIN, replace_buffer=replace_buffer)
+    task = self._ensure_buffer("_standalone_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING, replace_buffer)
     ctypes.memset(int(cmd.va_addr), 0, cmd_size)
     ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64 * len(commands))(*commands), len(commands)*8)
     desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(commands), 0, self._dma(cmd))
     ctypes.memmove(int(task.va_addr), ctypes.addressof(desc), _TASK_DESC_BYTES)
+    self._standalone_body = body
     self._submit(cmd, task, 1, standalone=True)
 
   def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
@@ -257,6 +283,11 @@ class RockchipProgram(Program['RockchipDevice']):
         return
     bodies:list[tuple[int, ...]] = []
     body_precision = 0
+    def append_body(body:tuple[int, ...]) -> None:
+      bodies.append(body)
+      if len(bodies) == _MAX_EW_GROUP_OPS:
+        self._submit_pcchain(bodies)
+        bodies.clear()
     for i, op in enumerate(ops):
       if op.submit_barrier and bodies:
         self._submit_pcchain(bodies)
@@ -288,7 +319,7 @@ class RockchipProgram(Program['RockchipDevice']):
             RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+start*2),
             RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+start*2), count, op.ew_cfg,
             stateful=True, int32_output=True, int16_input=True), address))
-        bodies.extend(stages)
+        for body in stages: append_body(body)
         body_precision = 0
         continue
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
@@ -305,7 +336,7 @@ class RockchipProgram(Program['RockchipDevice']):
                                 RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
                                 stateful=True, int32_output=precision == 32, int32_input=precision == 32,
                                 int16_output=precision == 16, int16_input=precision == 16)
-          bodies.append(patch_stage(stage, address))
+          append_body(patch_stage(stage, address))
         continue
       if op.int32_input or op.int32_output:
         if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
@@ -343,8 +374,8 @@ class RockchipProgram(Program['RockchipDevice']):
         stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
                               RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
                               RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
-                              stateful=op.stateful or op.int16_output, int16_output=op.int16_output)
-        bodies.append(patch_stage(stage, address))
+                              stateful=op.stateful or op.int16_output or not bodies, int16_output=op.int16_output)
+        append_body(patch_stage(stage, address))
     if bodies: self._submit_pcchain(bodies)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
@@ -379,7 +410,6 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(idx) != op.count or len(src) < (op.count if scatter else op.src_count) or len(dst) < (op.dst_count if scatter else op.count):
           raise RuntimeError("RKHostAddress exceeds buffer")
         limit = op.dst_count if scatter else op.index_limit or op.src_count
-        if op.normalize_negative: idx = np.where(idx < 0, idx+limit, idx)
         valid = (idx >= 0) & (idx < limit)
         if not scatter:
           idx = op.base + np.arange(op.count, dtype=np.intp)*op.lane_stride + idx*op.index_scale
@@ -390,10 +420,10 @@ class RockchipProgram(Program['RockchipDevice']):
         else:
           dst[:op.count] = op.fill_bits
           dst[np.nonzero(valid)[0]] = src[idx[valid]]
-    def apply_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+    def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
       for gather in gathers:
         dest = buffer(gather.dst_kind, gather.dst_index)
-        if clear_scratch and gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
+        if gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
           ctypes.memset(int(dest.va_addr), 0, dest.size)
           cleared_scratch.add(gather.dst_index)
         lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
@@ -414,7 +444,7 @@ class RockchipProgram(Program['RockchipDevice']):
           index = np.full(gather.count, gather.base, dtype=np.intp)
           for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
           dst[dst_index] = src[index]
-    apply_gathers(self.image.gathers, True)
+    apply_gathers(self.image.gathers)
     apply_host_addresses(self.image.host_gathers, False)
     self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
@@ -424,27 +454,22 @@ class RockchipProgram(Program['RockchipDevice']):
       if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return self._dma(self.scratch[index])
     start = time.perf_counter()
-    native_int16 = any(op.int16_input or op.int16_output for op in self.image.ew_ops)
-    if self.image.ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
-    def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+    def synchronized_gathers(gathers:tuple[RKGather, ...]) -> None:
       touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
       touched.update((g.dst_kind, g.dst_index) for g in gathers)
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      apply_gathers(gathers, clear_scratch)
+      apply_gathers(gathers)
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}),
                              rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if self.image.mid_gathers:
       cursor = 0
-      points = sorted({g.after if g.after >= 0 else self.image.gather_after for g in self.image.mid_gathers})
+      points = sorted({g.after for g in self.image.mid_gathers})
       for point in points:
         self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:point])
-        synchronized_gathers(tuple(g for g in self.image.mid_gathers
-                                   if (g.after if g.after >= 0 else self.image.gather_after) == point), True)
+        synchronized_gathers(tuple(g for g in self.image.mid_gathers if g.after == point))
         cursor = point
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
-    if self.image.ew_ops: self.dev._native_int16 = native_int16
-    if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if self.image.host_scatters:
       touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \
                 {(op.index.kind, op.index.index) for op in self.image.host_scatters} | \
@@ -452,11 +477,6 @@ class RockchipProgram(Program['RockchipDevice']):
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       apply_host_addresses(self.image.host_scatters, True)
       self.dev._sync_buffers(tuple(buffer(op.dst.kind, op.dst.index) for op in self.image.host_scatters), rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    if (fill:=self.image.fill) is not None:
-      bits = self.image.constants[:fill.itemsize] * fill.count
-      dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]
-      ctypes.memmove(int(dest.va_addr), bits, len(bits))
-      self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):
@@ -464,11 +484,11 @@ class RockchipDevice(Compiled):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count = self.task_count = 0
     self._poisoned = False
-    self._native_int16 = False
+    self._ew_precision = 0
     self.reset_npu()
     self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
     self._program_resources:collections.OrderedDict[int, weakref.ReferenceType[RockchipProgram]] = collections.OrderedDict()
-    super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
+    super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
   def _touch_program(self, program:RockchipProgram) -> None:
     self._program_resources.pop(id(program), None)
     self._program_resources[id(program)] = weakref.ref(program)
@@ -506,5 +526,5 @@ class RockchipDevice(Compiled):
   def reset_npu(self):
     self._check_healthy()
     rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
-    self._native_int16 = False
+    self._ew_precision = 0
   def synchronize(self): pass
