@@ -1051,6 +1051,22 @@ def _physical_lists(minimum:int=0) -> tuple[list[int], Callable[[int], int], lis
   def scratch(size:int) -> int: scratch_sizes.append(max(minimum, size)); return len(scratch_sizes)-1
   return scratch_sizes, scratch, gathers, ops
 
+def _int16_arena(slot:int, row_bytes:int, lanes:int) -> tuple[Callable[[], RKArg], Callable[[], int], list[RKGather],
+                                                                    list[RKEWOp], Callable[[int, Iterable[int]], dict[int, RKArg]]]:
+  rows = 0
+  gathers:list[RKGather] = []; ops:list[RKEWOp] = []
+  def allocate() -> RKArg:
+    nonlocal rows
+    value = RKArg(RKBufferKind.SCRATCH, slot, rows*row_bytes); rows += 1
+    return value
+  def constants(source_slot:int, values:Iterable[int]) -> dict[int, RKArg]:
+    result:dict[int, RKArg] = {}
+    for constant in values:
+      result[constant] = dst = allocate()
+      gathers.append(RKGather(source_slot, slot, lanes, values=(constant,)*lanes, dst_addend=dst.addend//2, itemsize=2))
+    return result
+  return allocate, lambda:rows*row_bytes, gathers, ops, constants
+
 def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
   first = True
@@ -1228,12 +1244,7 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
   sources = [param for param,_ in operands if param is not None]
   if not sources: return None
 
-  stride, rows = _reduction_stride(count), 0
-  def allocate() -> RKArg:
-    nonlocal rows
-    value = RKArg(RKBufferKind.SCRATCH, 0, rows*stride); rows += 1
-    return value
-  gathers:list[RKGather] = []
+  allocate, arena_size, gathers, ops, materialize_constants = _int16_arena(0, _reduction_stride(count), count)
   raw_operands:list[tuple[RKArg, ...]] = []
   for param,spec in operands:
     raw = tuple(allocate() for _ in range(4)); raw_operands.append(raw)
@@ -1248,12 +1259,7 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
         gathers.append(RKGather(param.arg.slot, 0, count,
           offsets=tuple(offset*4+byte if offset >= 0 else -1 for offset in offsets), dst_stride=2,
           dst_addend=dst.addend, itemsize=1))
-  constants:dict[int, RKArg] = {}
-  for constant_value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256):
-    constants[constant_value] = dst = allocate()
-    gathers.append(RKGather(sources[0].arg.slot, 0, count, values=(constant_value,)*count,
-                            dst_addend=dst.addend//2, itemsize=2))
-  ops:list[RKEWOp] = []
+  constants = materialize_constants(sources[0].arg.slot, (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256))
 
   def clamp_one(value:RKArg) -> RKArg:
     positive, result = allocate(), allocate()
@@ -1388,7 +1394,7 @@ def _lower_int32_division(output:RKOutput) -> RKImage|None:
   post = tuple(RKGather(value.index, out_param.arg.slot, count,
     offsets=tuple(value.addend+lane*2 for lane in range(count)), dst_stride=4, dst_addend=byte,
     dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1) for byte,value in enumerate(result))
-  return RKImage((RKScratch(rows*stride),), gathers=tuple(gathers), ew_ops=tuple(ops),
+  return RKImage((RKScratch(arena_size()),), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=tuple(replace(gather, after=len(ops)) for gather in post))
 
 def _int16_byte_bits(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
@@ -1419,12 +1425,8 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
     operands.append(parsed)
   sources = [param for param,_ in operands if param is not None]
   if not sources: return None
-  lanes, vector_bytes, rows = count*4, _reduction_stride(count*4), 0
-  def allocate() -> RKArg:
-    nonlocal rows
-    value = RKArg(RKBufferKind.SCRATCH, 0, rows*vector_bytes); rows += 1
-    return value
-  gathers:list[RKGather] = []
+  lanes, vector_bytes = count*4, _reduction_stride(count*4)
+  allocate, arena_size, gathers, ops, materialize_constants = _int16_arena(0, vector_bytes, lanes)
   values:list[RKArg] = []
   for param,spec in operands:
     value = allocate(); values.append(value)
@@ -1437,12 +1439,7 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
       byte_offsets = tuple(offset*4+byte if offset >= 0 else -1 for offset in offsets for byte in range(4))
       gathers.append(RKGather(param.arg.slot, 0, lanes, offsets=byte_offsets, dst_stride=2,
                               dst_addend=value.addend, itemsize=1))
-  constants:dict[int, RKArg] = {}
-  for constant_value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128):
-    constants[constant_value] = slot = allocate()
-    gathers.append(RKGather(sources[0].arg.slot, 0, lanes, values=(constant_value,)*lanes,
-                            dst_addend=slot.addend//2, itemsize=2))
-  ops:list[RKEWOp] = []
+  constants = materialize_constants(sources[0].arg.slot, (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128))
   lhs, rhs = _int16_byte_bits(ops, allocate, constants, values[0], lanes), \
              _int16_byte_bits(ops, allocate, constants, values[1], lanes)
   weighted:list[RKArg] = []
@@ -1455,7 +1452,7 @@ def _lower_int32_byte_logic(output:RKOutput) -> RKImage|None:
     if bit: ops.append(RKEWOp(combined, combined, constants[1<<bit], lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
     weighted.append(combined)
   result = _reduce_rows(ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True)
-  return RKImage((RKScratch(rows*vector_bytes),), gathers=tuple(gathers), ew_ops=tuple(ops),
+  return RKImage((RKScratch(arena_size()),), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=(replace(_int16_low_bytes(result, out_param.arg.slot, lanes), after=len(ops)),))
 
 def _lower_int32_shift(output:RKOutput) -> RKImage|None:
@@ -1477,13 +1474,8 @@ def _lower_int32_shift(output:RKOutput) -> RKImage|None:
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, 32)
   pre_lanes = vector_lanes*5
   if count < 1 or matrix_lanes > _MAX_EW_ELEMS_FP16: return None
-  pre_rows = 0
-  def pre_allocate() -> RKArg:
-    nonlocal pre_rows
-    value = RKArg(RKBufferKind.SCRATCH, 0, pre_rows*pre_lanes*2); pre_rows += 1
-    return value
+  pre_allocate, pre_size, gathers, pre_ops, materialize_constants = _int16_arena(0, pre_lanes*2, pre_lanes)
   raw = pre_allocate()
-  gathers:list[RKGather] = []
   for byte in range(4):
     gathers.append(RKGather(source.arg.slot, 0, count,
       offsets=tuple(offset*4+byte if offset >= 0 else -1 for offset in value_offsets),
@@ -1496,12 +1488,7 @@ def _lower_int32_shift(output:RKOutput) -> RKImage|None:
     gathers.append(RKGather(shift_source.arg.slot, 0, count,
       offsets=tuple(offset*4 if offset >= 0 else -1 for offset in shift_offsets),
       dst_stride=2, dst_addend=raw.addend+4*vector_bytes, itemsize=1))
-  constants:dict[int, RKArg] = {}
-  for constant_value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128):
-    constants[constant_value] = slot = pre_allocate()
-    gathers.append(RKGather(source.arg.slot, 0, pre_lanes, values=(constant_value,)*pre_lanes,
-                            dst_addend=slot.addend//2, itemsize=2))
-  pre_ops:list[RKEWOp] = []
+  constants = materialize_constants(source.arg.slot, (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128))
   planes = _int16_byte_bits(pre_ops, pre_allocate, constants, raw, pre_lanes)
 
   post_rows = 0
@@ -1572,7 +1559,7 @@ def _lower_int32_shift(output:RKOutput) -> RKImage|None:
   post = tuple(RKGather(result.index, out_param.arg.slot, count,
     base=result.addend, axes=((1, count, 2),), dst_stride=4, dst_addend=byte,
     dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1) for byte,result in enumerate(byte_results))
-  return RKImage((RKScratch(pre_rows*pre_lanes*2), RKScratch(post_rows*matrix_lanes*2)),
+  return RKImage((RKScratch(pre_size()), RKScratch(post_rows*matrix_lanes*2)),
                  gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=tuple(replace(gather, after=len(pre_ops)) for gather in mid)+
                              tuple(replace(gather, after=len(ops)) for gather in post))

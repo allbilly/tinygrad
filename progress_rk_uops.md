@@ -3208,3 +3208,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 149. Share the native-INT16 byte arena — complete
+
+- Replaced three duplicated scratch-row allocators and constant-gather builders in INT32 division/remainder, bytewise
+  logic, and barrel shifting with one `_int16_arena` physical helper. Each UOp handler still owns its real semantics;
+  only physical row allocation and immutable constant materialization are shared.
+- Compared serialized images before and after the rewrite for CDIV, CMOD, dynamic AND, XOR with a constant, constant
+  SHL, and dynamic signed SHR. All six SHA-256 hashes and image byte lengths are identical, including the 140,443-byte
+  restoring-divider images and their 3,479 EW stages.
+- No CPU arithmetic, tensor-operation recovery, or generated hardware behavior changed.
+- Renderer executable size fell from 4,106 to 4,092 lines, 6,141 lines below its 10,233-line baseline (60.0%); runtime
+  remains 454 lines.
+- Hardware replay remains deferred pending NPU recovery; this milestone did not access `/dev/dri`.
+
+Verification:
+
+- Old/current INT32 physical images: 6/6 byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 97 passed in 4.43 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
