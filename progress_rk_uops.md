@@ -3643,3 +3643,39 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 163. Vectorize exact static-local address proofs — WIP checkpoint
+
+- Profiling after the 3,600-line checkpoint identified a scalar-true masked-selection program as the compile-only
+  outlier. Its 73 renderer UOps contain three dependent 320-step integer local reductions; the prior symbolic path
+  exceeded a 12-second profile timeout without producing an image.
+- Added a fail-closed compile-time vector evaluator for local programs used exclusively by global-load addresses and
+  gates. It accepts exact integer/Boolean definitions with constant positive axes and supported sequential updates;
+  float/FP16 locals, cycles, nonlocal data loads, nonzero local indices, non-constant load defaults, unsupported
+  expressions, and work above a conservative 256 MiB admission bound retain the old path or reject.
+- The exact captured 320-lane graph now proves offsets `range(320)` in about 0.6 seconds and renders in about 0.4
+  seconds as a 66-byte `NATIVE` identity image with one EW stage, zero gathers, zero synchronized gathers, and no host
+  gather/scatter. The existing nested integer-address case is a positive structural twin. Sequential FP16 address and
+  gate tests using `[2048, 1, -2048]`, plus mapped scalar MAX, are negative twins and remain on their existing paths.
+- Adversarial review exposed and the final tests close three admission gaps: dedicated float/Boolean load ABIs defer
+  to sequential lowering, local values shared with numeric output expressions are excluded, and axis/destination/order
+  arrays are reserved before NumPy allocation. Both vector and sequential local paths now enforce the existing
+  one-million-step cap before materializing loop-environment lists. A cheap REG-buffer pre-admission also prevents
+  unrelated graphs from entering the proof.
+- Renderer executable size grows from **3,598 to 3,697 lines** (net +99); runtime remains **508** and total tree size is
+  **29,272**. This is an explicit performance WIP, not the requested 3,400-line cleanup milestone.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 134 passed.
+- Exact 320-lane image: 66 bytes, one EW stage, zero gathers/mid-gathers/host operations, encode/decode round-trip.
+- Float/Boolean source, mixed numeric-use, dynamic-default, and oversized-allocation cases: fail closed to their native
+  sequential paths or reject before allocation as appropriate.
+- Order-sensitive FP16 source-index and gate tests: passed on the unchanged sequential path.
+- Generic cosine/tangent ownership regression: passed after the early admission guard.
+- Independent adversarial verification: `VERIFIED`; both 16,384×4,096 loop paths reject before environment-list
+  construction, and no weakened test or adjacent correctness blocker was found.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
+- Hardware execution remains pending the required manual power cycle; no all-445 pass is claimed.

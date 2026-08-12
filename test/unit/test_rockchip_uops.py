@@ -13,7 +13,7 @@ from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContext, RKExecut
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
   _eval_expr, _fp16_rewrite, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _hoist_leading_vector_materialization, _lower_mapped_scalar_local_reduction, _lower_uop_program, _output_store, _reuse_linear_scratch,
-  _semantic_local_loads, _static_int_vector, RockchipRenderer, decode_image, encode_image)
+  _semantic_local_loads, _static_int_vector, _static_local_load_offsets, RockchipRenderer, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp, graph_rewrite
 from tinygrad.uop.symbolic import sym
@@ -1402,6 +1402,114 @@ def test_nested_static_local_accumulators_materialize_load_addresses():
   image = _lower_uop_program(list(UOp.sink(inner_init, inner_update, outer_init, outer_update, output).toposort()))
   assert image is not None and len(image.gathers) == 1 and image.gathers[0].offsets == (0, 0, 0, 0)
   assert not image.host_gathers and decode_image(encode_image(image)) == image
+
+def _one_step_integer_local_index(source_dtype, count:int=2, expose_index:bool=False, dynamic_default:bool=False,
+                                  loop_extents:tuple[int, ...]=(1,)):
+  output_dtype = source_dtype if source_dtype is dtypes.bool else dtypes.half
+  out, source = UOp.param(0, output_dtype, (count,)), UOp.param(1, source_dtype, (count,))
+  lane = UOp.range(count, 3)
+  axes = tuple(UOp.range(extent, i, AxisType.REDUCE) for i,extent in enumerate(loop_extents))
+  local = UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
+  initialize = local.index(0).store(0)
+  pointer = local.after(initialize, *axes).index(0)
+  update = pointer.store(pointer.load()+(lane+sum(axes, UOp.const(0, dtypes.int))))
+  index = local.after(update.end(*axes)).index(0).load()
+  if dynamic_default:
+    fallback = UOp.param(2, source_dtype, (count,)).index(lane).load()
+    value = source.index(index).load(fallback, lane < count-1)
+  else: value = source.index(index).load()
+  if source_dtype is dtypes.float: value = value.cast(dtypes.half)+1
+  if expose_index: value = value+index.cast(dtypes.half)
+  uops = list(UOp.sink(initialize, update, out.index(lane).store(value)).toposort())
+  output = _output_store(uops, output_dtype, allow_local=True)
+  assert output is not None
+  return uops, output
+
+def test_static_local_offsets_defer_dedicated_global_load_abis():
+  for dtype in (dtypes.bool, dtypes.float):
+    uops, output = _one_step_integer_local_index(dtype)
+    assert _static_local_load_offsets(uops, output, output[4]) is None
+    image = _lower_uop_program(uops)
+    assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+    assert decode_image(encode_image(image)) == image
+
+def test_static_local_offsets_require_exclusive_address_use():
+  uops, output = _one_step_integer_local_index(dtypes.half, expose_index=True)
+  assert _static_local_load_offsets(uops, output, output[4]) is None
+  image = _lower_uop_program(uops)
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert decode_image(encode_image(image)) == image
+
+def test_static_local_offsets_defer_dynamic_load_default():
+  uops, output = _one_step_integer_local_index(dtypes.half, dynamic_default=True)
+  assert _static_local_load_offsets(uops, output, output[4]) is None
+  image = _lower_uop_program(uops)
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert decode_image(encode_image(image)) == image
+
+def test_static_local_offsets_preflight_axis_and_order_vectors(monkeypatch):
+  def unexpected_allocation(*_args, **_kwargs): raise AssertionError("axis allocation escaped the 256 MiB preflight")
+  monkeypatch.setattr("tinygrad.renderer.rockchip.np.arange", unexpected_allocation)
+  for count in (10_000_000, 100_000_000):
+    uops, output = _one_step_integer_local_index(dtypes.half, count=count)
+    assert _static_local_load_offsets(uops, output, output[4]) is None
+
+def test_static_local_offsets_preflight_reducer_steps(monkeypatch):
+  uops, output = _one_step_integer_local_index(dtypes.half, count=1, loop_extents=(16_384, 4_096))
+  def unexpected_iteration(*_args, **_kwargs): raise AssertionError("loop environments escaped the step preflight")
+  monkeypatch.setattr("tinygrad.renderer.rockchip._iter_selected_range_env", unexpected_iteration)
+  assert _static_local_load_offsets(uops, output, output[4]) is None
+
+def test_static_local_unroll_preflight_reducer_steps(monkeypatch):
+  out, local = UOp.param(0, dtypes.int, (1,)), UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
+  axes = UOp.range(16_384, 0, AxisType.REDUCE), UOp.range(4_096, 1, AxisType.REDUCE)
+  initialize = local.index(0).store(0)
+  pointer = local.after(initialize, *axes).index(0)
+  update = pointer.store(pointer.load()+1)
+  result = local.after(update.end(*axes)).index(0).load()
+  uops = list(UOp.sink(initialize, update, out.index(0).store(result)).toposort())
+  def unexpected_iteration(*_args, **_kwargs): raise AssertionError("loop environments escaped the fallback step preflight")
+  monkeypatch.setattr("tinygrad.renderer.rockchip._iter_selected_range_env", unexpected_iteration)
+  assert _lower_uop_program(uops) is None
+
+def test_vector_static_integer_locals_collapse_identity_masked_select_address():
+  count = 320
+  out, source = UOp.param(0, dtypes.half, (count,)), UOp.param(1, dtypes.half, (count,))
+  lane = UOp.range(count, 2)
+  third_axis = UOp.range(count, 2, AxisType.REDUCE, src=(lane,))
+  second_axis = UOp.range(count, 1, AxisType.REDUCE, src=(third_axis,))
+  first_axis = UOp.range(count, 0, AxisType.REDUCE, src=(second_axis,))
+  first = UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
+  first_init = first.after(second_axis).index(0).store(0)
+  first_ptr = first.after(first_init, first_axis).index(0)
+  first_term = ((first_axis+second_axis < count-1) != UOp.const(True, dtypes.bool)).cast(dtypes.int)
+  first_update = first_ptr.store(first_ptr.load()+first_term)
+  first_result = first.after(first_update.end(first_axis)).index(0).load()
+
+  second = UOp.placeholder((1,), dtypes.int, 1, addrspace=AddrSpace.REG)
+  second_init = second.after(lane, third_axis).index(0).store(0)
+  second_ptr = second.after(second_init, second_axis).index(0)
+  second_term = (first_result != lane+third_axis-count+1).where(0, 1)
+  second_update = second_ptr.store(second_ptr.load()+second_term)
+  second_result = second.after(second_update.end(second_axis)).index(0).load()
+
+  third = UOp.placeholder((1,), dtypes.int, 2, addrspace=AddrSpace.REG)
+  third_init = third.after(lane).index(0).store(0)
+  third_ptr = third.after(third_init, third_axis).index(0)
+  third_term = (lane+third_axis < count-1).where(0, second_result)
+  third_update = third_ptr.store(third_ptr.load()+third_term)
+  index = third.after(third_update.end(third_axis)).index(0).load()
+  normalized = (index < 0).where(index+count, index)
+  gate = ((normalized < 0) != UOp.const(True, dtypes.bool)) & (normalized < count)
+  output = out.index(lane).store(source.index(normalized).load(UOp.const(0.0, dtypes.half), gate)).end(lane)
+  uops = list(UOp.sink(first_init, first_update, second_init, second_update, third_init, third_update, output).toposort())
+  parsed = _output_store(uops, dtypes.half, allow_local=True)
+  assert parsed is not None
+  offsets = _static_local_load_offsets(uops, parsed, parsed[4])
+  assert offsets is not None and tuple(offsets.values()) == (tuple(range(count)),)
+  image = _lower_uop_program(uops)
+  assert image is not None and (len(image.ew_ops), len(image.gathers), len(image.mid_gathers), len(image.host_gathers)) == (1, 0, 0, 0)
+  assert len(encode_image(image)) == 66 and decode_image(encode_image(image)) == image
 
 
 def test_packed_bool_load_uses_canonical_int16_lanes():

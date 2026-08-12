@@ -5768,3 +5768,26 @@ checkpoint; runtime remains **508** and total tree size is **29,173**. The Rockc
 `-n12`, full Ruff and mypy pass, and exactly 445 backend tests collect. Independent adversarial review returned
 `VERIFIED WITH CAVEATS`: the sole caveat is that hardware execution remains deliberately pending the required manual
 power cycle. This is a WIP checkpoint, not an all-445 hardware-pass claim.
+
+## 2026-08-13 — vectorize exact static-local address proofs
+
+The slowest compile-only case after the 3,600-line checkpoint was a scalar-true masked selection whose 73-UOp final
+program contains three dependent 320-step integer local reductions. Symbolically expanding that address program took
+more than 12 seconds without producing an image. The renderer now executes only proven integer/Boolean local address
+and gate programs in bounded compile-time vectors, while leaving floating-point locals on the existing sequential UOp
+path. The resulting address is proved to be the identity and lowers to a 66-byte native image with one EW stage, no
+gathers, and no host execution; the exact captured proof takes about 0.6 seconds and final rendering about 0.4 seconds.
+
+Admission is deliberately narrow: local definitions must use supported exact integer operations and constant positive
+axes, all local loads must belong exclusively to global-load addresses or gates, and cycles, runtime tensor inputs,
+nonzero local indices, non-constant load defaults, unsupported dtypes/operations, and programs exceeding a conservative
+256 MiB work bound fail closed. Adversarial review exposed and the final regressions close typed-load routing, mixed
+numeric-use, and pre-allocation memory-accounting gaps. Existing order-sensitive FP16 `[2048, 1, -2048]` address and
+gate images remain on their sequential path. A cheap REG-buffer gate also prevents unrelated graphs from entering.
+
+This performance checkpoint grows the renderer from **3,598 to 3,697 executable lines** (net +99); runtime remains
+**508** and total tree size is **29,272**. The complete Rockchip unit gate passes 134 tests with `-n12`, full Ruff and
+mypy pass, and the focused native image round-trips exactly. Independent adversarial review returned `VERIFIED` after
+the typed-load, exclusivity, pre-allocation, and loop-step counterexamples were added as regressions. NPU execution and
+the all-445 hardware replay remain deliberately pending the required manual power cycle, so this is not the requested
+3,400-line checkpoint or an all-pass backend claim.

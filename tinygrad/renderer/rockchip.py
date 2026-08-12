@@ -10,7 +10,8 @@ from tinygrad.dtype import DType, dtypes, float_to_fp16
 from tinygrad.helpers import Target, ceildiv, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, consumer_map_from_toposort, exec_alu, graph_rewrite, python_alu
+from tinygrad.uop.ops import (AddrSpace, AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, consumer_map_from_toposort, exec_alu, graph_rewrite,
+                              python_alu)
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
 
@@ -289,6 +290,7 @@ _MAX_OPTIONAL_RECIPE_NODES = 4096
 _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 64
 _MAX_STATIC_LOCAL_STEPS = 1 << 20
 _MAX_STATIC_RANGE_ENVS = 1 << 18
+_MAX_STATIC_LOCAL_VECTOR_BYTES = 256 << 20
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
 _FP16_EXACT_INTEGER = 1 << 11
 _EW_DATA_MODE_FP16 = 1 << 28
@@ -1936,7 +1938,8 @@ def _accurate_add_recipe(u:UOp) -> UOp:
 
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
-  def __init__(self, output:RKOutput, nodes:dict[UOp, None], *, accurate_adds:bool=True):
+  def __init__(self, output:RKOutput, nodes:dict[UOp, None], *, accurate_adds:bool=True,
+               static_load_offsets:dict[UOp, tuple[int, ...]]|None=None):
     _, self.out_param, self.count, self.out_index, self.root = output
     self.out = RKArg(RKBufferKind.ARG, self.out_param.arg.slot)
     self.values:dict[UOp, RKValue] = {}
@@ -1944,6 +1947,7 @@ class RKContext:
     self.scratch_specs = RKScratch(_scratch_bytes(self.count)), RKScratch(self.count*4)
     self.constants:dict[bytes, int] = {}
     self.materialized_slots:dict[tuple, RKValue] = {}
+    self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
     self.raw_components:dict[RKArg, tuple[RKValue, ...]] = {}
     self.int32_divmod:dict[tuple[UOp, UOp], tuple[tuple[RKArg, ...], tuple[RKArg, ...], RKArg, RKArg]] = {}
     self.int16_masks:dict[RKArg, int] = {}
@@ -2115,7 +2119,7 @@ class RKContext:
     itemsize = 4 if layout is RKLayout.INT32 else 2
     fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
       _int16_bits(0 if default is None else default.arg) if dtype is dtypes.int16 else int(0 if default is None else default.arg) & 0xffffffff
-    if runtime_address:
+    if u not in self.static_load_offsets and runtime_address:
       if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1": raise _RKGenericReject
       runtime_index = _runtime_affine_index(index, self.out_index, self.count)
       runtime_loads = {node.key:node for node in (*index_nodes, *gate_nodes)
@@ -2158,9 +2162,11 @@ class RKContext:
         itemsize=itemsize, index_itemsize=index_itemsize, fill_bits=fill_bits, index_limit=index_limit,
         base=base, index_scale=index_scale, lane_stride=lane_stride))
       return value
-    if gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
+    if int(param.src[0].arg) == self.count and (gate is None and index.key == self.out_index.key or
+       self.static_load_offsets.get(u) == tuple(range(self.count))):
       return RKValue(RKArg(RKBufferKind.ARG, param.arg.slot), dtype, self.count, layout)
-    plan = _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
+    plan = RKGather(param.arg.slot, 0, self.count, offsets=self.static_load_offsets[u], fill_bits=fill_bits) \
+      if u in self.static_load_offsets else _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
     _validate_gather_bounds(plan, int(param.src[0].arg))
     return self._gather_slot(dtype, layout, replace(plan, itemsize=itemsize), self.count*itemsize)
 
@@ -3145,9 +3151,10 @@ def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
     if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
                                    for loop in definition.loops): raise _RKGenericReject
     accumulator = expand_dependencies(definition.initial, buffer, env)
+    steps = math.prod(int(loop.src[0].arg) for loop in definition.loops)
+    if steps > budget[0]: raise _RKGenericReject
+    budget[0] -= steps
     for loop_env in _iter_selected_range_env(list(definition.loops)):
-      budget[0] -= 1
-      if budget[0] < 0: raise _RKGenericReject
       term = expand_dependencies(definition.term, buffer, {**env, **loop_env})
       accumulator = UOp(definition.update_op, buffer.dtype, src=(accumulator, term))
     expanded[key] = accumulator
@@ -3195,6 +3202,98 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
     if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
     definitions[buffer] = _RKStaticLocalDef(initializers[0], *updates[0])
   return definitions
+
+def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dict[UOp, tuple[int, ...]]|None:
+  """Vector-execute exact integer local address programs while preserving their sequential update order."""
+  if not any(u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG for u in uops): return None
+  local_cache:dict[UOp, tuple[UOp, ...]] = {}
+  local_loads = set(_semantic_local_loads(root, local_cache))
+  if not local_loads: return None
+  def address_exprs(load:UOp) -> tuple[UOp, ...]:
+    return (load.src[0].src[1],) + ((load.src[2],) if len(load.src) > 2 else ())
+  global_loads = [u for u in root.toposort() if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX and
+                  _root_param(u.src[0]) is not None and any(_semantic_local_loads(x, local_cache) for x in address_exprs(u))]
+  if not global_loads or any(u.dtype.scalar() in (dtypes.float, dtypes.bool) for u in global_loads) or \
+     {load for u in global_loads for expr in address_exprs(u) for load in _semantic_local_loads(expr, local_cache)} != local_loads: return None
+  address_nodes = {node for load in global_loads for expr in (load.src[0], *address_exprs(load)[1:]) for node in expr.toposort()}
+  consumers = consumer_map_from_toposort(root.toposort())
+  if any(len(load.src) > 1 and load.src[1].op is not Ops.CONST for load in global_loads) or any(
+     _semantic_local_loads(node, local_cache) and any(user not in address_nodes and user not in global_loads for user in consumers[node])
+     for node in address_nodes): return None
+  try:
+    infos:dict[UOp, tuple[_RKStaticLocalDef, tuple[UOp, ...]]] = {}
+    info_active:set[UOp] = set()
+    def info(buffer:UOp) -> tuple[_RKStaticLocalDef, tuple[UOp, ...]]:
+      if buffer in infos: return infos[buffer]
+      if buffer in info_active: raise _RKGenericReject
+      info_active.add(buffer)
+      definition = _static_local_defs(uops, {buffer})[buffer]
+      dtype = buffer.dtype.scalar()
+      if (not (dtypes.is_int(dtype) or dtype is dtypes.bool) or dtype.fmt is None or any(
+          loop.src[0].op is not Ops.CONST or not 0 < int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL for loop in definition.loops) or
+          any(dtypes.is_float(node.dtype.scalar()) or node.op is Ops.PARAM or
+              node.op is Ops.LOAD and _local_buffer(node) is None
+          for expr in (definition.initial, definition.term) for node in expr.toposort())): raise _RKGenericReject
+      expressions = (definition.initial, definition.term)
+      loads = set(load for expr in expressions for load in _semantic_local_loads(expr, local_cache))
+      children = {_local_buffer(load) for load in loads}-{buffer}
+      if None in children: raise _RKGenericReject
+      dependencies = set(axis for expr in expressions for axis in _index_ranges(expr.substitute({load:load.const_like(0) for load in loads})))
+      dependencies |= set(axis for child in typing_cast(set[UOp], children) for axis in info(child)[1])
+      deps = tuple(sorted(dependencies-set(definition.loops), key=lambda axis:axis.key))
+      infos[buffer] = definition, deps
+      info_active.remove(buffer)
+      return infos[buffer]
+    buffers = {_local_buffer(load) for load in local_loads}
+    if None in buffers: return None
+    for buffer in typing_cast(set[UOp], buffers): info(buffer)
+    out_axes = tuple(_index_ranges(output[3]))
+    axes = tuple(sorted(set(out_axes).union(*(set(definition.loops)|set(deps) for definition,deps in infos.values())), key=lambda axis:axis.key))
+    extents = {axis:int(axis.src[0].arg) for axis in axes if axis.op in (Ops.RANGE, Ops.SPECIAL) and
+               axis.src[0].op is Ops.CONST and int(axis.src[0].arg) > 0}
+    reserved = sum(size*axis.dtype.scalar().itemsize for axis,size in extents.items()) + 4*output[2]*np.dtype(np.int64).itemsize
+    if len(extents) != len(axes) or reserved > _MAX_STATIC_LOCAL_VECTOR_BYTES:
+      raise _RKGenericReject
+    vectors = {axis:np.arange(size, dtype=np.dtype(axis.dtype.scalar().fmt)).reshape((1,)*i+(size,)+(1,)*(len(axes)-i-1))
+               for i,(axis,size) in enumerate(extents.items())}
+    tables:dict[UOp, np.ndarray] = {}
+    memory = [reserved, 0]  # resident vectors/tables plus destination/order arrays, cumulative reducer work
+    def evaluate(expr:UOp, free:tuple[UOp, ...], scalar_env:dict[UOp, int]) -> np.ndarray:
+      nodes = expr.toposort()
+      itemsize = max((node.dtype.scalar().itemsize for node in nodes if node.dtype.scalar().fmt is not None), default=8)
+      if memory[0]+math.prod(extents[axis] for axis in free)*itemsize*(len(nodes)+1) > _MAX_STATIC_LOCAL_VECTOR_BYTES:
+        raise _RKGenericReject
+      env:dict[UOp, _StaticValue] = {**scalar_env, **{axis:vectors[axis] for axis in free if axis not in scalar_env}}
+      cache:dict[UOp, _StaticValue] = {}
+      def load(u:UOp) -> _StaticValue:
+        buffer = _local_buffer(u)
+        if buffer is None or np.any(np.asarray(_eval_expr(u.src[0].src[1], env, cache, True, load)) != 0): raise _RKGenericReject
+        deps = info(buffer)[1]
+        if any(dep not in free and dep not in scalar_env for dep in deps): raise _RKGenericReject
+        return tables[buffer][tuple(slice(scalar_env[axis], scalar_env[axis]+1) if axis in scalar_env else slice(None) for axis in axes)]
+      return np.asarray(_eval_expr(expr, env, cache, True, load))
+    update = {Ops.ADD:np.add, Ops.MUL:np.multiply, Ops.MAX:np.maximum, Ops.AND:np.bitwise_and, Ops.OR:np.bitwise_or}
+    for buffer,(definition,deps) in infos.items():
+      shape = tuple(extents[axis] if axis in deps else 1 for axis in axes)
+      allocation = math.prod(extents[axis] for axis in deps)*buffer.dtype.scalar().itemsize
+      groups = math.prod(extents[loop] for loop in definition.loops)
+      if groups > _MAX_STATIC_LOCAL_STEPS: raise _RKGenericReject
+      memory[0] += allocation
+      memory[1] += allocation*groups
+      if max(memory) > _MAX_STATIC_LOCAL_VECTOR_BYTES: raise _RKGenericReject
+      accumulator = np.broadcast_to(evaluate(definition.initial, deps, {}), shape).astype(np.dtype(buffer.dtype.scalar().fmt), copy=True)
+      for loop_env in _iter_selected_range_env(list(definition.loops)):
+        update[definition.update_op](accumulator, np.broadcast_to(evaluate(definition.term, deps, loop_env), shape), out=accumulator)
+      tables[buffer] = accumulator
+    out_shape = tuple(extents[axis] if axis in out_axes else 1 for axis in axes)
+    destinations = np.broadcast_to(evaluate(output[3], out_axes, {}), out_shape).astype(np.int64, copy=False).reshape(-1)
+    if len(destinations) != output[2] or not np.array_equal(np.sort(destinations), np.arange(output[2])): raise _RKGenericReject
+    order = np.argsort(destinations)
+    return {load:tuple(np.broadcast_to(evaluate(expr if len(parts) == 1 else parts[1].where(expr, expr.const_like(-1)), out_axes, {}),
+      out_shape).astype(np.int64, copy=False).reshape(-1)[order].tolist())
+      for load in global_loads for parts in (address_exprs(load),) for expr in (parts[0],)}
+  except (_RKGenericReject, RuntimeError, ValueError, KeyError, TypeError, MemoryError):
+    return None
 
 def _mapped_max_descriptor(uops:list[UOp], root:UOp) -> tuple[_RKStaticLocalDef, UOp]:
   local_loads = _semantic_local_loads(root)
@@ -3402,7 +3501,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (not _contiguous_output(output[3], output[2]) and
         _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
-    local_root = _unroll_static_local(uops, reduced)
+    static_load_offsets = _static_local_load_offsets(uops, output, reduced)
+    local_root = reduced if static_load_offsets is not None else _unroll_static_local(uops, reduced)
     root = graph_rewrite(local_root, _pm_masked_loads, name="rockchip masked load materialization")
     root_nodes = root.toposort()
     root,root_nodes = _finite_max_neutrals(root, root_nodes)
@@ -3418,7 +3518,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       output = (*output[:4], root)
     image = RKContext(output, expanded_nodes, accurate_adds=(not recipes_ready and (storage_uops is None or storage_product_adds) and
                                              len(expanded_nodes) <= _MAX_OPTIONAL_RECIPE_NODES and
-                                             not _has_runtime_address(output[4]))).finish()
+                                             not _has_runtime_address(output[4])),
+                      static_load_offsets=static_load_offsets).finish()
     image_u16_counts = (len(image.scratch), len(image.gathers)+len(image.mid_gathers),
                         len(image.host_gathers), len(image.host_scatters))
     if any(count > _RKIMAGE_U16_MAX for count in image_u16_counts):
