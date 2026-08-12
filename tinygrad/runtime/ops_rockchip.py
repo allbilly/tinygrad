@@ -13,7 +13,6 @@ _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _PC_DATA_AMOUNT_MAX = (1 << 16) - 1
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
-_SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
 _MAX_FP32_EW_GROUP_OPS = 16
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
@@ -104,22 +103,17 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
-    def submit() -> None:
-      self.dev._sync_buffer(cmd, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-      self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    try:
       rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
         flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
         task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
         regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
         subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
-    for attempt in range(_SUBMIT_RETRIES+1):
-      try:
-        submit()
-        break
-      except TimeoutError:
-        self.dev.timeout_retries += 1
-        if attempt == _SUBMIT_RETRIES: raise
-        self.dev.reset_npu()
+    except TimeoutError as exc:
+      # The 0.9.8 driver already soft-resets on timeout. Retrying after a failed IOMMU reset can panic the kernel.
+      self.dev._poisoned = True
+      raise RuntimeError("RKNPU submit timed out; platform NPU reset or power cycle required") from exc
     self.submit_count += 1
     self.dev.submit_count += 1
     self.dev.task_count += n
@@ -433,7 +427,8 @@ class RockchipProgram(Program['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
-    self.submit_count = self.task_count = self.timeout_retries = 0
+    self.submit_count = self.task_count = 0
+    self._poisoned = False
     self._native_int16 = False
     self.reset_npu()
     self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
@@ -446,7 +441,10 @@ class RockchipDevice(Compiled):
       _, reference = self._program_resources.popitem(last=False)
       if (old:=reference()) is not None: old._release_resources()
   def _forget_program(self, program:RockchipProgram) -> None: self._program_resources.pop(id(program), None)
+  def _check_healthy(self) -> None:
+    if self._poisoned: raise RuntimeError("RKNPU is unavailable after a submit timeout; platform NPU reset or power cycle required")
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
+    self._check_healthy()
     alloc = max(4096, (size+4095)&-4096)
     try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=alloc, flags=flags|_BO_FLAGS)
     except OSError as exc: raise MemoryError(f"RKNPU GEM allocation failed for {alloc} bytes") from exc
@@ -459,6 +457,7 @@ class RockchipDevice(Compiled):
       raise MemoryError(f"RKNPU GEM mapping failed for {alloc} bytes") from exc
     return HCQBuffer(mapped, size, meta=meta)
   def _sync_buffer(self, buf:HCQBuffer, flags:int):
+    self._check_healthy()
     rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
     seen:set[int] = set()
@@ -468,8 +467,9 @@ class RockchipDevice(Compiled):
       self._sync_buffer(buf, flags)
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
-    rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
+    if not self._poisoned: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
   def reset_npu(self):
+    self._check_healthy()
     rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
     self._native_int16 = False
   def synchronize(self): pass

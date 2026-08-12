@@ -3229,3 +3229,28 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 150. Fail closed after an unrecoverable driver timeout — complete
+
+- Diagnosed the OS crash from the previous-boot kernel journal. A long native chain timed out after completing 1,292
+  tasks; the driver's own abort path then failed two NPU-IOMMU force resets and failed to reattach the IOMMU domain.
+  A later GEM allocation entered `rknpu_iommu_dma_map_sg` with the detached domain and caused a kernel null-pointer
+  dereference. This is a driver failure state, not a recoverable transient start timeout.
+- Removed the runtime's four reset-and-retry attempts. A submit timeout is now attempted exactly once, marks the device
+  poisoned, and raises an explicit platform-reset/power-cycle error. Later submissions, synchronizations, allocations,
+  and reset ioctls fail before entering the damaged kernel path; cleanup unmaps userspace memory without issuing GEM
+  destroy ioctls to the poisoned device.
+- Found a separate hazard in `~/rk3588/examples/elementwise.py`: its terminal PC-chain descriptor writes
+  `PC_BASE_ADDRESS=0`. Its 131,072-lane health case is the first three-task chain and timed out after all smaller cases
+  passed. Tinygrad's runtime already avoids this RK3588 speculative-fetch hazard by terminating at a mapped zero-filled
+  guard page, so no equivalent terminal-address bug remains in the production PC-chain builder.
+- No CPU arithmetic or fallback was added. The change only prevents further driver access after hardware timeout.
+- Runtime executable size is 453 lines, one line below milestone 149; renderer remains 4,092 lines.
+
+Verification:
+
+- Timeout regression: one submit ioctl, zero retries/resets, poisoned second submission rejected before ioctl.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 97 passed in 5.21s.
+- `.venv/bin/python -m ruff check tinygrad/runtime/ops_rockchip.py test/unit/test_rockchip_uops.py`: pass.
+- `.venv/bin/python -m mypy tinygrad/runtime/ops_rockchip.py`: pass.
+- `git diff --check`: pass.

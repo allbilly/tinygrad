@@ -1,5 +1,6 @@
 import math, struct
 from types import SimpleNamespace
+import pytest
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
@@ -50,11 +51,12 @@ def test_special_has_exact_static_integer_bounds():
   assert _exact_int_range(lane*3+2) == (2, 20)
 
 
-def test_submit_retries_once_after_driver_timeout(monkeypatch):
+def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
   class FakeDevice:
-    fd_ctl, submit_count, task_count, timeout_retries, resets = object(), 0, 0, 0, 0
-    def _sync_buffer(self, _buffer, _flags): pass
-    def reset_npu(self): self.resets += 1
+    fd_ctl, submit_count, task_count, _poisoned = object(), 0, 0, False
+    def _check_healthy(self):
+      if self._poisoned: raise RuntimeError("poisoned")
+    def _sync_buffer(self, _buffer, _flags): self._check_healthy()
     def _forget_program(self, _program): pass
     def _gpu_free(self, _buffer): pass
   program = object.__new__(rockchip_runtime.RockchipProgram)
@@ -64,11 +66,12 @@ def test_submit_retries_once_after_driver_timeout(monkeypatch):
   def submit(_fd, **_kwargs):
     nonlocal calls
     calls += 1
-    if calls == 1: raise TimeoutError
+    raise TimeoutError
   monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_SUBMIT", submit)
-  program._submit(buffer, buffer, 1)
-  assert calls == 2 and program.dev.resets == program.dev.timeout_retries == 1
-  assert program.submit_count == program.dev.submit_count == 1 and program.dev.task_count == 1
+  with pytest.raises(RuntimeError, match="platform NPU reset or power cycle required"): program._submit(buffer, buffer, 1)
+  with pytest.raises(RuntimeError, match="poisoned"): program._submit(buffer, buffer, 1)
+  assert calls == 1 and program.dev._poisoned
+  assert program.submit_count == program.dev.submit_count == program.dev.task_count == 0
 
 
 def test_generic_fp16_uops_lower_in_dependency_order():
