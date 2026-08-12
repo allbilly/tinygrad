@@ -3481,3 +3481,37 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `test/backend/test_rockchip.py --collect-only`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 158. Cross the first 4,000-line target with canonical static ALU and typed comparison composition — WIP checkpoint
+
+- Replaced the backend's hand-written compile-time ALU dispatch with Tinygrad's canonical `exec_alu`, `python_alu`,
+  and `float_to_fp16` primitives. Rockchip retains only the cases whose scalar/vector contracts differ: lazy scalar
+  versus eager vector `WHERE`, NumPy-safe vector division/modulo and `MAX`, zero-divisor behavior, and explicit dtype
+  recasting. This evaluator is still used only for compile-time static indexes, masks, constants, and layout plans; it
+  does not read runtime tensor values or execute runtime arithmetic on the host.
+- Consolidated native-INT16 comparison emission behind `RKContext._i16` and `_i16_equal`. FP16 zero canonicalization,
+  NaN classification, byte ordering, equality, and wide-INT32 comparison now compose through the same typed physical
+  primitives instead of parallel global stage builders. The emitted scratch allocation, EW ordering, flags, and
+  serialized images remain unchanged for all nine focused FP16/INT32 comparison and mixed-`WHERE` oracles.
+- Deleted `_fold_general_where` and its sole fallback matcher. The renderer already attempts the generic typed UOp
+  executor before FP16 recipe rewriting, and `RKContext` owns true ternary `WHERE` semantics, including non-finite
+  arms. A regression proves the recipe pass leaves an ordinary finite `WHERE` intact and the recipes-ready generic
+  executor lowers it natively.
+- Renderer executable size fell from **4,064 to 3,989 lines** (net -75): canonical static evaluation saves 17 lines,
+  and typed comparison/`WHERE` consolidation saves 58. Runtime remains **507** lines and total tree size is **29,563**.
+  This crosses the first 4,000-line target without deleting comments/docstrings or restoring a tensor-operation
+  catalog.
+- Hardware validation remains pending the required manual power cycle. This checkpoint did not open `/dev/dri` and
+  does not claim the 445-case hardware census passes; it is the requested WIP commit boundary before that replay.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 118 passed.
+- Static-evaluator differential: 18,707 exact cases; 151 old/current images byte-identical and four identical
+  unsupported outcomes across 2,762,522 encoded bytes.
+- Nine FP16/INT32 comparison and mixed-`WHERE` images: byte-identical, `NATIVE`, and zero host gathers/scatters.
+- Independent adversarial verification: `VERIFIED`; no weakened test, host numeric path, orphaned symbol, or debris.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
+- `git diff --check`: pass.

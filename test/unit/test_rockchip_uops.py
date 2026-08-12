@@ -8,7 +8,7 @@ from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContext, RKExecut
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
-  _fp32_expr_to_half, _gather_plan, _iter_range_env,
+  _eval_expr, _fp16_rewrite, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -131,6 +131,22 @@ def test_static_range_expressions_vectorize_in_output_order():
   out_index = col * 3 + row
   value = (row < 2).where(col + row * 4, UOp.const(-1, dtypes.int))
   assert _static_int_vector(out_index, value, 12) == (0, 4, -1, 1, 5, -1, 2, 6, -1, 3, 7, -1)
+
+
+def test_static_alu_preserves_division_zero_and_scalar_where_laziness():
+  lane = UOp.range(5, 0)
+  lhs, rhs = lane-5, lane-2
+  evaluator = RKStaticIndexEvaluator(lane, 5)
+  assert tuple(evaluator.values(UOp(op, dtypes.int, src=(lhs, rhs)), int) for op in
+               (Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD)) == (
+    (2, 4, 0, -2, 0), (-1, 0, -3, 0, -1), (2, 4, 0, -2, -1), (-1, 0, -3, 0, 1))
+
+  dynamic = UOp.param(0, dtypes.int, (1,))
+  lazy = UOp(Ops.WHERE, dtypes.int, src=(UOp.const(False, dtypes.bool), dynamic, UOp.const(7, dtypes.int)))
+  assert _eval_expr(lazy, {}, {}) == 7
+  try: _eval_expr(lazy, {}, {}, True)
+  except RuntimeError as error: assert "dynamic_static_expr" in str(error)
+  else: raise AssertionError("vector WHERE must evaluate every lane source")
 
 
 def test_static_gather_rows_share_output_range_materialization(monkeypatch):
@@ -397,6 +413,15 @@ def test_generic_where_owns_ternary_arity():
   assert image is not None
   assert any(op.compare or op.ew_cfg == _EW_CFG[Ops.MAX] for op in image.ew_ops)
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
+
+
+def test_fp16_recipe_rewrite_leaves_general_where_for_context():
+  lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  uops = _program(dtypes.half, lambda i:(lhs.index(i).load() < UOp.const(0.0, dtypes.half)).where(
+    lhs.index(i).load() + UOp.const(2.0, dtypes.half), rhs.index(i).load() * UOp.const(3.0, dtypes.half)))
+  rewritten = _fp16_rewrite(uops)
+  assert any(u.op is Ops.WHERE for u in rewritten)
+  assert _lower_uop_program(rewritten, recipes_ready=True) is not None
 
 
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():

@@ -5677,3 +5677,21 @@ cases, and the corrected combined change received a `VERIFIED` adversarial verdi
 Renderer size is now **4,064 executable lines**, down 31 from the prior WIP; runtime remains **507** and total tree size
 is **29,638**. Hardware and the all-445 replay remain pending the required manual power cycle, so this checkpoint does
 not claim backend completion.
+
+## 2026-08-13 — cross the first 4,000-line typed-UOp target
+
+Rockchip's compile-time static evaluator now delegates ordinary scalar/vector UOp semantics to Tinygrad's canonical
+ALU and FP16 conversion primitives while retaining the backend-specific lazy `WHERE`, NumPy vector, division-by-zero,
+and dtype-cast contracts. This is still compile-time address/layout materialization only: runtime tensor values are
+not read or evaluated on the host.
+
+FP16 and INT32 comparison recipes now share `RKContext`'s native-INT16 physical operations for equality, byte order,
+signed-zero canonicalization, and NaN classification. The superseded global builders are gone, and the generic typed
+executor—not a fallback graph dialect—owns ordinary ternary `WHERE`. Nine focused comparison/`WHERE` images and 151
+static-materialization images remained byte-identical, native, and free of host gather/scatter execution.
+
+Renderer size is now **3,989 executable lines**, down 75 from the prior WIP and below the first 4,000-line target;
+runtime remains **507** and total tree size is **29,563**. The Rockchip unit gate passes 118 tests with `-n12`, full
+Ruff and mypy pass, all 445 backend cases still collect, and independent adversarial review returned `VERIFIED`.
+Hardware and the full 445-case execution remain deliberately pending the required manual power cycle, so this is a
+WIP checkpoint rather than an all-pass backend claim.
