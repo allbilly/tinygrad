@@ -510,6 +510,17 @@ def test_static_fp32_subgraph_rounds_only_after_coordinate_cancellation():
   assert lowered.op is Ops.CAST and lowered.dtype.scalar() is dtypes.half and lowered.src == (fraction,)
 
 
+def test_static_fp32_where_and_trunc_survive_precise_dynamic_storage():
+  source, lane = UOp.param(1, dtypes.half, (8,)), UOp.range(4, 0)
+  coordinate = (lane.cast(dtypes.float)+UOp.const(0.5, dtypes.float))*UOp.const(3/7, dtypes.float)
+  fraction = coordinate - UOp(Ops.TRUNC, dtypes.float, src=(coordinate,))
+  weight = (lane < UOp.const(2, dtypes.int)).where(fraction, UOp.const(1.0, dtypes.float)-fraction)
+  value = source.index(lane*2).load().cast(dtypes.float)*weight + \
+          source.index(lane*2+1).load().cast(dtypes.float)*(UOp.const(1.0, dtypes.float)-weight)
+  image = _lower_uop_program(_program(dtypes.half, lambda i:value.substitute({lane:i}).cast(dtypes.half)))
+  assert image is not None and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+
+
 def test_terminal_half_to_float_cast_uses_chunked_dpu_output_conversion():
   source = UOp.param(1, dtypes.half, (9,))
   image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))

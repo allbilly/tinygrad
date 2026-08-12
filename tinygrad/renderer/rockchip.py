@@ -530,7 +530,7 @@ def _eval_vector(u:UOp, env:dict[UOp, np.ndarray], cache:dict[UOp, np.ndarray]) 
 _STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.SPECIAL, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.TRUNC, Ops.WHERE,
                Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.XOR, Ops.MAX}
 def _is_static_expr(u:UOp) -> bool:
-  return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
+  return all(node.op in _STATIC_OPS and not (isinstance(node.arg, str) and node.arg.startswith("rockchip_")) for node in u.toposort())
 
 def _index_ranges(index:UOp) -> list[UOp]:
   """Ranges used as index values, excluding AFTER/END ordering dependencies attached to a RANGE."""
@@ -791,7 +791,7 @@ def _tag_precise_adds(root:UOp) -> UOp:
   tagged:dict[UOp, UOp] = {}
   for node in root.toposort():
     tagged[node] = node.replace(src=tuple(tagged[src] for src in node.src),
-      arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD and node.arg is None else node.arg)
+      arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD and node.dtype.scalar() is dtypes.half and node.arg is None else node.arg)
   return tagged[root]
 
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
@@ -2422,11 +2422,15 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
     return UOp(Ops.MUL, dtypes.half, src=tuple(_fp32_expr_to_half(src) for src in u.src))
   if u.op in (Ops.SUB, Ops.MAX) and len(u.src) == 2:
     return UOp(u.op, dtypes.half, src=tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg)
+  if u.op is Ops.WHERE and len(u.src) == 3:
+    return UOp(Ops.WHERE, dtypes.half, src=(u.src[0], _fp32_expr_to_half(u.src[1]), _fp32_expr_to_half(u.src[2])), arg=u.arg)
+  if u.op is Ops.TRUNC and len(u.src) == 1:
+    return _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(_fp32_expr_to_half(u.src[0]),)))
   if u.op is Ops.NEG and len(u.src) == 1:
     return UOp(Ops.NEG, dtypes.half, src=(_fp32_expr_to_half(u.src[0]),))
   if u.op is Ops.ADD:
     return _precise_mul_sum(_fp32_add_terms(u))
-  raise _RKGenericReject
+  raise _RKGenericReject(f"FP32 storage {u.op.name}")
 
 def _nested_fp32_storage_cast(x:UOp) -> UOp|None:
   try: return _fp32_expr_to_half(x)
@@ -2527,9 +2531,6 @@ class RKContext:
                        RKLayout.INT_FP16 if embedded_half_int else None)
     self.accurate_adds = accurate_adds
     self.nodes = nodes
-    self.static_nodes:set[UOp] = set()
-    for node in nodes:
-      if node.op in _STATIC_OPS and all(src in self.static_nodes for src in node.src): self.static_nodes.add(node)
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
@@ -3003,7 +3004,7 @@ class RKContext:
 
   def _int32_compare(self, u:UOp) -> RKValue:
     def operand(src:UOp) -> RKValue:
-      value = self._static(src) if src in self.static_nodes else self.lower(src)
+      value = self._static(src) if _is_static_expr(src) else self.lower(src)
       if value.layout is not RKLayout.INT32: raise _RKGenericReject
       return value
     lhs, rhs = (operand(src) for src in u.src)
@@ -3145,7 +3146,7 @@ class RKContext:
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
     if u.dtype.scalar() is dtypes.bool:
-      dynamic = [None if src in self.static_nodes else self.lower(src) for src in u.src]
+      dynamic = [None if _is_static_expr(src) else self.lower(src) for src in u.src]
       preferred = (RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in dynamic) else
                    RKLayout.BOOL_MASK)
       values = [self._static(src, preferred) if value is None else self._coerce_bool(value, preferred)
@@ -3318,8 +3319,7 @@ class RKContext:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
-    elif (dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool) and u in self.static_nodes and
-          not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
+    elif dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool) and _is_static_expr(u):
       value = self._static(u)
     elif u.op is Ops.LOAD: value = self._load(u)
     elif u.op is Ops.BITCAST and len(u.src) == 1:

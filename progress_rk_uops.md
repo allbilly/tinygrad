@@ -2992,3 +2992,30 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 141. Keep static FP32 coordinates outside compensated-stage tagging — complete
+
+- Recovered the NPU after the earlier timeout and completed the first full hardware census on this branch:
+  423 passed, 12 failed, 12 skipped, and 152 subtests passed in 19:01. The failures were four remaining semantic cases,
+  two average-pool subtests, and six interpolation methods; none was an NPU timeout.
+- Removed `RKContext.static_nodes`, whose construction-time catalog became stale when generic storage rewrites created
+  new static UOps. Static values are now classified directly from their UOp dependency graph, and the classifier uses
+  Tinygrad's iterative topological walk instead of Python recursion.
+- Extended the generic FP32 storage boundary through semantic `WHERE` and `TRUNC` UOps. Tightened compensated-stage
+  tagging to physical FP16 `ADD` only, so static FP32 coordinate graphs remain exact materializations instead of being
+  retagged and lowered as lossy dynamic half arithmetic.
+- The two failing average-pool padding subtests and all six interpolation methods now pass on hardware. Focused timing
+  improved one-dimensional interpolation from 3.64 seconds while failing to 0.49 seconds while passing; the complete
+  seven-method hardware gate passes in 27.08 seconds. No tensor-operation recognizer or host numeric execution was
+  introduced.
+- The deleted static catalog offsets the two generic storage handlers: renderer executable size remains 4,438 lines,
+  5,795 lines below its 10,233-line baseline (56.6%); runtime remains 454 lines.
+
+Verification:
+
+- `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest` over the repaired average-pool method and
+  all six interpolation methods with `-q -n0`: 7 passed, 3 subtests passed in 27.08 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 94 passed in 6.21 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: pass.
+- `git diff --check`: pass.
