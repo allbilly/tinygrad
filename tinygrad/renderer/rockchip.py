@@ -589,17 +589,7 @@ def _static_vector_env(out_index:UOp, exprs:tuple[UOp, ...]) -> tuple[list[dict[
   return envs, {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}, {}
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
-  envs, vector_env, cache = _static_vector_env(out_index, (expr,))
-  dst_lanes = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
-  expr_lanes = np.broadcast_to(_eval_vector(expr, vector_env, cache), len(envs))
-  values:list[int|None] = [None] * count
-  for dst,raw in zip(dst_lanes, expr_lanes):
-    if not 0 <= dst < count: raise RuntimeError("RKPLAN_REJECT:static_index")
-    value = encode(raw.item())
-    if values[dst] not in (None, value): raise RuntimeError("RKPLAN_REJECT:static_index")
-    values[dst] = value
-  if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")
-  return tuple(x for x in values if x is not None)
+  return RKStaticIndexEvaluator(out_index, count).values(expr, encode)
 
 def _static_int_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   """Evaluate a compile-time integer expression in compact output order."""
@@ -649,6 +639,7 @@ class RKStaticIndexEvaluator:
   def __init__(self, out_index:UOp, count:int):
     self.out_index, self.count, self.ranges = out_index, count, _index_ranges(out_index)
     self._vectors:tuple[dict[UOp, np.ndarray], np.ndarray]|None = None
+    self._cache:dict[UOp, np.ndarray] = {}
 
   def _prepare(self) -> tuple[dict[UOp, np.ndarray], np.ndarray]:
     if self._vectors is not None: return self._vectors
@@ -663,13 +654,29 @@ class RKStaticIndexEvaluator:
     self._vectors = vector_env, dst
     return self._vectors
 
+  def values(self, expr:UOp, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
+    if any(r not in self.ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
+    vector_env, dst = self._prepare()
+    raw = np.broadcast_to(_eval_vector(expr, vector_env, self._cache), len(dst))
+    if encode is int: encoded = raw.astype(np.int64)
+    elif encode is _fp16_bits: encoded = raw.astype(np.float16).view(np.uint16).astype(np.int64)
+    elif encode is _int16_bits: encoded = raw.astype(np.int64) & 0xffff
+    else: encoded = np.fromiter((encode(x.item()) for x in raw), dtype=np.int64, count=len(dst))
+    order = np.argsort(dst)
+    ordered_dst, ordered_values = dst[order], encoded[order]
+    if len(np.unique(ordered_dst)) != self.count or \
+       np.any((ordered_dst[1:] == ordered_dst[:-1]) & (ordered_values[1:] != ordered_values[:-1])):
+      raise RuntimeError("RKPLAN_REJECT:static_index")
+    values = np.empty(self.count, dtype=np.int64)
+    values[dst] = encoded
+    return tuple(values.tolist())
+
   def offsets(self, load_index:UOp, gate:UOp|None) -> tuple[int, ...]:
     if any(r not in self.ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
       raise RuntimeError("RKPLAN_REJECT:gather_index")
     vector_env, dst = self._prepare()
-    cache:dict[UOp, np.ndarray] = {}
-    src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(dst)).astype(np.int64)
-    values = src if gate is None else np.where(np.broadcast_to(_eval_vector(gate, vector_env, cache), len(dst)), src, -1)
+    src = np.broadcast_to(_eval_vector(load_index, vector_env, self._cache), len(dst)).astype(np.int64)
+    values = src if gate is None else np.where(np.broadcast_to(_eval_vector(gate, vector_env, self._cache), len(dst)), src, -1)
     if np.any(values < -1): raise RuntimeError("RKPLAN_REJECT:gather_index")
     offsets = np.full(self.count, -2, dtype=np.int64)
     offsets[dst] = values
@@ -2301,7 +2308,7 @@ def _exact_int_range(root:UOp) -> tuple[int, int]|None:
     if u in cache: return cache[u]
     result:tuple[int, int]|None = None
     if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.int, dtypes.weakint): result = (int(u.arg), int(u.arg))
-    elif u.op is Ops.RANGE and u.src[0].op is Ops.CONST: result = (0, max(0, int(u.src[0].arg)-1))
+    elif u.op in (Ops.RANGE, Ops.SPECIAL) and u.src[0].op is Ops.CONST: result = (0, max(0, int(u.src[0].arg)-1))
     elif u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.bool: result = (0, 1)
     elif u.op is Ops.WHERE and len(u.src) == 3:
       yes, no = bounds(u.src[1]), bounds(u.src[2])
@@ -2531,6 +2538,7 @@ class RKContext:
                        RKLayout.INT_FP16 if embedded_half_int else None)
     self.accurate_adds = accurate_adds
     self.nodes = nodes
+    self.static_evaluator = RKStaticIndexEvaluator(self.out_index, self.count)
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
@@ -2591,10 +2599,10 @@ class RKContext:
         value = self._constant(UOp.const(int(bool(scalar)), dtypes.int16))
         return RKValue(value.arg, dtype, self.count, bool_layout)
       return self._constant(UOp.const(scalar, dtype))
-    if dtype is dtypes.half: vector, layout = _static_values(self.out_index, u, self.count, _fp16_bits), RKLayout.FP16
-    elif dtype is dtypes.int16: vector, layout = _static_values(self.out_index, u, self.count, _int16_bits), RKLayout.INT16
+    if dtype is dtypes.half: vector, layout = self.static_evaluator.values(u, _fp16_bits), RKLayout.FP16
+    elif dtype is dtypes.int16: vector, layout = self.static_evaluator.values(u, _int16_bits), RKLayout.INT16
     elif dtype is dtypes.int:
-      values = _static_values(self.out_index, u, self.count, int)
+      values = self.static_evaluator.values(u, int)
       if self.int_layout is RKLayout.INT_FP16 and all(-2048 <= value <= 2048 for value in values):
         vector, layout = tuple(_fp16_bits(float(value)) for value in values), self.int_layout
       elif self.int_layout is RKLayout.INT16 and all(-32768 <= value <= 32767 for value in values):
@@ -2603,8 +2611,8 @@ class RKContext:
         vector, layout = tuple(value & 0xffffffff for value in values), self.int_layout
       else: raise _RKGenericReject
     elif dtype is dtypes.bool:
-      if bool_layout is RKLayout.BOOL_INT16: vector, layout = _static_values(self.out_index, u, self.count, lambda x:int(bool(x))), bool_layout
-      else: vector, layout = _static_values(self.out_index, u, self.count, lambda x:_fp16_bits(float(bool(x)))), RKLayout.BOOL_MASK
+      if bool_layout is RKLayout.BOOL_INT16: vector, layout = self.static_evaluator.values(u, lambda x:int(bool(x))), bool_layout
+      else: vector, layout = self.static_evaluator.values(u, lambda x:_fp16_bits(float(bool(x)))), RKLayout.BOOL_MASK
     else: raise _RKGenericReject
     return self._static_slot(dtype, layout, vector)
 
@@ -3180,7 +3188,7 @@ class RKContext:
       routes:dict[UOp, list[bool]] = {}
       def route(node:UOp, active:tuple[bool, ...]) -> None:
         if node.op is Ops.WHERE and _is_static_expr(node.src[0]):
-          selector = tuple(bool(x) for x in _static_values(self.out_index, node.src[0], self.count, lambda x:int(bool(x))))
+          selector = tuple(bool(x) for x in self.static_evaluator.values(node.src[0], lambda x:int(bool(x))))
           route(node.src[1], tuple(live and take for live,take in zip(active, selector)))
           route(node.src[2], tuple(live and not take for live,take in zip(active, selector)))
           return

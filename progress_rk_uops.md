@@ -3019,3 +3019,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: pass.
 - `git diff --check`: pass.
+
+### 142. Share static UOp materialization and bound hardware lanes — complete
+
+- Added the missing integer bound semantic for `SPECIAL`: like `RANGE`, a hardware lane with constant extent `N` is
+  exactly bounded by `[0, N-1]`. This lets ordinary integer `ADD/MUL/MAX` UOps choose their physical layout without a
+  pool or unpool recognizer. Max-pool return indices and max-unpool now both pass on hardware.
+- Profiled the newly passing max-unpool case, which became the observed slowest test at 19.85 seconds. cProfile found
+  20.70 of 37.65 seconds in 152 repeated static-vector materializations, including 5.1 million scalar NumPy `.item()`
+  conversions and repeated reconstruction of the same 60,000-lane output environment.
+- `RKStaticIndexEvaluator` now owns typed static values as well as gather offsets. One context shares its range vectors,
+  output permutation, and expression cache across all static UOps; common INT, INT16, and FP16 encodings stay in NumPy
+  arrays instead of crossing Python once per lane. Max-unpool fell from 19.85 to 9.30 seconds (53.1%) and remains exact.
+- Renderer executable size is 4,445 lines, still 5,788 lines below its 10,233-line baseline (56.6%); runtime remains
+  454 lines. The seven-line increase is the shared typed materialization API; it replaces repeated work, not UOp or
+  tensor-operation specialization, and performs no host numeric tensor semantics.
+
+Verification:
+
+- Max-pool return indices: hardware pass in 2.90 seconds.
+- Max-unpool: hardware pass in 9.30 seconds, down from 19.85 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 95 passed in 5.89 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: pass.
+- `git diff --check`: pass.

@@ -4,7 +4,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
-  _canonical_half_storage, _finite_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
+  _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -41,7 +41,13 @@ def test_static_gather_rows_share_output_range_materialization(monkeypatch):
   evaluator = RKStaticIndexEvaluator(col * 3 + row, 12)
   assert evaluator.offsets(row * 4 + col, None) == (0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11)
   assert evaluator.offsets(11 - (row * 4 + col), None) == (11, 7, 3, 10, 6, 2, 9, 5, 1, 8, 4, 0)
+  assert evaluator.values(row * 4 + col, int) == (0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11)
   assert calls == 1
+
+
+def test_special_has_exact_static_integer_bounds():
+  lane = UOp.special(7, "gidx0", dtypes.int)
+  assert _exact_int_range(lane*3+2) == (2, 20)
 
 
 def test_submit_retries_once_after_driver_timeout(monkeypatch):
