@@ -3279,3 +3279,31 @@ Verification:
 
 - `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 98 passed in 4.78 seconds.
 - `git diff --check`: pass.
+
+### 152. Return to the zero-failure renderer before resuming deletion — complete
+
+- Audited the full branch history after repeated NPU timeouts and confirmed two exact zero-failure baselines for the
+  authoritative `test/backend/test_rockchip.py` census: `2f09e4a035` and the post-catalog-deletion `9c081e342` both
+  completed 433 passes, 12 explicit skips, 154 subtests, and zero failures. The current file collects 445 pytest cases;
+  future reports keep that count separate from subtests instead of calling the census 455.
+- Preserved the pre-rollback cleanup tip at branch `rockchip-2608-ew-uops-cleanup-backup`, then restored only the
+  Rockchip renderer, runtime, and their implementation-specific unit census from `9c081e342`. The current upstream
+  ported-test file and complete branch history remain intact, so deleted-line patches can be recovered individually.
+- Reapplied the two independently proven crash guards to the old runtime: native INT16 scratch chains are split at 48
+  tasks, and a driver timeout poisons the device without retry/reset/free ioctls that can reach the failed IOMMU domain.
+- The exact scatter-add-with-infinity codegen image is again byte-identical to the all-pass oracle
+  (`839a7fa2f49dfd40db32e0ef926c91c9e00368cb9bf75489d3dbfac0ef857a38`). This reverses the later compensated-FP32
+  storage path which turned infinite scatter contributions into NaNs.
+- Renderer/runtime executable size returns to 6,658/487 lines. This deliberately gives back later cleanup savings so
+  deletion can restart from a semantic baseline and each milestone can be checked against the complete census.
+- No CPU numeric semantics were introduced. The rollback restores the already audited native DPU implementation and
+  retains only submission safety changes.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 85 passed in 7.72 seconds.
+- Exact scatter-add-with-infinity codegen image: byte-identical to `9c081e342`.
+- `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
+- `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py test/unit/test_rockchip_uops.py`: pass.
+- `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py`: pass.
+- `git diff --check`: pass.

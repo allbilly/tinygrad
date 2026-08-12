@@ -1,12 +1,10 @@
 import math, struct
 from types import SimpleNamespace
-import pytest
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
-  RKEWOp, RKGather, RKScratch,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
-  _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
+  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
+  _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -15,48 +13,17 @@ def _program(dtype, value, count:int=4):
   out, axis = UOp.param(0, dtype, (count,)), UOp.range(count, 0)
   return list(out.index(axis).store(value(axis)).end(axis).sink().toposort())
 
-def _terminal_gathers(image:RKImage) -> tuple[RKGather, ...]:
-  return tuple(gather for gather in image.mid_gathers if gather.after == len(image.ew_ops))
-
 
 def test_rkvalue_is_the_typed_physical_abi():
   value = RKValue(RKArg(RKBufferKind.ARG, 0), dtypes.half, 1, RKLayout.FP16)
   assert value.dtype is dtypes.half and value.count == 1 and value.layout is RKLayout.FP16
 
 
-def test_static_range_expressions_vectorize_in_output_order():
-  row, col = UOp.range(3, 0), UOp.range(4, 1)
-  out_index = col * 3 + row
-  value = (row < 2).where(col + row * 4, UOp.const(-1, dtypes.int))
-  assert _static_int_vector(out_index, value, 12) == (0, 4, -1, 1, 5, -1, 2, 6, -1, 3, 7, -1)
-
-
-def test_static_gather_rows_share_output_range_materialization(monkeypatch):
-  row, col = UOp.range(3, 0), UOp.range(4, 1)
-  calls, original = 0, _iter_range_env
-  def counted(ranges):
-    nonlocal calls
-    calls += 1
-    return original(ranges)
-  monkeypatch.setattr("tinygrad.renderer.rockchip._iter_range_env", counted)
-  evaluator = RKStaticIndexEvaluator(col * 3 + row, 12)
-  assert evaluator.offsets(row * 4 + col, None) == (0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11)
-  assert evaluator.offsets(11 - (row * 4 + col), None) == (11, 7, 3, 10, 6, 2, 9, 5, 1, 8, 4, 0)
-  assert evaluator.values(row * 4 + col, int) == (0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11)
-  assert calls == 1
-
-
-def test_special_has_exact_static_integer_bounds():
-  lane = UOp.special(7, "gidx0", dtypes.int)
-  assert _exact_int_range(lane*3+2) == (2, 20)
-
-
 def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
   class FakeDevice:
     fd_ctl, submit_count, task_count, _poisoned = object(), 0, 0, False
-    def _check_healthy(self):
+    def _sync_buffer(self, _buffer, _flags):
       if self._poisoned: raise RuntimeError("poisoned")
-    def _sync_buffer(self, _buffer, _flags): self._check_healthy()
     def _forget_program(self, _program): pass
     def _gpu_free(self, _buffer): pass
   program = object.__new__(rockchip_runtime.RockchipProgram)
@@ -68,8 +35,12 @@ def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
     calls += 1
     raise TimeoutError
   monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_SUBMIT", submit)
-  with pytest.raises(RuntimeError, match="platform NPU reset or power cycle required"): program._submit(buffer, buffer, 1)
-  with pytest.raises(RuntimeError, match="poisoned"): program._submit(buffer, buffer, 1)
+  try: program._submit(buffer, buffer, 1)
+  except RuntimeError as exc: assert "platform NPU reset or power cycle required" in str(exc)
+  else: raise AssertionError("timeout must poison the device")
+  try: program._submit(buffer, buffer, 1)
+  except RuntimeError as exc: assert "poisoned" in str(exc)
+  else: raise AssertionError("poisoned device must reject submission")
   assert calls == 1 and program.dev._poisoned
   assert program.submit_count == program.dev.submit_count == program.dev.task_count == 0
 
@@ -77,12 +48,12 @@ def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
 def test_native_int16_fast_path_bounds_every_pc_chain(monkeypatch):
   scratch = RKArg(RKBufferKind.SCRATCH, 0)
   op = RKEWOp(scratch, scratch, scratch, 1, _EW_CFG[Ops.ADD], int16_input=True, int16_output=True)
+  ops = (op,)*129
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev = SimpleNamespace(_forget_program=lambda _program:None)
-  program.image, program._scratch_ew_bodies = RKImage(ew_ops=(op,)*129), {}
+  program.image, program._scratch_ew_bodies = RKImage(RKTarget.RK3588, ew_ops=ops), {ops:tuple((1,) for _ in ops)}
   submitted = []
   monkeypatch.setattr(program, "_submit_pcchain", lambda bodies:submitted.append(len(bodies)))
-  monkeypatch.setattr(rockchip_runtime, "_ew_stages", lambda *_args, **_kwargs:[(1,)])
   program._run_ew_ops(lambda *_args:0, lambda *_args:None)
   assert submitted == [48, 48, 33]
 
@@ -151,25 +122,13 @@ def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
   assert decode_image(encode_image(image)) == image
 
 
-def test_masked_scaled_load_materializes_before_nonfinite_neutral_rewrite():
-  source = UOp.param(1, dtypes.half, (4,))
-  def selected(i:UOp) -> UOp:
-    gate = i < UOp.const(2, dtypes.int)
-    load = source.index(i-2).load(UOp.const(0.0, dtypes.half), gate != UOp.const(True, dtypes.bool))
-    return gate.where(UOp.const(-math.inf, dtypes.half), gate.where(UOp.const(0.0, dtypes.half), load * -1.0))
-  image = _lower_uop_program(_program(dtypes.half, selected))
-  assert image is not None and not image.mid_gathers and len(image.ew_ops) == 1
-  assert decode_image(encode_image(image)) == image
-
-
 def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
   magnitude, sign = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:
     ((magnitude.index(i).load().bitcast(dtypes.int16) & UOp.const(dtypes.int16.max, dtypes.int16)) |
      (sign.index(i).load().bitcast(dtypes.int16) & UOp.const(dtypes.int16.min, dtypes.int16))).bitcast(dtypes.half)))
-  assert image is not None and len(image.ew_ops) == 11 and len(image.mid_gathers) == 11
-  output = tuple(gather for gather in _terminal_gathers(image) if gather.dst_kind is RKBufferKind.ARG)
-  assert len(output) == 1 and output[0].itemsize == 2
+  assert image is not None and len(image.ew_ops) == 11 and len(image.mid_gathers) == 10
+  assert len(image.post_gathers) == 1 and image.post_gathers[0].itemsize == 2
   assert decode_image(encode_image(image)) == image
 
 
@@ -180,7 +139,7 @@ def test_generic_bool_where_uses_canonical_int16_ternary():
     return (left < right).where(left != UOp.const(0, dtypes.int), UOp.const(False, dtypes.bool))
   image = _lower_uop_program(_program(dtypes.bool, select))
   assert image is not None and image.ew_ops[-1].int16_output
-  assert len(_terminal_gathers(image)) == 1 and _terminal_gathers(image)[0].itemsize == 1
+  assert len(image.post_gathers) == 1 and image.post_gathers[0].itemsize == 1
 
 
 def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
@@ -190,7 +149,7 @@ def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
     return UOp(Ops.CMPNE, dtypes.bool, src=(less, UOp.const(True, dtypes.bool)))
   image = _lower_uop_program(_program(dtypes.bool, greater_equal))
   assert image is not None and len(image.ew_ops) > 10
-  assert _terminal_gathers(image) and _terminal_gathers(image)[-1].itemsize == 1
+  assert image.post_gathers and image.post_gathers[-1].itemsize == 1
   assert not any(op.compare for op in image.ew_ops)
   assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MUL] and image.ew_ops[-1].int16_output
 
@@ -198,7 +157,7 @@ def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
 def test_fp16_equality_uses_exact_raw_bytes_without_compare_resets():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() != rhs.index(i).load()))
-  assert image is not None and image.mid_gathers and _terminal_gathers(image)
+  assert image is not None and image.mid_gathers and image.post_gathers
   assert not any(op.compare for op in image.ew_ops) and all(op.int16_input and op.int16_output for op in image.ew_ops)
 
 
@@ -206,7 +165,7 @@ def test_generic_where_selects_infinity_without_mask_multiplication():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(-math.inf, dtypes.half))))
-  assert image is not None and not image.ew_ops and len(_terminal_gathers(image)) == 2
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
 
 
 def test_max_uses_finite_neutral_for_selected_negative_infinity():
@@ -330,7 +289,7 @@ def test_static_root_where_uses_exact_gathers_and_finite_padding_neutral():
     padded = source.index(i).load(UOp.const(-math.inf, dtypes.half), i < UOp.const(3, dtypes.int))
     return (i < UOp.const(4, dtypes.int)).where(padded, UOp.const(0.0, dtypes.half))
   image = _lower_uop_program(_program(dtypes.half, selected))
-  assert image is not None and not image.ew_ops and len(_terminal_gathers(image)) == 2
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
   assert any(gather.fill_bits == 0xfbff for gather in image.gathers)
 
 
@@ -338,7 +297,7 @@ def test_static_root_where_preserves_nonzero_constant_route():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(3.5, dtypes.half))))
-  assert image is not None and not image.ew_ops and len(_terminal_gathers(image)) == 2
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
   assert struct.pack("<e", 3.5) in image.constants
 
 
@@ -346,7 +305,7 @@ def test_generic_bool_store_has_explicit_boundary_conversion():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() < rhs.index(i).load()))
   assert image is not None
-  assert _terminal_gathers(image) and _terminal_gathers(image)[-1].itemsize == 1
+  assert image.post_gathers and image.post_gathers[-1].itemsize == 1
   assert not any(op.compare for op in image.ew_ops)
 
 
@@ -384,8 +343,8 @@ def test_static_bool_materializes_in_int16_consumer_layout():
   lhs, rhs = UOp.param(1, dtypes.int16, (4,)), UOp.param(2, dtypes.int16, (4,))
   image = _lower_uop_program(_program(dtypes.int16,
     lambda i:(i < UOp.const(2, dtypes.int)).where(lhs.index(i).load(), rhs.index(i).load())))
-  assert image is not None and not image.ew_ops and len(_terminal_gathers(image)) == 2
-  assert all(gather.itemsize == 2 for gather in _terminal_gathers(image))
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 2
+  assert all(gather.itemsize == 2 for gather in image.post_gathers)
 
 
 def test_int16_to_int32_is_an_explicit_output_boundary():
@@ -417,8 +376,8 @@ def test_bounded_semantic_int_does_not_alias_int32_output_before_widening():
 def test_int32_load_store_is_raw_four_byte_materialization():
   source = UOp.param(1, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load()))
-  assert image is not None and not image.ew_ops and len(_terminal_gathers(image)) == 1
-  assert _terminal_gathers(image)[0].itemsize == 4 and _terminal_gathers(image)[0].dst_kind is RKBufferKind.ARG
+  assert image is not None and not image.ew_ops and len(image.post_gathers) == 1
+  assert image.post_gathers[0].itemsize == 4 and image.post_gathers[0].dst_kind is RKBufferKind.ARG
 
 
 def test_native_int32_mul_uses_the_canonical_wide_layout():
@@ -454,7 +413,7 @@ def test_generic_sign_recipe_owns_tagged_semantics():
   assert sum(op.compare for op in image.ew_ops) == 2
 
 
-def test_unrolled_math_reduction_executes_periodic_indices():
+def test_unrolled_math_reduction_vectorizes_periodic_indices():
   out = UOp.param(0, dtypes.half, (1,))
   lhs, rhs, weights = (UOp.param(1, dtypes.half, (8,)), UOp.param(2, dtypes.half, (8,)),
                        UOp.param(3, dtypes.half, (2,)))
@@ -462,10 +421,12 @@ def test_unrolled_math_reduction_executes_periodic_indices():
   value = terms[0]
   for term in terms[1:]: value = value + term
   image = _lower_uop_program(list(out.index(0).store(value).sink().toposort()))
-  assert image is not None and image.ew_ops and decode_image(encode_image(image)) == image
+  assert image is not None and image.mid_gathers
+  assert any(gather.src_index == 3 and gather.offsets == (0, 1, 0, 1, 0, 1, 0, 1) for gather in image.gathers)
+  assert len(image.ew_ops) < 300
 
 
-def test_batched_unrolled_math_reduction_executes_each_uop():
+def test_batched_unrolled_math_reduction_materializes_each_uop_result():
   rows, groups = 8, 4
   out, source = UOp.param(0, dtypes.half, (rows,)), UOp.param(1, dtypes.half, (rows*groups,))
   normalizer, lane = UOp.param(2, dtypes.half, (rows,)), UOp.range(rows, 0)
@@ -473,7 +434,8 @@ def test_batched_unrolled_math_reduction_executes_each_uop():
   value = terms[0]
   for term in terms[1:]: value = value + term
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
-  assert image is not None and image.ew_ops and decode_image(encode_image(image)) == image
+  assert image is not None and len(image.mid_gathers) == groups
+  assert image.gather_after > 1 and image.ew_ops[image.gather_after].dst.kind is RKBufferKind.SCRATCH
 
 
 def test_static_reduce_uops_are_structurally_executed():
@@ -508,9 +470,8 @@ def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   value = (zero < value).where(value, zero)
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and image.constants == struct.pack("<eee", 1.0, 65.0, 0.0)
-  split = min(gather.after for gather in image.mid_gathers)
-  assert len(image.gathers) == groups*2 and split >= 17 and split%17 == 0
-  assert len(image.mid_gathers) == groups*2 and len(image.ew_ops) > split
+  assert len(image.gathers) == groups*2 and image.gather_after >= 17 and image.gather_after%17 == 0
+  assert len(image.mid_gathers) == groups*2 and len(image.ew_ops) > image.gather_after
   assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MAX]
 
 
@@ -532,17 +493,6 @@ def test_static_fp32_subgraph_rounds_only_after_coordinate_cancellation():
   assert lowered.op is Ops.CAST and lowered.dtype.scalar() is dtypes.half and lowered.src == (fraction,)
 
 
-def test_static_fp32_where_and_trunc_survive_precise_dynamic_storage():
-  source, lane = UOp.param(1, dtypes.half, (8,)), UOp.range(4, 0)
-  coordinate = (lane.cast(dtypes.float)+UOp.const(0.5, dtypes.float))*UOp.const(3/7, dtypes.float)
-  fraction = coordinate - UOp(Ops.TRUNC, dtypes.float, src=(coordinate,))
-  weight = (lane < UOp.const(2, dtypes.int)).where(fraction, UOp.const(1.0, dtypes.float)-fraction)
-  value = source.index(lane*2).load().cast(dtypes.float)*weight + \
-          source.index(lane*2+1).load().cast(dtypes.float)*(UOp.const(1.0, dtypes.float)-weight)
-  image = _lower_uop_program(_program(dtypes.half, lambda i:value.substitute({lane:i}).cast(dtypes.half)))
-  assert image is not None and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
-
-
 def test_terminal_half_to_float_cast_uses_chunked_dpu_output_conversion():
   source = UOp.param(1, dtypes.half, (9,))
   image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
@@ -555,45 +505,18 @@ def test_terminal_half_to_float_cast_uses_chunked_dpu_output_conversion():
 def test_terminal_int_to_float_cast_composes_integer_and_fp32_converters():
   source = UOp.param(1, dtypes.int, (9,))
   image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
-  assert image is not None and len(image.ew_ops) == 4
+  assert image is not None and len(image.ew_ops) == 6
   assert sum(bool(op.ew_cfg & _EW_STAGE_FP32_OUT) for op in image.ew_ops) == 3
   assert decode_image(encode_image(image)) == image
-
-
-def test_remapped_integer_and_bool_to_float_casts_use_generic_typed_values():
-  for dtype,stages in ((dtypes.int, 4), (dtypes.bool, 9)):
-    source = UOp.param(1, dtype, (9,))
-    image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(8-i).load().cast(dtypes.float), count=9))
-    assert image is not None and len(image.ew_ops) == stages and decode_image(encode_image(image)) == image
 
 
 def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():
   source = UOp.param(1, dtypes.half, (9,))
   integer = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load().cast(dtypes.int), count=9))
   boolean = _lower_uop_program(_program(dtypes.bool, lambda i:source.index(i).load().cast(dtypes.bool), count=9))
-  composed = _lower_uop_program(_program(dtypes.bool, lambda i:(source.index(8-i).load()+1.0).cast(dtypes.bool), count=9))
   assert integer is not None and integer.ew_ops[-1].int32_output
-  assert boolean is not None and boolean.ew_ops[-1].bool_output and composed is not None and composed.ew_ops[-1].bool_output
-  assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean and \
-    decode_image(encode_image(composed)) == composed
-
-
-def test_terminal_uint8_cast_and_where_use_int16_physical_values():
-  source = UOp.param(1, dtypes.half, (9,))
-  for value in (lambda i:source.index(i).load().cast(dtypes.uchar),
-                lambda i:(UOp.const(0.0, dtypes.half) < source.index(i).load()).where(
-                  source.index(i).load().cast(dtypes.uchar), UOp.const(0, dtypes.uchar))):
-    image = _lower_uop_program(_program(dtypes.uchar, value, count=9))
-    assert image is not None and image.ew_ops[-1].int16_output and _terminal_gathers(image)[-1].itemsize == 1
-    assert decode_image(encode_image(image)) == image
-
-
-def test_bounded_sums_of_native_half_comparisons_stay_int16_until_output():
-  out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (4,))
-  terms = [(source.index(i).load() < UOp.const(0.5, dtypes.half)).cast(dtypes.int) for i in range(4)]
-  image = _lower_uop_program(list(out.index(0).store(terms[0]+terms[1]+terms[2]+terms[3]).sink().toposort()))
-  assert image is not None and len(image.mid_gathers) == 10 and len({g.after for g in image.mid_gathers}) == 5
-  assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
+  assert boolean is not None and boolean.ew_ops[-1].bool_output
+  assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
 
 
 def test_fp32_pure_add_tree_uses_compensated_half_expansion_at_output_boundary():
@@ -686,33 +609,7 @@ def test_static_local_accumulator_is_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
 
 
-def test_indexed_local_bridge_and_boolean_accumulators_are_structurally_executed():
-  out, source = UOp.param(0, dtypes.bool, (2,)), UOp.param(1, dtypes.half, (8,))
-  group, worker = UOp.special(2, "gidx0", dtypes.int), UOp.special(2, "lidx0", dtypes.int)
-  first = UOp.placeholder((1,), dtypes.bool, 0, addrspace=AddrSpace.REG)
-  first_init = first.index(0).store(True)
-  first_axis = UOp.range(2, 0, AxisType.REDUCE)
-  first_ptr = first.after(first_init, first_axis).index(0)
-  present = source.index(group*4+worker*2+first_axis).load() != UOp.const(0.0, dtypes.half)
-  first_update = first_ptr.store(first_ptr.load() & present)
-  first_end = first_update.end(first_axis)
-
-  bridge = UOp.placeholder((2,), dtypes.bool, 0, addrspace=AddrSpace.LOCAL)
-  bridge_store = bridge.index(worker).store(first.after(first_end).index(0).load())
-  second = UOp.placeholder((1,), dtypes.bool, 1, addrspace=AddrSpace.REG)
-  second_init = second.index(0).store(True)
-  second_axis = UOp.range(2, 1, AxisType.REDUCE, src=(first_end,))
-  second_ptr = second.after(second_init, second_axis).index(0)
-  second_update = second_ptr.store(second_ptr.load() & bridge.after(bridge_store.barrier()).index(second_axis).load())
-  result = second.after(second_update.end(second_axis)).index(0).load()
-  output = out.index(group).store(result)
-
-  image = _lower_uop_program(list(UOp.sink(first_init, first_update, bridge_store, second_init, second_update, output).toposort()))
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert decode_image(encode_image(image)) == image
-
-
-def test_dependent_scalar_local_extrema_executes_as_ordinary_uops():
+def test_dependent_scalar_local_extrema_is_vectorized_from_uop_structure():
   count = 4
   out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))
   value_buffer = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG)
@@ -737,9 +634,8 @@ def test_dependent_scalar_local_extrema_executes_as_ordinary_uops():
   output = out.index(0).store(UOp.const(count, dtypes.int)-selected)
 
   image = _lower_uop_program(list(UOp.sink(value_init, value_update, index_init, index_update, output).toposort()))
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert any(op.int32_input or op.int32_output for op in image.ew_ops)
-  assert decode_image(encode_image(image)) == image
+  assert image is not None and len(image.ew_ops) < 100 and len(image.mid_gathers) == 7
+  assert any(gather.dst_stride == 32 for gather in image.mid_gathers)
 
 
 def test_nested_static_local_accumulators_materialize_load_addresses():
@@ -780,7 +676,7 @@ def test_packed_bool_load_uses_canonical_int16_lanes():
   assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
 
 
-def test_fp16_predicate_prefix_executes_generic_uops():
+def test_unrolled_fp16_predicate_prefix_uses_blocked_uop_recipe():
   source = UOp.param(1, dtypes.half, (4,))
   def prefix(lane:UOp) -> UOp:
     terms = []
@@ -792,11 +688,10 @@ def test_fp16_predicate_prefix_executes_generic_uops():
     for term in terms[1:]: value = value+term
     return value
   image = _lower_uop_program(_program(dtypes.int, prefix))
-  assert image is not None and any(op.int32_output for op in image.ew_ops)
-  assert decode_image(encode_image(image)) == image
+  assert image is not None and len(image.ew_ops) == 16 and sum(op.compare for op in image.ew_ops) == 3
 
 
-def test_normalized_int_prefix_executes_generic_int32_uops():
+def test_normalized_int_prefix_avoids_compare_submission():
   source = UOp.param(1, dtypes.int, (4,))
   def prefix(lane:UOp) -> UOp:
     terms = []
@@ -807,8 +702,7 @@ def test_normalized_int_prefix_executes_generic_int32_uops():
     for term in terms[1:]: value = value+term
     return (value < 0).where(value+4, value)
   image = _lower_uop_program(_program(dtypes.int, prefix))
-  assert image is not None and any(op.int32_output for op in image.ew_ops)
-  assert decode_image(encode_image(image)) == image
+  assert image is not None and len(image.ew_ops) == 10 and not any(op.compare for op in image.ew_ops)
 
 
 def test_direct_dynamic_int32_load_selects_all_raw_bytes():
@@ -818,52 +712,16 @@ def test_direct_dynamic_int32_load_selects_all_raw_bytes():
   gate = ((index < 0) != UOp.const(True, dtypes.bool)) & (index < 9)
   load = source.index(index).load(UOp.const(0, dtypes.int), gate)
   image = _lower_uop_program(list(out.index(lane).store(load).end(lane).sink().toposort()))
-  assert image is not None and len(_terminal_gathers(image)) == 4
-  assert {gather.dst_addend for gather in _terminal_gathers(image)} == {0, 1, 2, 3}
-  assert decode_image(encode_image(image)) == image
-
-
-def test_dynamic_index_materializer_composes_external_bool_gate():
-  out, source = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (4,))
-  indices, mask, lane = UOp.param(2, dtypes.int, (4,)), UOp.param(3, dtypes.bool, (4,)), UOp.range(4, 0)
-  index = indices.index(lane).load()
-  gate = (((index < 0) != UOp.const(True, dtypes.bool)) & (index < 4)) & mask.index(lane).load()
-  image = _lower_uop_program(list(out.index(lane).store(source.index(index).load(UOp.const(0.0, dtypes.half), gate)).end(lane).sink().toposort()))
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert any(gather.src_index == mask.arg.slot and gather.itemsize == 1 for gather in image.gathers)
-  assert decode_image(encode_image(image)) == image
-
-
-def test_int32_bounds_predicates_execute_as_ordinary_uops():
-  out, lhs, rhs = UOp.param(0, dtypes.bool, (4,)), UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
-  lane = UOp.range(4, 0)
-  values = [source.index(lane).load() for source in (lhs, rhs)]
-  bounded = [(value < 0).where(value+5, value) for value in values]
-  valid = [((value < 0) != UOp.const(True, dtypes.bool)) & (value < 5) for value in bounded]
-  image = _lower_uop_program(list(out.index(lane).store(valid[0] & valid[1]).end(lane).sink().toposort()))
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert any(op.int32_input and op.int32_output for op in image.ew_ops)
-  assert any(gather.dst_kind is RKBufferKind.ARG and gather.itemsize == 1 for gather in _terminal_gathers(image))
-  assert decode_image(encode_image(image)) == image
-
-
-def test_bounded_int32_lookup_executes_as_ordinary_uops():
-  out, indices = UOp.param(0, dtypes.int, (4,)), UOp.param(1, dtypes.int, (4,))
-  lane = UOp.range(4, 0)
-  index = indices.index(lane).load()
-  valid = ((index < 0) != UOp.const(True, dtypes.bool)) & (index < 5)
-  value = valid.where(index+lane*4, UOp.const(0, dtypes.int))
-  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert any(op.int32_input and op.int32_output for op in image.ew_ops)
+  assert image is not None and len(image.post_gathers) == 4
+  assert {gather.dst_addend for gather in image.post_gathers} == {0, 1, 2, 3}
   assert decode_image(encode_image(image)) == image
 
 
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:lhs.index(i).load() & rhs.index(i).load()))
-  assert image is not None and len(_terminal_gathers(image)) == 1
-  assert _terminal_gathers(image)[0].count == 16 and all(op.int16_input and op.int16_output for op in image.ew_ops)
+  assert image is not None and len(image.post_gathers) == 1
+  assert image.post_gathers[0].count == 16 and all(op.int16_input and op.int16_output for op in image.ew_ops)
 
 
 def test_embedded_int32_not_preserves_all_raw_bytes_before_wide_arithmetic():
@@ -877,8 +735,8 @@ def test_embedded_int32_not_preserves_all_raw_bytes_before_wide_arithmetic():
 def test_int32_shift_uop_executes_with_byte_plane_barrel_recipe():
   source = UOp.param(1, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load() << UOp.const(2, dtypes.int)))
-  assert image is not None and len(_terminal_gathers(image)) == 4
-  assert {gather.dst_addend for gather in _terminal_gathers(image)} == {0, 1, 2, 3}
+  assert image is not None and len(image.post_gathers) == 4
+  assert {gather.dst_addend for gather in image.post_gathers} == {0, 1, 2, 3}
 
 
 def test_cmod_range_keeps_expanded_parity_arithmetic_in_exact_fp16_lanes():
@@ -920,7 +778,7 @@ def test_mapped_loop_reduction_composes_generic_post_uops():
   post = (local.load().cast(dtypes.half)*UOp.const(1/65, dtypes.half)).sqrt()
   output = out.index(0).store(post)
   image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
-  assert image is not None and image.ew_ops
+  assert image is not None and image.gather_after < len(image.ew_ops)
   assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG, 0)
 
 
@@ -947,7 +805,7 @@ def test_static_structural_expansion_is_bounded():
 def test_deep_generic_graph_canonicalization_is_iterative():
   value = UOp.const(0, dtypes.int)
   for _ in range(4096): value = value + UOp.const(1, dtypes.int)
-  rewritten, _ = _finite_max_neutrals(value, value.toposort())
+  rewritten = _finite_int_max_neutrals(value)
   assert rewritten.key == value.key
 
 
@@ -974,24 +832,10 @@ def test_generic_ew_chain_reuses_dead_scratch_values():
   assert image is not None and len(image.ew_ops) == 128 and len(image.scratch) <= 4
 
 
-def test_leading_vector_materialization_is_composed_into_initial_lane_gathers():
-  arg, vector, copied, arena = RKArg(RKBufferKind.ARG, 1), *(RKArg(RKBufferKind.SCRATCH, i) for i in range(3))
-  image = RKImage(tuple(RKScratch(128) for _ in range(3)),
-    gathers=(RKGather(arg.index, vector.index, 4, axes=((1, 4, 1),)),),
-    ew_ops=(RKEWOp(copied, vector, vector, 4, _EW_CFG[Ops.MAX]),
-            RKEWOp(copied, arena, RKArg(arena.kind, arena.index, 32), 1, _EW_CFG[Ops.ADD]),
-            RKEWOp(RKArg(RKBufferKind.ARG, 0), copied, RKArg(arena.kind, arena.index, 64), 1, _EW_CFG[Ops.ADD])),
-    mid_gathers=tuple(RKGather(copied.index, arena.index, 1, base=lane, dst_addend=lane*32,
-                               src_kind=RKBufferKind.SCRATCH, after=1) for lane in range(4)))
-  folded = _hoist_leading_vector_materialization(image)
-  assert len(folded.ew_ops) == 2 and not folded.mid_gathers and len(folded.gathers) == 5
-  assert tuple(gather.offsets for gather in folded.gathers[1:]) == ((0,), (1,), (2,), (3,))
-
-
 def test_scratch_reuse_spans_mid_gathers_without_aliasing_their_state():
   scratch = tuple(RKScratch(64) for _ in range(5))
   arg, slots = RKArg(RKBufferKind.ARG, 0), tuple(RKArg(RKBufferKind.SCRATCH, i) for i in range(5))
-  image = RKImage(scratch, gathers=(RKGather(0, 0, 1, values=(0,)),), ew_ops=(
+  image = RKImage(RKTarget.RK3588, scratch, gathers=(RKGather(0, 0, 1, values=(0,)),), ew_ops=(
     RKEWOp(slots[1], slots[0], slots[0], 1, _EW_CFG[Ops.ADD]),
     RKEWOp(slots[2], slots[1], slots[0], 1, _EW_CFG[Ops.ADD]),
     RKEWOp(slots[4], slots[3], slots[3], 1, _EW_CFG[Ops.ADD]),),
@@ -1067,7 +911,7 @@ def test_dynamic_host_gather_materializes_nonaffine_static_lane_bases(monkeypatc
   assert decode_image(encode_image(image)) == image
 
 
-def test_nonaffine_scalar_mul_sum_executes_as_uops():
+def test_nonaffine_scalar_mul_sum_uses_static_gather_product_residual_and_kahan():
   groups = 64
   out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (groups,)), UOp.param(2, dtypes.half, (groups,))
   permutation = tuple((lane*17)%groups for lane in range(groups))
@@ -1075,4 +919,7 @@ def test_nonaffine_scalar_mul_sum_executes_as_uops():
   value = terms[0]
   for term in terms[1:]: value = value+term
   image = _lower_uop_program(list(out.index(UOp.const(0, dtypes.int)).store(value).sink().toposort()))
-  assert image is not None and image.ew_ops and decode_image(encode_image(image)) == image
+  assert image is not None and any(gather.offsets == permutation for gather in image.gathers)
+  assert len(image.mid_gathers) == groups*2 and sum(op.submit_barrier for op in image.ew_ops) >= groups*2
+  assert any(gather.values and 0x5410 in gather.values for gather in image.gathers)  # FP16 splitter 65
+  assert decode_image(encode_image(image)) == image
