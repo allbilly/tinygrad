@@ -1996,29 +1996,6 @@ def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
   return candidates[0] if len(candidates) == 1 else None
 
 
-def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
-  """Recover isclose's original operands, equal_nan mode, and its exact-equality FP16 tolerance range."""
-  nodes = root.toposort()
-  inverted = {inner.key for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 for inner,marker in (u.src, u.src[::-1])
-              if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg)}
-  pairs = [u for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0].dtype.scalar() is dtypes.half and
-           u.src[1].dtype.scalar() is dtypes.half and u.src[0].key != u.src[1].key and
-           u.key in inverted and not any(x.op is Ops.CONST and math.isinf(float(x.arg)) for x in u.src)]
-  self_nan = [u for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0].key == u.src[1].key and
-              u.src[0].dtype.scalar() is dtypes.half]
-  self_values = tuple({u.src[0].key:u.src[0] for u in self_nan}.values())
-  operands = pairs[0].src if len(pairs) == 1 else (self_values[0], self_values[0]) if len(self_values) == 1 else ()
-  infinities = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
-                math.isinf(float(u.arg))}
-  if root.op is not Ops.OR or len(operands) != 2 or not self_nan or infinities != {-math.inf, math.inf}: return None
-  equal_nan = any(u.op is Ops.AND and len(u.src) == 2 and all(x in self_nan for x in u.src) for u in nodes) or \
-              any(x in self_nan for x in root.src)
-  finite_constants = [abs(float(u.arg)) for u in nodes if u.op is Ops.CONST and
-                      u.dtype.scalar() in (dtypes.half, dtypes.float) and math.isfinite(float(u.arg))]
-  exact = any(_fp16_bits(value) == _fp16_bits(1e-5) for value in finite_constants) and \
-          not any(1e-4 < value < .1 for value in finite_constants)
-  return operands[0], operands[1], equal_nan, exact
-
 def _ieee_comparison_mask(root:UOp) -> UOp|None:
   """Build an IEEE-correct FP16 comparison mask without evaluating tensor values on the host."""
   one = UOp.const(1.0, dtypes.half)
@@ -2074,18 +2051,6 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
       return UOp(Ops.MAX, dtypes.half, src=(delta, delta), arg=_NATIVE_ABS)
     return None
   result = mask(root)
-  if result is None: return None
-  # The FP16 tolerance product may underflow even when both realized operands are bitwise equal. Tinygrad's isclose
-  # graph always carries its original lhs!=rhs test beside two self-NaN tests and the explicit infinity constants.
-  # OR exact IEEE equality back into that graph; NaN remains unequal unless the original equal_nan branch accepts it.
-  if (isclose:=_isclose_match(root)) is not None and (unequal:=atom(Ops.CMPNE, isclose[0], isclose[1])) is not None:
-    result = _mask_mul(result, _mask_mul(classes(isclose[0])[3], classes(isclose[1])[3]))
-    exact = inverse(unequal)
-    if isclose[2]:
-      lhs_nan, rhs_nan = classes(isclose[0])[0], classes(isclose[1])[0]
-      exact = exact.alu(Ops.MAX, _mask_mul(lhs_nan, rhs_nan))
-    if isclose[3]: return exact
-    result = result.alu(Ops.MAX, exact)
   return result
 
 def _fp16_nonzero_mask(root:UOp) -> UOp|None:

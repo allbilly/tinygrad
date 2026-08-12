@@ -3184,3 +3184,27 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 148. Delete obsolete isclose graph recovery — complete
+
+- Deleted `_isclose_match` and its post-hoc comparison-mask correction. Tinygrad's current `isclose` UOps already carry
+  exact equality, finite tolerance, infinity equality, and optional NaN equality explicitly, so recovering the original
+  tensor operation was both architecturally wrong and behaviorally inactive.
+- Captured current Rockchip codegen for default tolerance, `equal_nan=True`, and `rtol=0.01` through DEV=NULL. Before
+  deletion, forcing the matcher off produced byte-identical images for all three variants; after deletion they retain
+  the same 494/496/494 EW-stage counts and 21,899/21,987/21,899-byte serializations.
+- The required multi-scalar local executor was deliberately retained. Its previous deletion probe expanded
+  `std_mean` into 13,125 loop iterations, so it is structural bounded execution rather than dead catalog code.
+- No CPU arithmetic or host value inspection was added. Comparison semantics remain owned by CMPNE/CMPLT/AND/OR UOps
+  and their canonical physical boolean recipes.
+- Renderer executable size fell from 4,136 to 4,106 lines, 6,127 lines below its 10,233-line baseline (59.9%); runtime
+  remains 454 lines.
+- Hardware replay remains deferred pending NPU recovery; this milestone did not access `/dev/dri`.
+
+Verification:
+
+- Three current isclose codegen variants: 3/3 accepted; old/forced-generic serialized images byte-identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 97 passed in 4.48 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
