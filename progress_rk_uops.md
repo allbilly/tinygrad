@@ -3515,3 +3515,33 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 159. Execute static local programs through one ordered symbolic path — WIP checkpoint
+
+- Removed the separate NumPy-based `_static_local_load_offsets` address interpreter and its private `RKContext`
+  offset side channel. Static local buffers, dependent local buffers, indexes, and load gates now expand into ordinary
+  UOps under their inherited RANGE environment and then use the same typed `_gather_plan` path as every other load.
+- Replaced three local-load DAG walkers with one semantic traversal that ignores `AFTER` ordering-only sources while
+  preserving stable first-use order. Identity-indexed local bridges, scalar mapped MAX, and multi-local ADD retain
+  their existing physical image contracts; representative nested-address and mapped-local images remained
+  byte-identical.
+- The first consolidation incorrectly rebuilt local updates with balanced `_structural_reduce`. Adversarial review
+  exposed the FP16 sequence `[2048, 1, -2048]`: a STORE loop rounds sequentially to zero, while the balanced tree
+  produced one and changed a source address or load gate. The accepted implementation uses an ordered left fold and
+  restores the aggregate `1 << 20` expansion budget. Both counterexample images are again byte-identical to the
+  pre-change renderer, 107 bytes, `NATIVE`, one EW stage, offset zero, and no host execution.
+- Renderer executable size fell from **3,989 to 3,894 lines** (net -95); runtime remains **507** lines and total tree
+  size is **29,468**. Hardware validation and the full 445-case execution remain pending the required manual power
+  cycle, so this checkpoint makes no all-pass claim.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 121 passed.
+- Sequential FP16 address/gate images: byte-identical to `ee3777470`, with offsets `(0,)`.
+- Independent adversarial verification: `VERIFIED WITH CAVEATS`. The caveat is a pre-existing, unchanged
+  multi-scalar local ADD path that uses compensated mapped reduction instead of literal sequential FP16 updates; it
+  remains a separate fail-closed/semantic follow-up rather than an overclaim in this checkpoint.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
+- `git diff --check`: pass.

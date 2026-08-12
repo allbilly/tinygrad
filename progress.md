@@ -5695,3 +5695,23 @@ runtime remains **507** and total tree size is **29,563**. The Rockchip unit gat
 Ruff and mypy pass, all 445 backend cases still collect, and independent adversarial review returned `VERIFIED`.
 Hardware and the full 445-case execution remain deliberately pending the required manual power cycle, so this is a
 WIP checkpoint rather than an all-pass backend claim.
+
+## 2026-08-13 — unify ordered static-local UOp execution
+
+The Rockchip renderer no longer has a second NumPy interpreter just for local-buffer-derived addresses and gates.
+Bounded local programs now expand symbolically under their inherited RANGE environments into ordinary semantic UOps;
+the normal typed load planner then owns address and gate materialization. One shared walker also replaces three copies
+of local-load dependency traversal. No runtime tensor value is evaluated by the host, and no CPU/GPU fallback or
+tensor-operation recognizer was added.
+
+Adversarial review caught an order bug in the first version: balancing the FP16 local updates `[2048, 1, -2048]`
+changed the sequential STORE result from zero to one. The corrected path preserves update order with a left fold and
+restores the aggregate expansion budget. Native address and gate regressions now reproduce the prior 107-byte images,
+offset zero, one EW stage, and no host execution. The complete Rockchip unit file passes 121 tests with `-n12`; full
+Ruff and mypy pass, and all 445 backend cases still collect. Independent review returned `VERIFIED WITH CAVEATS`:
+the corrected diff is sound, while a pre-existing multi-scalar ADD fast path still uses compensated mapped reduction
+instead of literal sequential FP16 updates and remains a separate follow-up.
+
+Renderer size is now **3,894 executable lines**, down 95 from the prior WIP; runtime remains **507** and total tree
+size is **29,468**. Hardware and the all-445 replay remain pending the required manual power cycle, so this is a WIP
+checkpoint rather than a passing-backend claim.

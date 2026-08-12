@@ -9,7 +9,8 @@ from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContext, RKExecut
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
   _eval_expr, _fp16_rewrite, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _static_int_vector, decode_image, encode_image)
+  _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _semantic_local_loads, _static_int_vector,
+  decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
@@ -1077,6 +1078,38 @@ def test_static_local_accumulator_is_structurally_executed():
     output = out.index(row).store(local.load())
     image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
+
+
+def test_semantic_local_loads_ignore_after_ordering_dependencies():
+  value = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG).index(0).load()
+  ordering = UOp.placeholder((1,), dtypes.half, 1, addrspace=AddrSpace.REG).index(0).load()
+  assert _semantic_local_loads(value.after(ordering)) == (value,)
+
+
+def _order_sensitive_static_local_load(gated:bool) -> RKImage:
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (4,))
+  axis = UOp.range(3, 0, AxisType.REDUCE)
+  local = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG)
+  initialize = local.index(0).store(0.0)
+  pointer = local.after(initialize, axis).index(0)
+  term = (axis < 1).where(UOp.const(2048.0, dtypes.half), (axis < 2).where(1.0, -2048.0))
+  update = pointer.store(pointer.load()+term)
+  value = local.after(update.end(axis)).index(0).load()
+  gate = (value != UOp.const(0.0, dtypes.half)) != UOp.const(True, dtypes.bool)
+  load = source.index(0).load(UOp.const(-7.0, dtypes.half), gate) if gated else source.index(value.cast(dtypes.int)).load()
+  image = _lower_uop_program(list(UOp.sink(initialize, update, out.index(0).store(load)).toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  return image
+
+
+def test_static_local_source_index_preserves_sequential_fp16_updates():
+  image = _order_sensitive_static_local_load(False)
+  assert image.gathers[0].offsets == (0,) and decode_image(encode_image(image)) == image
+
+
+def test_static_local_load_gate_preserves_sequential_fp16_updates():
+  image = _order_sensitive_static_local_load(True)
+  assert image.gathers[0].offsets == (0,) and decode_image(encode_image(image)) == image
 
 
 def test_indexed_local_bridge_and_boolean_accumulators_are_structurally_executed():
