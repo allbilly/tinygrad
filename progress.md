@@ -5575,3 +5575,33 @@ large QK matcher (**18.12 s**), while its NPU execution remains approximately **
 All offsets, masks, and plans are derived from static UOps at compile time. Runtime gathers only move opaque lanes;
 every attention arithmetic operation executes on DPU EW. There is no tensor-value host computation, CMAC, LUT, FP32
 input, Tinygrad-core/runtime change, or tolerance relaxation.
+
+---
+
+## 2026-08-13 — compact typed-UOp WIP and TopK submit-state diagnosis
+
+The Rockchip restart is checkpointed at `ea8a95106`, with the spatial-chain safety follow-up at `9d3bd5101`. Semantic
+UOps remain the program and `RKValue` is only their physical dtype/layout ABI; DPU EW recipes, static movement, scratch
+allocation, and generic structural execution compose without a tensor-operation catalog. The current repair set covers
+non-finite scatter ADD, repeated product reductions, strict bounded INT32 composition, and mapped scalar-local MAX.
+No CPU/GPU tensor arithmetic or numeric fallback was introduced.
+
+Profiling identified cumulative indices as the first large literal-execution bottleneck. The exact 1,022-lane mapped
+MAX image is now 101,138 bytes and 1,106 logical EW stages with no host-address execution, down from roughly 4.1 MiB
+and 46,000 stages. In the partial census, the complete simple-cummax and simple-cummin methods took 57.34 and
+117.28 seconds. Native and spatial PC chains are capped at 48 tasks, changed command bytes are not overwritten in a
+submitted GEM, independent chains rearm hidden pointer phase, and timeouts poison the process without retry.
+
+The first replay of the 445 collected upstream-port cases reached TopK with 190 passes, 6 explicit skips, and 126
+passing subtests before a two-task INT32 index chain timed out at task counter zero. Eleven later failures were only
+fail-closed poison cascades, so the run was stopped and is not reported as passing. Offline image comparison found that
+the renderer output still matches the cleanup oracle: the regression was the new physical rearm prefix writing output
+surface stride zero before a native-INT32 chain that requires `0x10`. The WIP fix now selects stride from DATA_FORMAT's
+output precision—INT32/FP32 use `0x10`; FP16/INT16 use zero—and its host regression covers INT16-to-INT32, native INT32,
+INT32-to-FP16, FP32 output, and ordinary FP16.
+
+The fix passes 108 Rockchip unit tests with `-n12`, repository-wide Ruff, and Tinygrad mypy for 216 files. Hardware
+confirmation is blocked until a manual power cycle: the mandatory vendor health probe failed before arithmetic when a
+4 MiB CMA allocation and non-contiguous mmap fallback failed, followed by a DRM GEM refcount-underflow warning. No
+further NPU submission was attempted. Current renderer/runtime size is **4,340/507 executable lines** (29,914 total),
+so both the all-445 gate and the final 4,000-line target remain open.

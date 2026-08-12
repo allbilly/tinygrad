@@ -160,9 +160,21 @@ def test_changed_pcchains_use_fresh_buffers_and_rearm_first_body(monkeypatch):
     def reset_npu(self):
       events.append(("reset",))
       self._ew_precision = 0
-  def body(precision:int) -> tuple[int, ...]:
+  def format_body(process:int, output:int) -> tuple[int, ...]:
     return (rockchip_runtime._pc(rockchip_runtime._TARGET_DPU, rockchip_runtime.rk.REG_DPU_DATA_FORMAT,
-                                (precision << 29) | (precision << 26) | precision),)
+                                (output << 29) | (process << 26) | process),)
+  def body(precision:int) -> tuple[int, ...]: return format_body(precision, precision)
+
+  assert rockchip_runtime._rearm_body(body(4))[2] == rockchip_runtime._pc(
+    rockchip_runtime._TARGET_DPU, rockchip_runtime.rk.REG_DPU_DST_SURF_STRIDE, 1 << 4)
+  assert rockchip_runtime._rearm_body(format_body(1, 4))[2] == rockchip_runtime._pc(
+    rockchip_runtime._TARGET_DPU, rockchip_runtime.rk.REG_DPU_DST_SURF_STRIDE, 1 << 4)
+  assert rockchip_runtime._rearm_body(format_body(2, 5))[2] == rockchip_runtime._pc(
+    rockchip_runtime._TARGET_DPU, rockchip_runtime.rk.REG_DPU_DST_SURF_STRIDE, 1 << 4)
+  assert rockchip_runtime._rearm_body(format_body(4, 2))[2] == rockchip_runtime._pc(
+    rockchip_runtime._TARGET_DPU, rockchip_runtime.rk.REG_DPU_DST_SURF_STRIDE, 0)
+  assert rockchip_runtime._rearm_body(body(2))[2] == rockchip_runtime._pc(
+    rockchip_runtime._TARGET_DPU, rockchip_runtime.rk.REG_DPU_DST_SURF_STRIDE, 0)
 
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev, program._cmd_buf, program._task_buf, program._pcchain_bodies = FakeDevice(), None, None, None

@@ -24,9 +24,11 @@ def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) &
 def _task_command_bytes(body_qwords:int) -> int: return _align_up(body_qwords + _PC_TAIL, 2) * 8
 def _rearm_body(body:tuple[int, ...]) -> tuple[int, ...]:
   """Clear hidden DPU/RDMA ping-pong phase before an independent physical submission."""
+  precision = _body_precision(body)
+  dst_stride = 1 << 4 if precision is not None and precision[1] in (4, 5) else 0
   return (_pc(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x30),
           _pc(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30),
-          _pc(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, 0), *body)
+          _pc(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, dst_stride), *body)
 def _body_precision(body:tuple[int, ...]) -> tuple[int, int]|None:
   value = next(((word >> 16) & 0xffffffff for word in body
                 if word >> 48 == _TARGET_DPU and word & 0xffff == rk.REG_DPU_DATA_FORMAT), None)

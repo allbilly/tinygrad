@@ -3307,3 +3307,48 @@ Verification:
 - `.venv/bin/python -m ruff check tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py`: pass.
 - `git diff --check`: pass.
+
+### 153. Rebuild the compact typed-UOp executor and isolate the remaining submit-state failure — in progress
+
+- Created WIP checkpoint `ea8a95106` from the restored oracle and follow-up safety checkpoint `9d3bd5101`. The renderer
+  is again a typed physical UOp executor: semantic UOps lower through `RKValue` layouts, static gathers, DPU EW recipes,
+  and generic structural reductions. Runtime host work remains limited to address/layout materialization and raw lane
+  copies; no CPU/GPU tensor arithmetic or numeric fallback was added.
+- Restored the compact 4,092-line cleanup renderer, then repaired the known late-cleanup semantics without restoring
+  tensor-operation lowerers. Non-finite FP32-to-half ADD trees avoid TwoSum's `inf-inf` NaN, repeated composed product
+  terms use one generic mapped TwoProduct/Kahan recipe, and bounded exact INT32 expressions lower compositionally only
+  when every converted intermediate is statically proven inside binary16's exact-integer range. Conditional STORE is
+  accepted only when its Boolean gate is proven tautological; all other unsupported control flow still fails closed.
+- The slow cumulative-index path now uses a generic scalar-local `RANGE/MAX` mapper. The exact 1,022-lane image is
+  101,138 bytes with 1,106 logical EW stages, 12 initial gathers, 1,022 synchronized gathers, and no host-address work;
+  its previous literal image had about 46,000 EW stages and a 4.1 MiB serialization. In the partial census,
+  `test_simple_cummax` completed both sizes in 57.34 seconds and `test_simple_cummin` in 117.28 seconds, versus the
+  earlier roughly 204-second cummin path. The expanded 512-term MAX spelling remains a separate unoptimized form.
+- Hardened physical submission without retrying a failed driver: changed command/descriptor bytes receive fresh GEMs,
+  every independent chain clears DPU/RDMA ping-pong pointers, native and spatial chains are both bounded to 48 tasks,
+  and a timeout poisons the process before any further driver ioctl. The spatial-cap regression proves 49 operations
+  over two hardware tiles submit as `[48,1,48,1]`.
+- The first post-cap 445-case replay reached the upstream TopK method before the first real failure. Pytest recorded
+  190 passes, 6 explicit skips, and 126 passing subtests; TopK then timed out at task counter zero on a two-task index
+  chain, and the following 11 failures were only the deliberately poisoned process. The run was stopped rather than
+  accessing the driver again, so this is not an all-pass result and the unreplayed tail is not counted as passing.
+- Offline reconstruction found a physical regression rather than a renderer/UOp error. The repeated TopK images match
+  the 4,092-line cleanup image exactly, while the new rearm prefix unconditionally wrote
+  `DPU_DST_SURF_STRIDE=0`. A terminal native-INT32 chain follows an INT16-to-INT32 stage that establishes the required
+  `0x10` four-byte output-surface stride; clearing it immediately before the native-INT32 task explains the zero-task
+  start failure. The current WIP derives the rearm stride from DATA_FORMAT output precision: INT32/FP32 outputs use
+  `0x10`, while FP16/INT16 outputs, including INT32-to-FP16, use zero.
+- Hardware confirmation is pending an external power cycle. The required vendor health probe did not reach arithmetic:
+  its 4 MiB allocation exhausted CMA, the non-contiguous mmap fallback returned `ENXIO`, and process teardown logged a
+  DRM GEM refcount underflow. No TopK retry or further `/dev/dri` access was attempted after that kernel warning.
+- Current executable size is renderer/runtime **4,340/507** lines, total **29,914**. This is 5,893 renderer lines below
+  the 10,233-line baseline but still 340 lines above the 4,000-line target; neither the size target nor the 445-case gate
+  is complete.
+
+Verification at this WIP boundary:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 108 passed in 4.88 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
+- Full Rockchip census: not passed; the partial result above is retained as the exact current boundary.
