@@ -26,6 +26,16 @@ def _offset_ew_args(op:RKEWOp, dst_offset:int, src_offset:int|None=None) -> tupl
   src_offset = dst_offset if src_offset is None else src_offset
   return (replace(op.dst, addend=op.dst.addend+dst_offset), replace(op.lhs, addend=op.lhs.addend+src_offset),
           replace(op.rhs, addend=op.rhs.addend+src_offset))
+def _ew_stages(op:RKEWOp, address, limit:int, dst_itemsize:int, src_itemsize:int|None=None, *, compare:bool=False,
+               stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
+               int16_output:bool=False, int16_input:bool=False) -> list[tuple[int, ...]]:
+  src_itemsize = dst_itemsize if src_itemsize is None else src_itemsize
+  stages = []
+  for start in range(0, op.count, limit):
+    dst,lhs,rhs = _offset_ew_args(op, start*dst_itemsize, start*src_itemsize)
+    stages.append(patch_stage(emit_ew_stage(dst, lhs, rhs, min(limit, op.count-start), op.ew_cfg, compare, stateful,
+      int32_output, int32_input, int16_output, int16_input), address))
+  return stages
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
@@ -216,11 +226,7 @@ class RockchipProgram(Program['RockchipDevice']):
     if scratch_int16:
       if (cached:=self._scratch_ew_bodies.get(ops)) is None:
         stages = []
-        for op in ops:
-          for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
-            count, offset = min(_MAX_EW_ELEMS_FP16, op.count-start), start*2
-            stages.append(patch_stage(emit_ew_stage(*_offset_ew_args(op, offset), count, op.ew_cfg,
-              stateful=True, int16_output=True, int16_input=True), address))
+        for op in ops: stages.extend(_ew_stages(op, address, _MAX_EW_ELEMS_FP16, 2, stateful=True, int16_output=True, int16_input=True))
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return
@@ -281,12 +287,7 @@ class RockchipProgram(Program['RockchipDevice']):
           raise RuntimeError("INT32 argument output must be terminal")
         if bodies and body_precision not in (0, 16):
           flush()
-        stages = []
-        for start in range(0, op.count, 8):
-          count = min(8, op.count-start)
-          stages.append(patch_stage(emit_ew_stage(*_offset_ew_args(op, start*4, start*2), count, op.ew_cfg,
-            stateful=True, int32_output=True, int16_input=True), address))
-        bodies.extend(stages)
+        bodies.extend(_ew_stages(op, address, 8, 4, 2, stateful=True, int32_output=True, int16_input=True))
         body_precision = 0
         continue
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
@@ -295,12 +296,8 @@ class RockchipProgram(Program['RockchipDevice']):
           flush()
         body_precision, itemsize = precision, precision//8
         limit = _MAX_EW_ELEMS_FP16 if precision == 16 else _MAX_EW_ELEMS_FP16//2
-        for start in range(0, op.count, limit):
-          count, offset = min(limit, op.count-start), start*itemsize
-          stage = emit_ew_stage(*_offset_ew_args(op, offset), count, op.ew_cfg,
-                                stateful=True, int32_output=precision == 32, int32_input=precision == 32,
-                                int16_output=precision == 16, int16_input=precision == 16)
-          bodies.append(patch_stage(stage, address))
+        bodies.extend(_ew_stages(op, address, limit, itemsize, stateful=True, int32_output=precision == 32,
+          int32_input=precision == 32, int16_output=precision == 16, int16_input=precision == 16))
         continue
       if op.int32_input or op.int32_output:
         if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
@@ -317,12 +314,9 @@ class RockchipProgram(Program['RockchipDevice']):
         restore_fp16 = not op.compare
       if op.compare:
         flush()
-        for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
-          count = min(_MAX_EW_ELEMS_FP16, op.count-start)
-          offset = start*2
-          stage = emit_ew_stage(*_offset_ew_args(op, offset), count, op.ew_cfg, compare=True)
+        for compare_body in _ew_stages(op, address, _MAX_EW_ELEMS_FP16, 2, compare=True):
           self.dev.reset_npu()
-          self._submit_standalone(patch_stage(stage, address))
+          self._submit_standalone(compare_body)
           self.dev.reset_npu()
         continue
       for start in range(0, op.count, _MAX_EW_ELEMS_FP16):

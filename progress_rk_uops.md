@@ -2971,3 +2971,24 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 140. Give runtime typed EW tiling one stage builder — complete
+
+- Scratch INT16 execution, INT16→INT32 conversion, native INT16/INT32 execution, and compare submission each repeated
+  the same count clipping, destination/source byte-offset calculation, stage emission, and relocation. Routed all four
+  paths through one `_ew_stages()` physical builder while preserving their precision and state flags.
+- Old/current fake-device replay covered scratch INT16, spatial stateful tiling, INT16→INT32, native INT32,
+  compare/standalone, and barrier programs. All six produced identical command bodies, PC-chain groupings, standalone
+  submissions, and reset events. This changes only physical submission construction and adds no host numeric work.
+- Runtime executable size fell from 460 to 454 lines. Renderer remains 4,438 executable lines, 5,795 lines below its
+  10,233-line baseline (56.6%).
+- The full hardware census remains pending: both the normal reset ioctl and the local `(RESET, 6, RESET)` recovery
+  sequence completed, but `~/rk3588/examples/elementwise.py` still timed out with `Errno 110` on submit.
+
+Verification:
+
+- Old/current physical execution replay: 6/6 precision/scheduling families identical.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 93 passed in 4.47 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
