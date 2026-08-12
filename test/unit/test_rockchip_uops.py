@@ -4,7 +4,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from tinygrad.codegen import line_rewrite, pm_linearize_cleanups
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContext, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
@@ -151,6 +151,51 @@ def test_static_gather_rows_share_output_range_materialization(monkeypatch):
 def test_special_has_exact_static_integer_bounds():
   lane = UOp.special(7, "gidx0", dtypes.int)
   assert _exact_int_range(lane*3+2) == (2, 20)
+
+
+def test_exact_int_range_uses_guarded_canonical_uop_bounds():
+  lane, special = UOp.range(7, 0), UOp.special(7, "gidx0", dtypes.int)
+  signed = lane - UOp.const(3, dtypes.int)
+  dynamic_bool = UOp.param(1, dtypes.bool, (1,)).index(UOp.const(0, dtypes.int)).load()
+  cast = UOp(Ops.CAST, dtypes.int, src=(dynamic_bool,))
+  cases = {
+    UOp.const(-3, dtypes.int):(-3, -3), lane:(0, 6), special:(0, 6), cast:(0, 1),
+    UOp(Ops.WHERE, dtypes.int, src=(dynamic_bool, signed, special)):(-3, 6),
+    UOp(Ops.XOR, dtypes.int, src=(signed, UOp.const(-1, dtypes.int))):(-4, 2),
+    UOp(Ops.CDIV, dtypes.int, src=(signed, UOp.const(2, dtypes.int))):(-1, 1),
+    UOp(Ops.CMOD, dtypes.int, src=(signed, UOp.const(2, dtypes.int))):(-1, 1),
+    signed + special:(-3, 9), signed - special:(-9, 3), signed * UOp.const(2, dtypes.int):(-6, 6),
+    signed.maximum(UOp.const(0, dtypes.int)):(0, 3),
+  }
+  assert {_exact_int_range(u) for u in cases} == set(cases.values())
+  assert all(_exact_int_range(u) == expected for u,expected in cases.items())
+
+
+def test_exact_int_range_rejects_unknown_topologies_and_overflow():
+  lane, source = UOp.range(4, 0), UOp.param(1, dtypes.int, (4,))
+  load = source.index(lane).load()
+  unsupported = UOp(Ops.SHL, dtypes.int, src=(lane, UOp.const(1, dtypes.int)))
+  overflow = UOp(Ops.ADD, dtypes.int, src=(UOp.const(dtypes.int.max, dtypes.int), UOp.const(1, dtypes.int)))
+  assert _exact_int_range(load) is None and _exact_int_range(load + UOp.const(1, dtypes.int)) is None
+  assert _exact_int_range(unsupported) is None and _exact_int_range(overflow) is None
+  assert _exact_int_range(overflow - UOp.const(1, dtypes.int)) is None
+  assert _exact_int_range(UOp(Ops.CMOD, dtypes.int, src=(load, UOp.const(7, dtypes.int)))) == (-6, 6)
+  oversized = UOp.special((1<<31)+1, "oversized", dtypes.int)
+  assert _exact_int_range(oversized) is None and _exact_int_range(oversized + UOp.const(-1, dtypes.int)) is None
+
+
+def test_exact_int_range_preserves_physical_layout_thresholds():
+  def layout(root:UOp) -> RKLayout|None:
+    out = UOp.param(0, dtypes.int, (1,))
+    return RKContext((root, out, 1, UOp.const(0, dtypes.int), root), dict.fromkeys(root.toposort())).int_layout
+  exact_half = UOp.special(4097, "half", dtypes.int) - UOp.const(2048, dtypes.int)
+  outside_half = UOp.special(4098, "wide_half", dtypes.int) - UOp.const(2049, dtypes.int)
+  exact_i16 = UOp.special(65536, "i16", dtypes.int) - UOp.const(32768, dtypes.int)
+  outside_i16 = UOp.special(65537, "wide_i16", dtypes.int) - UOp.const(32768, dtypes.int)
+  assert tuple(_exact_int_range(root) for root in (exact_half, outside_half, exact_i16, outside_i16)) == \
+    ((-2048, 2048), (-2049, 2048), (-32768, 32767), (-32768, 32768))
+  assert tuple(layout(root) for root in (exact_half, outside_half, exact_i16, outside_i16)) == \
+    (RKLayout.INT_FP16, RKLayout.INT16, RKLayout.INT16, RKLayout.INT32)
 
 
 def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):

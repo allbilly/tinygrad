@@ -5660,3 +5660,20 @@ verdict is `VERIFIED`. Direct images pay only one or two additional generic copy
 Renderer size is now **4,095 executable lines**, down 36 from the prior WIP; runtime remains **507** and total tree size
 is **29,669**. Hardware and the all-445 replay remain pending the required manual power cycle, so this is a WIP
 checkpoint rather than a passing-backend claim.
+
+## 2026-08-13 — use canonical UOp bounds and one physical image-alias primitive
+
+Rockchip no longer maintains a second 40-line integer range-propagation implementation. Physical layout selection now
+consumes Tinygrad UOp `vmin`/`vmax` behind a fail-closed topology guard that admits only the previously supported
+integer forms. Dynamic loads and unsupported operations remain unknown, every accepted node is checked against its
+dtype, and exact FP16/INT16 threshold decisions remain unchanged. Adversarial review caught an initial omission for
+oversized RANGE/SPECIAL roots; the fixed guard now rejects those roots and their ancestors and was reverified.
+
+Six mapped-reduction ARG remapping closures were also replaced by one `_alias_image_args` primitive that preserves
+buffer kinds and byte addends. Representative product, mapped-loop, scalar-local, and multi-local images remained
+byte-identical. The Rockchip unit file now passes 116 tests with `-n12`; full Ruff and mypy pass, collection remains 445
+cases, and the corrected combined change received a `VERIFIED` adversarial verdict.
+
+Renderer size is now **4,064 executable lines**, down 31 from the prior WIP; runtime remains **507** and total tree size
+is **29,638**. Hardware and the all-445 replay remain pending the required manual power cycle, so this checkpoint does
+not claim backend completion.

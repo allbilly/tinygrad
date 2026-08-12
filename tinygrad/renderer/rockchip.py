@@ -92,6 +92,11 @@ def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg], map_value_source
     ew_ops=tuple(ew(op) for op in image.ew_ops),
     host_gathers=tuple(host(x) for x in image.host_gathers), host_scatters=tuple(host(x) for x in image.host_scatters))
 
+def _alias_image_args(image:RKImage, aliases:dict[int, RKArg]) -> RKImage:
+  """Retarget logical argument slots while preserving their byte addends."""
+  return _map_image_args(image, lambda arg:replace(aliases[arg.index], addend=aliases[arg.index].addend+arg.addend)
+    if arg.kind is RKBufferKind.ARG and arg.index in aliases else arg)
+
 def _hoist_leading_vector_materialization(image:RKImage) -> RKImage:
   """Compose a leading vector copy and its lane gathers so scalar execution starts in one NPU chain."""
   if len(image.ew_ops) < 2 or not image.mid_gathers: return image
@@ -844,9 +849,6 @@ def _append_product_residual(mapped:RKImage, out_slot:int, out_index:UOp, produc
       (param:=_root_param(direct.src[0])) is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST): return None
   base = len(mapped.scratch)
   lhs, rhs, lhs_high, rhs_high, splitter = (RKArg(RKBufferKind.SCRATCH, base+i) for i in range(5))
-  def remap(arg:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, lhs.index, arg.addend) \
-      if arg.kind is RKBufferKind.ARG and arg.index == out_slot else arg
   try:
     rhs_gather = _gather_plan(param.arg.slot, rhs.index, out_index, direct.src[0].src[1], None, lanes)
     _validate_gather_bounds(rhs_gather, int(param.src[0].arg))
@@ -861,7 +863,7 @@ def _append_product_residual(mapped:RKImage, out_slot:int, out_index:UOp, produc
             (lhs_high, lhs_high, rhs, Ops.MUL), (error_arg, error_arg, lhs_high, Ops.ADD),
             (rhs_high, lhs, rhs_high, Ops.MUL), (error_arg, error_arg, rhs_high, Ops.ADD),
             (lhs, lhs, rhs, Ops.MUL), (error_arg, error_arg, lhs, Ops.ADD))
-  mapped = _map_image_args(mapped, remap)
+  mapped = _alias_image_args(mapped, {out_slot:lhs})
   return replace(mapped, scratch=(*mapped.scratch, *(RKScratch(_scratch_bytes(lanes)) for _ in range(5))),
     gathers=(*mapped.gathers, rhs_gather, RKGather(out_slot, splitter.index, lanes, values=(_fp16_bits(65.0),)*lanes)),
     ew_ops=(*mapped.ew_ops, *(RKEWOp(dst, left, right, lanes, _EW_CFG[op], submit_barrier=i == 0, stateful=True)
@@ -947,9 +949,7 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   post_uops = _fp16_rewrite(list(UOp(Ops.SINK, src=(post_store,)).toposort()))
   post = _lower_uop_program(post_uops, vectorize_reductions=False, recipes_ready=True)
   if post is None: return None
-  def alias(arg:RKArg) -> RKArg:
-    return replace(arg, index=out_slot) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
-  post = _map_image_args(post, alias)
+  post = _alias_image_args(post, {fake_slot:RKArg(RKBufferKind.ARG, out_slot)})
   appended = _append_inplace_image(reduced, post)
   return appended
 
@@ -1120,10 +1120,7 @@ def _lower_repeated_add_reduction(uops:list[UOp]) -> RKImage|None:
   mapped = _lower_uop_program(map_uops, vectorize_reductions=False, recipes_ready=True)
   if mapped is None or (mapped:=_append_product_residual(mapped, out.arg.slot, lane, vector, len(terms))) is None: return None
   slots = {slot:len(mapped.scratch)+i for i,(slot,_,_) in enumerate(sources)}
-  def remap(arg:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, slots[arg.index], arg.addend) \
-      if arg.kind is RKBufferKind.ARG and arg.index in slots else arg
-  mapped = _map_image_args(mapped, remap)
+  mapped = _alias_image_args(mapped, {slot:_scratch_arg(target) for slot,target in slots.items()})
   gathers = tuple(RKGather(param.arg.slot, slots[slot], len(offsets), offsets=offsets) for slot,param,offsets in sources)
   mapped = replace(mapped, scratch=(*mapped.scratch, *(RKScratch(_scratch_bytes(len(terms))) for _ in sources)),
                    gathers=gathers+mapped.gathers)
@@ -1789,44 +1786,25 @@ def _fp16_nonzero_mask(root:UOp) -> UOp|None:
 
 def _exact_int_range(root:UOp) -> tuple[int, int]|None:
   """Conservatively bound an integer UOp before choosing its exact physical scratch layout."""
-  cache:dict[UOp, tuple[int, int]|None] = {}
-  def bounds(u:UOp) -> tuple[int, int]|None:
+  cache:dict[UOp, bool] = {}
+  def supported(u:UOp) -> bool:
     if u in cache: return cache[u]
-    result:tuple[int, int]|None = None
-    if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.int, dtypes.weakint): result = (int(u.arg), int(u.arg))
-    elif u.op in (Ops.RANGE, Ops.SPECIAL) and u.src[0].op is Ops.CONST: result = (0, max(0, int(u.src[0].arg)-1))
-    elif u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.bool: result = (0, 1)
-    elif u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() in (dtypes.int, dtypes.weakint): result = bounds(u.src[0])
-    elif u.op is Ops.WHERE and len(u.src) == 3:
-      yes, no = bounds(u.src[1]), bounds(u.src[2])
-      if yes is not None and no is not None: result = (min(yes[0], no[0]), max(yes[1], no[1]))
+    if u.dtype.scalar() not in (dtypes.int, dtypes.weakint): valid = False
+    elif u.op is Ops.CONST or u.op in (Ops.RANGE, Ops.SPECIAL) and len(u.src) == 1 and u.src[0].op is Ops.CONST: valid = True
+    elif u.op is Ops.CAST and len(u.src) == 1: valid = u.src[0].dtype.scalar() is dtypes.bool or supported(u.src[0])
+    elif u.op is Ops.WHERE and len(u.src) == 3: valid = all(supported(src) for src in u.src[1:])
     elif u.op is Ops.XOR and len(u.src) == 2:
-      for marker, source in (u.src, u.src[::-1]):
-        if marker.op is Ops.CONST and int(marker.arg) == -1 and (source_bounds:=bounds(source)) is not None:
-          result = (-1-source_bounds[1], -1-source_bounds[0])
-    elif u.op is Ops.CMOD and len(u.src) == 2:
-      left, right = bounds(u.src[0]), bounds(u.src[1])
-      if right is not None and right[0] == right[1] and right[0] != 0:
-        extent = abs(right[0])-1
-        result = (-extent, extent) if left is None else \
-                 (0, extent) if left[0] >= 0 else (-extent, 0) if left[1] <= 0 else (-extent, extent)
-    elif u.op is Ops.CDIV and len(u.src) == 2:
-      left, right = bounds(u.src[0]), bounds(u.src[1])
-      if left is not None and right is not None and right[0] == right[1] and right[0] != 0:
-        endpoints = cdiv(left[0], right[0]), cdiv(left[1], right[0])
-        result = min(endpoints), max(endpoints)
-    elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX) and len(u.src) == 2:
-      left, right = bounds(u.src[0]), bounds(u.src[1])
-      if left is not None and right is not None:
-        if u.op is Ops.ADD: result = (left[0]+right[0], left[1]+right[1])
-        elif u.op is Ops.SUB: result = (left[0]-right[1], left[1]-right[0])
-        elif u.op is Ops.MUL:
-          products = tuple(a*b for a in left for b in right)
-          result = (min(products), max(products))
-        else: result = (max(left[0], right[0]), max(left[1], right[1]))
-    cache[u] = result
-    return result
-  return bounds(root)
+      valid = any(marker.op is Ops.CONST and marker.arg == -1 and supported(source) for marker,source in (u.src, u.src[::-1]))
+    elif u.op in (Ops.CDIV, Ops.CMOD) and len(u.src) == 2:
+      valid = supported(u.src[1]) and u.src[1].vmin == u.src[1].vmax != 0 and (u.op is Ops.CMOD or supported(u.src[0]))
+    else: valid = u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX) and len(u.src) == 2 and all(supported(src) for src in u.src)
+    if valid:
+      low, high, dtype = int(u.vmin), int(u.vmax), u.dtype.scalar()
+      valid = dtype.min <= low <= high <= dtype.max
+    cache[u] = valid
+    return valid
+  if not supported(root): return None
+  return (0, max(0, int(root.vmax))) if root.op in (Ops.RANGE, Ops.SPECIAL) else (int(root.vmin), int(root.vmax))
 
 def _int_fp16_expr(u:UOp) -> UOp:
   """Represent an integer UOp whose values are exactly carried in FP16 lanes as a half-valued recipe."""
@@ -3432,10 +3410,8 @@ def _lower_mapped_scalar_local_reduction(uops:list[UOp]) -> RKImage|None:
     gathers.extend((replace(plan, dst_index=base_slot), RKGather(base_slot, vector_slot, lanes, axes=(broadcast,),
                                                                  src_kind=RKBufferKind.SCRATCH)))
     slots[fake_slot] = vector_slot
-  def map_arg(arg:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, slots[arg.index], arg.addend) \
-      if arg.kind is RKBufferKind.ARG and arg.index in slots else arg
-  mapped = _map_image_args(replace(mapped, scratch=tuple(scratch), gathers=tuple(gathers)), map_arg)
+  mapped = _alias_image_args(replace(mapped, scratch=tuple(scratch), gathers=tuple(gathers)),
+                             {slot:_scratch_arg(target) for slot,target in slots.items()})
   if (reduced:=_finish_mapped_add_reduction(mapped, fake_out_slot, rows, groups, 1.0, reduce_op=Ops.MAX)) is None: return None
 
   fake_source = UOp.param(fake_out_slot, dtypes.half, (rows,))
@@ -3445,10 +3421,8 @@ def _lower_mapped_scalar_local_reduction(uops:list[UOp]) -> RKImage|None:
                             vectorize_reductions=False)
   if post is None or (appended:=_append_inplace_image(reduced, post)) is None: return None
   slot = len(appended.scratch)
-  def alias(arg:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, slot, arg.addend) \
-      if arg.kind is RKBufferKind.ARG and arg.index == fake_out_slot else arg
-  return replace(_map_image_args(appended, alias), scratch=(*appended.scratch, RKScratch(_scratch_bytes(rows))))
+  return replace(_alias_image_args(appended, {fake_out_slot:_scratch_arg(slot)}),
+                 scratch=(*appended.scratch, RKScratch(_scratch_bytes(rows))))
 
 def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
   """Materialize independent scalar local ADD programs, then execute their shared output UOps."""
@@ -3512,10 +3486,7 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
   if appended is None: return None
   scratch_base = len(appended.scratch)
   slot_to_scratch = {fake.arg.slot:scratch_base+i for i,fake in enumerate(sources.values())}
-  def arg(value:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, slot_to_scratch[value.index], value.addend) \
-      if value.kind is RKBufferKind.ARG and value.index in slot_to_scratch else value
-  appended = _map_image_args(appended, arg)
+  appended = _alias_image_args(appended, {slot:_scratch_arg(target) for slot,target in slot_to_scratch.items()})
   return replace(appended, scratch=appended.scratch+tuple(RKScratch(64) for _ in sources))
 
 def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dict[UOp, tuple[int, ...]]:

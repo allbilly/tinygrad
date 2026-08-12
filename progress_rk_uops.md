@@ -3450,3 +3450,34 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `test/backend/test_rockchip.py --collect-only`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 157. Use guarded canonical UOp bounds and one image-alias primitive — WIP checkpoint
+
+- Replaced the backend's independent recursive integer range evaluator with Tinygrad's canonical UOp `vmin`/`vmax`
+  contract behind a strict topology guard. Only the previously supported CONST, static RANGE/SPECIAL, integer/bool
+  CAST, WHERE arms, bitwise-NOT XOR, constant-divisor CDIV/CMOD, and ADD/SUB/MUL/MAX shapes are admitted. Dynamic LOAD
+  expressions and unsupported operations still return unknown instead of inheriting a dtype-wide bound.
+- Every admitted node is checked against its scalar dtype before its bounds can select FP16/INT16 storage. Oversized
+  RANGE/SPECIAL roots and their ancestors therefore fail closed, while legal INT32 endpoints and the exact
+  `±2,048`/`±32,768` layout boundaries remain unchanged. The first adversarial review found the missing root
+  RANGE/SPECIAL check; the corrected implementation and ancestor-poisoning regression then received `VERIFIED`.
+- Added `_alias_image_args` and replaced six local ARG-to-scratch/ARG remapping closures used by product residuals,
+  mapped ADD loops, repeated product reductions, scalar-local MAX, and multi-local reductions. It preserves buffer
+  kind, target base addend, and the original argument byte addend. Representative mapped/reduction images remained
+  byte-identical across the consolidation.
+- Renderer executable size fell from **4,095 to 4,064 lines** (net -31): guarded UOp bounds save 19 lines and shared
+  image aliasing saves 12. Runtime remains **507** lines and total tree size is **29,638**. The renderer is 64 lines
+  above the first 4,000-line target.
+- Hardware validation remains pending the required manual power cycle. This checkpoint did not open `/dev/dri` and
+  does not claim that the 445-case census passes.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 116 passed.
+- Randomized supported-expression differential: no new unsafe topology acceptance or range.
+- Representative remapped images: byte-identical before/after.
+- Adversarial verification after the overflow fix: `VERIFIED`.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `test/backend/test_rockchip.py --collect-only`: 445 tests collected.
+- `git diff --check`: pass.
