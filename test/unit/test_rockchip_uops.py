@@ -1,18 +1,22 @@
-import ctypes, math, struct
+import base64, ctypes, hashlib, math, struct
 import numpy as np
 from collections.abc import Callable
 from types import SimpleNamespace
-from tinygrad.codegen import line_rewrite, pm_linearize_cleanups
+from tinygrad import Tensor
+from tinygrad.codegen import full_rewrite_to_sink, line_rewrite, pm_linearize_cleanups
+from tinygrad.codegen.late.linearizer import linearize
 from tinygrad.dtype import AddrSpace, dtypes
+from tinygrad.helpers import Target, ceildiv
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContext, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
   _eval_expr, _fp16_rewrite, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _hoist_leading_vector_materialization, _lower_uop_program, _reuse_linear_scratch, _semantic_local_loads, _static_int_vector,
-  decode_image, encode_image)
+  _hoist_leading_vector_materialization, _lower_mapped_scalar_local_reduction, _lower_uop_program, _output_store, _reuse_linear_scratch,
+  _semantic_local_loads, _static_int_vector, RockchipRenderer, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
-from tinygrad.uop.ops import AxisType, Ops, UOp
+from tinygrad.uop.ops import AxisType, Ops, UOp, graph_rewrite
+from tinygrad.uop.symbolic import sym
 
 
 def _program(dtype, value, count:int=4):
@@ -82,6 +86,50 @@ def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
     if index < len(image.ew_ops): execute(image.ew_ops[index])
   return np.frombuffer(args[0], dtype="<i4").copy()
 
+def _execute_raw_where_image(image:RKImage, yes:np.ndarray, no:np.ndarray, selector:np.ndarray, layout:RKLayout) -> np.ndarray:
+  """Test-only executor for the exact two-byte selector emitted by `_raw_where`."""
+  count = len(selector)
+  selector_bytes = selector.astype("<f2" if layout is RKLayout.BOOL_MASK else "<i2").tobytes()
+  args = [bytearray(count*2), bytearray(yes.astype("<u2").tobytes()), bytearray(no.astype("<u2").tobytes()), bytearray(selector_bytes)]
+  scratch = [bytearray(spec.size) for spec in image.scratch]
+  for slot in range(len(image.constants)//2):
+    lane = image.constants[slot*2:slot*2+2]
+    scratch[slot][:] = lane*(len(scratch[slot])//2)
+  def buffer(arg:RKArg) -> bytearray: return args[arg.index] if arg.kind is RKBufferKind.ARG else scratch[arg.index]
+  def view(arg:RKArg, dtype, lanes:int) -> np.ndarray:
+    return np.frombuffer(buffer(arg), dtype=dtype, count=lanes, offset=arg.addend)
+  def apply_gathers(gathers:tuple[RKGather, ...]|list[RKGather]) -> None:
+    for gather in gathers:
+      assert gather.itemsize == 1 and not gather.values and not gather.offsets
+      lanes = np.arange(gather.count, dtype=np.intp)
+      index = np.full(gather.count, gather.base, dtype=np.intp)
+      for divisor,limit,stride in gather.axes: index += (lanes//divisor%limit)*stride
+      src = np.frombuffer(buffer(RKArg(gather.src_kind, gather.src_index)), dtype=np.uint8)
+      dst = np.frombuffer(buffer(RKArg(gather.dst_kind, gather.dst_index)), dtype=np.uint8)
+      dst[gather.dst_addend+lanes*gather.dst_stride] = src[index]
+  apply_gathers(list(image.gathers))
+  mid:dict[int, list[RKGather]] = {}
+  for gather in image.mid_gathers: mid.setdefault(gather.after, []).append(gather)
+  for index in range(len(image.ew_ops)+1):
+    apply_gathers(mid.get(index, []))
+    if index == len(image.ew_ops): break
+    op = image.ew_ops[index]
+    if op.int16_input and op.int16_output:
+      lhs, rhs = view(op.lhs, "<i2", op.count).astype(np.int32), view(op.rhs, "<i2", op.count).astype(np.int32)
+      if op.ew_cfg == _EW_CFG[Ops.ADD]: result = lhs+rhs
+      elif op.ew_cfg == _EW_CFG[Ops.SUB]: result = lhs-rhs
+      elif op.ew_cfg == _EW_CFG[Ops.MUL]: result = lhs*rhs
+      elif op.ew_cfg == _EW_CFG[Ops.MAX]: result = np.maximum(lhs, rhs)
+      else: raise AssertionError(f"unsupported raw-selector EW config {op.ew_cfg:#x}")
+      view(op.dst, "<i2", op.count)[:] = np.clip(result, -32768, 32767).astype("<i2")
+    elif op.int16_output:
+      assert not op.int16_input and op.lhs == op.rhs
+      view(op.dst, "<i2", op.count)[:] = view(op.lhs, "<f2", op.count).astype("<i2")
+    else:
+      assert op.ew_cfg == _EW_CFG[Ops.MAX] and op.lhs == op.rhs
+      view(op.dst, "<u2", op.count)[:] = view(op.lhs, "<u2", op.count)
+  return np.frombuffer(args[0], dtype="<u2").copy()
+
 def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
   rng = np.random.default_rng(0x3588)
   lhs = rng.integers(-(1<<31), 1<<31, 100, dtype=np.int64).astype(np.int32)
@@ -98,6 +146,41 @@ def _trunc_divmod_int32(lhs:int, rhs:int) -> tuple[int, int]:
 
 def _terminal_gathers(image:RKImage) -> tuple[RKGather, ...]:
   return tuple(gather for gather in image.mid_gathers if gather.after == len(image.ew_ops))
+
+def _physical_ew_tasks(image:RKImage) -> int:
+  def count(op:RKEWOp) -> int:
+    if op.int16_input and op.int32_output: return ceildiv(op.count, 8)
+    if op.int16_input and op.int16_output: return ceildiv(op.count, _MAX_EW_ELEMS_FP16)
+    if op.int32_input and op.int32_output: return ceildiv(op.count, _MAX_EW_ELEMS_FP16//2)
+    if op.int32_input or op.int32_output: return ceildiv(op.count, 4)
+    return ceildiv(op.count, _MAX_EW_ELEMS_FP16)
+  return sum(map(count, image.ew_ops))
+
+def _cumulative_index_image(kind:str) -> RKImage:
+  source = Tensor.empty(512, dtype=dtypes.half, device="ROCKCHIP")
+  _,indices = getattr(source, kind)(0)
+  renderer = RockchipRenderer(Target("ROCKCHIP"))
+  for call in indices.schedule_linear().src:
+    if not call.src or call.src[0].op is not Ops.SINK: continue
+    uops = line_rewrite(linearize(full_rewrite_to_sink(call.src[0], renderer)), pm_linearize_cleanups)
+    if _output_store(uops, dtypes.int, allow_local=True) is not None:
+      return decode_image(base64.b64decode(renderer.render(uops)))
+  raise AssertionError("cumulative index kernel not found")
+
+def _repeated_max_uops(count:int, mode:str="valid") -> list[UOp]:
+  out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))
+  terms:list[UOp] = []
+  for k in range(count):
+    if mode == "float": term = source.index(UOp.const(k, dtypes.int)).load()
+    else:
+      weight = count-k if mode in ("valid", "corrupt") else -(k+1) if mode == "negative" else 4096-k
+      if mode == "corrupt" and k == 7: weight += 1
+      term = (source.index(UOp.const(k, dtypes.int)).load() != UOp.const(0, dtypes.half)).cast(dtypes.int)*UOp.const(weight, dtypes.int)
+    terms.append(graph_rewrite(term, sym))
+  root = terms[0]
+  for term in terms[1:]: root = UOp(Ops.MAX, root.dtype, src=(root, term))
+  value = root.cast(dtypes.int) if mode == "float" else UOp.const(count, dtypes.int)-root
+  return list(out.index(UOp.const(0, dtypes.int)).store(value).sink().toposort())
 
 
 def _bounded_int32_narrowing_program(tautological:bool=True) -> tuple[list[UOp], UOp]:
@@ -414,6 +497,42 @@ def test_generic_where_owns_ternary_arity():
   assert image is not None
   assert any(op.compare or op.ew_cfg == _EW_CFG[Ops.MAX] for op in image.ew_ops)
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
+
+def test_raw_where_selects_every_fp16_bit_pattern_exactly():
+  bits = np.array((0x0000, 0x8000, 0x0001, 0x8001, 0x7c00, 0xfc00,
+                   0x7e01, 0x7fff, 0x7d01, 0xfd55, 0x3555, 0xb555), dtype=np.uint16)
+  yes, no, selector = bits, bits[::-1].copy(), np.array((0, 1)*6, dtype=np.int16)
+  count = len(selector)
+  out, yes_p, no_p, selector_p = (UOp.param(slot, dtype, (count,)) for slot,dtype in
+    ((0, dtypes.half), (1, dtypes.half), (2, dtypes.half), (3, dtypes.bool)))
+  lane = UOp.range(count, 0)
+  yes_u, no_u, selector_u = yes_p.index(lane).load(), no_p.index(lane).load(), selector_p.index(lane).load()
+  root, store = selector_u.where(yes_u, no_u), out.index(lane).store(selector_u.where(yes_u, no_u))
+  for layout,stages in ((RKLayout.BOOL_MASK, 8), (RKLayout.BOOL_INT16, 7)):
+    ctx = RKContext((store, out, count, lane, root), dict.fromkeys(root.toposort()))
+    ctx.values.update({yes_u:RKValue(RKArg(RKBufferKind.ARG, 1), dtypes.half, count, RKLayout.FP16),
+      no_u:RKValue(RKArg(RKBufferKind.ARG, 2), dtypes.half, count, RKLayout.FP16),
+      selector_u:RKValue(RKArg(RKBufferKind.ARG, 3), dtypes.bool, count, layout)})
+    ctx.values[root] = ctx._raw_where(root)
+    image = ctx.finish()
+    assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+    assert len(image.ew_ops) == stages and len(image.mid_gathers) == 6 and decode_image(encode_image(image)) == image
+    np.testing.assert_array_equal(_execute_raw_where_image(image, yes, no, selector, layout), np.where(selector, yes, no))
+
+def test_where_consolidation_preserves_nonfinite_images():
+  source = UOp.param(1, dtypes.half, (4,))
+  cases = {
+    math.inf:("5034456804b30b5f188a0865c8563fca9ff5b6aafe7a3c2c77c73f291c4eb497", 7, 0),
+    math.nan:("137894cdd93bbcaac8aab59e7ed0b6787d06cc6cafc9de1b6f909fe3e126577b", 6, 0),
+    -math.inf:("4a897dde4abe379cc0f1b12b6f5a15513ce2c2d33a3d4f9d9f2042d7e81f5760", 7, 0),
+  }
+  for special,(digest,stages,mid_gathers) in cases.items():
+    image = _lower_uop_program(_program(dtypes.half, lambda i,special=special:
+      (source.index(i).load() != UOp.const(0.0, dtypes.half)).where(
+        UOp.const(special, dtypes.half), source.index(i).load()+UOp.const(1.0, dtypes.half))))
+    assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+    assert not image.host_gathers and not image.host_scatters and len(image.ew_ops) == stages and len(image.mid_gathers) == mid_gathers
+    assert hashlib.sha256(encode_image(image)).hexdigest() == digest and decode_image(encode_image(image)) == image
 
 
 def test_fp16_recipe_rewrite_leaves_general_where_for_context():
@@ -1111,6 +1230,31 @@ def test_static_local_load_gate_preserves_sequential_fp16_updates():
   image = _order_sensitive_static_local_load(True)
   assert image.gathers[0].offsets == (0,) and decode_image(encode_image(image)) == image
 
+def test_multiple_fp16_locals_preserve_sequential_store_updates():
+  out, lane = UOp.param(0, dtypes.half, (2,)), UOp.range(2, 3)
+  def local(slot:int, axis_id:int) -> tuple[UOp, UOp, UOp]:
+    buffer = UOp.placeholder((1,), dtypes.half, slot, addrspace=AddrSpace.REG)
+    initialize = buffer.index(0).store(0.0)
+    axis = UOp.range(3, axis_id, AxisType.REDUCE)
+    pointer = buffer.after(initialize, axis).index(0)
+    term = (axis < 1).where(UOp.const(2048.0, dtypes.half), (axis < 2).where(1.0, -2048.0))
+    update = pointer.store(pointer.load()+term)
+    return initialize, update, buffer.after(update.end(axis)).index(0).load()
+  first_init, first_update, first = local(0, 0)
+  second_init, second_update, second = local(1, 1)
+  image = _lower_uop_program(list(UOp.sink(first_init, first_update, second_init, second_update,
+                                          out.index(lane).store(first+second)).toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+  ordered = np.float16(0.0)
+  for term in (2048.0, 1.0, -2048.0): ordered = np.float16(ordered+np.float16(term))
+  reassociated = np.float16(np.float16(2048.0)+np.float16(-2048.0)+np.float16(1.0))
+  assert ordered == 0.0 and np.float16(reassociated*2) == 2.0  # the deleted twin returned the latter in both lanes
+  raw = encode_image(image)
+  assert (len(raw), hashlib.sha256(raw).hexdigest(), len(image.ew_ops), len(image.gathers), len(image.mid_gathers)) == \
+    (72, "ee8df290c10398cffb7021e8fa3210d3f2731ab10edae755b5a0cd5fac5f6bf3", 1, 0, 0)
+  assert image.constants == struct.pack("<e", ordered) and not image.host_gathers and not image.host_scatters
+  assert decode_image(raw) == image
+
 
 def test_indexed_local_bridge_and_boolean_accumulators_are_structurally_executed():
   out, source = UOp.param(0, dtypes.bool, (2,)), UOp.param(1, dtypes.half, (8,))
@@ -1186,9 +1330,31 @@ def test_large_mapped_scalar_max_uses_compact_affine_materialization():
   image = _lower_uop_program(list(UOp.sink(initialize, update, out.index(lane).store(count-result)).toposort()))
   assert image is not None and image.execution_class is RKExecutionClass.NATIVE
   raw = encode_image(image)
-  assert len(raw) < 105_000 and len(image.ew_ops) < 1_120 and len(image.mid_gathers) == count
+  assert (len(raw), hashlib.sha256(raw).hexdigest(), len(image.ew_ops), len(image.gathers), len(image.mid_gathers)) == \
+    (101_138, "a4526ac2867fbbff782d32e87d86ed66f61c324a725fb497caa2e4d839515b71", 1_106, 12, count)
   assert max(max(len(gather.offsets), len(gather.values)) for gather in image.gathers) <= count
   assert decode_image(raw) == image
+
+def test_expanded_cumulative_indices_use_exact_compact_native_images():
+  expected = {
+    "cummin":(50_640, "7ea956a31fc7f18885c0e3a87a4fa717fe72214391ec9b70f811ac740d04442e", 598, 1_033),
+    "cummax":(50_600, "d17f7515518f0ec5114fffab8f7aed445e1d921e9155ecf1326b5141e1e2c9d4", 597, 1_028),
+  }
+  for kind,(size,digest,stages,tasks) in expected.items():
+    image = _cumulative_index_image(kind)
+    raw = encode_image(image)
+    assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+    assert (len(raw), hashlib.sha256(raw).hexdigest(), len(image.ew_ops), len(image.gathers), len(image.mid_gathers),
+            _physical_ew_tasks(image)) == (size, digest, stages, 10, 512, tasks)
+    assert decode_image(raw) == image
+
+def test_repeated_max_admission_is_generic_and_fail_closed():
+  image = _lower_mapped_scalar_local_reduction(_repeated_max_uops(128))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+  assert len(image.mid_gathers) == 128 and not image.host_gathers and not image.host_scatters
+  assert decode_image(encode_image(image)) == image
+  for count,mode in ((128, "corrupt"), (128, "negative"), (128, "wide"), (128, "float"), (127, "valid"), (513, "valid")):
+    assert _lower_mapped_scalar_local_reduction(_repeated_max_uops(count, mode)) is None
 
 
 def test_nested_static_local_accumulators_materialize_load_addresses():

@@ -5715,3 +5715,22 @@ instead of literal sequential FP16 updates and remains a separate follow-up.
 Renderer size is now **3,894 executable lines**, down 95 from the prior WIP; runtime remains **507** and total tree
 size is **29,468**. Hardware and the all-445 replay remain pending the required manual power cycle, so this is a WIP
 checkpoint rather than a passing-backend claim.
+
+## 2026-08-13 — map repeated integer MAX and cross 3,800 lines
+
+The renderer now recognizes a generic 128–512-term plain integer `MAX` tree only when every term is proved to be an
+instance of one affine UOp template and all bounded integer intermediates remain exact in FP16. This compacts the
+slow 512-element cumulative-index images from 23,064/22,552 logical EW stages to 598/597, with 1,033/1,028 predicted
+physical tasks, while the existing 1,022-term mapped-local image remains byte-identical. The rule consumes only typed
+UOp structure and static layout facts; it does not recover a tensor operation or evaluate runtime values on the host.
+
+Generic and non-finite `WHERE` now share one lazy raw-bit selector. Exhaustive host simulation selected every FP16 bit
+pattern under both hardware Boolean layouts, and focused static, threshold, non-finite, and EXP2 images remained
+byte-identical. The inactive multi-local ADD specializer was also removed: no real `std_mean` fixture used it, while
+its synthetic FP16 twin demonstrably violated sequential STORE rounding. The ordinary symbolic path preserves the
+correct zero result without adding a CPU/GPU fallback.
+
+Renderer size is now **3,799 executable lines**, down 95 from the prior WIP; runtime remains **507** and total tree
+size is **29,373**. The complete Rockchip unit gate passes 126 tests with `-n12`, full Ruff and mypy pass, and exactly
+445 backend cases collect. Independent review returned `VERIFIED WITH CAVEATS`: hardware remains deliberately
+untouched pending the manual power cycle, so this is not an all-pass backend claim.

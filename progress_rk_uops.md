@@ -3545,3 +3545,42 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 160. Map repeated integer MAX and cross the 3,800-line target — WIP checkpoint
+
+- Added a generic lowering for a top-level plain integer `MAX` tree whose 128–512 terms can be proven to be one
+  affine UOp template. The renderer anti-unifies only differing typed integer constants, reconstructs and
+  symbolically normalizes every term, and accepts the mapping only when all original UOp keys match. Existing
+  nonnegative and exact-FP16-integer bounds still gate the physical mapped-MAX executor; malformed, negative,
+  over-2,048, floating-point, 127-term, and 513-term forms fail closed.
+- This removes the current slowest renderer/runtime shape without naming cumulative extrema. The 512-element cummin
+  index image fell from 23,064 to 598 logical EW stages and now predicts 1,033 physical EW tasks; cummax fell from
+  22,552 to 597 stages and 1,028 tasks. Their encoded images are 50,640 and 50,600 bytes. The existing 1,022-term
+  scalar-local image remains byte-identical at 101,138 bytes, 1,106 EW stages, and 1,022 synchronized gathers.
+- Consolidated generic and non-finite `WHERE` execution into one lazy raw-bit selector and removed the unreachable
+  EXP2-by-infinity recognizer. Root-INT, static-root, and ABS/ordered/threshold fast paths remain. Independent review
+  exhaustively selected all 65,536 FP16 bit patterns under both BOOL layouts and found the relevant existing
+  static, threshold, non-finite, and EXP2 images byte-identical to the previous checkpoint.
+- Deleted the inactive multi-scalar local ADD specializer. None of five real `std_mean` spellings entered it, while a
+  synthetic pair of FP16 STORE loops exposed that it reassociated `[2048, 1, -2048]` into two instead of preserving
+  the sequential result zero. The ordinary symbolic path now emits the correct native 72-byte, one-EW zero image;
+  the real `std_mean` image acceptance/rejection and hashes remain unchanged. Four trivial static-evaluator/gather
+  forwarding wrappers were also inlined without changing their physical consumers.
+- Renderer executable size fell from **3,894 to 3,799 lines** (net -95); runtime remains **507** lines and total tree
+  size is **29,373**. This crosses the requested 3,800-line checkpoint while also addressing the measured slowest
+  image. Hardware validation and the full 445-case execution remain pending the required manual power cycle, so this
+  WIP checkpoint does not claim a passing backend.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 126 passed.
+- Repeated-MAX image contracts: exact cummin/cummax hashes, counts, physical-task estimates, native execution, and no
+  host gather/scatter; the prior 1,022-term image is byte-identical.
+- Raw `WHERE`: exhaustive 65,536-pattern selection under BOOL_MASK and BOOL_INT16; 24 focused old/current images are
+  byte-identical.
+- Independent adversarial verification: `VERIFIED WITH CAVEATS`; only hardware execution and exhaustive enumeration
+  of every conceivable hand-authored EXP2 graph remain unverified.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
+- `git diff --check`: pass.
