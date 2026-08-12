@@ -804,6 +804,18 @@ def test_int32_bounds_predicates_execute_as_ordinary_uops():
   assert decode_image(encode_image(image)) == image
 
 
+def test_bounded_int32_lookup_executes_as_ordinary_uops():
+  out, indices = UOp.param(0, dtypes.int, (4,)), UOp.param(1, dtypes.int, (4,))
+  lane = UOp.range(4, 0)
+  index = indices.index(lane).load()
+  valid = ((index < 0) != UOp.const(True, dtypes.bool)) & (index < 5)
+  value = valid.where(index+lane*4, UOp.const(0, dtypes.int))
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert any(op.int32_input and op.int32_output for op in image.ew_ops)
+  assert decode_image(encode_image(image)) == image
+
+
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:lhs.index(i).load() & rhs.index(i).load()))

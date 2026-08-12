@@ -3070,3 +3070,29 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: pass.
 - `git diff --check`: pass.
+
+### 144. Delete bounded INT32 lookup recovery and vectorize static address planning — complete
+
+- Deleted the bounded-INT32-lookup tensor-pattern recognizer, its private selection image, two static-vector helpers,
+  and the pre-generic dispatch. A literal regression now proves the same `LOAD`, bounds predicates, `WHERE`, integer
+  arithmetic, and `STORE` program lowers through the ordinary typed UOp executor as `NATIVE`, with no host gather.
+- The removed catalog accounted for 64 executable renderer lines. The complete milestone is a net 59-line reduction
+  after adding the regression and sharing one `RKStaticIndexEvaluator` across all candidate gather plans.
+- Profiled the slowest observed ported test, `test_slice_fancy_indexing_dim_inject_none`. Its first subcase repeatedly
+  rebuilt the same output RANGE environment for 303 plans and converted millions of compile-time address coordinates
+  through Python generators. The shared evaluator and NumPy-backed tuple materialization retain exactly the same raw
+  gather/EW execution while reducing the full method from 26.70 to 18.01 seconds (32.5%).
+- The affected hardware gate passes all 13 gather, masked-select, and fancy-index tests in 62.61 seconds. These changes
+  perform only compile-time address and comparison-coordinate materialization on the host; all runtime index comparison,
+  selection, and tensor values remain native NPU operations.
+- Renderer executable size fell from 4,459 to 4,400 lines, 5,833 lines below its 10,233-line baseline (57.0%); runtime
+  remains 454 lines.
+
+Verification:
+
+- Affected hardware gate: 13 passed in 62.61 seconds with `-n0`.
+- Slowest affected method: 1 passed in 18.01 seconds, down from 26.70 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 96 passed in 4.46 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.

@@ -582,27 +582,12 @@ def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
-def _static_vector_env(out_index:UOp, exprs:tuple[UOp, ...]) -> tuple[list[dict[UOp, int]], dict[UOp, np.ndarray], dict[UOp, np.ndarray]]:
-  ranges = _index_ranges(out_index)
-  if any(r not in ranges for expr in exprs for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
-  envs = _iter_range_env(ranges)
-  return envs, {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}, {}
-
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
   return RKStaticIndexEvaluator(out_index, count).values(expr, encode)
 
 def _static_int_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   """Evaluate a compile-time integer expression in compact output order."""
   return _static_values(out_index, expr, count, int)
-
-def _static_int_vectors(out_index:UOp, exprs:tuple[UOp, ...], count:int) -> tuple[tuple[int, ...], ...]:
-  """Vector-evaluate static integer rows with one shared index-expression cache."""
-  envs, vector_env, cache = _static_vector_env(out_index, exprs)
-  dst = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
-  if len(envs) != count or np.any((dst < 0) | (dst >= count)) or not np.array_equal(np.sort(dst), np.arange(count)):
-    return tuple(_static_int_vector(out_index, expr, count) for expr in exprs)
-  order = np.argsort(dst)
-  return tuple(tuple(int(x) for x in np.broadcast_to(_eval_vector(expr, vector_env, cache), len(envs))[order]) for expr in exprs)
 
 _LinearTerm = UOp|tuple[UOp, int]
 def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[_LinearTerm, int]]|None:
@@ -681,7 +666,7 @@ class RKStaticIndexEvaluator:
     offsets = np.full(self.count, -2, dtype=np.int64)
     offsets[dst] = values
     if np.any(offsets == -2): raise RuntimeError("RKPLAN_REJECT:gather_index")
-    return tuple(int(x) for x in offsets)
+    return tuple(offsets.tolist())
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   return RKStaticIndexEvaluator(out_index, count).offsets(load_index, gate)
@@ -1633,62 +1618,6 @@ def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
   return RKImage(gathers=(gather,))
 
 
-def _int32_index_selection_image(out_slot:int, count:int, index_slot:int, index_offsets:tuple[int, ...],
-                                 candidate_values:tuple[tuple[int, ...], ...]) -> RKImage|None:
-  """Select per-lane bounded INT16 values by exact external INT32 index equality."""
-  rows = len(candidate_values)
-  if not rows or any(len(values) != count or any(not -32768 <= value <= 32767 for value in values) for values in candidate_values): return None
-  vector_bytes, vector_lanes, _ = _stripe_layout(count, 1)
-  block_rows = max(1, _MAX_EW_ELEMS_FP16//vector_lanes)
-  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
-  partials:list[RKArg] = []
-  for start in range(0, rows, block_rows):
-    op_start = len(ops)
-    block_count = min(block_rows, rows-start)
-    matrix_lanes = block_count*vector_lanes
-    coordinates = tuple((candidate,)*count for candidate in range(start, start+block_count))
-    if (mask:=_native_int16_byte_mask(ops, gathers, scratch, index_slot, index_offsets,
-                                     (coordinates,), count, vector_lanes)) is None: return None
-    weight_slot, selected = scratch(matrix_lanes*2), scratch(matrix_lanes*2)
-    values = tuple(value for row in candidate_values[start:start+block_count]
-                   for value in (*row, *((0,)*(vector_lanes-count))))
-    gathers.append(RKGather(index_slot, weight_slot, matrix_lanes, values=values))
-    ops.append(RKEWOp(_scratch_arg(selected), mask, _scratch_arg(weight_slot), matrix_lanes, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
-    partials.append(_reduce_rows(ops, [_scratch_arg(selected, row*vector_bytes) for row in range(block_count)],
-                                 count, _EW_CFG[Ops.ADD], int16=True))
-    if start and len(ops) > op_start: ops[op_start] = replace(ops[op_start], submit_barrier=True)
-  result = _reduce_rows(ops, partials, count, _EW_CFG[Ops.ADD], int16=True)
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, result, count, _EW_CFG[Ops.MAX],
-                    int16_input=True, int32_output=True))
-  return RKImage(tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops))
-
-def _lower_bounded_int32_lookup(output:RKOutput) -> RKImage|None:
-  """Evaluate a bounded static integer function selected by one arbitrary external INT32 index."""
-  _, out_param, count, out_index, root = output
-  loads = tuple({u.key:u for u in root.toposort() if u.op is Ops.LOAD}.values())
-  if (not 1 <= count <= _FP16_EXACT_INTEGER or len(loads) != 1 or loads[0].dtype.scalar() is not dtypes.int or
-      root.op is not Ops.WHERE or root.src[2].op is not Ops.CONST or int(root.src[2].arg) != 0): return None
-  load = loads[0]
-  if not load.src or load.src[0].op is not Ops.INDEX: return None
-  param = _root_param(load.src[0])
-  if param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST: return None
-  gates = _flatten_binary(root.src[0], Ops.AND)
-  limits = {int(u.src[1].arg) for u in gates if u.op is Ops.CMPLT and u.src[0].key == load.key and
-            u.src[1].op is Ops.CONST and 0 < int(u.src[1].arg) <= 32767}
-  nonnegative = [u for u in gates if u.op is Ops.CMPNE and any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg)
-                 for x in u.src) and any(x.op is Ops.CMPLT and x.src[0].key == load.key and x.src[1].op is Ops.CONST and
-                 int(x.src[1].arg) == 0 for x in u.src)]
-  if len(gates) != 2 or len(limits) != 1 or len(nonnegative) != 1: return None
-  limit = next(iter(limits))
-  try:
-    index_offsets = _gather_offsets(out_index, load.src[0].src[1], load.src[2] if len(load.src) == 3 else None, count)
-    candidate_values = _static_int_vectors(out_index,
-      tuple(root.substitute({load:load.const_like(candidate)}) for candidate in range(limit)), count)
-  except RuntimeError: return None
-  if any(not 0 <= offset < int(param.src[0].arg) for offset in index_offsets): return None
-  return _int32_index_selection_image(out_param.arg.slot, count, param.arg.slot, index_offsets, candidate_values)
-
-
 def _int32_less_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
                      lhs_components:list[RKArg], rhs_components:list[RKArg], lanes:int) -> RKArg:
   """Compare signed INT32 lanes represented as high-to-low widened bytes."""
@@ -1733,7 +1662,7 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
       alternate_coordinates is not None and (len(alternate_coordinates) != len(indices) or
         any(any(len(axis) != len(plans) for axis in alternatives) for alternatives in alternate_coordinates)) or
       len({plan.src_index for plan in plans}) != 1): return None
-  plan_offsets = tuple(_plan_offsets(plan) for plan in plans)
+  plan_offsets = tuple(np.asarray(_plan_offsets(plan), dtype=np.int64) for plan in plans)
   repeat = next((lanes for lanes in range(min(8, count), 0, -1) if count%lanes == 0 and
                  all(all(row[start:start+lanes] == (row[start],)*lanes for start in range(0, count, lanes))
                      for row in (*(offsets for _,_,offsets in indices), *((gate[2],) if gate else ())))), 1)
@@ -1764,7 +1693,7 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
       for channel in range(repeat):
         for byte,slot in enumerate(matrix_value[channel]):
           gathers.append(RKGather(plans[0].src_index, slot, group_count,
-            offsets=tuple(offset*itemsize+byte for offset in row[channel::repeat]), dst_stride=2,
+            offsets=tuple((row[channel::repeat]*itemsize+byte).tolist()), dst_stride=2,
             dst_addend=candidate*vector_lanes*2, itemsize=1))
     block_result:list[tuple[RKArg, ...]] = []
     for channel in range(repeat):
@@ -1834,16 +1763,19 @@ def _native_int16_byte_mask(ops:list[RKEWOp], gathers:list[RKGather], scratch:Ca
   if index_offsets and isinstance(index_offsets[0], int): offset_rows = (index_offsets,)*rows
   else: offset_rows = typing_cast(tuple[tuple[int, ...], ...], index_offsets)
   if len(offset_rows) != rows or any(len(offsets) != count for offsets in offset_rows): return None
+  offset_arrays = tuple(np.asarray(offsets, dtype=np.int64) for offsets in offset_rows)
   one, diff, magnitude, unequal = (scratch(matrix_lanes*2) for _ in range(4))
   gathers.append(RKGather(index_slot, one, matrix_lanes, values=(1,)*matrix_lanes, itemsize=2))
   masks:list[RKArg] = []
   for coordinates in coordinate_sets:
+    coordinate_matrix = np.zeros((rows, vector_lanes), dtype=np.int64)
+    coordinate_matrix[:, :count] = np.asarray(coordinates, dtype=np.int64)
     byte_masks:list[RKArg] = []
     for byte in range(4):
       dynamic, static, equal = (scratch(matrix_lanes*2) for _ in range(3))
-      gathers.extend(RKGather(index_slot, dynamic, count, offsets=tuple(offset*4+byte for offset in offsets),
-        dst_stride=2, dst_addend=row*vector_lanes*2, itemsize=1) for row,offsets in enumerate(offset_rows))
-      values = tuple((value >> (byte*8)) & 0xff for row in coordinates for value in (*row, *((0,)*(vector_lanes-count))))
+      gathers.extend(RKGather(index_slot, dynamic, count, offsets=tuple((offsets*4+byte).tolist()),
+        dst_stride=2, dst_addend=row*vector_lanes*2, itemsize=1) for row,offsets in enumerate(offset_arrays))
+      values = tuple(((coordinate_matrix >> (byte*8)) & 0xff).ravel().tolist())
       gathers.append(RKGather(index_slot, static, matrix_lanes, values=values, itemsize=2))
       ops.extend((RKEWOp(_scratch_arg(diff), _scratch_arg(dynamic), _scratch_arg(static), matrix_lanes,
                           _EW_CFG[Ops.SUB], **_INT16_EW),
@@ -2030,6 +1962,7 @@ def _lower_dynamic_multi_index_typed_load(output:RKOutput, dtype:DType) -> RKIma
   params = tuple(_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads)
   if any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params): return None
   concrete = tuple(param for param in params if param is not None)
+  index_evaluator = RKStaticIndexEvaluator(out_index, count)
   options = tuple(tuple(range(extent)) for _,_,extent,_ in axes)
   combinations:tuple[tuple[int, ...], ...] = ((),)
   for axis in options:
@@ -2040,15 +1973,16 @@ def _lower_dynamic_multi_index_typed_load(output:RKOutput, dtype:DType) -> RKIma
     bool_param = _root_param(bool_load.src[0]) if len(bool_load.src) == 1 and bool_load.src[0].op is Ops.INDEX else None
     if bool_load not in _flatten_binary(gate, Ops.AND) or bool_param is None or bool_param.dtype.scalar() is not dtypes.bool or \
        bool_param.src[0].op is not Ops.CONST: return None
-    try: bool_offsets = _gather_offsets(out_index, bool_load.src[0].src[1], None, count)
+    try: bool_offsets = index_evaluator.offsets(bool_load.src[0].src[1], None)
     except RuntimeError: return None
     bool_count = int(bool_param.src[0].arg)
     if any(not 0 <= offset < bool_count for offset in bool_offsets): return None
     external_gate = (bool_param.arg.slot, bool_count, bool_offsets)
   try:
-    offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in loads)
+    offsets = tuple(index_evaluator.offsets(load.src[0].src[1], None) for load in loads)
     plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index, data_index.substitute(mapping),
-      gate.substitute(mapping | ({bool_loads[0]:bool_loads[0].const_like(True)} if bool_loads else {})), count)
+      gate.substitute(mapping | ({bool_loads[0]:bool_loads[0].const_like(True)} if bool_loads else {})), count,
+      index_evaluator=index_evaluator)
                   for values in combinations
                   for mapping in ({load:load.const_like(value) for load,value in zip(loads, values)},))
   except RuntimeError: return None
@@ -4074,7 +4008,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (shift:=_lower_int32_shift(output)) is not None: return shift
     for source_dtype in (dtypes.int16, dtypes.int):
       if (coordinates:=_lower_bounded_integer_predicate_coordinates(output, source_dtype)) is not None: return coordinates
-    if (lookup:=_lower_bounded_int32_lookup(output)) is not None: return lookup
   try:
     if (not _contiguous_output(output[3], output[2]) and
         _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
