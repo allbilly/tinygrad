@@ -670,6 +670,32 @@ def test_static_local_accumulator_is_structurally_executed():
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
 
 
+def test_indexed_local_bridge_and_boolean_accumulators_are_structurally_executed():
+  out, source = UOp.param(0, dtypes.bool, (2,)), UOp.param(1, dtypes.half, (8,))
+  group, worker = UOp.special(2, "gidx0", dtypes.int), UOp.special(2, "lidx0", dtypes.int)
+  first = UOp.placeholder((1,), dtypes.bool, 0, addrspace=AddrSpace.REG)
+  first_init = first.index(0).store(True)
+  first_axis = UOp.range(2, 0, AxisType.REDUCE)
+  first_ptr = first.after(first_init, first_axis).index(0)
+  present = source.index(group*4+worker*2+first_axis).load() != UOp.const(0.0, dtypes.half)
+  first_update = first_ptr.store(first_ptr.load() & present)
+  first_end = first_update.end(first_axis)
+
+  bridge = UOp.placeholder((2,), dtypes.bool, 0, addrspace=AddrSpace.LOCAL)
+  bridge_store = bridge.index(worker).store(first.after(first_end).index(0).load())
+  second = UOp.placeholder((1,), dtypes.bool, 1, addrspace=AddrSpace.REG)
+  second_init = second.index(0).store(True)
+  second_axis = UOp.range(2, 1, AxisType.REDUCE, src=(first_end,))
+  second_ptr = second.after(second_init, second_axis).index(0)
+  second_update = second_ptr.store(second_ptr.load() & bridge.after(bridge_store.barrier()).index(second_axis).load())
+  result = second.after(second_update.end(second_axis)).index(0).load()
+  output = out.index(group).store(result)
+
+  image = _lower_uop_program(list(UOp.sink(first_init, first_update, bridge_store, second_init, second_update, output).toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+  assert decode_image(encode_image(image)) == image
+
+
 def test_dependent_scalar_local_extrema_executes_as_ordinary_uops():
   count = 4
   out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))

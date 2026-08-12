@@ -3155,3 +3155,32 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `git diff --check`: pass.
+
+### 147. Delete grouped boolean-reduction recovery — complete
+
+- Deleted the grouped `all`/`any` graph recognizer, its four private image builders, its block-reduction helper, and a
+  now-dead FP16 equality-stage helper. Boolean reductions now use the same literal local-UOp executor as scalar
+  ADD/MAX/MUL reductions; no tensor-operation name or graph dialect remains in their dispatch.
+- Extended the structural executor with the actual missing semantics: scalar AND/OR accumulators and a strictly proven
+  identity-indexed LOCAL bridge. AFTER ordering dependencies are excluded from semantic local-load discovery, and the
+  discovery is memoized so large math DAGs remain linear to inspect.
+- Captured the exact Rockchip codegen UOps for `Tensor.ones(1<<15).bool().all()` through a NULL device, including its
+  SPECIAL/RANGE/LOCAL/BARRIER/IF structure. Both reduction kernels lower through the generic path as NATIVE, with no
+  host gathers or host arithmetic. A smaller literal two-level LOCAL bridge is now a permanent unit regression.
+- Profiling the initially generic result found direct `CMPNE(half LOAD, 0)` repeatedly entering the full raw-byte IEEE
+  equality recipe. The CMPNE UOp handler now uses its exact ABS/nonzero physical recipe: NaN, infinity, signed zero, and
+  ordinary FP16 values retain the required bool semantics. For the captured 32K-element program, compile time fell from
+  0.429 to 0.101 seconds and the two physical images fell from 5,305 to 673 EW stages. The deleted catalog produced
+  1,804 stages, so the generic result is also 62.7% smaller by EW-stage count.
+- Renderer executable size fell from 4,234 to 4,136 lines, 6,097 lines below its 10,233-line baseline (59.6%); runtime
+  remains 454 lines.
+- Hardware replay and the 455-test census remain deferred because the NPU is still in the post-crash state documented
+  in milestone 146. This milestone did not open `/dev/dri`; its exact codegen capture used DEV=NULL.
+
+Verification:
+
+- Exact Rockchip large-`all` UOps: 2/2 generic NATIVE images, 673 total EW stages, 0.101-second host lowering.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 97 passed in 4.54 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `git diff --check`: pass.
