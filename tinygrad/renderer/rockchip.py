@@ -10,7 +10,7 @@ from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import Target, cdiv, ceildiv, cmod, floordiv, floormod, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
+from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, consumer_map_from_toposort, graph_rewrite
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
 
@@ -279,9 +279,9 @@ _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _MAX_MAPPED_DOT_SCRATCH_BYTES = 352 << 20
 _MAX_GENERIC_UNROLL = 1 << 14
-_MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 64
 _MAX_GENERIC_EXPANDED_NODES = 1 << 20
 _MAX_OPTIONAL_RECIPE_NODES = 4096
+_MIN_GENERIC_PRODUCT_RESIDUAL_TERMS = 64
 _MAX_STATIC_LOCAL_STEPS = 1 << 20
 _MAX_STATIC_RANGE_ENVS = 1 << 18
 _EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
@@ -2539,6 +2539,11 @@ class RKContext:
     self.accurate_adds = accurate_adds
     self.nodes = nodes
     self.static_evaluator = RKStaticIndexEvaluator(self.out_index, self.count)
+    self.static_nodes:dict[UOp, bool] = {}
+
+  def _is_static(self, u:UOp) -> bool:
+    return u.topovisit(lambda node:node.op in _STATIC_OPS and not (isinstance(node.arg, str) and node.arg.startswith("rockchip_")) and
+      all(self.static_nodes[src] for src in node.src), self.static_nodes)
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
@@ -2780,7 +2785,7 @@ class RKContext:
     if src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg) < 0:
       return self._constant(UOp.const(-65504.0, dtypes.half))
     if (src.op is Ops.LOAD and len(src.src) > 2 and src.src[1].op is Ops.CONST and
-        math.isinf(float(src.src[1].arg)) and float(src.src[1].arg) < 0 and _is_static_expr(src.src[2])):
+        math.isinf(float(src.src[1].arg)) and float(src.src[1].arg) < 0 and self._is_static(src.src[2])):
       return self._load(src, _fp16_bits(-65504.0))
     return self._operand(src, dtype)
 
@@ -3012,7 +3017,7 @@ class RKContext:
 
   def _int32_compare(self, u:UOp) -> RKValue:
     def operand(src:UOp) -> RKValue:
-      value = self._static(src) if _is_static_expr(src) else self.lower(src)
+      value = self._static(src) if self._is_static(src) else self.lower(src)
       if value.layout is not RKLayout.INT32: raise _RKGenericReject
       return value
     lhs, rhs = (operand(src) for src in u.src)
@@ -3154,7 +3159,7 @@ class RKContext:
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
     if u.dtype.scalar() is dtypes.bool:
-      dynamic = [None if _is_static_expr(src) else self.lower(src) for src in u.src]
+      dynamic = [None if self._is_static(src) else self.lower(src) for src in u.src]
       preferred = (RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in dynamic) else
                    RKLayout.BOOL_MASK)
       values = [self._static(src, preferred) if value is None else self._coerce_bool(value, preferred)
@@ -3170,7 +3175,7 @@ class RKContext:
       try: exact = all(_eval_cast(value, dtypes.half) == value for value in (no_int, yes_int-no_int))
       except (OverflowError, struct.error): exact = False
       if not exact: raise _RKGenericReject
-      selector = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+      selector = self._static(u.src[0], RKLayout.BOOL_MASK) if self._is_static(u.src[0]) else self.lower(u.src[0])
       if selector.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
       arithmetic_dtype, arithmetic_layout = ((dtypes.int16, RKLayout.INT16) if selector.layout is RKLayout.BOOL_INT16 else
                                               (dtypes.half, RKLayout.FP16))
@@ -3183,11 +3188,11 @@ class RKContext:
       value = RKValue(self.out, dtypes.int, self.count, RKLayout.INT32)
       self.ew_ops.append(RKEWOp(value.arg, result.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
       return value
-    if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
+    if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and self._is_static(u.src[0]):
       dtype = u.dtype.scalar()
       routes:dict[UOp, list[bool]] = {}
       def route(node:UOp, active:tuple[bool, ...]) -> None:
-        if node.op is Ops.WHERE and _is_static_expr(node.src[0]):
+        if node.op is Ops.WHERE and self._is_static(node.src[0]):
           selector = tuple(bool(x) for x in self.static_evaluator.values(node.src[0], lambda x:int(bool(x))))
           route(node.src[1], tuple(live and take for live,take in zip(active, selector)))
           route(node.src[2], tuple(live and not take for live,take in zip(active, selector)))
@@ -3251,7 +3256,7 @@ class RKContext:
       inf_index, finite_u = nonfinite[0], u.src[2-nonfinite[0]]
       finite = self.lower(finite_u)
       if finite.layout is not RKLayout.FP16: raise _RKGenericReject
-      selector = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+      selector = self._static(u.src[0], RKLayout.BOOL_MASK) if self._is_static(u.src[0]) else self.lower(u.src[0])
       if selector.layout is RKLayout.BOOL_INT16:
         yes, no = (self.lower(src) for src in u.src[1:])
         return self._raw_where(u, selector, yes, no)
@@ -3275,7 +3280,7 @@ class RKContext:
     if yes.layout is not no.layout or yes.layout not in (RKLayout.FP16, RKLayout.INT16, RKLayout.INT_FP16, RKLayout.INT32):
       raise _RKGenericReject
     mask_layout = RKLayout.BOOL_INT16 if yes.layout in (RKLayout.INT16, RKLayout.INT32) else RKLayout.BOOL_MASK
-    selector = self._static(u.src[0], mask_layout) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
+    selector = self._static(u.src[0], mask_layout) if self._is_static(u.src[0]) else self.lower(u.src[0])
     if selector.layout is not mask_layout and not (yes.layout in (RKLayout.FP16, RKLayout.INT_FP16, RKLayout.INT32) and
                                                     selector.layout in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16)):
       raise _RKGenericReject
@@ -3327,7 +3332,7 @@ class RKContext:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
-    elif dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool) and _is_static_expr(u):
+    elif dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool) and self._is_static(u):
       value = self._static(u)
     elif u.op is Ops.LOAD: value = self._load(u)
     elif u.op is Ops.BITCAST and len(u.src) == 1:
@@ -3407,9 +3412,18 @@ class RKContext:
   def finish(self) -> RKImage:
     nodes = self.nodes
     if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) for node in nodes):
+      consumers = consumer_map_from_toposort(nodes)
+      precise = {node for node in nodes if node.op is Ops.ADD and node.dtype.scalar() is dtypes.half and node.arg is None and
+                 not any(user.op is Ops.ADD and user.dtype.scalar() is dtypes.half and user.arg is None for user in consumers[node])}
+      deferred:set[UOp] = set()
       for node in nodes:
-        if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
+        if node in precise or any(src in deferred for src in node.src): deferred.add(node)
+      accurate_adds, self.accurate_adds = self.accurate_adds, False
+      for node in nodes:
+        if node not in deferred and node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool) and \
+           node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
           self.lower(node)
+      self.accurate_adds = accurate_adds
     result = self.lower(self.root)
     dtype = self.out_param.dtype.scalar()
     if dtype is dtypes.half and result.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16):
@@ -3845,6 +3859,7 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   if len(extents) != len(value_def.loops) or any(not 1 <= extent <= min(32767, _MAX_EW_ELEMS_FP16) for extent in extents): return None
   total = math.prod(extents)
   if not 2 <= total <= min(32767, _MAX_EW_ELEMS_FP16): return None
+  if total > 64 and total%32: return None
   if tuple(int(loop.src[0].arg) for loop in index_def.loops) != extents: return None
 
   weighted_terms = _flatten_binary(index_def.term, Ops.MUL)

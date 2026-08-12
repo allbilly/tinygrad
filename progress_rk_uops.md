@@ -3043,3 +3043,30 @@ Verification:
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: pass.
 - `git diff --check`: pass.
+
+### 143. Make large precision lowering linear and restore argmax fallback — complete
+
+- The new slowest failure, cross-entropy reduction, spent more than 90 seconds at 100% CPU before reaching hardware.
+  An interrupt trace found repeated `UOp.toposort()` calls while the large-program recursion guard eagerly lowered every
+  intermediate `ADD` and independently rebuilt overlapping compensated recipes.
+- Static classification is now an incremental `UOp.topovisit()` property of `RKContext`, so generated recipes remain
+  classifiable without the stale catalog removed in milestone 141 and each dependency is classified once. For large
+  graphs, the iterative pre-materializer defers only top-level FP16 precision boundaries and their consumers, then each
+  compensated sum is expanded once. The same cross-entropy case now reaches its numeric assertion in 6.22 seconds.
+- Hardware probing found the scalar-extrema fast path's exact-byte equality is reliable through 64 lanes and for aligned
+  larger vectors, but returns no selected lane for non-32-aligned sizes such as 100, 129, and 200. Those physical shapes
+  now use the already-existing literal local-UOp executor. The complete upstream argmax method passes in 1.98 seconds,
+  including its formerly incorrect 200-element reduction; no argmax graph dialect or CPU arithmetic was added.
+- Cross-entropy `sum` is the one remaining focused failure: 4.145 versus 4.11 at a 0.0255 combined tolerance. Its
+  `none` output passes elementwise tolerance and `mean` passes; this is now a numeric accuracy issue, not a compiler or
+  submission stall.
+- Renderer executable size is 4,459 lines, 5,774 lines below its 10,233-line baseline (56.4%); runtime remains 454.
+
+Verification:
+
+- Argmax hardware method: 1 passed in 1.98 seconds.
+- Cross-entropy reduction: reaches its sole numeric failure in 6.22 seconds, down from more than 90 seconds.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 95 passed in 4.65 seconds.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: pass.
+- `git diff --check`: pass.
