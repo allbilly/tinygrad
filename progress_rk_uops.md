@@ -3584,3 +3584,31 @@ Verification:
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
 - `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
+
+### 161. Restore linear synchronized-gather scheduling — WIP checkpoint
+
+- Profiling after the 3,800-line checkpoint again identifies dynamic `nonzero` as the next slow backend family. Its
+  runtime revisited every mid-program gather for every synchronization point, even though each gather already carries
+  its exact physical `after` boundary.
+- Restored the previously proven stable grouping pass from `7490132d0`: build each `after` batch once, then execute the
+  batches in sorted boundary order. Gather order within a boundary, EW slices, device synchronization, buffer clearing,
+  and raw memory movement are unchanged. This is scheduler metadata work only; it reads no tensor value and adds no
+  CPU/GPU numeric semantics or CMAC path.
+- The original hardware A/B for this exact transformation measured 9.60 seconds in the quadratic grouping code and
+  reduced cold `TestRockchipNonzeroOps::test_nonzero` from 35.00 to 28.34 seconds. Those numbers are historical evidence,
+  not a fresh device result: this checkpoint deliberately did not open `/dev/dri` while the manual power cycle remains
+  pending.
+- Renderer executable size remains **3,799 lines**. Runtime grows from **507 to 508 lines** and total tree size from
+  **29,373 to 29,374**. The next renderer milestone still targets 3,600 lines and the repeated predicate/selection
+  programs that dominate the remaining `nonzero` work.
+- Hardware validation and the all-445 replay remain pending the required manual power cycle, so this checkpoint does
+  not claim a passing backend.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 126 passed.
+- Independent adversarial verification: `VERIFIED`; 2,396,745 old/new scheduler traces matched exactly.
+- `.venv/bin/python -m ruff check .`: pass.
+- `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
+- `git diff --check`: pass.

@@ -5734,3 +5734,16 @@ Renderer size is now **3,799 executable lines**, down 95 from the prior WIP; run
 size is **29,373**. The complete Rockchip unit gate passes 126 tests with `-n12`, full Ruff and mypy pass, and exactly
 445 backend cases collect. Independent review returned `VERIFIED WITH CAVEATS`: hardware remains deliberately
 untouched pending the manual power cycle, so this is not an all-pass backend claim.
+
+## 2026-08-13 — restore linear synchronized-gather scheduling
+
+The runtime now groups mid-program gathers by their physical EW boundary once and walks those stable batches in order,
+instead of rescanning the complete gather tuple at every synchronization point. The change preserves each gather, EW
+slice, synchronization, and raw memory operation exactly; it only removes quadratic scheduler metadata work and adds no
+host tensor arithmetic. The previously recorded hardware A/B for this same transformation reduced cold `nonzero` from
+35.00 to 28.34 seconds, but hardware remains deliberately untouched in this checkpoint pending the manual power cycle.
+
+Renderer size stays at **3,799 executable lines**; runtime is **508** and the total tree is **29,374**. The Rockchip unit
+gate passes 126 tests with `-n12`, full Ruff and mypy pass, and exactly 445 backend tests collect. Independent review
+matched 2,396,745 old/new scheduler event traces and returned `VERIFIED`. This remains a WIP checkpoint, not an all-445
+hardware-pass claim.
