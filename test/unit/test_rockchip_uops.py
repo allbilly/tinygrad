@@ -74,6 +74,19 @@ def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
   assert program.submit_count == program.dev.submit_count == program.dev.task_count == 0
 
 
+def test_native_int16_fast_path_bounds_every_pc_chain(monkeypatch):
+  scratch = RKArg(RKBufferKind.SCRATCH, 0)
+  op = RKEWOp(scratch, scratch, scratch, 1, _EW_CFG[Ops.ADD], int16_input=True, int16_output=True)
+  program = object.__new__(rockchip_runtime.RockchipProgram)
+  program.dev = SimpleNamespace(_forget_program=lambda _program:None)
+  program.image, program._scratch_ew_bodies = RKImage(ew_ops=(op,)*129), {}
+  submitted = []
+  monkeypatch.setattr(program, "_submit_pcchain", lambda bodies:submitted.append(len(bodies)))
+  monkeypatch.setattr(rockchip_runtime, "_ew_stages", lambda *_args, **_kwargs:[(1,)])
+  program._run_ew_ops(lambda *_args:0, lambda *_args:None)
+  assert submitted == [48, 48, 33]
+
+
 def test_generic_fp16_uops_lower_in_dependency_order():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:lhs.index(i).load() + rhs.index(i).load() * 2.0))

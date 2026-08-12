@@ -222,7 +222,7 @@ class RockchipProgram(Program['RockchipDevice']):
         stages = []
         for op in ops: stages.extend(_ew_stages(op, address, _MAX_EW_ELEMS_FP16, 2, stateful=True, int16_output=True, int16_input=True))
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
-      self._submit_pcchain(list(cached))
+      for start in range(0, len(cached), _MAX_EW_GROUP_OPS): self._submit_pcchain(list(cached[start:start+_MAX_EW_GROUP_OPS]))
       return
     if tile_groups:
       groups:list[tuple[RKEWOp, ...]] = []

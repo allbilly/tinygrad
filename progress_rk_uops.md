@@ -3254,3 +3254,28 @@ Verification:
 - `.venv/bin/python -m ruff check tinygrad/runtime/ops_rockchip.py test/unit/test_rockchip_uops.py`: pass.
 - `.venv/bin/python -m mypy tinygrad/runtime/ops_rockchip.py`: pass.
 - `git diff --check`: pass.
+
+### 151. Bound native-INT16 PC chains before driver submission — complete
+
+- Audited the commit history against the authoritative milestone-43 checkpoint, where the post-catalog renderer passed
+  all 445 collected cases in one process: 433 passed, 12 skipped, zero failures, and 154 subtests passed. Later cleanup
+  milestones did not repeat that complete gate until milestone 141, which already reported 12 regressions; the old
+  checkpoint is therefore the behavioral oracle for the repair rather than evidence that missing UOp semantics are
+  required.
+- Found an unsafe physical-executor hole exposed by later generic lowering. Ordinary stateful groups are limited to 48
+  tasks per PC chain, but the pure native-INT16 scratch fast path bypassed that limit and submitted its complete cached
+  stage list at once. Previous crash journals show these long jobs timing out after 1,241 and 1,292 completed tasks,
+  after which the kernel driver's IOMMU reset/reattach failure made later allocation capable of crashing the OS.
+- Split cached native-INT16 stages at the existing 48-task physical limit. Every stage already carries complete stateful
+  INT16 configuration, so the split changes only ioctl boundaries and preserves NPU arithmetic, dependencies, memory,
+  and serialized RKImage semantics. No host tensor arithmetic or fallback was added.
+- Added a host-independent runtime regression proving a 129-stage INT16 chain is submitted as 48, 48, and 33 tasks.
+  Hardware replay is intentionally deferred: the latest reboot followed an unsafe platform recovery attempt, and this
+  milestone does not open `/dev/dri`, reset the NPU, or risk another kernel failure.
+- Runtime remains 453 executable lines because the bounded submit loop replaces the previous unbounded submit line;
+  renderer remains 4,092 executable lines.
+
+Verification:
+
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 98 passed in 4.78 seconds.
+- `git diff --check`: pass.
