@@ -3644,38 +3644,52 @@ Verification:
 - `DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
 
-### 163. Vectorize exact static-local address proofs — WIP checkpoint
+### 163. Superseded static-local renderer experiment — corrected checkpoint
 
-- Profiling after the 3,600-line checkpoint identified a scalar-true masked-selection program as the compile-only
-  outlier. Its 73 renderer UOps contain three dependent 320-step integer local reductions; the prior symbolic path
-  exceeded a 12-second profile timeout without producing an image.
-- Added a fail-closed compile-time vector evaluator for local programs used exclusively by global-load addresses and
-  gates. It accepts exact integer/Boolean definitions with constant positive axes and supported sequential updates;
-  float/FP16 locals, cycles, nonlocal data loads, nonzero local indices, non-constant load defaults, unsupported
-  expressions, and work above a conservative 256 MiB admission bound retain the old path or reject.
-- The exact captured 320-lane graph now proves offsets `range(320)` in about 0.6 seconds and renders in about 0.4
-  seconds as a 66-byte `NATIVE` identity image with one EW stage, zero gathers, zero synchronized gathers, and no host
-  gather/scatter. The existing nested integer-address case is a positive structural twin. Sequential FP16 address and
-  gate tests using `[2048, 1, -2048]`, plus mapped scalar MAX, are negative twins and remain on their existing paths.
-- Adversarial review exposed and the final tests close three admission gaps: dedicated float/Boolean load ABIs defer
-  to sequential lowering, local values shared with numeric output expressions are excluded, and axis/destination/order
-  arrays are reserved before NumPy allocation. Both vector and sequential local paths now enforce the existing
-  one-million-step cap before materializing loop-environment lists. A cheap REG-buffer pre-admission also prevents
-  unrelated graphs from entering the proof.
-- Renderer executable size grows from **3,598 to 3,697 lines** (net +99); runtime remains **508** and total tree size is
-  **29,272**. This is an explicit performance WIP, not the requested 3,400-line cleanup milestone.
+- The 73-UOp static-local fixture and its 66-byte identity image were valid renderer-only measurements, but follow-up
+  whole-pipeline profiling showed that the real scalar-true graph never reached this stage. `devectorize2` received
+  2,064 nodes and expanded beyond 166,000 visited nodes and 174,000 replacements in a bounded 11.8-second trace; an
+  unbounded probe exceeded 45 seconds and 2.4 GiB without producing renderer UOps.
+- The bounded vector evaluator therefore did not solve the actual workload. Its +99 renderer lines and focused tests
+  are removed. The separate sequential `_unroll_static_local` preflight remains because it prevents environment-list
+  construction beyond the existing step budget.
+- Five initial diagnostic `size=None` probes may have indirectly realized small Rockchip count kernels before the
+  count was stubbed. They are not hardware evidence. Later profiling used an invalid DRM path and an item stub.
+
+### 164. Fold scalar-true selection and consolidate dynamic typed loads — WIP checkpoint
+
+- `masked_select(size=None)` with a rank-0 direct constant-true mask now returns `self.flatten()` at the semantic API
+  boundary. This avoids constructing the cumulative-sum/scatter graph, takes roughly 0.1 ms in the compile-only probe,
+  and schedules no compute SINK. Tensor and bare-UOp identity tests cover multidimensional, empty, and scalar inputs;
+  fixed-size, scalar-false, rank-one, and derived-true masks remain unchanged. The Rockchip submit expectation changes
+  from one to zero while value equality remains required.
+- Consolidated the 76-line raw candidate emitter and 63-line dynamic typed-load parser into one candidate-major native
+  lowerer. It preserves FP16 raw payloads, INT16/INT32 bytes, negative normalization, external Boolean gates, multiple
+  axes, repeated channels, odd reductions, and blocked 1,001-candidate selection. A test-only physical interpreter
+  exercises all of these contracts, including exhaustive valid/no-match selection for the blocked fixture.
+- The new physical shape retains logical EW counts while reducing gathers: representative INT32 selection falls from
+  77 to 13 gathers, the two-axis fixture from 1,477 to 36, and the blocked fixture from 6,016 to 22. The independent
+  bounded-coordinate path remains byte-identical at 5,337 bytes, SHA-256
+  `065ebb556535c2724c9b7a641fb13a7bd464ce0a119bb4c61a1cdcf0f370f11c`.
+- Adversarial review caught signed-i32 byte-address overflow and u16 image-table overflow in the first consolidation.
+  The final admission rejects all oversized ARG slots and conservative scratch/gather plans before static evaluation,
+  checks actual index/source byte offsets before physical allocation, and audits the final specialized image. Element
+  offset `2^29-1` round-trips for INT32 data and indices; `2^29` rejects before gather construction. Eight older direct
+  specialized returns do not all share this centralized audit and remain a separate follow-up caveat.
+- Renderer executable size is **3,595 lines**, down 102 from the superseded WIP and three below milestone 162; runtime
+  remains **508**, `mixin/op.py` grows by one line, and total production size is **29,171** (net -101).
 
 Verification:
 
-- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -q -n12`: 134 passed.
-- Exact 320-lane image: 66 bytes, one EW stage, zero gathers/mid-gathers/host operations, encode/decode round-trip.
-- Float/Boolean source, mixed numeric-use, dynamic-default, and oversized-allocation cases: fail closed to their native
-  sequential paths or reject before allocation as appropriate.
-- Order-sensitive FP16 source-index and gate tests: passed on the unchanged sequential path.
-- Generic cosine/tangent ownership regression: passed after the early admission guard.
-- Independent adversarial verification: `VERIFIED`; both 16,384×4,096 loop paths reject before environment-list
-  construction, and no weakened test or adjacent correctness blocker was found.
+- `.venv/bin/python -m pytest test/unit/test_rockchip_uops.py -x -q -n12`: 139 passed.
+- `.venv/bin/python -m pytest test/null/test_tensor_uop_mixin.py -x -q -n12`: 216 passed.
+- Scalar-true CPU/Torch and JIT focused tests: passed; compile-only Tensor/UOp identities schedule zero compute SINKs.
+- Dynamic selector physical simulation: raw FP16/INT16/INT32, normalization, gates, multi-axis/repeat/odd/blocking cases
+  passed; 1,001-candidate image remains 724,098 bytes, 22 gathers, and 2,042 EW stages.
+- Independent adversarial verdicts: scalar identity `VERIFIED`; selector boundary hardening `VERIFIED WITH CAVEAT` for
+  the eight pre-existing specialized early-return paths outside this change.
 - `.venv/bin/python -m ruff check .`: pass.
 - `.venv/bin/python -m mypy tinygrad/`: 216 source files passed.
+- `ALLOW_DEVICE_USAGE=0 DEV=NPY .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q`: 445 tests collected.
 - `git diff --check`: pass.
 - Hardware execution remains pending the required manual power cycle; no all-445 pass is claimed.

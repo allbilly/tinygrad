@@ -10,10 +10,14 @@ from tinygrad.helpers import Target, ceildiv
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContext, RKExecutionClass, RKImage, RKLayout, RKStaticIndexEvaluator, RKValue,
   RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
+  _RKIMAGE_U16_MAX,
+  _MAX_STATIC_LOCAL_STEPS, _MAX_STATIC_RANGE_ENVS,
   _bool_tautology, _bounded_int32_fp16_root, _canonical_half_storage, _exact_int_range, _finite_max_neutrals, _fp16_bits,
+  _image_u16_safe,
   _eval_expr, _fp16_rewrite, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _hoist_leading_vector_materialization, _lower_mapped_scalar_local_reduction, _lower_uop_program, _output_store, _reuse_linear_scratch,
-  _semantic_local_loads, _static_int_vector, _static_local_load_offsets, RockchipRenderer, decode_image, encode_image)
+  _hoist_leading_vector_materialization, _lower_dynamic_typed_load, _lower_mapped_scalar_local_reduction, _lower_uop_program, _output_store,
+  _reuse_linear_scratch,
+  _semantic_local_loads, _static_int_vector, RockchipRenderer, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 from tinygrad.uop.ops import AxisType, Ops, UOp, graph_rewrite
 from tinygrad.uop.symbolic import sym
@@ -146,6 +150,72 @@ def _trunc_divmod_int32(lhs:int, rhs:int) -> tuple[int, int]:
 
 def _terminal_gathers(image:RKImage) -> tuple[RKGather, ...]:
   return tuple(gather for gather in image.mid_gathers if gather.after == len(image.ew_ops))
+
+def _dynamic_load_program(count:int=4, extents:tuple[int, ...]=(9,), dtype=dtypes.half, *, normalized:bool=False,
+                          external_gate:bool=False, repeat:int=1) -> list[UOp]:
+  out, source, lane = UOp.param(0, dtype, (count,)), UOp.param(1, dtype, (math.prod(extents)*repeat,)), UOp.range(count, 0)
+  coordinates:list[UOp] = []
+  gate:UOp|None = None
+  for axis,extent in enumerate(extents):
+    raw = UOp.param(axis+2, dtypes.int, (count//repeat,)).index(lane//repeat).load()
+    coordinate = (raw < 0).where(raw+extent, raw) if normalized else raw
+    valid = ((coordinate < 0) != UOp.const(True, dtypes.bool)) & (coordinate < extent)
+    coordinates.append(coordinate)
+    gate = valid if gate is None else gate & valid
+  index = coordinates[0]
+  for coordinate,extent in zip(coordinates[1:], extents[1:]): index = index*extent+coordinate
+  index = index*repeat+lane%repeat
+  if external_gate: gate = gate & UOp.param(len(extents)+2, dtypes.bool, (count//repeat,)).index(lane//repeat).load()  # type: ignore[operator]
+  assert gate is not None
+  zero = UOp.const(0.0, dtype) if dtype is dtypes.half else UOp.const(0, dtype)
+  return list(out.index(lane).store(source.index(index).load(zero, gate)).end(lane).sink().toposort())
+
+def _dynamic_offset_program(data_offset:int=0, index_offset:int=0) -> list[UOp]:
+  out, source, indices = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.int, (data_offset+1,)), \
+    UOp.param(2, dtypes.int, (index_offset+1,))
+  lane = UOp.range(1, 0)
+  dynamic = indices.index(lane+index_offset).load()
+  gate = ((dynamic < 0) != UOp.const(True, dtypes.bool)) & (dynamic < 1)
+  return list(out.index(lane).store(source.index(dynamic+data_offset).load(UOp.const(0, dtypes.int), gate)).end(lane).sink().toposort())
+
+def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -> bytes:
+  """Execute the selector's exact byte gathers plus native INT16 mask/reduction subset."""
+  args, scratch = [bytearray(output_bytes), *(bytearray(value) for value in inputs)], [bytearray(spec.size) for spec in image.scratch]
+  def buffer(kind:RKBufferKind, index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
+  def gathers(items) -> None:
+    for gather in items:
+      lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
+      dst, lanes = np.frombuffer(buffer(gather.dst_kind, gather.dst_index), dtype=lane_dtype), np.arange(gather.count, dtype=np.intp)
+      dst_index = gather.dst_addend+lanes*gather.dst_stride
+      if gather.values: dst[dst_index] = gather.values
+      elif gather.offsets:
+        src, offsets = np.frombuffer(buffer(gather.src_kind, gather.src_index), dtype=lane_dtype), np.asarray(gather.offsets)
+        valid = offsets >= 0
+        if not gather.partial: dst[dst_index] = gather.fill_bits
+        dst[dst_index[valid]] = src[offsets[valid]]
+      else:
+        src, offsets = np.frombuffer(buffer(gather.src_kind, gather.src_index), dtype=lane_dtype), np.full(gather.count, gather.base)
+        for divisor,limit,stride in gather.axes: offsets += lanes//divisor%limit*stride
+        dst[dst_index] = src[offsets]
+  def execute(op:RKEWOp) -> None:
+    assert op.int16_input and op.int16_output and not op.int32_input and not op.int32_output
+    def view(arg:RKArg) -> np.ndarray: return np.frombuffer(buffer(arg.kind, arg.index), dtype="<i2", count=op.count, offset=arg.addend)
+    lhs, rhs = view(op.lhs).astype(np.int32), view(op.rhs).astype(np.int32)
+    if op.ew_cfg == _EW_CFG[Ops.ADD]: value = lhs+rhs
+    elif op.ew_cfg == _EW_CFG[Ops.SUB]: value = lhs-rhs
+    elif op.ew_cfg == _EW_CFG[Ops.MUL]: value = lhs*rhs
+    elif op.ew_cfg == _EW_CFG[Ops.MAX]: value = np.maximum(lhs, rhs)
+    elif op.ew_cfg == _EW_CFG_MIN: value = np.minimum(lhs, rhs)
+    elif op.ew_cfg == _EW_CFG_ABS: value = np.abs(lhs)
+    else: raise AssertionError(f"unsupported dynamic selector EW config {op.ew_cfg:#x}")
+    view(op.dst)[:] = np.clip(value, -32768, 32767).astype("<i2")
+  gathers(image.gathers)
+  mid:dict[int, list[RKGather]] = {}
+  for gather in image.mid_gathers: mid.setdefault(gather.after, []).append(gather)
+  for index in range(len(image.ew_ops)+1):
+    gathers(mid.get(index, ()))
+    if index < len(image.ew_ops): execute(image.ew_ops[index])
+  return bytes(args[0])
 
 def _physical_ew_tasks(image:RKImage) -> int:
   def count(op:RKEWOp) -> int:
@@ -1403,63 +1473,6 @@ def test_nested_static_local_accumulators_materialize_load_addresses():
   assert image is not None and len(image.gathers) == 1 and image.gathers[0].offsets == (0, 0, 0, 0)
   assert not image.host_gathers and decode_image(encode_image(image)) == image
 
-def _one_step_integer_local_index(source_dtype, count:int=2, expose_index:bool=False, dynamic_default:bool=False,
-                                  loop_extents:tuple[int, ...]=(1,)):
-  output_dtype = source_dtype if source_dtype is dtypes.bool else dtypes.half
-  out, source = UOp.param(0, output_dtype, (count,)), UOp.param(1, source_dtype, (count,))
-  lane = UOp.range(count, 3)
-  axes = tuple(UOp.range(extent, i, AxisType.REDUCE) for i,extent in enumerate(loop_extents))
-  local = UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
-  initialize = local.index(0).store(0)
-  pointer = local.after(initialize, *axes).index(0)
-  update = pointer.store(pointer.load()+(lane+sum(axes, UOp.const(0, dtypes.int))))
-  index = local.after(update.end(*axes)).index(0).load()
-  if dynamic_default:
-    fallback = UOp.param(2, source_dtype, (count,)).index(lane).load()
-    value = source.index(index).load(fallback, lane < count-1)
-  else: value = source.index(index).load()
-  if source_dtype is dtypes.float: value = value.cast(dtypes.half)+1
-  if expose_index: value = value+index.cast(dtypes.half)
-  uops = list(UOp.sink(initialize, update, out.index(lane).store(value)).toposort())
-  output = _output_store(uops, output_dtype, allow_local=True)
-  assert output is not None
-  return uops, output
-
-def test_static_local_offsets_defer_dedicated_global_load_abis():
-  for dtype in (dtypes.bool, dtypes.float):
-    uops, output = _one_step_integer_local_index(dtype)
-    assert _static_local_load_offsets(uops, output, output[4]) is None
-    image = _lower_uop_program(uops)
-    assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-    assert decode_image(encode_image(image)) == image
-
-def test_static_local_offsets_require_exclusive_address_use():
-  uops, output = _one_step_integer_local_index(dtypes.half, expose_index=True)
-  assert _static_local_load_offsets(uops, output, output[4]) is None
-  image = _lower_uop_program(uops)
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert decode_image(encode_image(image)) == image
-
-def test_static_local_offsets_defer_dynamic_load_default():
-  uops, output = _one_step_integer_local_index(dtypes.half, dynamic_default=True)
-  assert _static_local_load_offsets(uops, output, output[4]) is None
-  image = _lower_uop_program(uops)
-  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
-  assert decode_image(encode_image(image)) == image
-
-def test_static_local_offsets_preflight_axis_and_order_vectors(monkeypatch):
-  def unexpected_allocation(*_args, **_kwargs): raise AssertionError("axis allocation escaped the 256 MiB preflight")
-  monkeypatch.setattr("tinygrad.renderer.rockchip.np.arange", unexpected_allocation)
-  for count in (10_000_000, 100_000_000):
-    uops, output = _one_step_integer_local_index(dtypes.half, count=count)
-    assert _static_local_load_offsets(uops, output, output[4]) is None
-
-def test_static_local_offsets_preflight_reducer_steps(monkeypatch):
-  uops, output = _one_step_integer_local_index(dtypes.half, count=1, loop_extents=(16_384, 4_096))
-  def unexpected_iteration(*_args, **_kwargs): raise AssertionError("loop environments escaped the step preflight")
-  monkeypatch.setattr("tinygrad.renderer.rockchip._iter_selected_range_env", unexpected_iteration)
-  assert _static_local_load_offsets(uops, output, output[4]) is None
-
 def test_static_local_unroll_preflight_reducer_steps(monkeypatch):
   out, local = UOp.param(0, dtypes.int, (1,)), UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
   axes = UOp.range(16_384, 0, AxisType.REDUCE), UOp.range(4_096, 1, AxisType.REDUCE)
@@ -1471,46 +1484,6 @@ def test_static_local_unroll_preflight_reducer_steps(monkeypatch):
   def unexpected_iteration(*_args, **_kwargs): raise AssertionError("loop environments escaped the fallback step preflight")
   monkeypatch.setattr("tinygrad.renderer.rockchip._iter_selected_range_env", unexpected_iteration)
   assert _lower_uop_program(uops) is None
-
-def test_vector_static_integer_locals_collapse_identity_masked_select_address():
-  count = 320
-  out, source = UOp.param(0, dtypes.half, (count,)), UOp.param(1, dtypes.half, (count,))
-  lane = UOp.range(count, 2)
-  third_axis = UOp.range(count, 2, AxisType.REDUCE, src=(lane,))
-  second_axis = UOp.range(count, 1, AxisType.REDUCE, src=(third_axis,))
-  first_axis = UOp.range(count, 0, AxisType.REDUCE, src=(second_axis,))
-  first = UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
-  first_init = first.after(second_axis).index(0).store(0)
-  first_ptr = first.after(first_init, first_axis).index(0)
-  first_term = ((first_axis+second_axis < count-1) != UOp.const(True, dtypes.bool)).cast(dtypes.int)
-  first_update = first_ptr.store(first_ptr.load()+first_term)
-  first_result = first.after(first_update.end(first_axis)).index(0).load()
-
-  second = UOp.placeholder((1,), dtypes.int, 1, addrspace=AddrSpace.REG)
-  second_init = second.after(lane, third_axis).index(0).store(0)
-  second_ptr = second.after(second_init, second_axis).index(0)
-  second_term = (first_result != lane+third_axis-count+1).where(0, 1)
-  second_update = second_ptr.store(second_ptr.load()+second_term)
-  second_result = second.after(second_update.end(second_axis)).index(0).load()
-
-  third = UOp.placeholder((1,), dtypes.int, 2, addrspace=AddrSpace.REG)
-  third_init = third.after(lane).index(0).store(0)
-  third_ptr = third.after(third_init, third_axis).index(0)
-  third_term = (lane+third_axis < count-1).where(0, second_result)
-  third_update = third_ptr.store(third_ptr.load()+third_term)
-  index = third.after(third_update.end(third_axis)).index(0).load()
-  normalized = (index < 0).where(index+count, index)
-  gate = ((normalized < 0) != UOp.const(True, dtypes.bool)) & (normalized < count)
-  output = out.index(lane).store(source.index(normalized).load(UOp.const(0.0, dtypes.half), gate)).end(lane)
-  uops = list(UOp.sink(first_init, first_update, second_init, second_update, third_init, third_update, output).toposort())
-  parsed = _output_store(uops, dtypes.half, allow_local=True)
-  assert parsed is not None
-  offsets = _static_local_load_offsets(uops, parsed, parsed[4])
-  assert offsets is not None and tuple(offsets.values()) == (tuple(range(count)),)
-  image = _lower_uop_program(uops)
-  assert image is not None and (len(image.ew_ops), len(image.gathers), len(image.mid_gathers), len(image.host_gathers)) == (1, 0, 0, 0)
-  assert len(encode_image(image)) == 66 and decode_image(encode_image(image)) == image
-
 
 def test_packed_bool_load_uses_canonical_int16_lanes():
   out, mask = UOp.param(0, dtypes.int, (4,)), UOp.param(1, dtypes.bool, (4,))
@@ -1573,6 +1546,136 @@ def test_dynamic_index_materializer_composes_external_bool_gate():
   assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
   assert any(gather.src_index == mask.arg.slot and gather.itemsize == 1 for gather in image.gathers)
   assert decode_image(encode_image(image)) == image
+
+def test_dynamic_candidate_selector_preserves_plain_fp16_int16_int32_raw_payloads():
+  indices = np.asarray((0, 1, 2, 8), dtype="<i4")
+  sources = {
+    dtypes.half:np.asarray((0x0000, 0x8000, 0x7e01, 0x7fff, 0x7c01, 0xfc01, 0x3555, 0xbc00, 0x0400), dtype="<u2"),
+    dtypes.int16:np.asarray((0x0000, 0x8000, 0xffff, 0x7fff, 0x00ff, 0xff00, 0x5555, 0xaaaa, 0x1234), dtype="<u2"),
+    dtypes.int:np.asarray((0, 0x80000000, 0x7fc01234, 0xffffffff, 0x7fffffff, 0x00800000,
+                           0xff800001, 0x55aa55aa, 0x12345678), dtype="<u4"),
+  }
+  for dtype,source in sources.items():
+    image = _lower_uop_program(_dynamic_load_program(dtype=dtype))
+    assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+    output = _execute_raw_dynamic_image(image, 4*dtype.itemsize, source.tobytes(), indices.tobytes())
+    assert output == source[indices].tobytes() and decode_image(encode_image(image)) == image
+    metrics = (6_019, 13, 55, 55) if dtype is dtypes.int else (5_071, 11, 37, 37)
+    assert (len(encode_image(image)), len(image.gathers), len(image.ew_ops), _physical_ew_tasks(image)) == metrics
+
+def test_dynamic_candidate_selector_normalizes_negative_indices_exactly():
+  source = np.asarray((0x0000, 0x8000, 0x7e01, 0x7fff, 0x7c01, 0xfc01, 0x3555, 0xbc00, 0x0400), dtype="<u2")
+  indices = np.asarray((-1, -9, -5, -10), dtype="<i4")
+  image = _lower_uop_program(_dynamic_load_program(normalized=True))
+  assert image is not None and not image.host_gathers
+  expected = np.asarray((source[8], source[0], source[4], 0), dtype="<u2")
+  assert _execute_raw_dynamic_image(image, 8, source.tobytes(), indices.tobytes()) == expected.tobytes()
+  assert (len(encode_image(image)), len(image.gathers), len(image.ew_ops), _physical_ew_tasks(image)) == (8_583, 19, 57, 57)
+
+def test_dynamic_candidate_selector_composes_external_gate_semantics():
+  source = np.asarray((0x8000, 0x7e01, 0x7fff, 0x7c01, 0xfc01, 0x3555, 0xbc00, 0x0400, 0x0001), dtype="<u2")
+  indices, gate = np.asarray((0, 1, 2, 8), dtype="<i4"), np.asarray((1, 0, 1, 0), dtype=np.uint8)
+  image = _lower_uop_program(_dynamic_load_program(external_gate=True))
+  assert image is not None and not image.host_gathers
+  expected = np.asarray((source[0], 0, source[2], 0), dtype="<u2")
+  assert _execute_raw_dynamic_image(image, 8, source.tobytes(), indices.tobytes(), gate.tobytes()) == expected.tobytes()
+  assert (len(encode_image(image)), len(image.gathers), len(image.ew_ops), _physical_ew_tasks(image)) == (5_204, 12, 39, 39)
+
+def test_dynamic_candidate_selector_composes_two_normalized_axes_and_gate():
+  source = (np.arange(81, dtype=np.uint32)*257+0x8000).astype("<u2")
+  first, second = np.asarray((-1, 0, 2, -10), dtype="<i4"), np.asarray((0, -1, 3, 4), dtype="<i4")
+  gate = np.asarray((1, 1, 0, 1), dtype=np.uint8)
+  image = _lower_uop_program(_dynamic_load_program(extents=(9, 9), normalized=True, external_gate=True))
+  assert image is not None and not image.host_gathers
+  expected = np.asarray((source[72], source[8], 0, 0), dtype="<u2")
+  assert _execute_raw_dynamic_image(image, 8, source.tobytes(), first.tobytes(), second.tobytes(), gate.tobytes()) == expected.tobytes()
+  assert (len(encode_image(image)), len(image.gathers), len(image.ew_ops), _physical_ew_tasks(image)) == (99_836, 36, 243, 243)
+
+def test_dynamic_candidate_selector_repeats_three_raw_channels():
+  source = (np.arange(21, dtype=np.uint32)*131+0x8000).astype("<u2")
+  indices, gate = np.asarray((6, 0, 3, 7), dtype="<i4"), np.asarray((1, 0, 1, 1), dtype=np.uint8)
+  image = _lower_uop_program(_dynamic_load_program(count=12, extents=(7,), external_gate=True, repeat=3))
+  assert image is not None and not image.host_gathers
+  expected = np.zeros(12, dtype="<u2")
+  expected[:3], expected[6:9] = source[18:21], source[9:12]
+  assert _execute_raw_dynamic_image(image, 24, source.tobytes(), indices.tobytes(), gate.tobytes()) == expected.tobytes()
+  assert (len(encode_image(image)), len(image.gathers), len(image.ew_ops), _physical_ew_tasks(image)) == (6_140, 16, 67, 67)
+
+def test_dynamic_candidate_selector_blocks_and_exhausts_1001_candidates():
+  source = (np.arange(1001, dtype=np.uint32)+0x8000).astype("<u2")
+  image = _lower_uop_program(_dynamic_load_program(count=64, extents=(1001,)))
+  assert image is not None and not image.host_gathers
+  for start in range(0, 1024, 64):
+    indices = np.arange(start, start+64, dtype="<i4")
+    expected = np.zeros(64, dtype="<u2")
+    valid = indices < len(source)
+    expected[valid] = source[indices[valid]]
+    assert _execute_raw_dynamic_image(image, 128, source.tobytes(), indices.tobytes()) == expected.tobytes()
+  assert (len(encode_image(image)), len(image.gathers), len(image.ew_ops), _physical_ew_tasks(image)) == (724_098, 22, 2_042, 2_042)
+
+def test_dynamic_candidate_selector_rejects_tables_before_allocation(monkeypatch):
+  def unexpected(*_args, **_kwargs): raise AssertionError("candidate table escaped pre-allocation admission")
+  monkeypatch.setattr("tinygrad.renderer.rockchip.RKStaticIndexEvaluator", unexpected)
+  cases = ((1, _MAX_STATIC_RANGE_ENVS+1), (4096, _MAX_STATIC_LOCAL_STEPS//(4096*2+1)+1))
+  for count,extent in cases:
+    program = _dynamic_load_program(count=count, extents=(extent,))
+    output = _output_store(program, dtypes.half)
+    assert output is not None and _lower_dynamic_typed_load(output, dtypes.half) is None
+
+def test_dynamic_candidate_selector_rejects_u16_tables_and_arg_slots_before_evaluation(monkeypatch):
+  def unexpected(*_args, **_kwargs): raise AssertionError("u16 admission escaped into static evaluation")
+  monkeypatch.setattr("tinygrad.renderer.rockchip.RKStaticIndexEvaluator", unexpected)
+  for limit,program in ((31, _dynamic_load_program(extents=(1, 1), normalized=True)),
+                        (80, _dynamic_load_program(count=64, extents=(1001,)))):
+    with monkeypatch.context() as bounded:
+      bounded.setattr("tinygrad.renderer.rockchip._RKIMAGE_U16_MAX", limit)
+      output = _output_store(program, dtypes.half)
+      assert output is not None and _lower_dynamic_typed_load(output, dtypes.half) is None
+  out, source, indices = UOp.param(0, dtypes.half, (1,)), UOp.param(_RKIMAGE_U16_MAX+1, dtypes.half, (1,)), UOp.param(2, dtypes.int, (1,))
+  lane = UOp.range(1, 0)
+  dynamic = indices.index(lane).load()
+  gate = ((dynamic < 0) != UOp.const(True, dtypes.bool)) & (dynamic < 1)
+  program = list(out.index(lane).store(source.index(dynamic).load(UOp.const(0.0, dtypes.half), gate)).end(lane).sink().toposort())
+  output = _output_store(program, dtypes.half)
+  assert output is not None and _lower_dynamic_typed_load(output, dtypes.half) is None
+
+def test_dynamic_candidate_selector_rejects_raw_i32_addresses_before_physical_allocation(monkeypatch):
+  safe, unsafe = (1 << 29)-1, 1 << 29
+  for program in (_dynamic_offset_program(data_offset=safe), _dynamic_offset_program(index_offset=safe)):
+    output = _output_store(program, dtypes.int)
+    assert output is not None and (image:=_lower_dynamic_typed_load(output, dtypes.int)) is not None
+    assert decode_image(encode_image(image)) == image
+  def unexpected(*_args, **_kwargs): raise AssertionError("unencodable raw address escaped into physical allocation")
+  monkeypatch.setattr("tinygrad.renderer.rockchip._physical_lists", unexpected)
+  for program in (_dynamic_offset_program(data_offset=unsafe), _dynamic_offset_program(index_offset=unsafe)):
+    output = _output_store(program, dtypes.int)
+    assert output is not None and _lower_dynamic_typed_load(output, dtypes.int) is None
+
+def test_dynamic_candidate_selector_final_audit_rejects_unencodable_ew_indices(monkeypatch):
+  invalid = RKArg(RKBufferKind.SCRATCH, _RKIMAGE_U16_MAX+1)
+  assert not _image_u16_safe(RKImage(ew_ops=(RKEWOp(invalid, RKArg(RKBufferKind.SCRATCH, 0), invalid, 1, _EW_CFG[Ops.ADD]),)))
+  def physical(*_args, **_kwargs):
+    sizes:list[int] = []
+    def scratch(size:int) -> int:
+      sizes.append(size)
+      return _RKIMAGE_U16_MAX+1
+    return sizes, scratch, [], []
+  monkeypatch.setattr("tinygrad.renderer.rockchip._physical_lists", physical)
+  output = _output_store(_dynamic_load_program(), dtypes.half)
+  assert output is not None and _lower_dynamic_typed_load(output, dtypes.half) is None
+
+def test_bounded_coordinate_selector_image_remains_byte_identical():
+  count = 4
+  out, source, index = UOp.param(0, dtypes.int, (count,)), UOp.param(1, dtypes.half, (count,)), UOp.param(2, dtypes.int, (count,))
+  lane = UOp.range(count, 0).cast(dtypes.int)
+  terms = [(source.index(k).load() != UOp.const(0, dtypes.half)).cast(dtypes.int) for k in range(count)]
+  total = sum(terms[1:], terms[0])
+  root = (lane < total).where(index.index(lane).load(), UOp.const(-1, dtypes.int))
+  image = _lower_uop_program(list(out.index(lane).store(root).sink().toposort()))
+  assert image is not None
+  blob = encode_image(image)
+  assert (len(blob), hashlib.sha256(blob).hexdigest(), len(image.gathers), len(image.mid_gathers), len(image.ew_ops)) == \
+    (5_337, "065ebb556535c2724c9b7a641fb13a7bd464ce0a119bb4c61a1cdcf0f370f11c", 38, 1, 37)
 
 
 def test_int32_bounds_predicates_execute_as_ordinary_uops():

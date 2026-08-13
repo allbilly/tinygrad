@@ -1192,6 +1192,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     ```
     """
     if not dtypes.is_bool(mask.dtype): raise RuntimeError(f"masked_select expects bool mask tensor, got {mask.dtype}")
+    if size is None and mask.shape == () and mask._uop.op is Ops.CONST and mask._uop.arg is True: return self.flatten()
     x, mask = self.flatten(), mask._broadcast_to(self.shape).flatten()
     mask_cumsum = mask.cumsum()
     if size is None:

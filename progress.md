@@ -5769,25 +5769,42 @@ checkpoint; runtime remains **508** and total tree size is **29,173**. The Rockc
 `VERIFIED WITH CAVEATS`: the sole caveat is that hardware execution remains deliberately pending the required manual
 power cycle. This is a WIP checkpoint, not an all-445 hardware-pass claim.
 
-## 2026-08-13 — vectorize exact static-local address proofs
+## 2026-08-13 — correct the static-local profiling conclusion
 
-The slowest compile-only case after the 3,600-line checkpoint was a scalar-true masked selection whose 73-UOp final
-program contains three dependent 320-step integer local reductions. Symbolically expanding that address program took
-more than 12 seconds without producing an image. The renderer now executes only proven integer/Boolean local address
-and gate programs in bounded compile-time vectors, while leaving floating-point locals on the existing sequential UOp
-path. The resulting address is proved to be the identity and lowers to a 66-byte native image with one EW stage, no
-gathers, and no host execution; the exact captured proof takes about 0.6 seconds and final rendering about 0.4 seconds.
+Whole-pipeline profiling disproved the preceding checkpoint's end-to-end performance conclusion. The captured 73-UOp
+program was a valid renderer-only stress case, and the bounded static-local evaluator did reduce that final lowering to
+about one second and a 66-byte native image. The real scalar-true masked-selection graph never reached it: generic
+`devectorize2` received 2,064 nodes and expanded past 166,000 visited nodes and 174,000 replacements in an 11.8-second
+bounded trace, with an unbounded probe exceeding 45 seconds and 2.4 GiB without producing renderer UOps. The evaluator
+therefore optimized a downstream form that the actual workload did not reach, and its +99 renderer lines are removed.
 
-Admission is deliberately narrow: local definitions must use supported exact integer operations and constant positive
-axes, all local loads must belong exclusively to global-load addresses or gates, and cycles, runtime tensor inputs,
-nonzero local indices, non-constant load defaults, unsupported dtypes/operations, and programs exceeding a conservative
-256 MiB work bound fail closed. Adversarial review exposed and the final regressions close typed-load routing, mixed
-numeric-use, and pre-allocation memory-accounting gaps. Existing order-sensitive FP16 `[2048, 1, -2048]` address and
-gate images remain on their sequential path. A cheap REG-buffer gate also prevents unrelated graphs from entering.
+Five early diagnostic `size=None` probes were run before count realization was stubbed and may have indirectly executed
+small Rockchip count kernels. No result from those probes is used as hardware evidence. Every subsequent diagnostic used
+an invalid DRM path and a compile-only item stub; this checkpoint still makes no device-validation claim.
 
-This performance checkpoint grows the renderer from **3,598 to 3,697 executable lines** (net +99); runtime remains
-**508** and total tree size is **29,272**. The complete Rockchip unit gate passes 134 tests with `-n12`, full Ruff and
-mypy pass, and the focused native image round-trips exactly. Independent adversarial review returned `VERIFIED` after
-the typed-load, exclusivity, pre-allocation, and loop-step counterexamples were added as regressions. NPU execution and
-the all-445 hardware replay remain deliberately pending the required manual power cycle, so this is not the requested
-3,400-line checkpoint or an all-pass backend claim.
+## 2026-08-13 — fold scalar-true selection and consolidate dynamic candidate loads
+
+A dynamic-size rank-0 direct constant-true `masked_select` is exactly the flattened source. `OpMixin.masked_select` now
+returns `self.flatten()` for that semantic identity before the cumulative-sum/scatter graph exists. Tensor and bare-UOp
+tests cover multidimensional, empty, and scalar inputs; fixed-size, scalar-false, rank-one, and derived-true masks retain
+their prior paths. Construction drops to roughly 0.1 ms and schedules no compute SINK, so the Rockchip submit expectation
+is correctly zero rather than one. The renderer's static-local vector evaluator and its glue/tests are selectively
+removed, while the independent sequential local-unroll step cap and its regression remain.
+
+The dynamic typed-load path now combines parsing and candidate-major raw-byte selection in one fail-closed lowerer.
+FP16 payload bits (including signed zero and NaN payloads), INT16, INT32, negative normalization, external gates,
+multi-axis addressing, repeated channels, odd row reductions, and 1,001-candidate blocking are exercised by a physical
+image simulator. Representative INT32 gathers fall from 77 to 13 and the two-axis fixture from 1,477 to 36 without
+changing logical EW counts; the independent bounded-coordinate selector remains byte-identical.
+
+Adversarial review found two serialization boundaries in the first consolidation. The final path rejects before table
+allocation when u16 image counts/indices would overflow, checks every ARG slot, and proves raw byte bases fit the signed
+i32 wire fields. Exact INT32 element offset `2^29-1` encodes and round-trips; `2^29` fails closed before physical gather
+construction. A final image audit covers the specialized return. Eight older specialized early-return paths still do
+not all share that audit and remain an explicit follow-up caveat.
+
+Renderer size is now **3,595 executable lines**, down 102 from the superseded WIP and three below the prior 3,600-line
+checkpoint; runtime remains **508**, the mixin grows by one line, and total tree size is **29,171** (net -101). The
+Rockchip UOp suite passes 139 tests with `-n12`, the null/UOp mixin suite passes 216, full Ruff and mypy pass, and exactly
+445 backend cases collect. Independent review verified both changes, with only the pre-existing early-return audit and
+the deliberately pending hardware replay noted as caveats. No all-445 hardware-pass claim is made.

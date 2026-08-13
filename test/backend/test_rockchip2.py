@@ -227,7 +227,7 @@ class TestRockchipMaskedSelectOps(_base.TestRockchipMaskedSelectOps):
     before = Device["ROCKCHIP"].submit_count
     with Context(NOOPT=1): got = Tensor(values, device="ROCKCHIP").masked_select(Tensor(True)).realize().numpy()
     np.testing.assert_array_equal(got, values)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 0)
   def test_fixed_masked_select_pad_and_truncate(self):
     values = np.array([-3., 2., -1., 4., 5., -2.], dtype=np.float16)
     source = Tensor(values, device="ROCKCHIP")
