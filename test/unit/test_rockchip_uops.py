@@ -1,4 +1,4 @@
-import math, struct
+import itertools, math, struct
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
@@ -6,12 +6,36 @@ from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, R
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
+import tinygrad.renderer.rockchip as rockchip_renderer
 from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
 def _program(dtype, value, count:int=4):
   out, axis = UOp.param(0, dtype, (count,)), UOp.range(count, 0)
   return list(out.index(axis).store(value(axis)).end(axis).sink().toposort())
+
+
+def test_binary_tree_iteration_is_ordered_and_bounded_on_shared_dags():
+  leaves = [UOp.const(x, dtypes.int) for x in range(8)]
+  root = leaves[0]
+  for leaf in leaves[1:]: root = root+leaf
+  assert list(rockchip_renderer._iter_binary(root, Ops.ADD)) == leaves
+  shared = root
+  for _ in range(30): shared = shared+shared
+  assert len(list(itertools.islice(rockchip_renderer._iter_binary(shared, Ops.ADD), 256))) == 256
+
+
+def test_static_vector_values_match_scalar_typed_evaluation():
+  outer, inner = UOp.range(5, 100), UOp.range(4, 101)
+  out_index = outer.cast(dtypes.int)*4+inner.cast(dtypes.int)
+  expressions = (outer*7-inner*3+5, (outer < 3).where(inner+11, outer-7),
+                 ((outer*7-inner*3+5).cast(dtypes.half)*0.5+1.25).cast(dtypes.half), (outer < 3) & (inner != 2))
+  for expr,encode in zip(expressions, (int, int, rockchip_renderer._fp16_bits, lambda x:int(bool(x)))):
+    expected = [None]*20
+    for env in rockchip_renderer._iter_range_env([outer, inner]):
+      cache = {}
+      expected[rockchip_renderer._eval_int(out_index, env, cache)] = encode(rockchip_renderer._eval_expr(expr, env, cache))
+    assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
 
 
 def test_rkvalue_is_the_typed_physical_abi():
@@ -647,6 +671,38 @@ def test_nested_static_local_accumulators_materialize_load_addresses():
   image = _lower_uop_program(list(UOp.sink(inner_init, inner_update, outer_init, outer_update, output).toposort()))
   assert image is not None and len(image.gathers) == 1 and image.gathers[0].offsets == (0, 0, 0, 0)
   assert not image.host_gathers and decode_image(encode_image(image)) == image
+
+
+def test_static_local_address_preserves_sequential_fp16_updates():
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (2,))
+  buffer = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG)
+  initialize, axis = buffer.index(0).store(0.0), UOp.range(3, 0, AxisType.REDUCE)
+  pointer = buffer.after(initialize, axis).index(0)
+  term = (axis < 1).where(UOp.const(2048.0, dtypes.half),
+                         (axis < 2).where(UOp.const(1.0, dtypes.half), UOp.const(-2048.0, dtypes.half)))
+  update = pointer.store(pointer.load()+term)
+  index = buffer.after(update.end(axis)).index(0).load().cast(dtypes.int)
+  store = out.index(0).store(source.index(index).load())
+  uops = list(UOp.sink(initialize, update, store).toposort())
+  output = rockchip_renderer._output_store(uops, dtypes.half, allow_local=True)
+  assert output is not None
+  assert next(iter(rockchip_renderer._static_local_load_offsets(uops, output, output[4]).values())) == (0,)
+  assert (image:=_lower_uop_program(uops)) is not None and decode_image(encode_image(image)) == image
+
+
+def test_static_local_address_preflights_reducer_product(monkeypatch):
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (2,))
+  buffer = UOp.placeholder((1,), dtypes.int, 0, addrspace=AddrSpace.REG)
+  initialize = buffer.index(0).store(0)
+  outer = UOp.range(16384, 0, AxisType.REDUCE)
+  inner = UOp.range(4096, 1, AxisType.REDUCE, src=(outer,))
+  pointer = buffer.after(initialize, outer, inner).index(0)
+  update = pointer.store(pointer.load()+1)
+  index = buffer.after(update.end(outer, inner)).index(0).load()
+  store = out.index(0).store(source.index(index).load())
+  monkeypatch.setattr(rockchip_renderer, "_iter_selected_range_env",
+                      lambda *_: (_ for _ in ()).throw(AssertionError("iterator reached")))
+  assert _lower_uop_program(list(UOp.sink(initialize, update, store).toposort())) is None
 
 
 def test_packed_bool_load_uses_canonical_int16_lanes():

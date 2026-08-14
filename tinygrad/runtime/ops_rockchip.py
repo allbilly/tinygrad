@@ -441,11 +441,12 @@ class RockchipProgram(Program['RockchipDevice']):
                              rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if self.image.mid_gathers:
       cursor = 0
-      points = sorted({g.after if g.after >= 0 else self.image.gather_after for g in self.image.mid_gathers})
-      for point in points:
+      by_point:dict[int, list[RKGather]] = {}
+      for gather in self.image.mid_gathers:
+        by_point.setdefault(gather.after if gather.after >= 0 else self.image.gather_after, []).append(gather)
+      for point,gathers in sorted(by_point.items()):
         self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:point])
-        synchronized_gathers(tuple(g for g in self.image.mid_gathers
-                                   if (g.after if g.after >= 0 else self.image.gather_after) == point), True)
+        synchronized_gathers(tuple(gathers), True)
         cursor = point
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
