@@ -5873,3 +5873,34 @@ structural targets; zero-hit alone is not sufficient evidence after the earlier 
 The transferred renderer SHA-256 (`28007016...4950`) exactly matches the fully tested `/tmp/rk-next.NowIem` worktree.
 No test, runtime, core code, tolerance, tensor-value execution, CPU/GPU fallback, CMAC, LUT, reset, reboot, or push was
 used. `lines_saving.md` remains untouched.
+
+---
+
+## 2026-08-15 — unify duplicated static scalar/vector UOp evaluation
+
+The most error-prone small subsystem was the compile-time static evaluator: `_eval_expr` and `_eval_vector`
+independently implemented the same casts, arithmetic, comparisons, bitwise operators, division/modulo rules, error
+handling, and cache behavior. This was not tensor execution; both paths only materialize static addresses, gates, and
+layouts while constructing an RK image. The two ALU dispatch tables now share `_static_cast` and `_static_alu`, using
+tinygrad's canonical `exec_alu`/`python_alu` operations while retaining lazy scalar WHERE, eager vector WHERE,
+zero-divisor conventions, vector broadcasting, and dtype recasting.
+
+A larger attempted deletion of the 94-line static-local address interpreter was rejected entirely in `/tmp`. It
+passed 432 hardware cases but broke `test_std_mean`; restoring shallow walkers did not recover the ordering semantics.
+No part of that failed experiment was transferred. This smaller evaluator refactor was transferred only after exact
+semantic, image, and hardware proof.
+
+- Exact renderer diff: **45 insertions / 62 deletions**, executable lines **5,507 -> 5,490** (**-17**); runtime remains
+  **489**, total **31,046**. Cumulative renderer reduction from the 6,616-line cleanup baseline is **1,126 lines**.
+- Static evaluator differential: **83,134** exact old/new scalar and vector outcomes, covering NaN/Inf, integer
+  boundaries, casts, comparisons, bitwise operations, both division families including zero, broadcasting, and lazy
+  scalar branches.
+- Ordered UOp image census: **107** lowering outcomes / **100** images, byte-identical list digest
+  `a4ca3c5c...05fa`; UOp tests: **89 passed** with `-n12`.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **784.28 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`a209292d...166f`) exactly matches the fully tested
+`/tmp/rk-static-eval.Ss3cwQ` worktree. No test, runtime, tolerance, tensor-value execution, CPU/GPU fallback, CMAC,
+LUT, reset, reboot, or push was used.
