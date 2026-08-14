@@ -2009,65 +2009,6 @@ def _lower_loop_int32_equality_add(uops:list[UOp], output:RKOutput) -> RKImage|N
   row_sources = operands + tuple((None,)*rows for _ in range(max(0, 2-len(operands))))
   return _int32_sum_occurrence_image(out_param.arg.slot, count, coordinate_values, row_sources)
 
-def _int32_index_selection_image(out_slot:int, count:int, index_slot:int, index_offsets:tuple[int, ...],
-                                 candidate_values:tuple[tuple[int, ...], ...]) -> RKImage|None:
-  """Select per-lane bounded INT16 values by exact external INT32 index equality."""
-  rows = len(candidate_values)
-  if not rows or any(len(values) != count or any(not -32768 <= value <= 32767 for value in values) for values in candidate_values): return None
-  vector_bytes, vector_lanes, _ = _stripe_layout(count, 1)
-  block_rows = max(1, _MAX_EW_ELEMS_FP16//vector_lanes)
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
-  partials:list[RKArg] = []
-  for start in range(0, rows, block_rows):
-    op_start = len(ops)
-    block_count = min(block_rows, rows-start)
-    matrix_lanes = block_count*vector_lanes
-    coordinates = tuple((candidate,)*count for candidate in range(start, start+block_count))
-    if (mask:=_native_int16_byte_mask(ops, gathers, scratch, index_slot, index_offsets,
-                                     (coordinates,), count, vector_lanes)) is None: return None
-    weight_slot, selected = scratch(matrix_lanes*2), scratch(matrix_lanes*2)
-    values = tuple(value for row in candidate_values[start:start+block_count]
-                   for value in (*row, *((0,)*(vector_lanes-count))))
-    gathers.append(RKGather(index_slot, weight_slot, matrix_lanes, values=values))
-    ops.append(RKEWOp(arg(selected), mask, arg(weight_slot), matrix_lanes, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
-    partials.append(_reduce_rows(ops, [arg(selected, row*vector_bytes) for row in range(block_count)],
-                                 count, _EW_CFG[Ops.ADD], int16=True))
-    if start and len(ops) > op_start: ops[op_start] = replace(ops[op_start], submit_barrier=True)
-  result = _reduce_rows(ops, partials, count, _EW_CFG[Ops.ADD], int16=True)
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, result, count, _EW_CFG[Ops.MAX],
-                    int16_input=True, int32_output=True))
-  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops))
-
-def _lower_bounded_int32_lookup(output:RKOutput) -> RKImage|None:
-  """Evaluate a bounded static integer function selected by one arbitrary external INT32 index."""
-  _, out_param, count, out_index, root = output
-  loads = tuple({u.key:u for u in root.toposort() if u.op is Ops.LOAD}.values())
-  if (not 1 <= count <= _FP16_EXACT_INTEGER or len(loads) != 1 or loads[0].dtype.scalar() is not dtypes.int or
-      root.op is not Ops.WHERE or root.src[2].op is not Ops.CONST or int(root.src[2].arg) != 0): return None
-  load = loads[0]
-  if not load.src or load.src[0].op is not Ops.INDEX: return None
-  param = _root_param(load.src[0])
-  if param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST: return None
-  gates = _flatten_binary(root.src[0], Ops.AND)
-  limits = {int(u.src[1].arg) for u in gates if u.op is Ops.CMPLT and u.src[0].key == load.key and
-            u.src[1].op is Ops.CONST and 0 < int(u.src[1].arg) <= 32767}
-  nonnegative = [u for u in gates if u.op is Ops.CMPNE and any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg)
-                 for x in u.src) and any(x.op is Ops.CMPLT and x.src[0].key == load.key and x.src[1].op is Ops.CONST and
-                 int(x.src[1].arg) == 0 for x in u.src)]
-  if len(gates) != 2 or len(limits) != 1 or len(nonnegative) != 1: return None
-  limit = next(iter(limits))
-  try:
-    index_offsets = _gather_offsets(out_index, load.src[0].src[1], load.src[2] if len(load.src) == 3 else None, count)
-    candidate_values = _static_int_vectors(out_index,
-      tuple(root.substitute({load:load.const_like(candidate)}) for candidate in range(limit)), count)
-  except RuntimeError: return None
-  if any(not 0 <= offset < int(param.src[0].arg) for offset in index_offsets): return None
-  return _int32_index_selection_image(out_param.arg.slot, count, param.arg.slot, index_offsets, candidate_values)
-
 def _lower_unrolled_int_prefix_sum(output:RKOutput) -> RKImage|None:
   """Lower the bounded histogram prefix emitted by fixed masked-select."""
   _, out_param, count, out_index, root = output
@@ -2983,29 +2924,6 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=ops,
                  post_gathers=(_int16_low_bytes(int_result, out_slot, count),))
 
-def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
-  """Recover isclose's original operands, equal_nan mode, and its exact-equality FP16 tolerance range."""
-  nodes = root.toposort()
-  inverted = {inner.key for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 for inner,marker in (u.src, u.src[::-1])
-              if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg)}
-  pairs = [u for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0].dtype.scalar() is dtypes.half and
-           u.src[1].dtype.scalar() is dtypes.half and u.src[0].key != u.src[1].key and
-           u.key in inverted and not any(x.op is Ops.CONST and math.isinf(float(x.arg)) for x in u.src)]
-  self_nan = [u for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0].key == u.src[1].key and
-              u.src[0].dtype.scalar() is dtypes.half]
-  self_values = tuple({u.src[0].key:u.src[0] for u in self_nan}.values())
-  operands = pairs[0].src if len(pairs) == 1 else (self_values[0], self_values[0]) if len(self_values) == 1 else ()
-  infinities = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
-                math.isinf(float(u.arg))}
-  if root.op is not Ops.OR or len(operands) != 2 or not self_nan or infinities != {-math.inf, math.inf}: return None
-  equal_nan = any(u.op is Ops.AND and len(u.src) == 2 and all(x in self_nan for x in u.src) for u in nodes) or \
-              any(x in self_nan for x in root.src)
-  finite_constants = [abs(float(u.arg)) for u in nodes if u.op is Ops.CONST and
-                      u.dtype.scalar() in (dtypes.half, dtypes.float) and math.isfinite(float(u.arg))]
-  exact = any(_fp16_bits(value) == _fp16_bits(1e-5) for value in finite_constants) and \
-          not any(1e-4 < value < .1 for value in finite_constants)
-  return operands[0], operands[1], equal_nan, exact
-
 def _ieee_comparison_mask(root:UOp) -> UOp|None:
   """Build an IEEE-correct FP16 comparison mask without evaluating tensor values on the host."""
   one = UOp.const(1.0, dtypes.half)
@@ -3062,17 +2980,6 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
     return None
   result = mask(root)
   if result is None: return None
-  # The FP16 tolerance product may underflow even when both realized operands are bitwise equal. Tinygrad's isclose
-  # graph always carries its original lhs!=rhs test beside two self-NaN tests and the explicit infinity constants.
-  # OR exact IEEE equality back into that graph; NaN remains unequal unless the original equal_nan branch accepts it.
-  if (isclose:=_isclose_match(root)) is not None and (unequal:=atom(Ops.CMPNE, isclose[0], isclose[1])) is not None:
-    result = _mask_mul(result, _mask_mul(classes(isclose[0])[3], classes(isclose[1])[3]))
-    exact = inverse(unequal)
-    if isclose[2]:
-      lhs_nan, rhs_nan = classes(isclose[0])[0], classes(isclose[1])[0]
-      exact = exact.alu(Ops.MAX, _mask_mul(lhs_nan, rhs_nan))
-    if isclose[3]: return exact
-    result = result.alu(Ops.MAX, exact)
   return result
 
 def _fp16_nonzero_mask(root:UOp) -> UOp|None:
@@ -3888,16 +3795,17 @@ class RKContext:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
     if u.op in (Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_equality(u)
     if u.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_less(u)
-    if all(src.dtype.scalar() is dtypes.int for src in u.src):
-      bounds = tuple(_exact_int_range(src, self.int_ranges) for src in u.src)
+    if all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
+      sources = tuple(UOp.const(int(src.arg), dtypes.int) if src.dtype.scalar() is dtypes.weakint else src for src in u.src)
+      bounds = tuple(_exact_int_range(src, self.int_ranges) for src in sources)
       if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(
         bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds
       ):
-        recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in u.src), arg=u.arg)
+        recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg)
         value = self.lower(recipe)
         if value.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
         return value
-      return self._int32_compare(u)
+      return self._int32_compare(u.replace(src=sources))
     if all(src.dtype.scalar() is dtypes.int16 for src in u.src):
       if (int16_recipe:=_native_int16_comparison(u)) is None: raise _RKGenericReject
       value = self.lower(int16_recipe)
@@ -5074,7 +4982,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (predicate_prefix:=_lower_unrolled_fp16_prefix_count(output)) is not None: return predicate_prefix
     for source_dtype in (dtypes.int16, dtypes.int):
       if (coordinates:=_lower_bounded_integer_predicate_coordinates(output, source_dtype)) is not None: return coordinates
-    if (lookup:=_lower_bounded_int32_lookup(output)) is not None: return lookup
     if (prefix_sum:=_lower_unrolled_int_prefix_sum(output)) is not None: return prefix_sum
     if (predicate_total:=_lower_loop_fp16_predicate_total(uops, output)) is not None: return predicate_total
     if (predicate_prefix:=_lower_loop_fp16_prefix_count(uops, output)) is not None: return predicate_prefix

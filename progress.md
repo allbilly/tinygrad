@@ -6008,3 +6008,40 @@ raw layout, and the existing raw UINT32-to-INT32 cast remains a representation a
 The transferred renderer SHA-256 (`dbf615db...f6d2`) exactly matches the fully tested
 `/tmp/rk-int32-shift.MyfT5h` worktree. No runtime/core code, test tolerance, host tensor arithmetic, CPU/GPU fallback,
 CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — delete obsolete semantic recovery catalogs
+
+Two post-hoc graph recognizers remained between the semantic UOps and `RKContext`. `_isclose_match` walked a complete
+boolean DAG to guess that it came from `Tensor.isclose`, then patched exact equality and NaN behavior back into the
+comparison result. A separate bounded-lookup recognizer rebuilt `LOAD`/bounds/`WHERE` as a private candidate-selection
+image. Both duplicated semantics already present in current UOps and made correctness depend on one historical graph
+spelling.
+
+The isclose recognizer and correction branch are deleted without replacement. The bounded lookup recognizer, its
+private INT16 candidate image, and dispatch are also deleted; ordinary typed INT32 comparison, boolean, arithmetic,
+WHERE, and load lowering now own the program. The only generic gap exposed was comparison against a constant
+`weakint`; `_compare` now normalizes only those constants to typed INT32 before using its existing exact raw-byte
+comparator.
+
+- Exact renderer diff: **5 insertions / 98 deletions**, executable lines **5,248 -> 5,164** (**-84**); runtime remains
+  **489**, total **30,720**. Cumulative renderer reduction from the 6,616-line cleanup baseline is **1,452 lines**.
+- Default, `equal_nan=True`, and `rtol=.01` isclose images are byte-for-byte unchanged: **22,277 / 22,373 / 22,277
+  bytes**, **497 / 499 / 497 EW stages**, with digests `e0e85163...20ba`, `5f5b9427...4abb`, and
+  `71c20f0a...de1d`.
+- A literal bounded lookup now executes as ordinary `NATIVE` UOps with zero host gathers/scatters, exact encode/decode,
+  and simulated values `(0, 4, 10, 0)` for indices `(-1, 0, 2, 6)`. Its small synthetic image changes from
+  **25 to 122 EW stages**, while scratch falls from **6,720 to 2,032 bytes** and gathers from **26 to 3**.
+- The directly affected gather, masked-select, nonzero, and fancy-index NPU cluster passed **15/15** in **97.81 s**;
+  the committed baseline took **97.61 s** on the same cluster.
+- UOp tests: **93 passed** with `-n12`. Main-suite logical predicate/isclose hardware: **4 passed**. The separate
+  Rockchip2 exact-bit values also matched, while its existing stale submit-count assertion fails identically at the
+  baseline and candidate (`32 != 2`), so it was not represented as a new pass.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **879.09 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`2e0d54cf...f086`) exactly matches the fully tested
+`/tmp/rk-obsolete-catalog.OlHjWc` worktree. No runtime/core code, hardware assertion, tolerance, host tensor arithmetic,
+CPU/GPU fallback, CMAC, reset, reboot, or push was used.
