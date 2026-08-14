@@ -5808,3 +5808,35 @@ fallback helpers and matcher rows were deleted; `_fold_trunc` remains because it
 
 The transferred renderer SHA-256 (`e906fe35...6c71`) exactly matches the fully tested `/tmp` worktree. No tests,
 runtime, core code, tolerance, tensor-value execution, CPU/GPU fallback, CMAC, LUT, reset, reboot, or push was used.
+
+---
+
+## 2026-08-14 — compact scratch lifetimes and static affine analysis
+
+The **789.37 s** measurement is the complete serial 445-case hardware census, not one test. Its slowest measured
+individual case is cummin at **61.75 s** under cProfile. In that profile `_reuse_linear_scratch` cost **3.43 s**
+because it retained every use event even though interval coloring consumes only the first and last event. Recording
+those two endpoints directly reduced that hotspot to **3.03 s** while preserving every serialized cumulative image.
+
+The duplicated affine and divided-affine index walkers were consolidated through one historical `_linear_index`
+implementation. Three obsolete late recovery rules—scaled negative, casted ReLU, and bool-to-half—were removed after
+zero successful matches and byte-identical host image coverage. An attempted removal of `_fold_masked_mul` was
+rejected in the temporary worktree: the hardware cross-entropy class-probability test produced NaN instead of
+0.1284. Restoring that rule fixed the test, and only the corrected candidate was transferred.
+
+- Exact renderer diff: **23 insertions / 64 deletions**, executable lines **5,590 -> 5,554** (**-36**); runtime remains
+  **489**, total **31,110**. Cumulative renderer reduction from the 6,616-line cleanup baseline is **1,062 lines**.
+- Complete host image census stayed byte-identical (list digest `3ea8c46d...428`; aggregate blob digest
+  `37ae9593...4380`). The five cumulative images also retained their exact hashes.
+- Scratch lifetime differential: **2,000** randomized schedules matched exactly (`ccf2c434...d1fc9`); static affine
+  differential: **20,000** randomized expressions plus CAST/CDIV boundary cases matched exactly.
+- UOp tests: **89 passed** with `-n12`; focused hardware: **13 passed**; restored masked-multiply hardware regression:
+  **1 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **789.37 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`e260da6d...1227`) exactly matches the proved `/tmp` worktree. A parallel hardware
+attempt produced DRM `EINVAL`; the documented health probe passed every elementwise size, and the authoritative full
+census was run serially. No test was weakened and no runtime/core/tolerance/CPU/GPU/CMAC/LUT/reset/reboot/push was
+used. `lines_saving.md` remains untouched.

@@ -106,9 +106,9 @@ def _alias_image_args(image:RKImage, aliases:dict[int, RKArg]) -> RKImage:
 
 def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKImage:
   """Color virtual scratch lifetimes across the complete physical execution schedule."""
-  events:dict[int, list[int]] = {}
+  events:dict[int, tuple[int, int]] = {}
   def touch(arg:RKArg, event:int) -> None:
-    if arg.kind is RKBufferKind.SCRATCH: events.setdefault(arg.index, []).append(event)
+    if arg.kind is RKBufferKind.SCRATCH: events[arg.index] = (events.get(arg.index, (event, event))[0], event)
   def touch_gather(gather:RKGather, event:int) -> None:
     if not gather.values: touch(RKArg(gather.src_kind, gather.src_index), event)
     touch(RKArg(gather.dst_kind, gather.dst_index), event)
@@ -134,7 +134,7 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   # Mid-program gathers may populate one logical slot in several partial phases. The runtime clears a
   # destination once per physical slot, so these stateful materialization slots must not alias.
   pinned = {gather.dst_index for gather in image.mid_gathers if gather.dst_kind is RKBufferKind.SCRATCH}
-  intervals = sorted(((min(points), max(points), slot) for slot,points in events.items()), key=lambda item:(item[0], item[2]))
+  intervals = sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2]))
   remap:dict[int, int] = {}
   physical:list[RKScratch] = []
   physical_reusable:list[bool] = []
@@ -749,45 +749,35 @@ def _static_int_vectors(out_index:UOp, exprs:tuple[UOp, ...], count:int) -> tupl
   order = np.argsort(dst)
   return tuple(tuple(int(x) for x in np.broadcast_to(_eval_vector(expr, vector_env, cache), len(dst))[order]) for expr in exprs)
 
-def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
+_LinearTerm = UOp|tuple[UOp, int]
+def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[_LinearTerm, int]]|None:
+  """Represent static address arithmetic as a sum of scaled RANGE or RANGE//constant terms."""
   if u.op is Ops.CONST: return int(u.arg), {}
-  if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {u: 1}
+  if divided and u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int, dtypes.uint):
+    return _linear_index(u.src[0], divided)
+  term:_LinearTerm|None = (u, 1) if divided and u.op in (Ops.RANGE, Ops.SPECIAL) else u if u.op in (Ops.RANGE, Ops.SPECIAL) else None
+  if divided and u.op is Ops.CDIV and len(u.src) == 2 and u.src[0].op in (Ops.RANGE, Ops.SPECIAL) and \
+     u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0: term = (u.src[0], int(u.src[1].arg))
+  if term is not None: return 0, {term:1}
   if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
-  lhs, rhs = _affine_index(u.src[0]), _affine_index(u.src[1])
+  lhs, rhs = _linear_index(u.src[0], divided), _linear_index(u.src[1], divided)
   if lhs is None or rhs is None: return None
   if u.op is Ops.MUL:
     if lhs[1] and rhs[1]: return None
     scale, affine = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
-    return affine[0]*scale, {r: coeff*scale for r, coeff in affine[1].items()}
-  sign = -1 if u.op is Ops.SUB else 1
-  coeffs = lhs[1].copy()
-  for r, coeff in rhs[1].items():
-    if (merged:=coeffs.get(r, 0) + sign*coeff): coeffs[r] = merged
-    elif r in coeffs: del coeffs[r]
-  return lhs[0] + sign*rhs[0], coeffs
-
-def _divided_affine_index(u:UOp) -> tuple[int, dict[tuple[UOp, int], int]]|None:
-  """Represent static address arithmetic as a sum of scaled `range//divisor` terms."""
-  if u.op is Ops.CONST: return int(u.arg), {}
-  if u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int, dtypes.uint):
-    return _divided_affine_index(u.src[0])
-  if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {(u, 1):1}
-  if (u.op is Ops.CDIV and len(u.src) == 2 and u.src[0].op in (Ops.RANGE, Ops.SPECIAL) and
-      u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0):
-    return 0, {(u.src[0], int(u.src[1].arg)):1}
-  if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
-  lhs, rhs = _divided_affine_index(u.src[0]), _divided_affine_index(u.src[1])
-  if lhs is None or rhs is None: return None
-  if u.op is Ops.MUL:
-    if lhs[1] and rhs[1]: return None
-    scale, divided = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
-    return divided[0]*scale, {term:coefficient*scale for term,coefficient in divided[1].items()}
+    return affine[0]*scale, {key:coefficient*scale for key,coefficient in affine[1].items()}
   sign = -1 if u.op is Ops.SUB else 1
   terms = lhs[1].copy()
-  for term,coefficient in rhs[1].items():
-    if (merged:=terms.get(term, 0)+sign*coefficient): terms[term] = merged
-    elif term in terms: del terms[term]
+  for key,coefficient in rhs[1].items():
+    if (merged:=terms.get(key, 0)+sign*coefficient): terms[key] = merged
+    elif key in terms: del terms[key]
   return lhs[0]+sign*rhs[0], terms
+
+def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
+  return typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(u))
+
+def _divided_affine_index(u:UOp) -> tuple[int, dict[tuple[UOp, int], int]]|None:
+  return typing_cast(tuple[int, dict[tuple[UOp, int], int]]|None, _linear_index(u, True))
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
@@ -5469,17 +5459,6 @@ def _opposite_condition(lhs:UOp, rhs:UOp) -> bool:
   return ((lhs_not is not None and _same_condition(lhs_not, rhs)) or
           (rhs_not is not None and _same_condition(lhs, rhs_not)))
 
-def _fold_scaled_negative(x:UOp) -> UOp|None:
-  """Map WHERE(base<0, base*scale, base) to native DPU EW PReLU."""
-  gate, negative, base = x.src
-  if (gate.op is not Ops.CMPLT or gate.src[0].key != base.key or gate.src[1].op is not Ops.CONST or
-      float(gate.src[1].arg) != 0.0 or negative.op is not Ops.MUL): return None
-  for value, factor in (negative.src, negative.src[::-1]):
-    if value.key != base.key or factor.op is not Ops.CONST: continue
-    scale = float(factor.arg)
-    if 0.0 <= scale <= 1.0: return UOp(Ops.MUL, x.dtype, src=(base, factor), arg=_NATIVE_LEAKY_RELU)
-  return None
-
 def _fold_masked_mul(x:UOp) -> UOp|None:
   """Push a WHERE through MUL so inactive factors become identities before native DPU multiplication."""
   gate, yes, no = x.src
@@ -5662,22 +5641,6 @@ def _fp32_where_to_fp16(x:UOp) -> UOp|None:
   return None if _is_static_expr(x) else \
     UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg)
 
-def _fold_casted_relu(root:UOp) -> UOp|None:
-  """Recover native half MAX from the float WHERE emitted for half ReLU inside a reduction."""
-  if len(root.src) != 1 or (where:=root.src[0]).op is not Ops.WHERE or where.dtype.scalar() is not dtypes.float: return None
-  gate, yes, no = where.src
-  if (yes.op is not Ops.CAST or len(yes.src) != 1 or yes.src[0].dtype.scalar() is not dtypes.half or
-      no.op is not Ops.CONST or float(no.arg) != 0.0): return None
-  val = yes.src[0]
-  if (gate.op is not Ops.CMPLT or gate.src[0].op is not Ops.CONST or float(gate.src[0].arg) != 0.0 or
-      gate.src[1].key != val.key): return None
-  return val.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
-
-def _fold_bool_to_half(predicate:UOp) -> UOp|None:
-  """Materialize an embedded boolean predicate as an FP16 DPU 0/1 mask."""
-  if (nonzero:=_fp16_nonzero_mask(predicate)) is not None: return nonzero
-  return _ieee_comparison_mask(predicate)
-
 def _replace_infinite_multiply(x:UOp) -> UOp|None:
   """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
   for value, factor in (x.src, x.src[::-1]):
@@ -5695,8 +5658,6 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
-  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)), _fold_bool_to_half),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
@@ -5707,7 +5668,6 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
-  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.
   (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat(Ops.LOAD, dtypes.half, name="load"), UPat.cvar("default"))),
    lambda gate,load,default: _fold_masked_load(gate, load, default)),
@@ -5722,7 +5682,6 @@ _pm_fp32_to_fp16 = PatternMatcher([
 _pm_generic_storage_precision = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.float, name="x"), _fp32_where_to_fp16),
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
-  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
