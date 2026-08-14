@@ -5611,3 +5611,36 @@ the baseline cross-entropy image sizes and fixed the failure. Neither rejected a
 All experiments and both rejected variants stayed in `/tmp`. Only the renderer file whose SHA-256 matched the fresh
 proof worktree was transferred. No tests were weakened or transferred, and no CPU/GPU tensor computation, CMAC, LUT,
 runtime arithmetic, tolerance change, reboot, or push was used.
+
+---
+
+## 2026-08-14 — delete dynamic-index accumulation recovery and reuse static lane grids
+
+The post-milestone cummin profile showed the previous integer-range hotspot was gone. The new renderer bottleneck was
+`_static_values`: **3,581 calls / 13.44 s cumulative**, repeatedly reconstructing the same output RANGE/SPECIAL lane
+grid for distinct static expressions. Full-result memoization was rejected after measuring **zero exact cache hits**.
+A bounded eight-entry cache now retains only the read-only integer lane grid and destination ordering. It does not
+cache expression results or tensor data. Every compiled cummin/cummax image remained byte-for-byte identical, and the
+isolated cummin test completed in **45.78 s**.
+
+The historical dynamic-index accumulation recovery duplicated functionality now covered by ordinary typed/static
+lowering. Removing it deletes six closed helpers—FP16/INT16 physical emitters, unrolled/loop parsers, selection
+materialization, and affine-load parsing—plus their dispatch. Exact executable-line accounting is:
+
+- six specialized recovery functions: **234 lines removed**;
+- `_lower_uop_program` dispatch: **149 -> 140** lines;
+- `_static_values`: **16 -> 12** lines;
+- bounded static-grid helper and decorator: **7 lines added**.
+
+Focused max-pool indices, max-unpool, padded average-pool, cumulative minimum, dot, and cross-entropy tests all passed
+together before the full run. The three other static range-grid constructors found by the twin search are single-call
+helpers rather than the measured repeated setup hotspot and remain candidates for later commonization.
+
+- Final hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures, all **445** collected cases,
+  in **821.38 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- Unchanged UOp tests: **89 passed** with `-n12`; Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check` pass.
+- `sz.py`: renderer/runtime **6,062/489 executable lines**, total **31,618**; renderer is **240 lines smaller** than
+  the preceding 6,302-line milestone and **554 lines smaller** than the original 6,616-line cleanup baseline.
+
+All behavioral and deletion experiments stayed in `/tmp`; only the byte-identical proved renderer was transferred.
+There is no host tensor arithmetic, CPU/GPU fallback, CMAC, LUT, test/tolerance change, runtime edit, reboot, or push.
