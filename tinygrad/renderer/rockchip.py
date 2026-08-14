@@ -1431,6 +1431,13 @@ def _stripe_gathers(src_slot:int, dst_slot:int, count:int, rows:Iterable[Iterabl
   return tuple(RKGather(src_slot, dst_slot, count, offsets=() if values else tuple(row), values=tuple(row) if values else (),
                         dst_addend=i*vector_lanes, itemsize=itemsize) for i,row in enumerate(rows))
 
+def _scratch_arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+
+def _physical_lists(minimum:int=0) -> tuple[list[int], Callable[[int], int], list[RKGather], list[RKEWOp]]:
+  scratch_sizes:list[int] = []; gathers:list[RKGather] = []; ops:list[RKEWOp] = []
+  def scratch(size:int) -> int: scratch_sizes.append(max(minimum, size)); return len(scratch_sizes)-1
+  return scratch_sizes, scratch, gathers, ops
+
 def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False, int32:bool=False) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
   if int16 and int32: raise ValueError("conflicting integer reduction precision")
@@ -1723,7 +1730,6 @@ def _int16_byte_sum(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[
                     operands:tuple[tuple[RKArg, ...], ...], count:int) -> tuple[RKArg, ...]:
   """Add four-byte operands exactly modulo 2**32 with native INT16 byte carries."""
   if len(operands) < 2 or any(len(operand) != 4 for operand in operands): raise ValueError("invalid byte sum")
-  def arg(slot:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot)
   zero, one, byte_base = (scratch(count*2) for _ in range(3))
   thresholds = tuple(scratch(count*2) for _ in range(len(operands)-1))
   gathers.extend((RKGather(source_slot, zero, count, values=(0,)*count),
@@ -1731,24 +1737,24 @@ def _int16_byte_sum(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[
                   RKGather(source_slot, byte_base, count, values=(256,)*count)))
   gathers.extend(RKGather(source_slot, slot, count, values=(256*(level+1)-1,)*count)
                  for level,slot in enumerate(thresholds))
-  carry, results = arg(zero), []
+  carry, results = _scratch_arg(zero), []
   int16 = dict(int16_input=True, int16_output=True)
   for byte in range(4):
     total = _reduce_rows(ops, [operand[byte] for operand in operands], count, _EW_CFG[Ops.ADD], int16=True)
     if byte:
-      slot = scratch(count*2); ops.append(RKEWOp(arg(slot), total, carry, count, _EW_CFG[Ops.ADD], **int16)); total = arg(slot)
+      slot = scratch(count*2); ops.append(RKEWOp(_scratch_arg(slot), total, carry, count, _EW_CFG[Ops.ADD], **int16)); total = _scratch_arg(slot)
     bits:list[RKArg] = []
     for threshold in thresholds:
       delta, positive, bit = (scratch(count*2) for _ in range(3))
-      ops.extend((RKEWOp(arg(delta), total, arg(threshold), count, _EW_CFG[Ops.SUB], **int16),
-                  RKEWOp(arg(positive), arg(delta), arg(zero), count, _EW_CFG[Ops.MAX], **int16),
-                  RKEWOp(arg(bit), arg(positive), arg(one), count, _EW_CFG_MIN, **int16)))
-      bits.append(arg(bit))
+      ops.extend((RKEWOp(_scratch_arg(delta), total, _scratch_arg(threshold), count, _EW_CFG[Ops.SUB], **int16),
+                  RKEWOp(_scratch_arg(positive), _scratch_arg(delta), _scratch_arg(zero), count, _EW_CFG[Ops.MAX], **int16),
+                  RKEWOp(_scratch_arg(bit), _scratch_arg(positive), _scratch_arg(one), count, _EW_CFG_MIN, **int16)))
+      bits.append(_scratch_arg(bit))
     carry = _reduce_rows(ops, bits, count, _EW_CFG[Ops.ADD], int16=True)
     scaled, result = scratch(count*2), scratch(count*2)
-    ops.extend((RKEWOp(arg(scaled), carry, arg(byte_base), count, _EW_CFG[Ops.MUL], **int16),
-                RKEWOp(arg(result), total, arg(scaled), count, _EW_CFG[Ops.SUB], **int16)))
-    results.append(arg(result))
+    ops.extend((RKEWOp(_scratch_arg(scaled), carry, _scratch_arg(byte_base), count, _EW_CFG[Ops.MUL], **int16),
+                RKEWOp(_scratch_arg(result), total, _scratch_arg(scaled), count, _EW_CFG[Ops.SUB], **int16)))
+    results.append(_scratch_arg(result))
   return tuple(results)
 
 def _int16_byte_bits(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
@@ -1840,7 +1846,6 @@ def _fp16_prefix_image(out_slot:int, count:int, source_slot:int, rows:tuple[tupl
   scratch_sizes = [_scratch_bytes(max_matrix_lanes)] * 4
   one, maximum, negative_maximum, threshold_slot = range(4)
   def scratch(count:int) -> int: scratch_sizes.append(_scratch_bytes(count)); return len(scratch_sizes)-1
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   gathers:list[RKGather] = []
   ops:list[RKEWOp] = []
   reduced_blocks:list[tuple[RKArg, int, int]] = []
@@ -1852,13 +1857,13 @@ def _fp16_prefix_image(out_slot:int, count:int, source_slot:int, rows:tuple[tupl
     gathers.extend(_stripe_gathers(source_slot, values, block_count,
                                    (row[start:start+block_count] for row in rows), vector_lanes))
     if mode == "greater":
-      ops.append(RKEWOp(arg(shifted), arg(values), arg(threshold_slot), matrix_lanes, _EW_CFG[Ops.SUB]))
-      mask = _ew_ieee_positive_mask(ops, arg, shifted, (one, maximum, negative_maximum), temps, matrix_lanes)
+      ops.append(RKEWOp(_scratch_arg(shifted), _scratch_arg(values), _scratch_arg(threshold_slot), matrix_lanes, _EW_CFG[Ops.SUB]))
+      mask = _ew_ieee_positive_mask(ops, _scratch_arg, shifted, (one, maximum, negative_maximum), temps, matrix_lanes)
     else:
       magnitude, mask_slot = temps[:2]
-      ops.extend((RKEWOp(arg(magnitude), arg(values), arg(values), matrix_lanes, _EW_CFG_ABS),
-                  RKEWOp(arg(mask_slot), arg(magnitude), arg(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True)))
-      mask = arg(mask_slot)
+      ops.extend((RKEWOp(_scratch_arg(magnitude), _scratch_arg(values), _scratch_arg(values), matrix_lanes, _EW_CFG_ABS),
+                  RKEWOp(_scratch_arg(mask_slot), _scratch_arg(magnitude), _scratch_arg(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True)))
+      mask = _scratch_arg(mask_slot)
     reduced = _reduce_rows(ops, [replace(mask, addend=mask.addend+row*vector_bytes) for row in range(len(rows))],
                            block_count, _EW_CFG[Ops.ADD])
     reduced_blocks.append((reduced, start, block_count))
@@ -1868,7 +1873,7 @@ def _fp16_prefix_image(out_slot:int, count:int, source_slot:int, rows:tuple[tupl
   mid = tuple(RKGather(reduced.index, compact, block_count,
                        offsets=tuple(reduced.addend//2+lane for lane in range(block_count)), dst_addend=start,
                        src_kind=RKBufferKind.SCRATCH) for reduced,start,block_count in reduced_blocks)
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), arg(compact), arg(int_tiles), count,
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), _scratch_arg(compact), _scratch_arg(int_tiles), count,
                     _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   constants = struct.pack("<eeee", 1.0, 65504.0, -65504.0, threshold)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), constants,
@@ -1920,11 +1925,7 @@ def _int32_sum_occurrence_image(out_slot:int, count:int, coordinate_values:tuple
   constant_source = min(source_slots)
   vector_bytes, vector_lanes, _ = _stripe_layout(count, 1)
   block_rows = max(1, _MAX_EW_ELEMS_FP16//vector_lanes)
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
   partials:list[RKArg] = []
   int16 = dict(int16_input=True, int16_output=True)
   for start in range(0, rows, block_rows):
@@ -1943,7 +1944,7 @@ def _int32_sum_occurrence_image(out_slot:int, count:int, coordinate_values:tuple
                                     dst_addend=row*vector_lanes*2, itemsize=1))
         if not any(item is not None for item in block):
           gathers.append(RKGather(constant_source, slot, matrix_lanes, values=(0,)*matrix_lanes))
-        byte_args.append(arg(slot))
+        byte_args.append(_scratch_arg(slot))
       operands.append(tuple(byte_args))
     summed = _int16_byte_sum(ops, gathers, scratch, constant_source, tuple(operands), matrix_lanes)
     one = scratch(matrix_lanes*2)
@@ -1954,14 +1955,15 @@ def _int32_sum_occurrence_image(out_slot:int, count:int, coordinate_values:tuple
       values = tuple((coordinate >> (byte*8)) & 0xff for _ in range(block_count)
                      for coordinate in (*coordinate_values, *((0,)*(vector_lanes-count))))
       gathers.append(RKGather(constant_source, expected, matrix_lanes, values=values))
-      ops.extend((RKEWOp(arg(diff), value, arg(expected), matrix_lanes, _EW_CFG[Ops.SUB], **int16),
-                  RKEWOp(arg(magnitude), arg(diff), arg(diff), matrix_lanes, _EW_CFG_ABS, **int16),
-                  RKEWOp(arg(unequal), arg(magnitude), arg(one), matrix_lanes, _EW_CFG_MIN, **int16),
-                  RKEWOp(arg(equal), arg(one), arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], **int16)))
-      masks.append(arg(equal))
+      ops.extend((RKEWOp(_scratch_arg(diff), value, _scratch_arg(expected), matrix_lanes, _EW_CFG[Ops.SUB], **int16),
+                  RKEWOp(_scratch_arg(magnitude), _scratch_arg(diff), _scratch_arg(diff), matrix_lanes, _EW_CFG_ABS, **int16),
+                  RKEWOp(_scratch_arg(unequal), _scratch_arg(magnitude), _scratch_arg(one), matrix_lanes, _EW_CFG_MIN, **int16),
+                  RKEWOp(_scratch_arg(equal), _scratch_arg(one), _scratch_arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], **int16)))
+      masks.append(_scratch_arg(equal))
     mask = masks[0]
     for byte_mask in masks[1:]:
-      slot = scratch(matrix_lanes*2); ops.append(RKEWOp(arg(slot), mask, byte_mask, matrix_lanes, _EW_CFG[Ops.MUL], **int16)); mask = arg(slot)
+      slot = scratch(matrix_lanes*2)
+      ops.append(RKEWOp(_scratch_arg(slot), mask, byte_mask, matrix_lanes, _EW_CFG[Ops.MUL], **int16)); mask = _scratch_arg(slot)
     partials.append(_reduce_rows(ops, [replace(mask, addend=mask.addend+row*vector_bytes) for row in range(block_count)],
                                  count, _EW_CFG[Ops.ADD], int16=True))
     if start and len(ops) > op_start: ops[op_start] = replace(ops[op_start], submit_barrier=True)
@@ -2041,10 +2043,9 @@ def _lower_unrolled_int_prefix_sum(output:RKOutput) -> RKImage|None:
   gathers:list[RKGather] = []
   mid = _stripe_gathers(compact, matrix, count, rows, vector_lanes)
   mid = tuple(replace(gather, src_kind=RKBufferKind.SCRATCH) for gather in mid)
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  ops:list[RKEWOp] = [RKEWOp(arg(compact), RKArg(RKBufferKind.ARG, source.arg.slot), arg(convert_tiles), count,
+  ops:list[RKEWOp] = [RKEWOp(_scratch_arg(compact), RKArg(RKBufferKind.ARG, source.arg.slot), _scratch_arg(convert_tiles), count,
                               _EW_CFG[Ops.MAX], int32_input=True)]
-  reduced = _reduce_rows(ops, [arg(matrix, row*vector_bytes) for row in range(count)], count, _EW_CFG[Ops.ADD])
+  reduced = _reduce_rows(ops, [_scratch_arg(matrix, row*vector_bytes) for row in range(count)], count, _EW_CFG[Ops.ADD])
   result = reduced
   if normalized is not None:
     zero, one, extent, negative_delta, positive, negative, correction, normalized_value = range(len(scratch), len(scratch)+8)
@@ -2053,13 +2054,13 @@ def _lower_unrolled_int_prefix_sum(output:RKOutput) -> RKImage|None:
     gathers.extend((RKGather(source.arg.slot, zero, count, values=(zero_bits,)*count),
                     RKGather(source.arg.slot, one, count, values=(one_bits,)*count),
                     RKGather(source.arg.slot, extent, count, values=(extent_bits,)*count)))
-    ops.extend((RKEWOp(arg(negative_delta), arg(zero), reduced, count, _EW_CFG[Ops.SUB]),
-                RKEWOp(arg(positive), arg(negative_delta), arg(zero), count, _EW_CFG[Ops.MAX]),
-                RKEWOp(arg(negative), arg(positive), arg(one), count, _EW_CFG_MIN),
-                RKEWOp(arg(correction), arg(negative), arg(extent), count, _EW_CFG[Ops.MUL], stateful=True),
-                RKEWOp(arg(normalized_value), reduced, arg(correction), count, _EW_CFG[Ops.ADD])))
-    result = arg(normalized_value)
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, arg(int_tiles), count,
+    ops.extend((RKEWOp(_scratch_arg(negative_delta), _scratch_arg(zero), reduced, count, _EW_CFG[Ops.SUB]),
+                RKEWOp(_scratch_arg(positive), _scratch_arg(negative_delta), _scratch_arg(zero), count, _EW_CFG[Ops.MAX]),
+                RKEWOp(_scratch_arg(negative), _scratch_arg(positive), _scratch_arg(one), count, _EW_CFG_MIN),
+                RKEWOp(_scratch_arg(correction), _scratch_arg(negative), _scratch_arg(extent), count, _EW_CFG[Ops.MUL], stateful=True),
+                RKEWOp(_scratch_arg(normalized_value), reduced, _scratch_arg(correction), count, _EW_CFG[Ops.ADD])))
+    result = _scratch_arg(normalized_value)
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, _scratch_arg(int_tiles), count,
                     _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   return RKImage(RKTarget.RK3588, tuple(scratch), gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid, gather_after=1)
 
@@ -2149,11 +2150,7 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
   grouped_gate = None if gate is None else (gate[0], gate[1], gate[2][::repeat])
   vector_lanes = _stripe_layout(group_count, 2)[1] if len(plans) > 1 else group_count
   block_rows = max(1, _MAX_EW_ELEMS_FP16//vector_lanes)
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(size); return len(scratch_sizes)-1
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists()
   block_values:list[list[tuple[RKArg, ...]]] = []
   for start in range(0, len(plans), block_rows):
     stop = min(len(plans), start+block_rows)
@@ -2167,8 +2164,8 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
       axis_masks.append(mask)
     combined_mask = axis_masks[0]
     for axis_mask in axis_masks[1:]:
-      dst = scratch(matrix_lanes*2); ops.append(RKEWOp(arg(dst), combined_mask, axis_mask, matrix_lanes,
-        _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)); combined_mask = arg(dst)
+      dst = scratch(matrix_lanes*2); ops.append(RKEWOp(_scratch_arg(dst), combined_mask, axis_mask, matrix_lanes,
+        _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)); combined_mask = _scratch_arg(dst)
     matrix_value = tuple(tuple(scratch(matrix_lanes*2) for _ in range(itemsize)) for _ in range(repeat))
     selected = tuple(tuple(scratch(matrix_lanes*2) for _ in range(itemsize)) for _ in range(repeat))
     for candidate,row in enumerate(plan_offsets[start:stop]):
@@ -2179,9 +2176,9 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
             dst_addend=candidate*vector_lanes*2, itemsize=1))
     block_result:list[tuple[RKArg, ...]] = []
     for channel in range(repeat):
-      ops.extend(RKEWOp(arg(dst), arg(src), combined_mask, matrix_lanes, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)
+      ops.extend(RKEWOp(_scratch_arg(dst), _scratch_arg(src), combined_mask, matrix_lanes, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)
                  for src,dst in zip(matrix_value[channel], selected[channel]))
-      block_result.append(tuple(_reduce_rows(ops, [arg(slot, row*vector_lanes*2) for row in range(rows)], group_count,
+      block_result.append(tuple(_reduce_rows(ops, [_scratch_arg(slot, row*vector_lanes*2) for row in range(rows)], group_count,
         _EW_CFG[Ops.ADD], int16=True) for slot in selected[channel]))  # type: ignore[arg-type]
     block_values.append(block_result)
   if not block_values: return None
@@ -2192,9 +2189,9 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
     for byte in range(itemsize):
       value = block_values[0][channel][byte]
       for block in block_values[1:]:
-        dst = scratch(group_count*2); ops.append(RKEWOp(arg(dst), value, block[channel][byte], group_count,
+        dst = scratch(group_count*2); ops.append(RKEWOp(_scratch_arg(dst), value, block[channel][byte], group_count,
           _EW_CFG[Ops.ADD], int16_input=True, int16_output=True))
-        value = arg(dst)
+        value = _scratch_arg(dst)
       channel_values.append(value)
     results.append(tuple(channel_values))
   if grouped_gate is not None:
@@ -2202,9 +2199,9 @@ def _dynamic_raw_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIn
     gathers.append(RKGather(grouped_gate[0], gate_slot, group_count, offsets=grouped_gate[2], dst_stride=2, itemsize=1))
     for channel,pair in enumerate(results):
       masked = tuple(scratch(group_count*2) for _ in range(itemsize))
-      ops.extend(RKEWOp(arg(dst), value, arg(gate_slot), group_count, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)
+      ops.extend(RKEWOp(_scratch_arg(dst), value, _scratch_arg(gate_slot), group_count, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)
                  for value,dst in zip(pair, masked))
-      results[channel] = tuple(arg(slot) for slot in masked)
+      results[channel] = tuple(_scratch_arg(slot) for slot in masked)
   byte_offsets = tuple(range(0, group_count*2, 2))
   post_gathers = tuple(RKGather(value.index, out_slot, group_count, offsets=tuple(value.addend+offset for offset in byte_offsets),
     dst_stride=repeat*itemsize, dst_addend=channel*itemsize+byte,
@@ -2247,7 +2244,7 @@ def _native_int16_byte_mask(ops:list[RKEWOp], gathers:list[RKGather], scratch:Ca
   if len(offset_rows) != rows or any(len(offsets) != count for offsets in offset_rows): return None
   one, diff, magnitude, unequal = (scratch(matrix_lanes*2) for _ in range(4))
   gathers.append(RKGather(index_slot, one, matrix_lanes, values=(1,)*matrix_lanes, itemsize=2))
-  def arg(slot:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot)
+  integer = dict(int16_input=True, int16_output=True)
   masks:list[RKArg] = []
   for coordinates in coordinate_sets:
     byte_masks:list[RKArg] = []
@@ -2257,20 +2254,20 @@ def _native_int16_byte_mask(ops:list[RKEWOp], gathers:list[RKGather], scratch:Ca
         dst_stride=2, dst_addend=row*vector_lanes*2, itemsize=1) for row,offsets in enumerate(offset_rows))
       values = tuple((value >> (byte*8)) & 0xff for row in coordinates for value in (*row, *((0,)*(vector_lanes-count))))
       gathers.append(RKGather(index_slot, static, matrix_lanes, values=values, itemsize=2))
-      ops.extend((RKEWOp(arg(diff), arg(dynamic), arg(static), matrix_lanes, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True),
-                  RKEWOp(arg(magnitude), arg(diff), arg(diff), matrix_lanes, _EW_CFG_ABS, int16_input=True, int16_output=True),
-                  RKEWOp(arg(unequal), arg(magnitude), arg(one), matrix_lanes, _EW_CFG_MIN, int16_input=True, int16_output=True),
-                  RKEWOp(arg(equal), arg(one), arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True)))
-      byte_masks.append(arg(equal))
+      ops.extend((RKEWOp(_scratch_arg(diff), _scratch_arg(dynamic), _scratch_arg(static), matrix_lanes, _EW_CFG[Ops.SUB], **integer),
+                  RKEWOp(_scratch_arg(magnitude), _scratch_arg(diff), _scratch_arg(diff), matrix_lanes, _EW_CFG_ABS, **integer),
+                  RKEWOp(_scratch_arg(unequal), _scratch_arg(magnitude), _scratch_arg(one), matrix_lanes, _EW_CFG_MIN, **integer),
+                  RKEWOp(_scratch_arg(equal), _scratch_arg(one), _scratch_arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], **integer)))
+      byte_masks.append(_scratch_arg(equal))
     mask = byte_masks[0]
     for byte_mask in byte_masks[1:]:
-      dst = scratch(matrix_lanes*2); ops.append(RKEWOp(arg(dst), mask, byte_mask, matrix_lanes,
-        _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)); mask = arg(dst)
+      dst = scratch(matrix_lanes*2); ops.append(RKEWOp(_scratch_arg(dst), mask, byte_mask, matrix_lanes,
+        _EW_CFG[Ops.MUL], int16_input=True, int16_output=True)); mask = _scratch_arg(dst)
     masks.append(mask)
   mask = masks[0]
   for alternate in masks[1:]:
-    dst = scratch(matrix_lanes*2); ops.append(RKEWOp(arg(dst), mask, alternate, matrix_lanes,
-      _EW_CFG[Ops.MAX], int16_input=True, int16_output=True)); mask = arg(dst)
+    dst = scratch(matrix_lanes*2); ops.append(RKEWOp(_scratch_arg(dst), mask, alternate, matrix_lanes,
+      _EW_CFG[Ops.MAX], int16_input=True, int16_output=True)); mask = _scratch_arg(dst)
   return mask
 
 def _native_integer_nonzero_mask(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[int], int], source_slot:int,
@@ -2285,12 +2282,11 @@ def _native_integer_nonzero_mask(ops:list[RKEWOp], gathers:list[RKGather], scrat
     gathers.extend(RKGather(source_slot, slot, count,
       offsets=tuple(offset*itemsize+byte if offset >= 0 else -1 for offset in row), dst_addend=i*vector_lanes*2,
       dst_stride=2, itemsize=1) for i,row in enumerate(rows))
-  def arg(slot:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot)
   for slot in byte_masks:
-    ops.append(RKEWOp(arg(slot), arg(slot), arg(one), matrix_lanes, _EW_CFG_MIN, int16_input=True, int16_output=True))
-  mask = arg(byte_masks[0])
+    ops.append(RKEWOp(_scratch_arg(slot), _scratch_arg(slot), _scratch_arg(one), matrix_lanes, _EW_CFG_MIN, int16_input=True, int16_output=True))
+  mask = _scratch_arg(byte_masks[0])
   for slot in byte_masks[1:]:
-    ops.append(RKEWOp(mask, mask, arg(slot), matrix_lanes, _EW_CFG[Ops.MAX], int16_input=True, int16_output=True))
+    ops.append(RKEWOp(mask, mask, _scratch_arg(slot), matrix_lanes, _EW_CFG[Ops.MAX], int16_input=True, int16_output=True))
   return mask
 
 def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
@@ -2332,11 +2328,7 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
 
   layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_ in axes)
   if any(matrix_lanes > _MAX_EW_ELEMS_FP16 for _,_,matrix_lanes,_ in layouts): return None
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(size); return len(scratch_sizes)-1
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  scratch_sizes, scratch, gathers, ops = _physical_lists()
   valid_axes:list[RKArg] = []
   for (param,_,_,offsets,extent,wrapped),(_,vector_lanes,_,_) in zip(axes, layouts):
     positive = tuple((coordinate,)*count for coordinate in range(extent))
@@ -2347,8 +2339,8 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
                                         for row in range(extent)], count, _EW_CFG[Ops.MAX], int16=True))
   result = valid_axes[0]
   for valid in valid_axes[1:]:
-    dst = scratch(count*2); ops.append(RKEWOp(arg(dst), result, valid, count, _EW_CFG[Ops.MUL],
-      int16_input=True, int16_output=True)); result = arg(dst)
+    dst = scratch(count*2); ops.append(RKEWOp(_scratch_arg(dst), result, valid, count, _EW_CFG[Ops.MUL],
+      int16_input=True, int16_output=True)); result = _scratch_arg(dst)
   post = (_int16_low_bytes(result, out_param.arg.slot, count),)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes),
                  gathers=tuple(gathers), ew_ops=tuple(ops), post_gathers=post)
@@ -2409,15 +2401,14 @@ def _lower_unrolled_fp16_predicate_total(output:RKOutput) -> RKImage|None:
   temps = tuple(range(6, 17)); spaced, int_tiles = 17, 18
   scratch = tuple(RKScratch(source_count*64 if slot == spaced else _int32_tiles_bytes(1) if slot == int_tiles else
                             _scratch_bytes(source_count)) for slot in range(int_tiles+1))
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  ops = [RKEWOp(arg(shifted), RKArg(RKBufferKind.ARG, source.arg.slot), arg(threshold_slot), source_count, _EW_CFG[Ops.SUB])]
-  mask = _ew_ieee_positive_mask(ops, arg, shifted, (one, maximum, negative_maximum), temps, source_count)
+  ops = [RKEWOp(_scratch_arg(shifted), RKArg(RKBufferKind.ARG, source.arg.slot), _scratch_arg(threshold_slot), source_count, _EW_CFG[Ops.SUB])]
+  mask = _ew_ieee_positive_mask(ops, _scratch_arg, shifted, (one, maximum, negative_maximum), temps, source_count)
   gather_after = len(ops)
   mid = (RKGather(mask.index, spaced, source_count, offsets=tuple(mask.addend//2+lane for lane in range(source_count)),
                   dst_stride=32, src_kind=RKBufferKind.SCRATCH),)
-  total = _reduce_rows(ops, [arg(spaced, lane*64) for lane in range(source_count)], 1, _EW_CFG[Ops.ADD])
-  if scale != 1: ops.append(RKEWOp(total, total, arg(scale_slot), 1, _EW_CFG[Ops.MUL]))
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), total, arg(int_tiles), 1,
+  total = _reduce_rows(ops, [_scratch_arg(spaced, lane*64) for lane in range(source_count)], 1, _EW_CFG[Ops.ADD])
+  if scale != 1: ops.append(RKEWOp(total, total, _scratch_arg(scale_slot), 1, _EW_CFG[Ops.MUL]))
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), total, _scratch_arg(int_tiles), 1,
                     _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   constants = struct.pack("<eeeee", 1.0, 65504.0, -65504.0, threshold, scale)
   return RKImage(RKTarget.RK3588, scratch, constants, ew_ops=tuple(ops), mid_gathers=mid, gather_after=gather_after)
@@ -2482,11 +2473,7 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
 
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
   _, source_vector_lanes, _ = _stripe_layout(1, source_count)
   source_rows = tuple((lane,) for lane in range(source_count))
   if (source_mask:=_native_integer_nonzero_mask(ops, gathers, scratch, source.arg.slot, source_rows, 1,
@@ -2496,7 +2483,7 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   if rank != 1:
     rank_slot = scratch(2)
     gathers.append(RKGather(source.arg.slot, rank_slot, 1, values=(_int16_bits(rank),)))
-    ops.append(RKEWOp(total, total, arg(rank_slot), 1, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
+    ops.append(RKEWOp(total, total, _scratch_arg(rank_slot), 1, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
   candidates = tuple((candidate,)*count for candidate in range(coordinate_count))
   if (equal:=_native_int16_byte_mask(ops, gathers, scratch, index_param.arg.slot, index_offsets,
                                      (candidates,), count, vector_lanes)) is None: return None
@@ -2513,17 +2500,17 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   valid_delta, positive, valid, remaining = (scratch(count*2) for _ in range(4))
   selected, guarded, fill_part, result = (scratch(matrix_lanes*2) for _ in range(4))
   int16 = dict(int16_input=True, int16_output=True)
-  ops.extend((RKEWOp(arg(valid_delta), arg(total_vector), arg(output_coordinate), count, _EW_CFG[Ops.SUB], **int16),
-              RKEWOp(arg(positive), arg(valid_delta), arg(zero), count, _EW_CFG[Ops.MAX], **int16),
-              RKEWOp(arg(valid), arg(positive), arg(one), count, _EW_CFG_MIN, **int16),
-              RKEWOp(arg(remaining), arg(one), arg(valid), count, _EW_CFG[Ops.SUB], **int16),
-              RKEWOp(arg(selected), equal, arg(coordinate_matrix), matrix_lanes, _EW_CFG[Ops.MUL], **int16)))
-  selected_value = _reduce_rows(ops, [arg(selected, row*vector_bytes) for row in range(coordinate_count)],
+  ops.extend((RKEWOp(_scratch_arg(valid_delta), _scratch_arg(total_vector), _scratch_arg(output_coordinate), count, _EW_CFG[Ops.SUB], **int16),
+              RKEWOp(_scratch_arg(positive), _scratch_arg(valid_delta), _scratch_arg(zero), count, _EW_CFG[Ops.MAX], **int16),
+              RKEWOp(_scratch_arg(valid), _scratch_arg(positive), _scratch_arg(one), count, _EW_CFG_MIN, **int16),
+              RKEWOp(_scratch_arg(remaining), _scratch_arg(one), _scratch_arg(valid), count, _EW_CFG[Ops.SUB], **int16),
+              RKEWOp(_scratch_arg(selected), equal, _scratch_arg(coordinate_matrix), matrix_lanes, _EW_CFG[Ops.MUL], **int16)))
+  selected_value = _reduce_rows(ops, [_scratch_arg(selected, row*vector_bytes) for row in range(coordinate_count)],
                                 count, _EW_CFG[Ops.ADD], int16=True)
-  ops.extend((RKEWOp(arg(guarded), selected_value, arg(valid), count, _EW_CFG[Ops.MUL], **int16),
-              RKEWOp(arg(fill_part), arg(fill_slot), arg(remaining), count, _EW_CFG[Ops.MUL], **int16),
-              RKEWOp(arg(result), arg(guarded), arg(fill_part), count, _EW_CFG[Ops.ADD], **int16),
-              RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), arg(result), arg(result), count, _EW_CFG[Ops.MAX],
+  ops.extend((RKEWOp(_scratch_arg(guarded), selected_value, _scratch_arg(valid), count, _EW_CFG[Ops.MUL], **int16),
+              RKEWOp(_scratch_arg(fill_part), _scratch_arg(fill_slot), _scratch_arg(remaining), count, _EW_CFG[Ops.MUL], **int16),
+              RKEWOp(_scratch_arg(result), _scratch_arg(guarded), _scratch_arg(fill_part), count, _EW_CFG[Ops.ADD], **int16),
+              RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), _scratch_arg(result), _scratch_arg(result), count, _EW_CFG[Ops.MAX],
                      int16_input=True, int32_output=True)))
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=mid, gather_after=gather_after)
@@ -2555,15 +2542,11 @@ def _lower_dynamic_load_with_bool_total_gate(output:RKOutput, dtype:DType=dtypes
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, source_count)
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
 
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(size, 64)); return len(scratch_sizes)-1
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
   bool_values = scratch(source_count*64)
   gathers.extend(RKGather(mask_param.arg.slot, bool_values, 1, offsets=(lane,), dst_addend=lane*64, dst_stride=2, itemsize=1)
                  for lane in range(source_count))
-  total = _reduce_rows(ops, [arg(bool_values, lane*64) for lane in range(source_count)], 1, _EW_CFG[Ops.ADD], int16=True)
+  total = _reduce_rows(ops, [_scratch_arg(bool_values, lane*64) for lane in range(source_count)], 1, _EW_CFG[Ops.ADD], int16=True)
   coordinates = tuple((coordinate,)*count for coordinate in range(source_count))
   if (equal:=_native_int16_byte_mask(ops, gathers, scratch, index_param.arg.slot, index_offsets,
                                      (coordinates,), count, vector_lanes)) is None: return None
@@ -2586,20 +2569,20 @@ def _lower_dynamic_load_with_bool_total_gate(output:RKOutput, dtype:DType=dtypes
 
   valid_delta, positive, valid, remaining = (scratch(count*2) for _ in range(4))
   int16 = dict(int16_input=True, int16_output=True)
-  ops.extend((RKEWOp(arg(valid_delta), arg(total_vector), arg(output_coordinate), count, _EW_CFG[Ops.SUB], **int16),
-              RKEWOp(arg(positive), arg(valid_delta), arg(zero), count, _EW_CFG[Ops.MAX], **int16),
-              RKEWOp(arg(valid), arg(positive), arg(one), count, _EW_CFG_MIN, **int16),
-              RKEWOp(arg(remaining), arg(one), arg(valid), count, _EW_CFG[Ops.SUB], **int16)))
+  ops.extend((RKEWOp(_scratch_arg(valid_delta), _scratch_arg(total_vector), _scratch_arg(output_coordinate), count, _EW_CFG[Ops.SUB], **int16),
+              RKEWOp(_scratch_arg(positive), _scratch_arg(valid_delta), _scratch_arg(zero), count, _EW_CFG[Ops.MAX], **int16),
+              RKEWOp(_scratch_arg(valid), _scratch_arg(positive), _scratch_arg(one), count, _EW_CFG_MIN, **int16),
+              RKEWOp(_scratch_arg(remaining), _scratch_arg(one), _scratch_arg(valid), count, _EW_CFG[Ops.SUB], **int16)))
   results:list[RKArg] = []
   for value,fill_slot in zip(raw_values, fill_slots):
     selected_matrix, guarded, fill_part, result = (scratch(matrix_lanes*2), scratch(count*2), scratch(count*2), scratch(count*2))
-    ops.append(RKEWOp(arg(selected_matrix), arg(value), equal, matrix_lanes, _EW_CFG[Ops.MUL], **int16))
-    selected_byte = _reduce_rows(ops, [arg(selected_matrix, row*vector_bytes) for row in range(source_count)], count,
+    ops.append(RKEWOp(_scratch_arg(selected_matrix), _scratch_arg(value), equal, matrix_lanes, _EW_CFG[Ops.MUL], **int16))
+    selected_byte = _reduce_rows(ops, [_scratch_arg(selected_matrix, row*vector_bytes) for row in range(source_count)], count,
                                  _EW_CFG[Ops.ADD], int16=True)
-    ops.extend((RKEWOp(arg(guarded), selected_byte, arg(valid), count, _EW_CFG[Ops.MUL], **int16),
-                RKEWOp(arg(fill_part), arg(fill_slot), arg(remaining), count, _EW_CFG[Ops.MUL], **int16),
-                RKEWOp(arg(result), arg(guarded), arg(fill_part), count, _EW_CFG[Ops.ADD], **int16)))
-    results.append(arg(result))
+    ops.extend((RKEWOp(_scratch_arg(guarded), selected_byte, _scratch_arg(valid), count, _EW_CFG[Ops.MUL], **int16),
+                RKEWOp(_scratch_arg(fill_part), _scratch_arg(fill_slot), _scratch_arg(remaining), count, _EW_CFG[Ops.MUL], **int16),
+                RKEWOp(_scratch_arg(result), _scratch_arg(guarded), _scratch_arg(fill_part), count, _EW_CFG[Ops.ADD], **int16)))
+    results.append(_scratch_arg(result))
   post = tuple(RKGather(value.index, out_param.arg.slot, count,
                         offsets=tuple(value.addend+lane*2 for lane in range(count)), dst_stride=itemsize, dst_addend=byte,
                         dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
@@ -2708,12 +2691,11 @@ def _bool_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tupl
   zero, one, candidates_slot, diff, magnitude, unequal, equal, int_tiles = range(8)
   gathers = _stripe_gathers(source_slot, candidates_slot, count, offsets, vector_lanes)
   scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(_int32_tiles_bytes(count)))
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   ops:list[RKEWOp] = []
-  _ew_eq_mask(ops, arg, candidates_slot, zero, (diff, magnitude, unequal, equal), one, matrix_lanes)
-  selected = _reduce_rows(ops, [arg(unequal, row*vector_bytes) for row in range(window)], count,
+  _ew_eq_mask(ops, _scratch_arg, candidates_slot, zero, (diff, magnitude, unequal, equal), one, matrix_lanes)
+  selected = _reduce_rows(ops, [_scratch_arg(unequal, row*vector_bytes) for row in range(window)], count,
                           _EW_CFG[Ops.MAX if op is Ops.OR else Ops.MUL])
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), selected, arg(int_tiles), count, _EW_CFG[Ops.MAX],
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), selected, _scratch_arg(int_tiles), count, _EW_CFG[Ops.MAX],
                     stateful=True, int32_output=True, bool_output=True))
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
 
@@ -2735,15 +2717,14 @@ def _contiguous_bool_reduction_image(out_slot:int, count:int, source_slot:int, g
   """Reduce contiguous FP16 blocks without materializing their transposed offset matrix."""
   source_count = count*groups
   zero, diff, magnitude, unequal, packed, int_tiles = range(6)
-  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  ops = [RKEWOp(arg(diff), RKArg(RKBufferKind.ARG, source_slot), arg(zero), source_count, _EW_CFG[Ops.SUB]),
-         RKEWOp(arg(magnitude), arg(diff), arg(diff), source_count, _EW_CFG_ABS, submit_barrier=True, stateful=True),
-         RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), source_count, _EW_CFG[Ops.MAX], compare=True)]
-  ops.extend(_block_bool_reduction_ops(arg(unequal), count, groups, op))
+  ops = [RKEWOp(_scratch_arg(diff), RKArg(RKBufferKind.ARG, source_slot), _scratch_arg(zero), source_count, _EW_CFG[Ops.SUB]),
+         RKEWOp(_scratch_arg(magnitude), _scratch_arg(diff), _scratch_arg(diff), source_count, _EW_CFG_ABS, submit_barrier=True, stateful=True),
+         RKEWOp(_scratch_arg(unequal), _scratch_arg(magnitude), _scratch_arg(magnitude), source_count, _EW_CFG[Ops.MAX], compare=True)]
+  ops.extend(_block_bool_reduction_ops(_scratch_arg(unequal), count, groups, op))
   gather_after = len(ops)
   mid = (RKGather(unequal, packed, count, offsets=tuple(lane*groups for lane in range(count)),
                   src_kind=RKBufferKind.SCRATCH),)
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), arg(packed), arg(int_tiles), count, _EW_CFG[Ops.MAX],
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), _scratch_arg(packed), _scratch_arg(int_tiles), count, _EW_CFG[Ops.MAX],
                     stateful=True, int32_output=True, bool_output=True))
   full, output = _scratch_bytes(source_count), _scratch_bytes(count)
   scratch = (RKScratch(full), RKScratch(full), RKScratch(full), RKScratch(full), RKScratch(output),
@@ -2767,10 +2748,7 @@ def _integer_predicate_reduction_image(out_slot:int, count:int, source_slot:int,
   """Reduce exact integer nonzero masks with native INT16 ADD/MAX/MUL."""
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, len(offsets))
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
-  scratch_sizes:list[int] = []
-  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
-  gathers:list[RKGather] = []
-  ops:list[RKEWOp] = []
+  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
   if (mask:=_native_integer_nonzero_mask(ops, gathers, scratch, source_slot, offsets,
                                          count, vector_lanes, itemsize)) is None: return None
   reduced = _reduce_rows(ops, [replace(mask, addend=mask.addend+row*vector_bytes) for row in range(len(offsets))],
@@ -3556,10 +3534,6 @@ class RKContext:
     dst = self._alu_dst(u, out_dtype, layout, ((u.src[0], lhs), (u.src[1], rhs)))
     return self._emit(dst, lhs, rhs, cfg, compare=compare)
 
-  def _accurate_add(self, u:UOp) -> RKValue:
-    recipe = _accurate_add_recipe(u)
-    return self.lower(recipe)
-
   def _coerce_bool(self, value:RKValue, layout:RKLayout) -> RKValue:
     if value.layout is layout: return value
     if value.layout is not RKLayout.BOOL_MASK or layout is not RKLayout.BOOL_INT16: raise _RKGenericReject
@@ -3792,6 +3766,7 @@ class RKContext:
     return self._pack_raw(u, byte_results, RKLayout.INT32)
 
   def _compare(self, u:UOp) -> RKValue:
+    if len(u.src) != 2: raise _RKGenericReject
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
     if u.op in (Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_equality(u)
     if u.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_less(u)
@@ -3801,8 +3776,7 @@ class RKContext:
       if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(
         bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds
       ):
-        recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg)
-        value = self.lower(recipe)
+        value = self.lower(UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg))
         if value.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
         return value
       return self._int32_compare(u.replace(src=sources))
@@ -3926,8 +3900,6 @@ class RKContext:
 
   def _fp16_equality(self, u:UOp) -> RKValue:
     """Evaluate IEEE FP16 equality through raw bytes and native INT16 arithmetic, without reset-heavy compare stages."""
-    if u.op not in (Ops.CMPNE, Ops.CMPEQ) or len(u.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in u.src):
-      raise _RKGenericReject
     values = tuple(self._operand(src, dtypes.half) for src in u.src)
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
@@ -3989,8 +3961,6 @@ class RKContext:
 
   def _fp16_less(self, u:UOp) -> RKValue:
     """Evaluate IEEE FP16 less-than as an ordered raw-byte comparison without reset-heavy compare stages."""
-    if u.op is not Ops.CMPLT or len(u.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in u.src):
-      raise _RKGenericReject
     values = tuple(self._operand(src, dtypes.half) for src in u.src)
     if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
     constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1)}
@@ -4223,40 +4193,29 @@ class RKContext:
       source_dtype = u.src[0].dtype.scalar()
       int_range = _exact_int_range(u.src[0], self.int_ranges) if source_dtype is dtypes.int else None
       if dtype is dtypes.half and source_dtype is dtypes.float:
-        if u.src[0].op is Ops.LOAD: source = self._load(u.src[0])
-        else:
-          recipe = _fp32_expr_to_half(u.src[0])
-          source = self.lower(recipe)
+        source = self._load(u.src[0]) if u.src[0].op is Ops.LOAD else self.lower(_fp32_expr_to_half(u.src[0]))
       elif dtype is dtypes.half and source_dtype is dtypes.int and int_range is not None and \
            -_FP16_EXACT_INTEGER <= int_range[0] <= int_range[1] <= _FP16_EXACT_INTEGER:
-        recipe = _int_fp16_expr(u.src[0])
-        source = self.lower(recipe)
+        source = self.lower(_int_fp16_expr(u.src[0]))
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
-      elif dtype is dtypes.half and source.layout is RKLayout.BOOL_INT16:
-        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        value = self.lower(recipe)
-      elif dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16):
+      elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or
+                                                     dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16):
+        value = self.lower(u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half)))
+        if dtype is dtypes.int:
+          if value.layout is not RKLayout.FP16: raise _RKGenericReject
+          value = RKValue(value.arg, dtype, self.count, RKLayout.INT_FP16)
+      elif (source.layout is RKLayout.FP16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.half) or
+            dtype is dtypes.half and source.layout in (RKLayout.BOOL_MASK, RKLayout.INT_FP16)):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
-      elif dtype is dtypes.float and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
-        value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
-      elif dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16):
+      elif (dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16) or
+            dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT16):
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
-      elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT16:
-        value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
-      elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT_FP16:
-        recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        converted = self.lower(recipe)
-        if converted.layout is not RKLayout.FP16: raise _RKGenericReject
-        value = RKValue(converted.arg, dtype, self.count, RKLayout.INT_FP16)
       elif dtype is dtypes.int and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         if self.int_layout is RKLayout.INT_FP16:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
-          else:
-            recipe = _int_fp16_expr(u)
-            converted = self.lower(recipe)
-            value = RKValue(converted.arg, dtype, self.count, self.int_layout)
+          else: value = RKValue(self.lower(_int_fp16_expr(u)).arg, dtype, self.count, self.int_layout)
         elif self.int_layout is RKLayout.INT16:
           value = self._scratch(dtype, self.int_layout)
           self.ew_ops.append(RKEWOp(value.arg, source.arg, source.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int16_output=True))
@@ -4266,22 +4225,18 @@ class RKContext:
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject(f"cast {source.layout.name}->{dtype}")
     elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None and self.accurate_adds:
-      try: value = self._accurate_add(u)
+      try: value = self.lower(_accurate_add_recipe(u))
       except _RKGenericReject: value = self._alu(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
-    elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): value = self._compare(u)
-    elif dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ) and \
-         all(src.dtype.scalar() is dtypes.bool for src in u.src): value = self._bool_binary(u)
-    elif (dtype is dtypes.bool and u.op in (Ops.AND, Ops.OR, Ops.XOR, Ops.CMPNE, Ops.CMPEQ) and
-          (ieee_recipe:=_ieee_comparison_mask(u)) is not None): value = self._ieee_bool(ieee_recipe)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
-    elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
+    elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool:
+      if all(src.dtype.scalar() is dtypes.bool for src in u.src): value = self._bool_binary(u)
+      elif (ieee_recipe:=_ieee_comparison_mask(u)) is not None: value = self._ieee_bool(ieee_recipe)
+      else: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
     elif u.op in (Ops.SHL, Ops.SHR) and dtype in (dtypes.int, dtypes.uint): value = self._int32_shift(u)
     elif u.op in (Ops.CDIV, Ops.CMOD) and dtype is dtypes.int:
-      if self.int_layout is RKLayout.INT_FP16:
-        converted = self.lower(_int_fp16_expr(u))
-        value = RKValue(converted.arg, dtype, self.count, self.int_layout)
+      if self.int_layout is RKLayout.INT_FP16: value = RKValue(self.lower(_int_fp16_expr(u)).arg, dtype, self.count, self.int_layout)
       else: value = self._int32_divmod(u)
     elif u.op is Ops.WHERE: value = self._where(u)
     elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)

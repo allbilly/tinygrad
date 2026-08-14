@@ -6045,3 +6045,32 @@ comparator.
 The transferred renderer SHA-256 (`2e0d54cf...f086`) exactly matches the fully tested
 `/tmp/rk-obsolete-catalog.OlHjWc` worktree. No runtime/core code, hardware assertion, tolerance, host tensor arithmetic,
 CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — unify Rockchip physical-builder and typed-dispatch plumbing
+
+The messiest remaining code was not one of the long precision algorithms. It was the plumbing around them: six
+physical image builders each recreated the same scratch allocator and gather/EW working lists, thirteen local closures
+rebuilt the same scratch `RKArg`, and `RKContext.lower` branched the same CAST, comparison, and boolean semantics in
+several places. These parallel mechanisms made small ABI changes require edits across unrelated lowering paths.
+
+One `_physical_lists` constructor now owns scratch/list setup, and `_scratch_arg` owns scratch argument construction.
+The six builders and thirteen call sites retain their original allocation and append order. `RKContext` now checks
+comparison arity once, has one comparison dispatch and one boolean-ALU dispatch, shares equivalent CAST ABI branches,
+and calls the accurate-add recipe directly instead of routing through a one-use wrapper.
+
+- Exact renderer diff: **124 insertions / 169 deletions**, executable lines **5,164 -> 5,118** (**-46**); runtime
+  remains **489**, total **30,674**. Cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **1,498 lines**.
+- A baseline-versus-candidate lowering oracle compared **172 ordered outcomes**, including **164 RKImages** and
+  **5,456,366 encoded bytes**. Every result was byte-for-byte identical; the aggregate digest is
+  `eb1bf55e...52691`.
+- UOp tests: **93 passed** with `-n12`; the Rockchip vendor health probe passed **60/60** elementwise cases.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **781.29 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`c2d28e18...31fee6d`) exactly matches the fully tested
+`/tmp/rk-context-clean.Jok8In` worktree. No test/runtime/core code, assertion, tolerance, host tensor arithmetic,
+CPU/GPU fallback, CMAC, reset, reboot, or push was used.
