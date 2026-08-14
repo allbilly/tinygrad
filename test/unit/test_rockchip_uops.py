@@ -76,6 +76,7 @@ def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
   for index in range(len(image.ew_ops)+1):
     apply_gathers(tuple(mid.get(index, ())))
     if index < len(image.ew_ops): execute(image.ew_ops[index])
+  apply_gathers(image.post_gathers)
   return np.frombuffer(args[0], dtype="<i4").copy()
 
 def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
@@ -859,10 +860,30 @@ def test_direct_dynamic_int32_load_selects_all_raw_bytes():
 
 
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
-  lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
-  image = _lower_uop_program(_program(dtypes.int, lambda i:lhs.index(i).load() & rhs.index(i).load()))
-  assert image is not None and len(image.post_gathers) == 1
-  assert image.post_gathers[0].count == 16 and all(op.int16_input and op.int16_output for op in image.ew_ops)
+  rng = np.random.default_rng(0x2608)
+  samples = [rng.integers(-(1<<31), 1<<31, 64, dtype=np.int64).astype(np.int32) for _ in range(3)]
+  edges = np.asarray((-(1<<31), (1<<31)-1, -1, 0, 1, -1431655766, 1431655765, 0x00ff00ff), dtype=np.int32)
+  for index in range(3): samples[index][:len(edges)] = np.roll(edges, index)
+  functions = {Ops.AND:np.bitwise_and, Ops.OR:np.bitwise_or, Ops.XOR:np.bitwise_xor}
+  for op,fn in functions.items():
+    out, lhs, rhs, third = (UOp.param(slot, dtypes.int, (len(samples[0]),)) for slot in range(4))
+    lane = UOp.range(len(samples[0]), 0)
+    direct = UOp(op, dtypes.int, src=(lhs.index(lane).load(), rhs.index(lane).load()))
+    for value,inputs,expected in ((direct, samples[:2], fn(samples[0], samples[1])),
+      (UOp(op, dtypes.int, src=(direct, third.index(lane).load())), samples, fn(fn(samples[0], samples[1]), samples[2]))):
+      image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+      assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+      assert not image.host_gathers and not image.host_scatters and all(x.int16_input and x.int16_output for x in image.ew_ops)
+      assert decode_image(encode_image(image)) == image
+      np.testing.assert_array_equal(_execute_integer_image(image, *inputs), expected)
+    for constant in (0, 1, -1, 0x00ff00ff, -1431655766):
+      image = _lower_uop_program(_int32_binary_program(
+        lambda left,_right,op=op,constant=constant:UOp(op, dtypes.int, src=(left, UOp.const(constant, dtypes.int))), len(samples[0])))
+      assert image is not None and decode_image(encode_image(image)) == image
+      np.testing.assert_array_equal(_execute_integer_image(image, samples[0]), fn(samples[0], np.int32(constant)))
+  maximum = _lower_uop_program(_int32_binary_program(lambda lhs,rhs:lhs & rhs, _MAX_EW_ELEMS_FP16//4))
+  assert maximum is not None and decode_image(encode_image(maximum)) == maximum
+  assert _lower_uop_program(_int32_binary_program(lambda lhs,rhs:lhs & rhs, _MAX_EW_ELEMS_FP16//4+1)) is None
 
 
 def test_wide_int32_cdiv_cmod_physical_semantics_and_composition():

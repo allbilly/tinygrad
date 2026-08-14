@@ -5938,3 +5938,37 @@ path; unsupported layouts still fail closed.
 The transferred renderer SHA-256 (`e24b5c91...1cf33`) exactly matches the fully tested
 `/tmp/rk-int32-div.XExQbU` worktree. No runtime/core code, test tolerance, host tensor arithmetic, CPU/GPU fallback,
 CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — compose INT32 bitwise UOps and unify raw-byte plumbing
+
+INT32 `AND`/`OR`/`XOR` still bypassed the typed executor through a 50-line root-only emitter, even though
+`RKContext._integer_bitwise` contained the same byte-plane algorithm for INT16. Raw representation plumbing was also
+split across three caches and three nearly identical split/pack implementations for FP16, INT16, and INT32, while
+FP16 and INT32 comparisons independently implemented the same ordered-byte loop.
+
+The root emitter and dispatch are deleted. The typed bitwise executor now selects its two- or four-byte width from
+the proven layout, so direct, constant, and nested INT32 operations use the same compositional UOp path. One
+`_raw_parts` cache and one `_pack_raw` helper replace the five split/pack functions, and `_ordered_byte_less` owns the
+shared lexical comparison. A direct root NOT keeps a one-stage raw-byte fast path because native wide subtraction
+saturates `~INT_MIN` incorrectly; canonical boolean inversion is now one exact `1-x` stage.
+
+- Exact renderer diff: **68 insertions / 149 deletions**, executable lines **5,353 -> 5,276** (**-77**); runtime
+  remains **489**, total **30,832**. Cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **1,340 lines**.
+- A physical integer-image oracle checked seeded full-range values and extrema for all three operators, direct and
+  nested expressions, five constant masks, native/no-host execution, and encode/decode. The exact 4,000-element
+  byte-lane limit encodes; 4,001 fails closed.
+- Eight non-migrated raw consumers remained byte-identical: FP16 LT/NE/raw WHERE, INT16 XOR/mask packing, INT32 LT,
+  nested NOT-plus-wide arithmetic, and exact INT32 division. The division digest remains `56483ae6...482f0`.
+- A 64-lane AND keeps **92 EW stages** while its image falls from **14,062 to 12,254 bytes** and scratch from
+  **48,640 to 14,336 bytes**. Direct INT32 NOT falls from **100 to 1 EW task**; boolean NOT falls from **2 to 1**.
+- UOp tests: **92 passed** with `-n12`; focused Rockchip and Rockchip2 bitwise/shift hardware: **13 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **797.26 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`4b7c5a57...5243`) exactly matches the fully tested
+`/tmp/rk-int32-bitwise.M4tnLP` worktree. No runtime/core code, hardware assertion, tolerance, host tensor arithmetic,
+CPU/GPU fallback, CMAC, reset, reboot, or push was used.
