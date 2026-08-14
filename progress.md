@@ -5575,3 +5575,39 @@ large QK matcher (**18.12 s**), while its NPU execution remains approximately **
 All offsets, masks, and plans are derived from static UOps at compile time. Runtime gathers only move opaque lanes;
 every attention arithmetic operation executes on DPU EW. There is no tensor-value host computation, CMAC, LUT, FP32
 input, Tinygrad-core/runtime change, or tolerance relaxation.
+
+---
+
+## 2026-08-14 — unify physical UOp execution without changing renderer capabilities
+
+A serial profile identified `test_simple_cummin` as the slowest completed compiler-heavy Rockchip case. On the
+6,616-line baseline it took **50.51 s** without profiler overhead. Under cProfile, `_exact_int_range` was called 3,072
+times and consumed **13.38 s cumulative** through 4.75 million recursive calls. Reusing conservative child bounds and
+the canonical guarded UOp `vmin`/`vmax` bounds reduced the same case to approximately **45 s**.
+
+The largest poorly factored block was the parallel legacy `lower_ew` executor and its private leaf/selection analysis.
+The compositional `RKContext` executor already owns those physical stages. The proven rewrite removes the duplicate
+executor while retaining the specialized precision/reduction paths. Its executable-line accounting is:
+
+- legacy physical executor and private leaf analysis: **298 lines removed** (`lower_ew` 176, `_selection_gather` 82,
+  `_ew_leaf` 14, `_unsupported_ew_ops` 11, `_compensated_mul_sum` 9, `_mul_reduction_terms` 6);
+- exact integer bounds: **33 -> 21** lines;
+- mapped and unrolled reducer plumbing: **207 -> 199** lines;
+- program orchestration and the compositional helper: **net +4** lines.
+
+The first temporary rewrite incorrectly advertised local scheduling on the only renderer. That changed precise dot
+graphs into shorter generic local programs and failed four dot tests. Restoring separate non-local and local-bool
+renderer capabilities fixed all four. A second temporary attempt accidentally omitted the 146-line expanded-ADD
+reducer dispatch; the full census caught a cross-entropy accuracy failure at 52%. Restoring that dispatch reproduced
+the baseline cross-entropy image sizes and fixed the failure. Neither rejected attempt was transferred.
+
+- Final hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures, all **445** collected cases,
+  in **840.34 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- Strong unchanged UOp tests: **89 passed** with `-n12`; Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`
+  pass.
+- `sz.py`: renderer/runtime **6,302/489 executable lines**, total **31,858**; renderer is **314 lines smaller** than
+  the preceding 6,616-line milestone.
+
+All experiments and both rejected variants stayed in `/tmp`. Only the renderer file whose SHA-256 matched the fresh
+proof worktree was transferred. No tests were weakened or transferred, and no CPU/GPU tensor computation, CMAC, LUT,
+runtime arithmetic, tolerance change, reboot, or push was used.
