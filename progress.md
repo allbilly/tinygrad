@@ -6139,3 +6139,41 @@ nonpositive-EXP2 helper are deleted, while the still-observed EXP2, LOG2, SQRT, 
 The transferred renderer SHA-256 (`28252db6...574d51`) exactly matches the fully tested
 `/tmp/rk-fallback-clean.g1nbNz` worktree. No test/runtime/core code, assertion, tolerance, host tensor arithmetic,
 CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — delete prefix, count, and occurrence graph recovery
+
+Seven pre-generic dispatch entries still recognized historical masked-select/nonzero/cumulative graph spellings and
+emitted private prefix, predicate-total, and INT32 occurrence images. Their 16-function dependency component rebuilt
+static row matrices, IEEE masks, byte-carry sums, local ADD loops, and terminal conversions already expressible by the
+typed UOp executor.
+
+The seven entries and their now-closed helpers are deleted. FP16 predicates, INT32 prefix arithmetic, WHERE, local
+updates, typed loads, and final widening now compose through ordinary UOps. The independent bounded-coordinate path
+remains because it has distinct dynamic-rank/fill semantics and current hardware ownership.
+
+- Exact production diff: **417 renderer lines deleted**, executable renderer size **5,010 -> 4,628** (**-382**);
+  runtime remains **489**, total falls **30,567 -> 30,185**, and cumulative renderer reduction from the 6,616-line
+  cleanup baseline is **1,988 lines**.
+- Of **172 ordered unit outcomes / 164 RKImages**, **162 images remain byte-for-byte identical**. The two intentionally
+  migrated synthetic prefixes remain `NATIVE`, use zero host gathers/scatters, terminate in INT32 widening, and
+  encode/decode exactly. Their small image shapes change from **16 -> 333 EW / 1,085 -> 16,882 bytes** and
+  **10 -> 70 EW / 855 -> 4,321 bytes**; the obsolete exact-stage assertions were replaced by those semantic/ABI
+  contracts rather than hidden.
+- Baseline/candidate hardware profiling identified `test_simple_cummin` as the slowest affected case
+  (**35.46 / 35.60 s**, effectively unchanged). The 22-test cumulative/masked-select/nonzero gate passed in
+  **152.79 / 154.27 s**. The 7-test one-hot/arg-extrema/sort/top-k gate passed in **42.81 / 35.98 s**; top-k improved
+  **17.69 -> 4.88 s**, while sort changed **16.00 -> 22.00 s**. Combined affected time improved
+  **195.60 -> 190.25 s**.
+- A historical two-line native-INT16-to-FP16 state-restoration experiment was retested against the slowest case but
+  did not improve today's schedule (**37.20 s**); it was rejected and fully reverted in `/tmp`.
+- UOp tests: **93 passed** with `-n12`. Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero
+  failures across all **445** cases in **814.71 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass. Fable-judge reports
+  **VERIFIED WITH CAVEAT** solely for the two deliberate image-shape contract replacements above; no skipped numeric
+  check, tolerance change, host execution path, dead reference, or scope creep was found.
+
+The transferred renderer SHA-256 (`1a28d441...3deab`) and focused-test SHA-256 (`200850b4...79e03`) exactly match the
+fully tested `/tmp/rk-prefix-clean.HwTr3p` worktree. No runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.

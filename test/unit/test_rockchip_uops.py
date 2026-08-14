@@ -816,7 +816,7 @@ def test_packed_bool_load_uses_canonical_int16_lanes():
   assert image.ew_ops[-1].int16_input and image.ew_ops[-1].int32_output
 
 
-def test_unrolled_fp16_predicate_prefix_uses_blocked_uop_recipe():
+def test_fp16_predicate_prefix_executes_generic_uops():
   source = UOp.param(1, dtypes.half, (4,))
   def prefix(lane:UOp) -> UOp:
     terms = []
@@ -828,10 +828,11 @@ def test_unrolled_fp16_predicate_prefix_uses_blocked_uop_recipe():
     for term in terms[1:]: value = value+term
     return value
   image = _lower_uop_program(_program(dtypes.int, prefix))
-  assert image is not None and len(image.ew_ops) == 16 and sum(op.compare for op in image.ew_ops) == 3
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+  assert any(op.int32_output for op in image.ew_ops) and decode_image(encode_image(image)) == image
 
 
-def test_normalized_int_prefix_avoids_compare_submission():
+def test_normalized_int_prefix_executes_generic_int32_uops():
   source = UOp.param(1, dtypes.int, (4,))
   def prefix(lane:UOp) -> UOp:
     terms = []
@@ -842,7 +843,8 @@ def test_normalized_int_prefix_avoids_compare_submission():
     for term in terms[1:]: value = value+term
     return (value < 0).where(value+4, value)
   image = _lower_uop_program(_program(dtypes.int, prefix))
-  assert image is not None and len(image.ew_ops) == 10 and not any(op.compare for op in image.ew_ops)
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+  assert any(op.int32_output for op in image.ew_ops) and decode_image(encode_image(image)) == image
 
 
 def test_direct_dynamic_int32_load_selects_all_raw_bytes():
