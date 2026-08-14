@@ -587,30 +587,24 @@ def _output_store(uops:list[UOp], dtype:DType|tuple[DType, ...], *, allow_local:
   if out_param.dtype.scalar() not in accepted or out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
   return store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
 
-def _iter_range_env(ranges:list[UOp], max_envs:int=_MAX_STATIC_RANGE_ENVS) -> list[dict[UOp, int]]:
+def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> list[dict[UOp, int]]:
   if not ranges: return [{}]
   order:list[UOp] = []
-  seen:set[UOp] = set()
-  def add(r:UOp) -> None:
-    if r in seen: return
-    for src in r.src[1:]:
-      if src.op is Ops.RANGE: add(src)
-    seen.add(r); order.append(r)
-  for r in ranges: add(r)
+  if dependencies:
+    seen:set[UOp] = set()
+    def add(r:UOp) -> None:
+      if r in seen: return
+      for src in r.src[1:]:
+        if src.op is Ops.RANGE: add(src)
+      seen.add(r); order.append(r)
+    for r in ranges: add(r)
+  else: order = ranges
   envs:list[dict[UOp, int]] = [{}]
   for r in order:
     if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
     bound = int(r.src[0].arg)
-    if bound < 0 or bound and len(envs) > max_envs//bound: raise RuntimeError("RKPLAN_REJECT:static_index_budget")
+    if max_envs is not None and (bound < 0 or bound and len(envs) > max_envs//bound): raise RuntimeError("RKPLAN_REJECT:static_index_budget")
     envs = [{**env, r: i} for env in envs for i in range(bound)]
-  return envs
-
-def _iter_selected_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
-  """Enumerate only the selected structural axes, preserving dependent output axes as vector lanes."""
-  envs:list[dict[UOp, int]] = [{}]
-  for r in ranges:
-    if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
-    envs = [{**env, r:i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
 def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, list[dict[UOp, int]], UOp, int]|None:
@@ -712,14 +706,20 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
   ranges, vector_env, dst_lanes = _static_vector_env(out_index, count)
   if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
   expr_lanes = np.broadcast_to(_eval_vector(expr, vector_env, {}), len(dst_lanes))
-  values:list[int|None] = [None] * count
-  for dst,raw in zip(dst_lanes, expr_lanes):
-    if not 0 <= dst < count: raise RuntimeError("RKPLAN_REJECT:static_index")
-    value = encode(raw.item())
-    if values[dst] not in (None, value): raise RuntimeError("RKPLAN_REJECT:static_index")
-    values[dst] = value
-  if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")
-  return tuple(x for x in values if x is not None)
+  encoded:np.ndarray
+  if encode is _fp16_bits:
+    fp_values = np.asarray(expr_lanes, dtype=np.float64)
+    if np.any(np.isfinite(fp_values) & (np.abs(fp_values) >= 65520)): raise OverflowError("float too large to pack with e format")
+    encoded = fp_values.astype(np.float16).view(np.uint16)
+  elif encode is _int16_bits: encoded = np.asarray(expr_lanes).astype(np.int64) & 0xffff
+  elif encode is int: encoded = np.asarray(expr_lanes).astype(np.int64)
+  else: encoded = np.fromiter((encode(raw.item()) for raw in expr_lanes), dtype=np.int64, count=len(expr_lanes))
+  if np.any((dst_lanes < 0) | (dst_lanes >= count)): raise RuntimeError("RKPLAN_REJECT:static_index")
+  order = np.argsort(dst_lanes); dst, values = dst_lanes[order], encoded[order]
+  starts = np.empty(len(dst), dtype=np.bool_); starts[:1] = True; starts[1:] = dst[1:] != dst[:-1]
+  if not np.array_equal(dst[starts], np.arange(count)) or np.any(values[1:][~starts[1:]] != values[:-1][~starts[1:]]):
+    raise RuntimeError("RKPLAN_REJECT:static_index")
+  return tuple(int(x) for x in values[starts])
 
 def _static_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   return _static_values(out_index, expr, count, _fp16_bits)
@@ -3814,8 +3814,8 @@ class RKContext:
         vector, layout = tuple(value & 0xffffffff for value in values), self.int_layout
       else: raise _RKGenericReject
     elif dtype is dtypes.bool:
-      if bool_layout is RKLayout.BOOL_INT16: vector, layout = _static_values(self.out_index, u, self.count, lambda x:int(bool(x))), bool_layout
-      else: vector, layout = _static_values(self.out_index, u, self.count, lambda x:_fp16_bits(float(bool(x)))), RKLayout.BOOL_MASK
+      if bool_layout is RKLayout.BOOL_INT16: vector, layout = _static_values(self.out_index, u, self.count, int), bool_layout
+      else: vector, layout = _static_values(self.out_index, u, self.count, _fp16_bits), RKLayout.BOOL_MASK
     else: raise _RKGenericReject
     key = (layout, vector)
     if key not in self.static_slots:
@@ -4464,7 +4464,7 @@ class RKContext:
       routes:dict[UOp, list[bool]] = {}
       def route(node:UOp, active:tuple[bool, ...]) -> None:
         if node.op is Ops.WHERE and _is_static_expr(node.src[0]):
-          selector = tuple(bool(x) for x in _static_values(self.out_index, node.src[0], self.count, lambda x:int(bool(x))))
+          selector = tuple(bool(x) for x in _static_values(self.out_index, node.src[0], self.count, int))
           route(node.src[1], tuple(live and take for live,take in zip(active, selector)))
           route(node.src[2], tuple(live and not take for live,take in zip(active, selector)))
           return
@@ -4871,7 +4871,7 @@ def _unroll_static_reduces(root:UOp) -> UOp:
       iterations = math.prod(int(r.src[0].arg) for r in ranges)
       if iterations > _MAX_GENERIC_UNROLL or iterations*len(mapped.src[0].toposort()) > _MAX_GENERIC_EXPANDED_NODES:
         raise _RKGenericReject
-      envs = _iter_selected_range_env(ranges)
+      envs = _iter_range_env(ranges, None, False)
       if not envs: raise _RKGenericReject
       terms = [_substitute_static_ranges(mapped.src[0], {r:r.const_like(env[r]) for r in ranges}) for env in envs]
       mapped = _structural_reduce(reduce_op, u.dtype, terms)
@@ -4912,7 +4912,7 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
       iterations = math.prod(int(loop.src[0].arg) for loop in definition.loops)
       if iterations > _MAX_GENERIC_UNROLL: raise _RKGenericReject
       accumulator = expand_dependencies(definition.initial, buffer)
-      for env in _iter_selected_range_env(list(definition.loops)):
+      for env in _iter_range_env(list(definition.loops), None, False):
         term = _substitute_static_ranges(definition.term, {loop:loop.const_like(env[loop]) for loop in definition.loops})
         accumulator = UOp(definition.update_op, buffer.dtype, src=(accumulator, expand_dependencies(term, buffer)))
       expanded[buffer] = accumulator
@@ -4943,7 +4943,7 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   iterations = math.prod(int(r.src[0].arg) for r in ranges)
   if iterations > _MAX_GENERIC_UNROLL or iterations*len(term.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
   reduced = initializers[0]
-  for env in _iter_selected_range_env(ranges):
+  for env in _iter_range_env(ranges, None, False):
     reduced = UOp(update.op, update.dtype, src=(reduced, _substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges})))
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
   return root.substitute(substitutions)
@@ -5116,7 +5116,7 @@ def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dic
     shape = tuple(extents[axis] if axis in deps else 1 for axis in axes)
     accumulator = np.broadcast_to(evaluate(definition.initial, deps, {}), shape).astype(np.dtype(buffer.dtype.scalar().fmt), copy=True)
     update = {Ops.ADD:np.add, Ops.MUL:np.multiply, Ops.MAX:np.maximum}[definition.update_op]
-    for loop_env in _iter_selected_range_env(list(definition.loops)):
+    for loop_env in _iter_range_env(list(definition.loops), None, False):
       update(accumulator, np.broadcast_to(evaluate(definition.term, deps, loop_env), shape), out=accumulator)
     tables[buffer] = accumulator; active.remove(buffer)
   out_axes = tuple(_index_ranges(output[3]))
@@ -5178,7 +5178,7 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   mapped_candidate = _substitute_static_ranges(candidate, loop_map)
   if _strip_cast(mapped_candidate).key != _strip_cast(value_def.term).key: return None
   try:
-    index_envs = _iter_selected_range_env(list(index_def.loops))
+    index_envs = _iter_range_env(list(index_def.loops), None, False)
     coordinates = tuple(_eval_int(coordinate, env) for env in index_envs)
   except RuntimeError: return None
   if len(coordinates) != total or any(not 0 <= value <= 32767 for value in coordinates): return None
@@ -5557,25 +5557,6 @@ def _fold_threshold_where(x:UOp) -> UOp|None:
       Ops.ADD, _mask_mul(mask, UOp.const(float(yes.arg)-threshold, dtypes.half)))
   return None
 
-def _fold_general_where(x:UOp) -> UOp|None:
-  """Select FP16 arms with DPU masks, avoiding multiplication by nonfinite constants."""
-  if (threshold:=_fold_threshold_where(x)) is not None: return threshold
-  mask = _mask_expr(x.src[0])
-  if mask is None: return None
-  yes, no = (arm.cast(dtypes.half) for arm in x.src[1:])
-  one = UOp.const(1.0, dtypes.half)
-  inverse = one.alu(Ops.SUB, mask)
-  nonfinite = tuple(arm.op is Ops.CONST and not math.isfinite(float(arm.arg)) for arm in x.src[1:])
-  if any(nonfinite):
-    if any(arm.op is Ops.CONST and math.isnan(float(arm.arg)) for arm in x.src[1:]): return None
-    if all(nonfinite): return yes if float(x.src[1].arg) == float(x.src[2].arg) else None
-    inf_index = next(i for i,is_nonfinite in enumerate(nonfinite) if is_nonfinite)
-    finite, denominator = (no, inverse) if inf_index == 0 else (yes, mask)
-    sign = math.copysign(1.0, float(x.src[1+inf_index].arg))
-    correction = UOp.const(sign, dtypes.half).alu(Ops.FDIV, denominator).alu(Ops.SUB, UOp.const(sign, dtypes.half))
-    return finite.alu(Ops.ADD, correction)
-  return _mask_mul(yes, mask).alu(Ops.ADD, _mask_mul(no, inverse))
-
 def _fold_relu_cap(x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
   def relu(u:UOp) -> UOp|None:
@@ -5785,7 +5766,6 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, name="x"), lambda x: x.src[1].alu(Ops.MAX, x.src[2])
    if x.src[0].op is Ops.CMPLT and x.src[0].src[0] is x.src[2] and x.src[0].src[1] is x.src[1] and
       x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
-  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
 _pm_generic_storage_precision = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.float, name="x"), _fp32_where_to_fp16),

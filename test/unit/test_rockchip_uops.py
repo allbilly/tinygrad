@@ -722,8 +722,11 @@ def test_static_local_address_preflights_reducer_product(monkeypatch):
   update = pointer.store(pointer.load()+1)
   index = buffer.after(update.end(outer, inner)).index(0).load()
   store = out.index(0).store(source.index(index).load())
-  monkeypatch.setattr(rockchip_renderer, "_iter_selected_range_env",
-                      lambda *_: (_ for _ in ()).throw(AssertionError("iterator reached")))
+  original = rockchip_renderer._iter_range_env
+  def guarded_iterator(ranges, max_envs=rockchip_renderer._MAX_STATIC_RANGE_ENVS, dependencies=True):
+    if not dependencies: raise AssertionError("iterator reached")
+    return original(ranges, max_envs, dependencies)
+  monkeypatch.setattr(rockchip_renderer, "_iter_range_env", guarded_iterator)
   assert _lower_uop_program(list(UOp.sink(initialize, update, store).toposort())) is None
 
 

@@ -5718,3 +5718,36 @@ destination ordering rather than rebuilding the same static setup.
 
 The transferred renderer SHA-256 matches the fully tested `/tmp` worktree. No tests, runtime, tolerance, or backend
 semantics changed; no CPU/GPU tensor computation, CMAC, LUT, reboot, reset, or push was used.
+
+---
+
+## 2026-08-14 — vectorize static lane encoding and remove the obsolete final WHERE fallback
+
+The 5,746-line renderer was profiled before another deletion pass. `test_simple_cummin` took **79.43 s** under
+cProfile, with `_lower_uop_program` at **23.23 s**, `RKContext.lower` at **15.58 s**, and `_static_values` at
+**11.72 s** across 3,581 calls. The scalar encoder called `.item()` for roughly 2.88 million lanes.
+
+The temporary candidate keeps UOps as the semantic source but encodes already-vectorized static lanes with NumPy,
+including exact FP16 overflow, signed-zero, infinity, NaN, duplicate-lane, missing-lane, and output-order checks. It
+also merges the selected-axis iterator into `_iter_range_env`. The final `_fold_general_where` matcher is removed:
+ordinary `RKContext._where` already owns these images, and the complete host image census stayed byte-identical.
+
+Under the same cProfile command, the candidate reduced total time to **69.46 s**. `_static_values` fell to **1.81 s**,
+`RKContext.lower` to **5.59 s**, and `_lower_uop_program` to **13.10 s**. The unprofiled focused hardware cummin case
+passed in **41.59 s**.
+
+- Exact production diff: renderer **33 insertions / 53 deletions**, test **5 insertions / 2 deletions**; executable
+  renderer lines **5,746 -> 5,730** (**-16**), runtime remains **489**, total **31,286**.
+- Complete host image census: identical aggregate digest before/after (`37ae9593...4380`).
+- UOp tests: **89 passed** with `-n12`; Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check` pass.
+- Full hardware census on the immediately preceding candidate: **433 passed, 12 skipped, 154 subtests passed**, zero
+  failures across all **445** cases in **838.74 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Adversarial review then hardened the FP16 check against `INT64_MIN` absolute-value overflow. The final form preserved
+  the census digest, matched scalar FP16 encoding on the boundary corpus, passed all 89 host tests, and passed the
+  focused hardware cummin case. The full 445 run was not redundantly repeated after this admitted-domain-equivalent
+  edge guard.
+
+All implementation experiments stayed in `/tmp`; the transferred renderer and focused test hashes exactly match the
+proved temporary worktree. The test change preserves the same pre-allocation assertion under the consolidated private
+iterator name. No test was weakened, and no host tensor arithmetic, CPU/GPU fallback, CMAC, LUT, tolerance change,
+runtime edit, reset, reboot, or push was used.
