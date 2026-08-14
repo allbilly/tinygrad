@@ -96,6 +96,20 @@ class RKImage:
   def execution_class(self) -> RKExecutionClass:
     return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
 
+def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg]) -> RKImage:
+  def gather(value:RKGather) -> RKGather:
+    src, dst = fn(RKArg(value.src_kind, value.src_index)), fn(RKArg(value.dst_kind, value.dst_index))
+    return replace(value, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
+  def host(value:RKHostAddress) -> RKHostAddress: return replace(value, src=fn(value.src), index=fn(value.index), dst=fn(value.dst))
+  return replace(image, gathers=tuple(map(gather, image.gathers)), mid_gathers=tuple(map(gather, image.mid_gathers)),
+    post_gathers=tuple(map(gather, image.post_gathers)), ew_ops=tuple(replace(op, dst=fn(op.dst), lhs=fn(op.lhs), rhs=fn(op.rhs))
+    for op in image.ew_ops), fill=replace(image.fill, dst=fn(image.fill.dst)) if image.fill is not None else None,
+    host_gathers=tuple(map(host, image.host_gathers)), host_scatters=tuple(map(host, image.host_scatters)))
+
+def _alias_image_args(image:RKImage, aliases:dict[int, RKArg]) -> RKImage:
+  return _map_image_args(image, lambda arg:replace(aliases[arg.index], addend=aliases[arg.index].addend+arg.addend)
+    if arg.kind is RKBufferKind.ARG and arg.index in aliases else arg)
+
 def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKImage:
   """Color virtual scratch lifetimes across the complete physical execution schedule."""
   events:dict[int, list[int]] = {}
@@ -526,7 +540,7 @@ def _eval_vector(u:UOp, env:Mapping[UOp, np.ndarray|int], cache:dict[UOp, np.nda
     lhs = _eval_vector(u.src[0], env, cache, load)
     if u.op is Ops.NEG: ret = _vector_cast(-lhs, u.dtype)
     elif u.op is Ops.RECIPROCAL: ret = _vector_cast(1.0 / lhs, u.dtype)
-    elif u.op is Ops.TRUNC: ret = _vector_cast(np.trunc(lhs), u.dtype)
+    elif u.op is Ops.TRUNC: ret = _vector_cast(np.vectorize(int, otypes=[np.int64])(lhs), u.dtype)
     else:
       rhs = _eval_vector(u.src[1], env, cache, load)
       if u.op is Ops.ADD: ret = _vector_cast(lhs + rhs, u.dtype)
@@ -540,7 +554,7 @@ def _eval_vector(u:UOp, env:Mapping[UOp, np.ndarray|int], cache:dict[UOp, np.nda
         quotient = np.zeros(np.broadcast_shapes(lhs.shape, rhs.shape), dtype=np.result_type(lhs, rhs))
         np.floor_divide(lhs, rhs, out=quotient, where=rhs != 0)
         ret = _vector_cast(quotient if u.op is Ops.FLOORDIV else lhs-quotient*rhs, u.dtype)
-      elif u.op is Ops.MAX: ret = _vector_cast(np.maximum(lhs, rhs), u.dtype)
+      elif u.op is Ops.MAX: ret = _vector_cast(np.where(lhs < rhs, rhs, lhs), u.dtype)
       elif u.op is Ops.CMPLT: ret = lhs < rhs
       elif u.op is Ops.CMPNE: ret = lhs != rhs
       elif u.op is Ops.AND: ret = _vector_cast(np.bitwise_and(lhs, rhs), u.dtype)
@@ -1184,9 +1198,7 @@ def _append_mapped_product_residual(mapped:RKImage, out_slot:int, out_index:UOp,
   def remap(arg:RKArg) -> RKArg:
     return RKArg(RKBufferKind.SCRATCH, lhs.index, arg.addend) \
       if arg.kind is RKBufferKind.ARG and arg.index == out_slot else arg
-  def remap_gather(gather:RKGather) -> RKGather:
-    src, dst = remap(RKArg(gather.src_kind, gather.src_index)), remap(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
+  mapped = _map_image_args(mapped, remap)
   gate = direct.src[2] if len(direct.src) > 2 else None
   fill_bits = _fp16_bits(direct.src[1].arg if len(direct.src) > 1 else 0)
   try:
@@ -1203,14 +1215,13 @@ def _append_mapped_product_residual(mapped:RKImage, out_slot:int, out_index:UOp,
             (lhs_high, lhs_high, rhs, Ops.MUL), (error_arg, error_arg, lhs_high, Ops.ADD),
             (rhs_high, lhs, rhs_high, Ops.MUL), (error_arg, error_arg, rhs_high, Ops.ADD),
             (lhs, lhs, rhs, Ops.MUL), (error_arg, error_arg, lhs, Ops.ADD))
-  ops = tuple(replace(op, dst=remap(op.dst), lhs=remap(op.lhs), rhs=remap(op.rhs)) for op in mapped.ew_ops)+tuple(
+  ops = mapped.ew_ops+tuple(
     RKEWOp(dst, left, right, lanes, _EW_CFG[op], submit_barrier=i == 0, stateful=True)
     for i,(dst,left,right,op) in enumerate(stages))
   return replace(mapped, scratch=mapped.scratch+tuple(RKScratch(_scratch_bytes(lanes)) for _ in range(5)),
-    gathers=tuple(remap_gather(gather) for gather in mapped.gathers)+(rhs_gather,
+    gathers=mapped.gathers+(rhs_gather,
       RKGather(out_slot, splitter.index, lanes, values=(_fp16_bits(65.0),)*lanes, dst_kind=RKBufferKind.SCRATCH)),
-    ew_ops=ops, mid_gathers=tuple(remap_gather(gather) for gather in mapped.mid_gathers),
-    host_gathers=tuple(replace(host, src=remap(host.src), index=remap(host.index), dst=remap(host.dst)) for host in mapped.host_gathers))
+    ew_ops=ops)
 
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append an in-place EW image, scheduling its input materialization after the first image completes."""
@@ -1302,15 +1313,7 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp], *, generic_only:bool=False)
     try: post = lower_ew(post_uops)
     except RuntimeError: return None
   if post is None: return reject("post")
-  def alias(arg:RKArg) -> RKArg:
-    return replace(arg, index=out_slot) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
-  def alias_gather(gather:RKGather) -> RKGather:
-    src, dst = alias(RKArg(gather.src_kind, gather.src_index)), alias(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
-  post = replace(post, gathers=tuple(alias_gather(gather) for gather in post.gathers),
-    ew_ops=tuple(replace(op, dst=alias(op.dst), lhs=alias(op.lhs), rhs=alias(op.rhs)) for op in post.ew_ops),
-    mid_gathers=tuple(alias_gather(gather) for gather in post.mid_gathers),
-    post_gathers=tuple(alias_gather(gather) for gather in post.post_gathers))
+  post = _alias_image_args(post, {fake_slot:RKArg(RKBufferKind.ARG, out_slot)})
   appended = _append_inplace_image(reduced, post)
   return appended if appended is not None else reject("append")
 
@@ -1447,22 +1450,13 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp], *, generic_only:boo
     def remap_arg(arg:RKArg) -> RKArg:
       return RKArg(RKBufferKind.SCRATCH, fallback_slots[arg.index], arg.addend) \
         if arg.kind is RKBufferKind.ARG and arg.index in fallback_slots else arg
-    def remap_gather(gather:RKGather) -> RKGather:
-      src, dst = remap_arg(RKArg(gather.src_kind, gather.src_index)), remap_arg(RKArg(gather.dst_kind, gather.dst_index))
-      return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
     fallback_gathers = tuple(RKGather(param.arg.slot, fallback_slots[fake_slot], len(offsets), offsets=offsets,
                                      itemsize=param.dtype.scalar().itemsize)
                              for fake_slot,param,offsets in static_fallbacks)
+    mapped = _map_image_args(mapped, remap_arg)
     mapped = replace(mapped, scratch=mapped.scratch+tuple(
       RKScratch(max(64, len(offsets)*param.dtype.scalar().itemsize)) for _,param,offsets in static_fallbacks),
-      gathers=fallback_gathers+tuple(remap_gather(gather) for gather in mapped.gathers),
-      ew_ops=tuple(replace(op, dst=remap_arg(op.dst), lhs=remap_arg(op.lhs), rhs=remap_arg(op.rhs)) for op in mapped.ew_ops),
-      mid_gathers=tuple(remap_gather(gather) for gather in mapped.mid_gathers),
-      post_gathers=tuple(remap_gather(gather) for gather in mapped.post_gathers),
-      host_gathers=tuple(replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
-                         for host in mapped.host_gathers),
-      host_scatters=tuple(replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
-                          for host in mapped.host_scatters))
+      gathers=fallback_gathers+mapped.gathers)
   finished = _finish_mapped_add_reduction(mapped, out.arg.slot, count, mapped_groups, post_scale,
                                            op_barriers=precise_product, kahan=precise_product)
   if finished is not None and count > 1 and mapped_math and finished.gather_after < len(finished.ew_ops):
@@ -5633,11 +5627,13 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
       if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
                                      for loop in definition.loops):
         raise _RKGenericReject
-      terms = [expand_dependencies(definition.initial, buffer)]
+      iterations = math.prod(int(loop.src[0].arg) for loop in definition.loops)
+      if iterations > _MAX_GENERIC_UNROLL: raise _RKGenericReject
+      accumulator = expand_dependencies(definition.initial, buffer)
       for env in _iter_selected_range_env(list(definition.loops)):
         term = _substitute_static_ranges(definition.term, {loop:loop.const_like(env[loop]) for loop in definition.loops})
-        terms.append(expand_dependencies(term, buffer))
-      expanded[buffer] = _structural_reduce(definition.update_op, buffer.dtype, terms)
+        accumulator = UOp(definition.update_op, buffer.dtype, src=(accumulator, expand_dependencies(term, buffer)))
+      expanded[buffer] = accumulator
       active.remove(buffer)
       if len(expanded[buffer].toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
       return expanded[buffer]
@@ -5664,10 +5660,9 @@ def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
   if any(node.op is Ops.WHERE and node.dtype.scalar() is dtypes.float for node in term.toposort()): raise _RKGenericReject
   iterations = math.prod(int(r.src[0].arg) for r in ranges)
   if iterations > _MAX_GENERIC_UNROLL or iterations*len(term.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
-  terms = [initializers[0]]
+  reduced = initializers[0]
   for env in _iter_selected_range_env(ranges):
-    terms.append(_substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges}))
-  reduced = _structural_reduce(update.op, update.dtype, terms)
+    reduced = UOp(update.op, update.dtype, src=(reduced, _substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges})))
   substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
   return root.substitute(substitutions)
 
@@ -5702,9 +5697,8 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
   return definitions
 
 def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
-  """Materialize independent scalar local ADD programs, then execute their shared output UOps."""
-  def reject(_reason:str) -> RKImage|None: return None
-  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return reject("output")
+  """Materialize independent scalar FP32 local ADD programs, then execute their shared output UOps."""
+  if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
   store, out, count, _, root = output
   def semantic_local_loads(expr:UOp) -> list[UOp]:
     if expr.op in (Ops.RANGE, Ops.SPECIAL): return []
@@ -5712,23 +5706,20 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
     return [load for src in expr.src for load in semantic_local_loads(src)]
   local_loads = list(dict.fromkeys(semantic_local_loads(root)))
   buffers = list(dict.fromkeys(buffer for load in local_loads if (buffer:=_local_buffer(load)) is not None))
-  if not 1 < len(buffers) <= count: return reject(f"buffers:{len(buffers)}:{count}")
+  if not 1 < len(buffers) <= count: return None
   try: definitions = _static_local_defs(uops, set(buffers))
-  except _RKGenericReject: return reject("definitions")
-  if any(definition.update_op is not Ops.ADD or definition.initial.op is not Ops.CONST or
-         float(definition.initial.arg) != 0.0 or not definition.loops or
+  except _RKGenericReject: return None
+  if any(buffer.dtype.scalar() is not dtypes.float or definition.update_op is not Ops.ADD or
+         definition.initial.op is not Ops.CONST or float(definition.initial.arg) != 0.0 or not definition.loops or
          any(loop.src[0].op is not Ops.CONST or int(loop.src[0].arg) <= 0 for loop in definition.loops)
-         for definition in definitions.values()): return reject("shape")
-  if any(semantic_local_loads(definition.term) for definition in definitions.values()):
-    return reject("dependent")
-
+         for buffer,definition in definitions.items()): return None
+  if any(semantic_local_loads(definition.term) for definition in definitions.values()): return None
   next_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out.arg.slot)
   staged:RKImage|None = None
   sources:dict[UOp, UOp] = {}
-
-  for position,buffer in enumerate(buffers):
+  for buffer in buffers:
     definition, groups = definitions[buffer], math.prod(int(loop.src[0].arg) for loop in definitions[buffer].loops)
-    if groups > _MAX_STATIC_RANGE_ENVS: return reject("groups")
+    if groups > _MAX_STATIC_RANGE_ENVS: return None
     flat = UOp.const(0, dtypes.int)
     stride = 1
     for loop in reversed(definition.loops):
@@ -5739,16 +5730,14 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
     map_store = fake.index(flat).store(definition.term)
     mapped = _lower_uop_program(_fp16_rewrite(list(UOp(Ops.SINK, src=(map_store,)).toposort())),
                                 vectorize_reductions=False, recipes_ready=True)
-    if mapped is None or (reduced:=_finish_mapped_add_reduction(mapped, fake_slot, 1, groups, 1.0)) is None:
-      return reject(f"mapped:{position}")
+    if mapped is None or (reduced:=_finish_mapped_add_reduction(mapped, fake_slot, 1, groups, 1.0)) is None: return None
     staged = reduced if staged is None else _append_inplace_image(staged, reduced)
-    if staged is None: return reject(f"staged:{position}")
+    if staged is None: return None
     sources[buffer] = fake
-
   substitutions:dict[UOp, UOp] = {}
   for load in local_loads:
     buffer = _local_buffer(load)
-    if buffer is None: return reject("substitution")
+    if buffer is None: return None
     fake = sources[buffer]
     replacement = fake.index(0).load()
     substitutions[load] = replacement.cast(load.dtype.scalar()) if load.dtype.scalar() is not dtypes.half else replacement
@@ -5759,21 +5748,11 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
   post_store = store.replace(src=(post_index, post_root, *store.src[2:]))
   post = _lower_uop_program(_fp16_rewrite(list(UOp(Ops.SINK, src=(post_store,)).toposort())),
                             vectorize_reductions=False, recipes_ready=True)
-  if post is None or staged is None: return reject("post")
-  appended = _append_inplace_image(staged, post)
-  if appended is None: return reject("append")
+  if post is None or staged is None or (appended:=_append_inplace_image(staged, post)) is None: return None
   scratch_base = len(appended.scratch)
   slot_to_scratch = {fake.arg.slot:scratch_base+i for i,fake in enumerate(sources.values())}
-  def arg(value:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, slot_to_scratch[value.index], value.addend) \
-      if value.kind is RKBufferKind.ARG and value.index in slot_to_scratch else value
-  def gather(value:RKGather) -> RKGather:
-    src, dst = arg(RKArg(value.src_kind, value.src_index)), arg(RKArg(value.dst_kind, value.dst_index))
-    return replace(value, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index)
-  return replace(appended, scratch=appended.scratch+tuple(RKScratch(64) for _ in sources),
-    gathers=tuple(gather(x) for x in appended.gathers),
-    ew_ops=tuple(replace(op, dst=arg(op.dst), lhs=arg(op.lhs), rhs=arg(op.rhs)) for op in appended.ew_ops),
-    mid_gathers=tuple(gather(x) for x in appended.mid_gathers), post_gathers=tuple(gather(x) for x in appended.post_gathers))
+  aliases = {slot:RKArg(RKBufferKind.SCRATCH, target) for slot,target in slot_to_scratch.items()}
+  return replace(_alias_image_args(appended, aliases), scratch=appended.scratch+tuple(RKScratch(64) for _ in sources))
 
 def _static_local_load_offsets(uops:list[UOp], output:RKOutput, root:UOp) -> dict[UOp, tuple[int, ...]]:
   """Vector-execute bounded local programs used only to materialize global addresses."""

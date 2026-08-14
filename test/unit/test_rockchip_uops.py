@@ -28,9 +28,13 @@ def test_binary_tree_iteration_is_ordered_and_bounded_on_shared_dags():
 def test_static_vector_values_match_scalar_typed_evaluation():
   outer, inner = UOp.range(5, 100), UOp.range(4, 101)
   out_index = outer.cast(dtypes.int)*4+inner.cast(dtypes.int)
+  truncated_negative = UOp(Ops.TRUNC, dtypes.half, src=(UOp.const(-0.5, dtypes.half),))
+  max_nan_rhs = UOp(Ops.MAX, dtypes.half, src=(UOp.const(1.0, dtypes.half), UOp.const(math.nan, dtypes.half)))
   expressions = (outer*7-inner*3+5, (outer < 3).where(inner+11, outer-7),
-                 ((outer*7-inner*3+5).cast(dtypes.half)*0.5+1.25).cast(dtypes.half), (outer < 3) & (inner != 2))
-  for expr,encode in zip(expressions, (int, int, rockchip_renderer._fp16_bits, lambda x:int(bool(x)))):
+                 ((outer*7-inner*3+5).cast(dtypes.half)*0.5+1.25).cast(dtypes.half), (outer < 3) & (inner != 2),
+                 truncated_negative, max_nan_rhs)
+  for expr,encode in zip(expressions, (int, int, rockchip_renderer._fp16_bits, lambda x:int(bool(x)),
+                                       rockchip_renderer._fp16_bits, rockchip_renderer._fp16_bits)):
     expected = [None]*20
     for env in rockchip_renderer._iter_range_env([outer, inner]):
       cache = {}
@@ -688,6 +692,24 @@ def test_static_local_address_preserves_sequential_fp16_updates():
   assert output is not None
   assert next(iter(rockchip_renderer._static_local_load_offsets(uops, output, output[4]).values())) == (0,)
   assert (image:=_lower_uop_program(uops)) is not None and decode_image(encode_image(image)) == image
+
+
+def test_multiple_fp16_locals_preserve_sequential_store_updates():
+  out, lane = UOp.param(0, dtypes.half, (2,)), UOp.range(2, 3)
+  def local(slot:int, axis_id:int) -> tuple[UOp, UOp, UOp]:
+    buffer = UOp.placeholder((1,), dtypes.half, slot, addrspace=AddrSpace.REG)
+    initialize, axis = buffer.index(0).store(0.0), UOp.range(3, axis_id, AxisType.REDUCE)
+    pointer = buffer.after(initialize, axis).index(0)
+    term = (axis < 1).where(UOp.const(2048.0, dtypes.half), (axis < 2).where(1.0, -2048.0))
+    update = pointer.store(pointer.load()+term)
+    return initialize, update, buffer.after(update.end(axis)).index(0).load()
+  first_init, first_update, first = local(0, 0)
+  second_init, second_update, second = local(1, 1)
+  image = _lower_uop_program(list(UOp.sink(first_init, first_update, second_init, second_update,
+                                          out.index(lane).store(first+second)).toposort()))
+  assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+  assert image.constants == struct.pack("<e", 0.0) and len(image.ew_ops) == 1 and not image.gathers and not image.mid_gathers
+  assert decode_image(encode_image(image)) == image
 
 
 def test_static_local_address_preflights_reducer_product(monkeypatch):
