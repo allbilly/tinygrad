@@ -5124,7 +5124,7 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
   unit = UOp.const(-1.0 if value < 0 else 1.0, dtypes.half)
   return unit.alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
 
-_pm_fp32_to_fp16 = PatternMatcher([
+_pm_storage_common = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
@@ -5134,6 +5134,8 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+])
+_pm_fp32_to_fp16 = _pm_storage_common + PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.
@@ -5149,16 +5151,7 @@ _pm_fp32_to_fp16 = PatternMatcher([
 ])
 _pm_generic_storage_precision = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.float, name="x"), _fp32_where_to_fp16),
-  (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
-  (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
-  (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
-  (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
-])
+]) + _pm_storage_common
 _pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
                           (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_where_abs)])
 def _unit_ratio_source(root:UOp) -> UOp|None:
@@ -5196,8 +5189,6 @@ def _fold_atan(root:UOp) -> UOp|None:
   selected = angle.alu(Ops.ADD, large.alu(Ops.MUL, reflected.alu(Ops.SUB, angle)))
   sign = source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)))
   return selected.alu(Ops.MUL, sign)
-
-_pm_atan = PatternMatcher([(UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_atan)])
 
 def _hyperbolic_log_source(root:UOp) -> tuple[UOp, int]|None:
   """Match log(x + sqrt(x*x +/- 1)) after natural log expands to LOG2 times ln(2)."""
@@ -5250,10 +5241,6 @@ def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
   large = _hyperbolic_tail(safe, (-0.25, -3/32, -5/96))
   gate = _finite_positive_mask(source.alu(Ops.SUB, UOp.const(2.0, dtypes.half)))
   return small.alu(Ops.ADD, gate.alu(Ops.MUL, large.alu(Ops.SUB, small)))
-
-_pm_inverse_hyperbolic = PatternMatcher([
-  (UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_inverse_hyperbolic),
-])
 
 def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
   """Approximate FP16 sqrt/rsqrt with range-independent Babylonian iterations on DPU EW."""
@@ -5379,29 +5366,6 @@ def _dpu_exp2(source:UOp) -> UOp:
   finite = _mask_mul(result, one.alu(Ops.SUB, below))
   return finite.alu(Ops.ADD, one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one))
 
-def _dpu_exp2_nonpositive(source:UOp) -> UOp:
-  """Approximate EXP2 for a known nonpositive finite-or-negative-infinite input without domain comparisons."""
-  source = source.cast(dtypes.half)
-  bounded = _native_min(source.alu(Ops.MAX, UOp.const(-24.0, dtypes.half)), UOp.const(0.0, dtypes.half))
-  integer = _native_floor(bounded)
-  fraction = bounded.alu(Ops.SUB, integer)
-  polynomial = UOp.const(0.0013333558, dtypes.half)
-  for coefficient in (0.0096181291, 0.0555041087, 0.2402265069, 0.6931471806, 1.0):
-    polynomial = polynomial.alu(Ops.MUL, fraction).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
-  return polynomial.alu(Ops.MUL, _dpu_pow2_integer(integer))
-
-def _fold_masked_exp2(x:UOp) -> UOp|None:
-  """Move a static `-inf` padding mask outside EXP2 so cumulative exponentials remain compact."""
-  exponent = x.src[0]
-  scaled, factor = next(((value, const) for value,const in (exponent.src, exponent.src[::-1]) if const.op is Ops.CONST), (None, None)) \
-    if exponent.op is Ops.MUL else (exponent, UOp.const(1.0, exponent.dtype))
-  if scaled is None or factor is None or scaled.op is not Ops.WHERE: return None
-  gate, yes, no = scaled.src
-  padded = tuple(arm.op is Ops.CONST and math.isinf(float(arm.arg)) and float(arm.arg) < 0 for arm in (yes, no))
-  if padded.count(True) != 1 or not _is_static_expr(gate): return None
-  value, mask = (no, UOp.const(1.0, dtypes.half).alu(Ops.SUB, gate.cast(dtypes.half))) if padded[0] else (yes, gate.cast(dtypes.half))
-  return _mask_mul(_dpu_exp2_nonpositive(value.cast(dtypes.half).alu(Ops.MUL, factor.cast(dtypes.half))), mask)
-
 def _fp16_predecessor(value:float) -> float:
   """Return the previous positive binary16 value for inclusive threshold masks."""
   return struct.unpack("<e", struct.pack("<H", _fp16_bits(value)-1))[0]
@@ -5437,22 +5401,13 @@ def _dpu_log2(source:UOp) -> UOp:
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
   return result.alu(Ops.ADD, zero_correction).alu(Ops.ADD, negative_correction).alu(Ops.ADD, inf_correction)
 
-_pm_rsqrt = PatternMatcher([(UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float),
-  src=(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)),)), lambda source:_dpu_sqrt(source, True))])
 _pm_sqrt = PatternMatcher([(UPat(Ops.SQRT, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sqrt(source))])
 _pm_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_exp2(source))])
-_pm_masked_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), name="x"), _fold_masked_exp2)])
 _pm_log2 = PatternMatcher([(UPat(Ops.LOG2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_log2(source))])
-_pm_sin = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sin(source))])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
-  sink = graph_rewrite(sink, _pm_inverse_hyperbolic, name="rockchip inverse hyperbolic")
-  sink = graph_rewrite(sink, _pm_atan, name="rockchip atan")
-  sink = graph_rewrite(sink, _pm_sin, name="rockchip sin")
-  sink = graph_rewrite(sink, _pm_masked_exp2, name="rockchip masked exp2")
   sink = graph_rewrite(sink, _pm_exp2, name="rockchip exp2")
   sink = graph_rewrite(sink, _pm_log2, name="rockchip log2")
-  sink = graph_rewrite(sink, _pm_rsqrt, name="rockchip rsqrt")
   sink = graph_rewrite(sink, _pm_sqrt, name="rockchip sqrt")
   sink = graph_rewrite(sink, _pm_abs, name="rockchip abs")
   return list(graph_rewrite(sink, _pm_fp32_to_fp16, name="rockchip float→half").toposort())

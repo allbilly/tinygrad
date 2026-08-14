@@ -6107,3 +6107,35 @@ address is genuinely runtime-dependent.
 The transferred renderer SHA-256 (`fdfa6a39...0790bc`) exactly matches the fully tested
 `/tmp/rk-static-local-clean.09aMA1` worktree. No runtime code, tolerance, host tensor arithmetic, CPU/GPU fallback,
 CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — retire duplicate late math recovery and share storage rules
+
+The messiest remaining fallback plumbing ran several composite/masked math recognizers twice: semantic UOps first
+passed through `_expand_math_uops`, then the late `_fp16_rewrite` tried to recover sine, atan, inverse-hyperbolic,
+masked-EXP2, and reciprocal-sqrt spellings again. The same region also copied nine identical storage-conversion rules
+between `_pm_fp32_to_fp16` and `_pm_generic_storage_precision`.
+
+Semantic math expansion is now the sole owner of those five recipes. Their implementations remain in place for that
+owner; only the redundant late matcher objects and calls are deleted. The closed masked-EXP2 fallback and its private
+nonpositive-EXP2 helper are deleted, while the still-observed EXP2, LOG2, SQRT, and ABS late guards remain. One
+`_pm_storage_common` matcher now owns the nine shared storage rules without changing their order.
+
+- Exact renderer diff: **4 insertions / 49 deletions**, executable lines **5,049 -> 5,010** (**-39**); runtime remains
+  **489**, total falls **30,606 -> 30,567**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **1,606 lines**.
+- The baseline-versus-candidate lowering oracle compared **172 ordered outcomes**, including **164 RKImages**; every
+  outcome and serialized image remained byte-for-byte identical with aggregate digest
+  `e4c290e8305db1e24fb4075674c7dfe9b25c8444763fb2820dcbc325b600ae70`.
+- A separate 13-operation Tensor corpus covering sin, cos, tan, EXP2, LOG2, SQRT, reciprocal-sqrt, atan, asinh, acosh,
+  atanh, ABS, and WHERE was byte-for-byte identical between baseline and candidate.
+- UOp tests: **93 passed** with `-n12`; directly affected transcendental and attention hardware: **49 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **809.31 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass. An adversarial fable-judge audit
+  found no weakened tests, dead references, scope creep, or alternate host execution path.
+
+The transferred renderer SHA-256 (`28252db6...574d51`) exactly matches the fully tested
+`/tmp/rk-fallback-clean.g1nbNz` worktree. No test/runtime/core code, assertion, tolerance, host tensor arithmetic,
+CPU/GPU fallback, CMAC, reset, reboot, or push was used.
