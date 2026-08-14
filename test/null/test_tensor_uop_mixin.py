@@ -323,12 +323,17 @@ class TestTensorUOpScatterReduce(unittest.TestCase):
     self._check(_t(3, 4).float(), Tensor([[0, 1, 0, 1]]*3, dtype=dtypes.int32), Tensor.ones(3, 4).float(), reduce="mean", include_self=False)
 
 class TestTensorUOpMaskedSelect(unittest.TestCase):
-  # only the fixed-size path is pure
+  # fixed-size and direct scalar-True paths are pure
   def _check(self, t, mask, **kw):
     self.assertIs(t.masked_select(mask, **kw).uop, t.uop.masked_select(mask.uop, **kw))
   def test_masked_select_1d(self): self._check(_t(6), Tensor([True, False, True, False, True, False]), size=4)
   def test_masked_select_2d(self):
     self._check(_t(3, 3), Tensor([[True, False, True], [False, True, False], [False, False, True]]), size=6, fill_value=-1)
+  def test_scalar_true_is_flatten(self):
+    for t in (_t(2, 3), _t(0), Tensor(7)):
+      mask = Tensor(True)
+      self._check(t, mask)
+      self.assertIs(t.masked_select(mask).uop, t.flatten().uop)
 
 class TestTensorUOpNonzero(unittest.TestCase):
   def _check(self, t, **kw): self.assertIs(t.nonzero(**kw).uop, t.uop.nonzero(**kw))

@@ -767,10 +767,8 @@ def test_static_local_address_preserves_sequential_fp16_updates():
   index = buffer.after(update.end(axis)).index(0).load().cast(dtypes.int)
   store = out.index(0).store(source.index(index).load())
   uops = list(UOp.sink(initialize, update, store).toposort())
-  output = rockchip_renderer._output_store(uops, dtypes.half, allow_local=True)
-  assert output is not None
-  assert next(iter(rockchip_renderer._static_local_load_offsets(uops, output, output[4]).values())) == (0,)
-  assert (image:=_lower_uop_program(uops)) is not None and decode_image(encode_image(image)) == image
+  assert (image:=_lower_uop_program(uops)) is not None and image.gathers[0].offsets == (0,)
+  assert decode_image(encode_image(image)) == image
 
 
 def test_multiple_fp16_locals_preserve_sequential_store_updates():

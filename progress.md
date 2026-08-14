@@ -6074,3 +6074,36 @@ and calls the accurate-add recipe directly instead of routing through a one-use 
 The transferred renderer SHA-256 (`c2d28e18...31fee6d`) exactly matches the fully tested
 `/tmp/rk-context-clean.Jok8In` worktree. No test/runtime/core code, assertion, tolerance, host tensor arithmetic,
 CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — remove the parallel static-local address interpreter
+
+The messiest remaining local-address path was a 97-line NumPy interpreter beside the semantic UOp executor. It
+rediscovered scalar local definitions, free axes, dependency tables, output ordering, allocation limits, load gates,
+and final offsets, then passed those offsets through a private `RKContext` side channel. The same local program still
+had to be supported by the ordered semantic unroller, so fixes could diverge between two implementations.
+
+The private interpreter and side channel are deleted. A direct rank-0 constant-True `masked_select(size=None)` is now
+the exact generic algebraic identity `flatten()`, avoiding the only large program that needed the parallel evaluator.
+Genuine local-address programs remain on the ordered semantic unroller. Its multi-buffer path now carries inherited
+range environments, discovers semantic local dependencies transitively, preserves sequential updates, and ignores
+`RANGE`/`AFTER` ordering-only loads. `RKContext._load` uses the same semantic traversal when deciding whether an
+address is genuinely runtime-dependent.
+
+- Exact renderer diff: **67 insertions / 137 deletions**, executable lines **5,118 -> 5,049** (**-69**); the generic
+  masked-select identity adds one executable mixin line, runtime remains **489**, and total falls **30,674 -> 30,606**
+  (**-68**). Cumulative renderer reduction from the 6,616-line cleanup baseline is **1,567 lines**.
+- A baseline-versus-candidate lowering oracle compared **172 ordered outcomes**, including **164 RKImages**. Every
+  outcome and serialized image was byte-for-byte identical; the aggregate digest is
+  `e4c290e8305db1e24fb4075674c7dfe9b25c8444763fb2820dcbc325b600ae70`.
+- Null Tensor/UOp identity tests cover matrix, empty, and scalar inputs. CPU masked-select value tests passed, and the
+  Rockchip scalar-True hardware case now correctly performs **zero submits** while returning the exact flattened data.
+- UOp tests: **93 passed** with `-n12`; focused scalar-True and `std_mean` hardware regressions: **2 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **797.22 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`fdfa6a39...0790bc`) exactly matches the fully tested
+`/tmp/rk-static-local-clean.09aMA1` worktree. No runtime code, tolerance, host tensor arithmetic, CPU/GPU fallback,
+CMAC, reset, reboot, or push was used.
