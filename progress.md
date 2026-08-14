@@ -5644,3 +5644,48 @@ helpers rather than the measured repeated setup hotspot and remain candidates fo
 
 All behavioral and deletion experiments stayed in `/tmp`; only the byte-identical proved renderer was transferred.
 There is no host tensor arithmetic, CPU/GPU fallback, CMAC, LUT, test/tolerance change, runtime edit, reboot, or push.
+
+---
+
+## 2026-08-14 — delete the superseded unrolled integer selector catalog
+
+The post-cache cProfile still identifies cumulative minimum as the slowest completed compiler-heavy case. Under
+profiler overhead, renderer construction consumes **24.21 s**: `RKContext.lower` takes **15.67 s**, `_static_values`
+**11.62 s**, WHERE lowering **8.19 s**, and boolean lowering **6.89 s**. The bounded static lane-grid cache therefore
+removed about **2.1 s** of the earlier profiled `_static_values` cost, while an additional identity-output shortcut
+measured only noise (**45.57 s** versus **45.78 s**) and was rejected in `/tmp`.
+
+The next largest proved obsolete block was a private unrolled integer selector catalog duplicating generic typed and
+static UOp lowering. The temporary candidate removed only this closed catalog and its dispatch. Exact executable-line
+accounting is:
+
+- `_int32_equality_matrix`: **62 lines**;
+- `_lower_unrolled_int_occurrence_count`: **54 lines**;
+- `_lower_bounded_fp16_predicate_coordinates`: **49 lines**;
+- `_lower_unrolled_int32_sum_occurrence`: **43 lines**;
+- `_lower_unrolled_integer_prefix_count`: **34 lines**;
+- `_lower_unrolled_bool_prefix_count`: **20 lines**;
+- `_ew_integer_eq_mask`: **8 lines**;
+- `_lower_uop_program` dispatch: **5 lines**.
+
+That is **280 executable renderer lines** removed by a two-insertion/300-deletion source diff. On the resulting
+5,782-line renderer, the major executable groups are: physical image ABI/encoding/stage emission **430**; static UOp
+evaluation and gather planning **414**; precision and mapped reductions **498**; shared byte/reduction primitives
+**210**; cast and wide-integer arithmetic **505**; prefix/index/dynamic selectors **1,068**; typed transforms and the
+generic `RKContext` executor **1,322**; static reduction/local lowering and root dispatch **654**; and fallback
+rewrites/transcendental recipes/renderer classes **681**. Within the largest group, `RKContext` itself is **1,035**
+lines; it is broad compositional functionality rather than a proved duplicate, so it was not compressed blindly.
+
+Focused pool-index, max-unpool, masked-select, nonzero, cumulative, argmin/argmax, argsort, and top-k hardware tests
+passed before the full run. The complete hardware census then passed **433 tests**, skipped the same **12** explicit
+contracts, and passed **154 subtests**, with zero failures across all **445** collected cases in **847.32 s** under
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+
+- Unchanged UOp tests: **89 passed** with `-n12`.
+- Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,782/489 executable lines**, total **31,338**; renderer is **280 lines smaller** than
+  the preceding 6,062-line milestone and **834 lines smaller** than the original 6,616-line cleanup baseline.
+
+All experiments, including the rejected identity shortcut, stayed in `/tmp`. The transferred renderer SHA-256
+matches the fully tested temporary worktree exactly. No tests were changed or weakened; no host tensor arithmetic,
+CPU/GPU fallback, CMAC, LUT, tolerance change, runtime edit, reset, reboot, or push was used.
