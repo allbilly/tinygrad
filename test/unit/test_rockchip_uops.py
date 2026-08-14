@@ -939,11 +939,45 @@ def test_embedded_int32_not_preserves_all_raw_bytes_before_wide_arithmetic():
   assert sum(op.int32_input and op.int32_output for op in image.ew_ops) == 2
 
 
-def test_int32_shift_uop_executes_with_byte_plane_barrel_recipe():
-  source = UOp.param(1, dtypes.int, (4,))
-  image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load() << UOp.const(2, dtypes.int)))
-  assert image is not None and len(image.post_gathers) == 4
-  assert {gather.dst_addend for gather in image.post_gathers} == {0, 1, 2, 3}
+def test_int32_shift_uops_compose_over_signed_and_unsigned_raw_bytes():
+  values = np.asarray((-(1<<31), -7, -1, 0, 1, 7, (1<<31)-1, 0x55aa55aa), dtype=np.int32)
+  shifts = np.asarray((0, 7, 8, 15, 16, 31, 32, 2), dtype=np.int32)
+  marker = np.int32(0x13579bdf)
+  def expected(op:Ops, dtype, amount, base=values):
+    amount = np.asarray(amount, dtype=np.uint32)&31
+    if op is Ops.SHL: return (base.view(np.uint32).astype(np.uint64) << amount).astype(np.uint32).view(np.int32)
+    return (base.view(np.uint32) >> amount).view(np.int32) if dtype is dtypes.uint else base >> amount
+  for dtype in (dtypes.int, dtypes.uint):
+    physical = values if dtype is dtypes.int else values.view(np.uint32)
+    for op in (Ops.SHL, Ops.SHR):
+      for amount in (0, 7, 8, 15, 16, 31, 32):
+        out, source = UOp.param(0, dtypes.int, (len(values),)), UOp.param(1, dtype, (len(values),))
+        lane = UOp.range(len(values), 0)
+        shifted = UOp(op, dtype, src=(source.index(lane).load(), UOp.const(amount, dtype)))
+        result = shifted.cast(dtypes.int) if dtype is dtypes.uint else shifted
+        image = _lower_uop_program(list(out.index(lane).store(result).end(lane).sink().toposort()))
+        assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+        assert not image.host_gathers and not image.host_scatters and decode_image(encode_image(image)) == image
+        np.testing.assert_array_equal(_execute_integer_image(image, physical), expected(op, dtype, amount))
+      out, source, amount = (UOp.param(slot, dtype if slot else dtypes.int, (len(values),)) for slot in range(3))
+      lane = UOp.range(len(values), 0)
+      shifted = UOp(op, dtype, src=(source.index(lane).load(), amount.index(lane).load()))
+      shifted = shifted.cast(dtypes.int) if dtype is dtypes.uint else shifted
+      nested = UOp(Ops.XOR, dtypes.int, src=(shifted, UOp.const(int(marker), dtypes.int)))
+      image = _lower_uop_program(list(out.index(lane).store(nested).end(lane).sink().toposort()))
+      assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+      assert not image.host_gathers and not image.host_scatters and decode_image(encode_image(image)) == image
+      np.testing.assert_array_equal(_execute_integer_image(image, physical, shifts if dtype is dtypes.int else shifts.view(np.uint32)),
+                                    np.bitwise_xor(expected(op, dtype, shifts), marker))
+      inner = UOp(Ops.SHL, dtype, src=(source.index(lane).load(), UOp.const(1, dtype)))
+      shifted = UOp(op, dtype, src=(inner, amount.index(lane).load()))
+      result = shifted.cast(dtypes.int) if dtype is dtypes.uint else shifted
+      image = _lower_uop_program(list(out.index(lane).store(result).end(lane).sink().toposort()))
+      assert image is not None and image.execution_class is RKExecutionClass.NATIVE
+      assert not image.host_gathers and not image.host_scatters and decode_image(encode_image(image)) == image
+      inner_expected = expected(Ops.SHL, dtype, 1)
+      np.testing.assert_array_equal(_execute_integer_image(image, physical, shifts if dtype is dtypes.int else shifts.view(np.uint32)),
+                                    expected(op, dtype, shifts, inner_expected))
 
 
 def test_cmod_range_keeps_expanded_parity_arithmetic_in_exact_fp16_lanes():

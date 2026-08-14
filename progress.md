@@ -5972,3 +5972,39 @@ saturates `~INT_MIN` incorrectly; canonical boolean inversion is now one exact `
 The transferred renderer SHA-256 (`4b7c5a57...5243`) exactly matches the fully tested
 `/tmp/rk-int32-bitwise.M4tnLP` worktree. No runtime/core code, hardware assertion, tolerance, host tensor arithmetic,
 CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — compose signed and unsigned INT32 shifts
+
+The next self-contained duplication was the 118-physical-line root-only INT32 barrel shifter. It separately parsed
+loads and output casts, allocated two private scratch arenas, split values into bytes and bits, applied the five
+`1/2/4/8/16` shift stages, reduced the result back into bytes, and packed four output gathers. Because this happened
+before `RKContext`, it only recognized a final output shift and could not lower a shift nested inside another shift or
+ordinary bitwise arithmetic.
+
+That standalone emitter and its dispatch are deleted. The same exact bit-plane algorithm now consumes typed INT32
+`RKValue`s inside `RKContext`, reusing `_raw_parts`, `_pack_raw`, `_stripe_layout`, `_int16_byte_bits`, the shared row
+reducer, and the normal scratch allocator. Signed `SHR` retains arithmetic sign fill; unsigned `SHR` uses zero fill;
+all amounts retain modulo-32 semantics. UINT32 load/static/constant values are admitted only in the canonical INT32
+raw layout, and the existing raw UINT32-to-INT32 cast remains a representation alias.
+
+- Exact renderer diff: **98 insertions / 129 deletions**, executable lines **5,276 -> 5,248** (**-28**); runtime
+  remains **489**, total **30,804**. Cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **1,368 lines**.
+- The test-only physical image executor checked signed and unsigned `SHL`/`SHR` at amounts
+  **0, 7, 8, 15, 16, 31, and 32**, with `INT_MIN`, `INT_MAX`, negative values, tensor shift amounts, nested shifts,
+  and a nested XOR. Every result matched exact wrapped 32-bit semantics, with native/no-host execution and exact
+  encode/decode round trips.
+- The compositional direct 8-lane shift uses **95 EW stages**, a **13,571-byte** image, and **57,568 bytes** of
+  scratch versus the root-only image's **94 stages**, **13,391 bytes**, and **57,280 bytes**. This small direct cost
+  buys ordinary nested composition and removes the parallel planner/emitter implementation.
+- Three non-migrated wide-integer consumers remained byte-identical: INT32 AND, nested NOT-plus-ADD, and CDIV.
+- UOp tests: **92 passed** with `-n12`; focused serial Rockchip/Rockchip2 bitwise and shift hardware: **13 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **797.40 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`dbf615db...f6d2`) exactly matches the fully tested
+`/tmp/rk-int32-shift.MyfT5h` worktree. No runtime/core code, test tolerance, host tensor arithmetic, CPU/GPU fallback,
+CMAC, reset, reboot, or push was used.
