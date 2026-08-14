@@ -5840,3 +5840,36 @@ The transferred renderer SHA-256 (`e260da6d...1227`) exactly matches the proved 
 attempt produced DRM `EINVAL`; the documented health probe passed every elementwise size, and the authoritative full
 census was run serially. No test was weakened and no runtime/core/tolerance/CPU/GPU/CMAC/LUT/reset/reboot/push was
 used. `lines_saving.md` remains untouched.
+
+---
+
+## 2026-08-14 — remove unreachable EXP2-WHERE recovery and unify typed integer finishers
+
+The preceding **789.37 s** result was the aggregate serial 445-case census; cummin remained the measured slowest
+individual case at about **61.75 s** under cProfile. Two proposed compiler-speed changes were rejected in `/tmp`:
+caching `_static_values` changed the cumulative compiler from 22.36 to 22.60 s, and memoizing scratch `RKArg` remaps
+changed the controlled profile from 40.117 to 40.422 s. Neither was transferred.
+
+The accepted cleanup consolidates the two exact FP16-to-native-integer image finishers, inlines three single-use
+forwarders, and deletes the closed EXP2-times-infinity WHERE recovery branch. Generic first-pass math expansion owns
+that expression before `_where`; removing the late branch preserved every host census image. Six focused Rockchip
+EXP2/power/nonfinite hardware tests passed before the full census.
+
+The executable-line inventory before this edit identified the largest groups as late rewrite/local-unroll/dispatch
+(1,133), prefix/selector/dynamic-load catalogs (1,096), RKContext (1,018), typed integer/root specializers (631), and
+mapped reduction emitters (549). The largest functions remain INT32 division (165), WHERE (152 before this deletion),
+vectorized unrolled ADD (144), vectorized scalar-local extrema (141), and root dispatch (135). These are the next
+structural targets; zero-hit alone is not sufficient evidence after the earlier masked-multiply counterexample.
+
+- Exact renderer diff: **22 insertions / 73 deletions**, executable lines **5,554 -> 5,507** (**-47**); runtime remains
+  **489**, total **31,063**. Cumulative renderer reduction from the 6,616-line cleanup baseline is **1,109 lines**.
+- Complete host image census remained byte-identical (`37ae9593...4380`); all five 512-lane cumulative image hashes
+  remained exact; UOp tests: **89 passed** with `-n12`.
+- Focused Rockchip EXP2/power/nonfinite hardware tests: **6 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **780.29 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`28007016...4950`) exactly matches the fully tested `/tmp/rk-next.NowIem` worktree.
+No test, runtime, core code, tolerance, tensor-value execution, CPU/GPU fallback, CMAC, LUT, reset, reboot, or push was
+used. `lines_saving.md` remains untouched.
