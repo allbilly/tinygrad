@@ -5904,3 +5904,37 @@ semantic, image, and hardware proof.
 The transferred renderer SHA-256 (`a209292d...166f`) exactly matches the fully tested
 `/tmp/rk-static-eval.Ss3cwQ` worktree. No test, runtime, tolerance, tensor-value execution, CPU/GPU fallback, CMAC,
 LUT, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — make exact INT32 division compositional
+
+The messiest remaining self-contained block was signed INT32 division. A 49-line root recognizer reverse-engineered
+direct `CDIV`/`CMOD` plus Tinygrad's canonical floor-division wrapper, then a separate 165-line emitter duplicated
+scratch allocation, constants, native INT16 byte arithmetic, sign handling, restoring division, and INT32 packing
+outside `RKContext`. This made division dependent on one final graph spelling and prevented normal nesting or reuse.
+
+The standalone 214-line recognizer/emitter and its early root dispatch are deleted. The same exact byte-restoring
+algorithm now occupies 76 executable lines behind typed `RKContext` `CDIV`/`CMOD` lowering. It consumes ordinary
+INT32 `RKValue`s, reuses the existing byte-plane and row-reduction primitives, packs the canonical INT32 layout, and
+caches quotient/remainder components by semantic operand pair. Nested arithmetic now composes normally, and sibling
+quotient/remainder expressions share one restoring core. Proven-bounded `INT_FP16` division/modulo keeps its prior
+path; unsupported layouts still fail closed.
+
+- Exact renderer diff: **90 insertions / 234 deletions**, executable lines **5,490 -> 5,353** (**-137**); runtime
+  remains **489**, total **30,909**. Cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **1,263 lines**.
+- A test-only physical integer image executor checked **100 deterministic random lanes plus signed extrema,
+  divide-by-zero, mixed signs, and `INT_MIN / -1`**, for direct, nested, sibling, floor-division, and floor-modulo
+  graphs. All results matched exact wrapped INT32 semantics; sibling `CDIV`/`CMOD` reused one core.
+- At 100 lanes, the direct quotient image changed from **148,365 to about 140,390 bytes** and scratch allocation from
+  **851,968 to 13,600 bytes**. At the 16,000-lane hardware limit the new image remains about **140 KB**, encodes and
+  round-trips, and uses **2,176,000 bytes** of colored scratch.
+- UOp tests: **92 passed** with `-n12`; focused hardware division/modulo coverage: **4 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **795.46 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`e24b5c91...1cf33`) exactly matches the fully tested
+`/tmp/rk-int32-div.XExQbU` worktree. No runtime/core code, test tolerance, host tensor arithmetic, CPU/GPU fallback,
+CMAC, reset, reboot, or push was used.

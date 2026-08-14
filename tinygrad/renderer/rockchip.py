@@ -1751,235 +1751,6 @@ def _int16_byte_sum(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[
     results.append(arg(result))
   return tuple(results)
 
-def _int32_division_root(root:UOp) -> tuple[str, UOp, UOp]|None:
-  """Recognize truncating quotient/remainder and Tinygrad's canonical floor corrections."""
-  if root.op is Ops.CDIV and root.dtype.scalar() is dtypes.int: return "trunc", root.src[0], root.src[1]
-  if root.op is Ops.CMOD and root.dtype.scalar() is dtypes.int: return "cmod", root.src[0], root.src[1]
-  if root.op is not Ops.ADD or root.dtype.scalar() is not dtypes.int: return None
-  divisions = [u for u in root.toposort() if u.op is Ops.CDIV and u.dtype.scalar() is dtypes.int]
-  remainders = [u for u in root.toposort() if u.op is Ops.CMOD and u.dtype.scalar() is dtypes.int]
-  def negative_operand(predicate:UOp) -> UOp|None:
-    if predicate.op is not Ops.CMPLT or len(predicate.src) != 2: return None
-    constants = [x for x in predicate.src if x.op is Ops.CONST and int(x.arg) == 0]
-    return next((x for x in predicate.src if x.op is not Ops.CONST), None) if len(constants) == 1 else None
-  def valid_sign_diff(predicate:UOp, operands:tuple[UOp, UOp]) -> bool:
-    dynamic = [x for x in operands if x.op is not Ops.CONST]
-    negative_constants = sum(x.op is Ops.CONST and int(x.arg) < 0 for x in operands)
-    if predicate.op is Ops.CMPLT:
-      return not negative_constants and len(dynamic) == 1 and (operand:=negative_operand(predicate)) is not None and operand.key == dynamic[0].key
-    if predicate.op is not Ops.CMPNE: return False
-    comparisons = [negative_operand(x) for x in predicate.src if x.op is Ops.CMPLT]
-    bools = [x for x in predicate.src if x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool]
-    if len(dynamic) == 2:
-      return len(comparisons) == 2 and {x.key for x in comparisons if x is not None} == {x.key for x in dynamic}
-    return len(dynamic) == negative_constants == len(comparisons) == len(bools) == 1 and comparisons[0] is not None and \
-      comparisons[0].key == dynamic[0].key and bool(bools[0].arg)
-  if len(remainders) != 1: return None
-  remainder = remainders[0]
-  if len(divisions) == 1:
-    division = divisions[0]
-    if len(division.src) != 2: return None
-    division_operands = (division.src[0], division.src[1])
-    if tuple(x.key for x in division.src) != tuple(x.key for x in remainder.src): return None
-    correction = next((x for x in root.src if x is not division), None)
-    if correction is None or correction.op is not Ops.MUL: return None
-    constants = [x for x in correction.src if x.op is Ops.CONST and x.dtype.scalar() is dtypes.int and int(x.arg) == -1]
-    predicates = [x.src[0] for x in correction.src if x.op is Ops.CAST and x.dtype.scalar() is dtypes.int and len(x.src) == 1]
-    if len(constants) != 1 or len(predicates) != 1 or predicates[0].op is not Ops.AND: return None
-    terms = predicates[0].src
-    nonzero = next((x for x in terms if x.op is Ops.CMPNE and any(y.key == remainder.key for y in x.src)), None)
-    sign_diff = next((x for x in terms if x is not nonzero), None)
-    return ("floor", *division_operands) if nonzero is not None and sign_diff is not None and \
-      valid_sign_diff(sign_diff, division_operands) else None
-  if len(remainder.src) != 2: return None
-  remainder_operands = (remainder.src[0], remainder.src[1])
-  correction = next((x for x in root.src if x is not remainder), None)
-  if correction is None or correction.op is not Ops.WHERE or len(correction.src) != 3 or correction.src[0].op is not Ops.AND: return None
-  condition, selected, zero = correction.src
-  if selected.key != remainder.src[1].key or zero.op is not Ops.CONST or int(zero.arg) != 0: return None
-  nonzero = next((x for x in condition.src if x.op is Ops.CMPNE and any(y.key == remainder.key for y in x.src)), None)
-  sign_diff = next((x for x in condition.src if x is not nonzero), None)
-  return ("floormod", *remainder_operands) if nonzero is not None and sign_diff is not None and \
-    valid_sign_diff(sign_diff, remainder_operands) else None
-
-def _lower_int32_division(output:RKOutput) -> RKImage|None:
-  """Divide signed INT32 exactly with a byte-restoring divider on native INT16 EW."""
-  _, out_param, count, out_index, root = output
-  if not 1 <= count <= _MAX_EW_ELEMS_FP16 or (parsed_root:=_int32_division_root(root)) is None: return None
-  mode, lhs, rhs = parsed_root
-  operands:list[tuple[UOp|None, tuple[int, ...]|int]] = []
-  for term in (lhs, rhs):
-    if term.op is Ops.CONST and term.dtype.scalar() is dtypes.int:
-      operands.append((None, int(term.arg)&0xffffffff))
-    elif (parsed:=_typed_load_offsets(term, dtypes.int, out_index, count, allow_fill=True)) is not None:
-      operands.append(parsed)
-    else: return None
-  sources = [param for param,_ in operands if param is not None]
-  if not sources: return None
-
-  stride, rows = _reduction_stride(count), 0
-  def allocate() -> RKArg:
-    nonlocal rows
-    value = RKArg(RKBufferKind.SCRATCH, 0, rows*stride); rows += 1
-    return value
-  gathers:list[RKGather] = []
-  raw_operands:list[tuple[RKArg, ...]] = []
-  for param,spec in operands:
-    raw = tuple(allocate() for _ in range(4)); raw_operands.append(raw)
-    if param is None:
-      value = typing_cast(int, spec)
-      for byte,dst in enumerate(raw):
-        gathers.append(RKGather(sources[0].arg.slot, 0, count, values=((value >> (byte*8))&0xff,)*count,
-                                dst_addend=dst.addend//2, itemsize=2))
-    else:
-      offsets = typing_cast(tuple[int, ...], spec)
-      for byte,dst in enumerate(raw):
-        gathers.append(RKGather(param.arg.slot, 0, count,
-          offsets=tuple(offset*4+byte if offset >= 0 else -1 for offset in offsets), dst_stride=2,
-          dst_addend=dst.addend, itemsize=1))
-  constants:dict[int, RKArg] = {}
-  for constant_value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256):
-    constants[constant_value] = dst = allocate()
-    gathers.append(RKGather(sources[0].arg.slot, 0, count, values=(constant_value,)*count,
-                            dst_addend=dst.addend//2, itemsize=2))
-  integer = dict(int16_input=True, int16_output=True)
-  ops:list[RKEWOp] = []
-
-  def clamp_one(value:RKArg) -> RKArg:
-    positive, result = allocate(), allocate()
-    ops.extend((RKEWOp(positive, value, constants[0], count, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(result, positive, constants[1], count, _EW_CFG_MIN, **integer)))
-    return result
-
-  def positive_over(value:RKArg, threshold:int) -> RKArg:
-    delta = allocate()
-    ops.append(RKEWOp(delta, value, constants[threshold], count, _EW_CFG[Ops.SUB], **integer))
-    return clamp_one(delta)
-
-  def xor_bit(lhs_bit:RKArg, rhs_bit:RKArg) -> RKArg:
-    result = allocate()
-    ops.extend((RKEWOp(result, lhs_bit, rhs_bit, count, _EW_CFG[Ops.SUB], **integer),
-                RKEWOp(result, result, result, count, _EW_CFG_ABS, **integer)))
-    return result
-
-  def twos_complement(raw:tuple[RKArg, ...], sign:RKArg) -> tuple[RKArg, ...]:
-    """Conditionally negate four unsigned byte lanes, carrying in base 256."""
-    carry, result = sign, []
-    for byte in raw:
-      doubled, invert_delta, selected, total = allocate(), allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(doubled, byte, byte, count, _EW_CFG[Ops.ADD], **integer),
-                  RKEWOp(invert_delta, constants[255], doubled, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(invert_delta, invert_delta, sign, count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(selected, byte, invert_delta, count, _EW_CFG[Ops.ADD], **integer),
-                  RKEWOp(total, selected, carry, count, _EW_CFG[Ops.ADD], **integer)))
-      carry = positive_over(total, 255)
-      scaled, value = allocate(), allocate()
-      ops.extend((RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(value, total, scaled, count, _EW_CFG[Ops.SUB], **integer)))
-      result.append(value)
-    return tuple(result)
-
-  signs, magnitudes = [], []
-  for raw in raw_operands:
-    sign = positive_over(raw[3], 127)
-    signs.append(sign); magnitudes.append(twos_complement(raw, sign))
-  numerator, denominator = magnitudes
-  denominator_bits = [clamp_one(byte) for byte in denominator]
-  denominator_nonzero = _reduce_rows(ops, denominator_bits, count, _EW_CFG[Ops.MAX], int16=True)
-  numerator_bits = tuple(bit for byte in numerator for bit in _int16_byte_bits(ops, allocate, constants, byte, count))
-
-  remainder = [constants[0]]*4
-  quotient = [constants[0]]*4
-  for bit_index in range(31, -1, -1):
-    shifted:list[RKArg] = []
-    incoming = numerator_bits[bit_index]
-    for byte_arg in remainder:
-      carry = positive_over(byte_arg, 127)
-      doubled, scaled, wrapped, out_value = allocate(), allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(doubled, byte_arg, byte_arg, count, _EW_CFG[Ops.ADD], **integer),
-                  RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(wrapped, doubled, scaled, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(out_value, wrapped, incoming, count, _EW_CFG[Ops.ADD], **integer)))
-      shifted.append(out_value); incoming = carry
-    remainder = shifted
-
-    greater, equal = constants[0], constants[1]
-    for left,right in zip(reversed(remainder), reversed(denominator)):
-      diff, positive, candidate = allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(diff, left, right, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(positive, diff, constants[0], count, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(positive, positive, constants[1], count, _EW_CFG_MIN, **integer),
-                  RKEWOp(candidate, equal, positive, count, _EW_CFG_MIN, **integer)))
-      next_greater = allocate()
-      ops.append(RKEWOp(next_greater, greater, candidate, count, _EW_CFG[Ops.MAX], **integer)); greater = next_greater
-      magnitude, unequal, byte_equal, next_equal = allocate(), allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(magnitude, diff, diff, count, _EW_CFG_ABS, **integer),
-                  RKEWOp(unequal, magnitude, constants[1], count, _EW_CFG_MIN, **integer),
-                  RKEWOp(byte_equal, constants[1], unequal, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(next_equal, equal, byte_equal, count, _EW_CFG_MIN, **integer)))
-      equal = next_equal
-    ge = allocate()
-    ops.extend((RKEWOp(ge, greater, equal, count, _EW_CFG[Ops.MAX], **integer),
-                RKEWOp(ge, ge, denominator_nonzero, count, _EW_CFG_MIN, **integer)))
-
-    borrow, reduced = constants[0], []
-    for left,right in zip(remainder, denominator):
-      masked, partial, delta = allocate(), allocate(), allocate()
-      ops.extend((RKEWOp(masked, right, ge, count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(partial, left, masked, count, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(delta, partial, borrow, count, _EW_CFG[Ops.SUB], **integer)))
-      negative = allocate()
-      ops.append(RKEWOp(negative, constants[0], delta, count, _EW_CFG[Ops.SUB], **integer))
-      borrow = clamp_one(negative)
-      scaled, out_value = allocate(), allocate()
-      ops.extend((RKEWOp(scaled, borrow, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(out_value, delta, scaled, count, _EW_CFG[Ops.ADD], **integer)))
-      reduced.append(out_value)
-    remainder = reduced
-    byte_index, weight = bit_index >> 3, 1 << (bit_index&7)
-    weighted, out_value = allocate(), allocate()
-    ops.extend((RKEWOp(weighted, ge, constants[weight], count, _EW_CFG[Ops.MUL], **integer),
-                RKEWOp(out_value, quotient[byte_index], weighted, count, _EW_CFG[Ops.ADD], **integer)))
-    quotient[byte_index] = out_value
-
-  quotient_sign = xor_bit(signs[0], signs[1])
-  if mode in ("cmod", "floormod"):
-    result_magnitude = tuple(remainder)
-    result_sign = signs[0]
-    if mode == "floormod":
-      remainder_nonzero = _reduce_rows(ops, [clamp_one(byte) for byte in remainder], count, _EW_CFG[Ops.MAX], int16=True)
-      correction = allocate()
-      ops.append(RKEWOp(correction, quotient_sign, remainder_nonzero, count, _EW_CFG_MIN, **integer))
-      corrected = []
-      for rem,denom in zip(remainder, denominator):
-        doubled, delta, selected, out_value = allocate(), allocate(), allocate(), allocate()
-        ops.extend((RKEWOp(doubled, rem, rem, count, _EW_CFG[Ops.ADD], **integer),
-                    RKEWOp(delta, denom, doubled, count, _EW_CFG[Ops.SUB], **integer),
-                    RKEWOp(selected, delta, correction, count, _EW_CFG[Ops.MUL], **integer),
-                    RKEWOp(out_value, rem, selected, count, _EW_CFG[Ops.ADD], **integer)))
-        corrected.append(out_value)
-      result_magnitude, result_sign = tuple(corrected), signs[1]
-    result = twos_complement(result_magnitude, result_sign)
-  else:
-    if mode == "floor":
-      remainder_nonzero = _reduce_rows(ops, [clamp_one(byte) for byte in remainder], count, _EW_CFG[Ops.MAX], int16=True)
-      correction = allocate()
-      ops.append(RKEWOp(correction, quotient_sign, remainder_nonzero, count, _EW_CFG_MIN, **integer))
-      carry, corrected = correction, []
-      for byte_arg in quotient:
-        total = allocate(); ops.append(RKEWOp(total, byte_arg, carry, count, _EW_CFG[Ops.ADD], **integer))
-        carry = positive_over(total, 255)
-        scaled, out_value = allocate(), allocate()
-        ops.extend((RKEWOp(scaled, carry, constants[256], count, _EW_CFG[Ops.MUL], **integer),
-                    RKEWOp(out_value, total, scaled, count, _EW_CFG[Ops.SUB], **integer)))
-        corrected.append(out_value)
-      quotient = corrected
-    result = twos_complement(tuple(quotient), quotient_sign)
-  post = tuple(RKGather(value.index, out_param.arg.slot, count,
-    offsets=tuple(value.addend+lane*2 for lane in range(count)), dst_stride=4, dst_addend=byte,
-    dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1) for byte,value in enumerate(result))
-  return RKImage(RKTarget.RK3588, (RKScratch(rows*stride),), gathers=tuple(gathers), ew_ops=tuple(ops), post_gathers=post)
-
 def _int16_byte_bits(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
                      value:RKArg, lanes:int) -> tuple[RKArg, ...]:
   """Split unsigned byte lanes into eight exact native INT16 0/1 planes."""
@@ -3676,6 +3447,7 @@ class RKContext:
     self.gather_slots:dict[tuple, RKValue] = {}
     self.static_load_offsets = {} if static_load_offsets is None else static_load_offsets
     self.int32_components:dict[RKArg, tuple[RKValue, ...]] = {}
+    self.int32_divmod:dict[tuple[UOp, UOp], tuple[tuple[RKArg, ...], tuple[RKArg, ...], RKArg, RKArg]] = {}
     self.int16_raw:dict[RKArg, tuple[RKValue, RKValue]] = {}
     self.int16_masks:dict[RKArg, int] = {}
     self.fp16_raw:dict[RKArg, tuple[RKValue, RKValue]] = {}
@@ -4233,6 +4005,90 @@ class RKContext:
     self.int32_components[source.arg] = components
     return components
 
+  def _i16(self, lhs:RKArg, rhs:RKArg, cfg:int) -> RKArg:
+    dst = self._scratch(dtypes.int16, RKLayout.INT16).arg
+    self.ew_ops.append(RKEWOp(dst, lhs, rhs, self.count, cfg, int16_input=True, int16_output=True))
+    return dst
+
+  def _i16_const(self, value:int) -> RKArg: return self._constant(UOp.const(value, dtypes.int16)).arg
+
+  def _i16_clamp_one(self, value:RKArg) -> RKArg:
+    return self._i16(self._i16(value, self._i16_const(0), _EW_CFG[Ops.MAX]), self._i16_const(1), _EW_CFG_MIN)
+
+  def _i16_positive_over(self, value:RKArg, threshold:int) -> RKArg:
+    return self._i16_clamp_one(self._i16(value, self._i16_const(threshold), _EW_CFG[Ops.SUB]))
+
+  def _i16_xor(self, lhs:RKArg, rhs:RKArg) -> RKArg:
+    delta = self._i16(lhs, rhs, _EW_CFG[Ops.SUB])
+    return self._i16(delta, delta, _EW_CFG_ABS)
+
+  def _i16_twos_complement(self, raw:tuple[RKArg, ...], sign:RKArg) -> tuple[RKArg, ...]:
+    carry, result = sign, []
+    for byte in raw:
+      doubled = self._i16(byte, byte, _EW_CFG[Ops.ADD])
+      inverted = self._i16(self._i16(self._i16_const(255), doubled, _EW_CFG[Ops.SUB]), sign, _EW_CFG[Ops.MUL])
+      total = self._i16(self._i16(byte, inverted, _EW_CFG[Ops.ADD]), carry, _EW_CFG[Ops.ADD])
+      carry = self._i16_positive_over(total, 255)
+      result.append(self._i16(total, self._i16(carry, self._i16_const(256), _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB]))
+    return tuple(result)
+
+  def _pack_int32(self, u:UOp, components:tuple[RKArg, ...]) -> RKValue:
+    result, after = self._dst(u, dtypes.int, RKLayout.INT32), len(self.ew_ops)
+    for byte,component in enumerate(components):
+      self.mid_gathers.append(RKGather(component.index, result.arg.index, self.count, base=component.addend,
+        axes=((1, self.count, 2),), dst_stride=4, dst_addend=byte, dst_kind=result.arg.kind,
+        src_kind=component.kind, itemsize=1, after=after))
+    self.int32_components[result.arg] = tuple(RKValue(value, dtypes.int16, self.count, RKLayout.INT16) for value in components)
+    return result
+
+  def _int32_divmod(self, u:UOp) -> RKValue:
+    if len(u.src) != 2 or self.int_layout is not RKLayout.INT32 or not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
+    key = u.src
+    if key not in self.int32_divmod:
+      values = tuple(self._operand(src, dtypes.int) for src in key)
+      if any(value.layout is not RKLayout.INT32 for value in values): raise _RKGenericReject
+      raw = tuple(tuple(part.arg for part in self._int32_bytes(value)) for value in values)
+      constants = {value:self._i16_const(value) for value in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256)}
+      signs = tuple(self._i16_positive_over(value[3], 127) for value in raw)
+      numerator, denominator = (self._i16_twos_complement(value, sign) for value,sign in zip(raw, signs))
+      denominator_nonzero = _reduce_rows(self.ew_ops, [self._i16_clamp_one(value) for value in denominator],
+                                         self.count, _EW_CFG[Ops.MAX], int16=True)
+      numerator_bits = tuple(bit for byte in numerator for bit in
+                             _int16_byte_bits(self.ew_ops, lambda:self._scratch(dtypes.int16, RKLayout.INT16).arg,
+                                              constants, byte, self.count))
+      remainder, quotient = [constants[0]]*4, [constants[0]]*4
+      for bit_index in range(31, -1, -1):
+        shifted:list[RKArg] = []
+        incoming = numerator_bits[bit_index]
+        for byte in remainder:
+          carry = self._i16_positive_over(byte, 127)
+          doubled = self._i16(byte, byte, _EW_CFG[Ops.ADD])
+          wrapped = self._i16(doubled, self._i16(carry, constants[256], _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB])
+          shifted.append(self._i16(wrapped, incoming, _EW_CFG[Ops.ADD])); incoming = carry
+        remainder = shifted
+        greater, equal = constants[0], constants[1]
+        for left,right in zip(reversed(remainder), reversed(denominator)):
+          diff = self._i16(left, right, _EW_CFG[Ops.SUB])
+          positive = self._i16(self._i16(diff, constants[0], _EW_CFG[Ops.MAX]), constants[1], _EW_CFG_MIN)
+          greater = self._i16(greater, self._i16(equal, positive, _EW_CFG_MIN), _EW_CFG[Ops.MAX])
+          magnitude = self._i16(diff, diff, _EW_CFG_ABS)
+          byte_equal = self._i16(constants[1], self._i16(magnitude, constants[1], _EW_CFG_MIN), _EW_CFG[Ops.SUB])
+          equal = self._i16(equal, byte_equal, _EW_CFG_MIN)
+        ge = self._i16(self._i16(greater, equal, _EW_CFG[Ops.MAX]), denominator_nonzero, _EW_CFG_MIN)
+        borrow, reduced = constants[0], []
+        for left,right in zip(remainder, denominator):
+          partial = self._i16(left, self._i16(right, ge, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB])
+          delta = self._i16(partial, borrow, _EW_CFG[Ops.SUB])
+          borrow = self._i16_clamp_one(self._i16(constants[0], delta, _EW_CFG[Ops.SUB]))
+          reduced.append(self._i16(delta, self._i16(borrow, constants[256], _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD]))
+        remainder = reduced
+        byte_index, weight = bit_index >> 3, 1 << (bit_index&7)
+        quotient[byte_index] = self._i16(quotient[byte_index], self._i16(ge, constants[weight], _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD])
+      self.int32_divmod[key] = tuple(quotient), tuple(remainder), signs[0], self._i16_xor(signs[0], signs[1])
+    quotient_raw, remainder_raw, remainder_sign, quotient_sign = self.int32_divmod[key]
+    return self._pack_int32(u, self._i16_twos_complement(
+      quotient_raw if u.op is Ops.CDIV else remainder_raw, quotient_sign if u.op is Ops.CDIV else remainder_sign))
+
   def _int32_compare(self, u:UOp) -> RKValue:
     def operand(src:UOp) -> RKValue:
       value = self._static_int32(src) if src in self.static_nodes else self.lower(src)
@@ -4624,10 +4480,11 @@ class RKContext:
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool: value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
-    elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
-      recipe = _int_fp16_expr(u)
-      converted = self.lower(recipe)
-      value = RKValue(converted.arg, dtype, self.count, self.int_layout)
+    elif u.op in (Ops.CDIV, Ops.CMOD) and dtype is dtypes.int:
+      if self.int_layout is RKLayout.INT_FP16:
+        converted = self.lower(_int_fp16_expr(u))
+        value = RKValue(converted.arg, dtype, self.count, self.int_layout)
+      else: value = self._int32_divmod(u)
     elif u.op is Ops.WHERE: value = self._where(u)
     elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN): value = self._math(u)
     else: raise _RKGenericReject(f"uop {u.op.name} {dtype}")
@@ -5251,7 +5108,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if (int_output:=_output_store(uops, dtypes.int)) is not None:
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
     if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
-    if (division:=_lower_int32_division(int_output)) is not None: return division
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
      (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_half_image(bool_output, nonzero, True, bool_output=True)
   if (byte_output:=_output_store(uops, dtypes.uchar)) is not None and \
