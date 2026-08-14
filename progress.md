@@ -6177,3 +6177,36 @@ remains because it has distinct dynamic-rank/fill semantics and current hardware
 The transferred renderer SHA-256 (`1a28d441...3deab`) and focused-test SHA-256 (`200850b4...79e03`) exactly match the
 fully tested `/tmp/rk-prefix-clean.HwTr3p` worktree. No runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — move direct casts and scalar boolean reductions into typed UOp lowering
+
+The messiest remaining renderer region is the front of `_lower_uop_program`: a legacy catalog parses particular
+graph spellings and builds complete `RKImage`s before the composable `RKContext` UOp executor gets a chance to lower
+the same semantics. The catalog duplicates graph traversal, static index evaluation, layout selection, scratch
+allocation, and terminal conversion. It is also mixed with genuinely necessary precision and indexing fast paths,
+so deleting the whole region is unsafe.
+
+Direct half-to-INT32 and integer/bool-to-FP32 casts now lower through `RKContext` layouts and ordinary CAST/WHERE
+composition. The private scalar loop boolean recognizer and integer-predicate image builder are deleted; the generic
+executor owns those scalar reductions, while the distinct grouped boolean reducer remains. Three broader isolated
+experiments were rejected rather than transferred: deleting scalar numeric reduction missed tolerance by **0.038**,
+deleting the dot reducer changed **292 / 20,250** values with maximum error **0.02148**, and deleting the predicate-total
+load path rejected a real collapsed fancy-index kernel. Those paths therefore remain explicit contracts, not presumed
+dead code.
+
+- Exact renderer diff: **7 insertions / 94 deletions**, executable lines **4,628 -> 4,549** (**-79**); runtime remains
+  **489**, total falls **30,185 -> 30,106**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,067 lines**.
+- The baseline/candidate keyed lowering census changed only the two expected direct-cast images. Remapped INT32 and
+  bool-to-FP32 cases now explicitly exercise the typed executor and retain exact encode/decode round trips.
+- UOp tests: **94 passed** with `-n12`; directly affected cast, rounding, modulo, division, predicate, and boolean
+  reduction hardware tests: **22 passed**. The two exact reduction/dot regressions that rejected broader cuts also pass.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **822.36 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`343a5adc...33d9`) and focused-test SHA-256 (`e78336c9...ef7`) exactly match the
+fully tested `/tmp/rk-cast-bool.vkKKFs` worktree. No runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.

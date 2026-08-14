@@ -1633,13 +1633,6 @@ def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[
   return RKImage(RKTarget.RK3588, scratch_buffers, b"".join(struct.pack("<e", value) for value in constants),
                  gathers=gathers, ew_ops=tuple(ops))
 
-def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
-  """Truncate a direct FP16 load on DPU before the terminal INT32 conversion."""
-  root = output[4]
-  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.int or len(root.src) != 1 or
-      root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
-  return _typed_half_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)), True)
-
 def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
   root = output[4]
@@ -1658,41 +1651,6 @@ def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   quotient = _native_floor(truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half)))
   remainder = truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))
   return _typed_half_image(output, remainder, False)
-
-def _lower_integer_fp32_cast(output:RKOutput) -> RKImage|None:
-  """Compose the DPU INT32-to-FP16 and FP16-to-FP32 converters for integer and boolean inputs."""
-  _, out_param, count, out_index, root = output
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.float or len(root.src) != 1 or
-      (load:=root.src[0]).op is not Ops.LOAD or load.dtype.scalar() not in (dtypes.int, dtypes.bool) or
-      len(load.src) != 1 or load.src[0].op is not Ops.INDEX or
-      (source:=_root_param(load.src[0])) is None or source.src[0].op is not Ops.CONST): return None
-  try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
-  except RuntimeError: return None
-  if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
-  fp16_slot, tiles_slot = 0, 1
-  groups = tuple(range(0, count, _EW_ELEMS_32BIT))
-  scratch_sizes = [max(64, len(groups)*16), _int32_tiles_bytes(_EW_ELEMS_32BIT)]
-  gathers:tuple[RKGather, ...] = ()
-  input_arg = RKArg(RKBufferKind.ARG, source.arg.slot)
-  if load.dtype.scalar() is dtypes.bool or offsets != tuple(range(count)):
-    raw_slot = len(scratch_sizes)
-    scratch_sizes.append(max(64, count*4))
-    gathers = (RKGather(source.arg.slot, raw_slot, count, offsets=offsets,
-                        dst_stride=4 if load.dtype.scalar() is dtypes.bool else 1,
-                        itemsize=1 if load.dtype.scalar() is dtypes.bool else 4),)
-    input_arg = RKArg(RKBufferKind.SCRATCH, raw_slot)
-  ops:list[RKEWOp] = []
-  for group,start in enumerate(groups):
-    lanes = min(_EW_ELEMS_32BIT, count-start)
-    ops.append(RKEWOp(RKArg(RKBufferKind.SCRATCH, fp16_slot, group*16), replace(input_arg, addend=start*4),
-                      RKArg(RKBufferKind.SCRATCH, tiles_slot), lanes, _EW_CFG[Ops.MAX], int32_input=True))
-  for group,start in enumerate(groups):
-    lanes = min(_EW_ELEMS_32BIT, count-start)
-    value = RKArg(RKBufferKind.SCRATCH, fp16_slot, group*16)
-    ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot, group*16), value, value, lanes,
-                        _EW_CFG[Ops.MAX] | _EW_STAGE_FP32_OUT))
-  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=gathers, ew_ops=tuple(ops))
 
 def _int16_byte_bits(ops:list[RKEWOp], allocate:Callable[[], RKArg], constants:dict[int, RKArg],
                      value:RKArg, lanes:int) -> tuple[RKArg, ...]:
@@ -2347,24 +2305,6 @@ def _stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, offse
   return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(matrix_lanes)),), gathers=gathers,
                  ew_ops=tuple(ops), post_gathers=post)
 
-def _integer_predicate_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tuple[tuple[int, ...], ...],
-                                       op:Ops, itemsize:int) -> RKImage|None:
-  """Reduce exact integer nonzero masks with native INT16 ADD/MAX/MUL."""
-  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, len(offsets))
-  if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
-  scratch_sizes, scratch, gathers, ops = _physical_lists(64)
-  if (mask:=_native_integer_nonzero_mask(ops, gathers, scratch, source_slot, offsets,
-                                         count, vector_lanes, itemsize)) is None: return None
-  reduced = _reduce_rows(ops, [replace(mask, addend=mask.addend+row*vector_bytes) for row in range(len(offsets))],
-                         count, _EW_CFG[{Ops.OR:Ops.MAX, Ops.AND:Ops.MUL}.get(op, op)], int16=True)
-  if op is Ops.ADD:
-    ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), reduced, reduced, count, _EW_CFG[Ops.MAX],
-                      int16_input=True, int32_output=True))
-    post:tuple[RKGather, ...] = ()
-  else: post = (_int16_low_bytes(reduced, out_slot, count),)
-  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
-                 post_gathers=post)
-
 def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, groups:int, op:Ops) -> RKImage:
   """Reduce contiguous opaque bool blocks after widening their bytes into native INT16 lanes."""
   source_count = count*groups
@@ -2387,34 +2327,6 @@ def _integer_nonzero_load(term:UOp, dtype:DType=dtypes.int) -> UOp|None:
   candidates = [load for load,zero in (term.src, term.src[::-1]) if load.op is Ops.LOAD and load.dtype.scalar() is dtype and
                 load.src[0].op is Ops.INDEX and zero.op is Ops.CONST and int(zero.arg) == 0]
   return candidates[0] if len(candidates) == 1 else None
-
-def _lower_loop_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
-  """Lower the register-loop form of FP16 any/all through the same balanced DPU EW image."""
-  store, out_param, _, _, root = output
-  nodes = list(root.toposort())
-  if (shape:=_loop_reduction_shape(store, out_param, nodes)) is None or _local_load(root) is None: return None
-  rows, envs, reduce_range, groups = shape
-  local_stores = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None]
-  updates = [u for u in local_stores if reduce_range in u.toposort()]
-  if len(local_stores) != 2 or len(updates) != 1: return None
-  update = _unwrap_condition(updates[0].src[1])
-  if update.op not in (Ops.OR, Ops.AND): return None
-  acc = next((x for x in update.src if _local_load(x) is not None), None)
-  predicate = update.src[1 if update.src[0] is acc else 0] if acc is not None else None
-  if predicate is None or (load:=_nonzero_load(predicate)) is None and \
-     (load:=_integer_nonzero_load(predicate, dtypes.int16)) is None: return None
-  source = _root_param(load.src[0])
-  identity = update.op is Ops.AND
-  initials = [u for u in local_stores if u is not updates[0] and u.src[1].op is Ops.CONST and
-              u.src[1].dtype.scalar() is dtypes.bool and bool(u.src[1].arg) == identity]
-  if len(initials) != 1 or source is None or source.src[0].op is not Ops.CONST: return None
-  try:
-    offsets = tuple(tuple(_eval_int(load.src[0].src[1], {**env, reduce_range:group}) for env in envs) for group in range(groups))
-  except RuntimeError: return None
-  source_count = int(source.src[0].arg)
-  if source_count != rows*groups or sorted(offset for row in offsets for offset in row) != list(range(source_count)): return None
-  return (_integer_predicate_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op, 2)
-          if load.dtype.scalar() is dtypes.int16 else _bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op))
 
 def _lower_grouped_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Lower grouped FP16 or stored-bool any/all after proving launch coordinates and full source coverage."""
@@ -2791,6 +2703,7 @@ class RKContext:
     self.int_layout = (RKLayout.INT32 if self.root.dtype.scalar() is dtypes.int and dynamic_int_load else
                        RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and packed_bool_load and int_range is not None and
                        -32768 <= int_range[0] <= int_range[1] <= 32767 else
+                       RKLayout.INT_FP16 if self.root.dtype.scalar() is dtypes.int and self.root.op is Ops.CAST and embedded_half_int else
                        RKLayout.INT_FP16 if self.root.dtype.scalar() is dtypes.int and int_range is not None and
                        -2048 <= int_range[0] <= int_range[1] <= 2048 else
                        RKLayout.INT16 if self.root.dtype.scalar() is dtypes.int and int_range is not None and
@@ -3799,6 +3712,10 @@ class RKContext:
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
+      elif dtype is dtypes.float and source_dtype is dtypes.int and source.layout is RKLayout.INT32:
+        value = self._narrow_int32(source)
+      elif dtype is dtypes.float and source_dtype is dtypes.bool and source.layout is RKLayout.BOOL_INT16:
+        value = self.lower(u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half)))
       elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or
                                                      dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16):
         value = self.lower(u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half)))
@@ -4378,18 +4295,14 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     return combined
   if vectorize_reductions and (multi_local:=_lower_multi_scalar_local_reductions(uops)) is not None: return multi_local
   if (scatter:=_lower_host_scatter(uops)) is not None: return scatter
-  if (float_output:=_output_store(uops, dtypes.float)) is not None and \
-     (integer_cast:=_lower_integer_fp32_cast(float_output)) is not None: return integer_cast
   if (int_output:=_output_store(uops, dtypes.int)) is not None:
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
-    if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
      (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_half_image(bool_output, nonzero, True, bool_output=True)
   if (byte_output:=_output_store(uops, dtypes.uchar)) is not None and \
      (fp16_byte_cast:=_lower_fp16_uint8_cast(byte_output)) is not None: return fp16_byte_cast
-  if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None:
-    if (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
-    if (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
+  if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
+     (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):
     if (direct_load:=_output_store(uops, dtype)) is None: continue
     if (image:=_lower_direct_dynamic_typed_load(direct_load, dtype)) is not None: return image
