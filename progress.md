@@ -5751,3 +5751,33 @@ All implementation experiments stayed in `/tmp`; the transferred renderer and fo
 proved temporary worktree. The test change preserves the same pre-allocation assertion under the consolidated private
 iterator name. No test was weakened, and no host tensor arithmetic, CPU/GPU fallback, CMAC, LUT, tolerance change,
 runtime edit, reset, reboot, or push was used.
+
+---
+
+## 2026-08-14 — cache immutable stateful command templates and delete unreachable cos/tan fallbacks
+
+The older hardware duration table ranked nested convolution first at 144.67 s, but that measurement was stale after
+the recent renderer work. A fresh current-tree cProfile run passed nested convolution in **17.53 s**; only **4.73 s**
+was in the renderer, led by the required precise MUL/ADD reduction. Cummin remained slower at **41.59 s** unprofiled.
+
+Its post-static-vector cProfile generated 96,067 EW stages. `_emit_stateful_stage` rebuilt the same immutable register
+command tuples 89,398 times, consuming **3.16 s**, while the per-operation relocation arguments were the only varying
+state. A bounded 256-entry cache now stores only command words and relocation word positions; every call still builds
+fresh `RKReloc` objects containing its own ARG/scratch addresses. Profiled total time fell from **69.46 to 66.25 s**;
+stateful emission fell from **3.16 to 0.62 s** and total EW emission from **3.46 to 0.87 s**.
+
+The late FP16 cosine/tangent recovery catalog is unreachable under the generic-first renderer architecture. Both
+operations already lower during the first `_lower_uop_program` attempt; deleting their late polynomial/recovery code
+preserves exact serialized images. Current 64-lane cos/tan hashes remain `363eff2f...20a2` and `d808180e...fa5e`.
+
+- Exact renderer diff: **16 insertions / 86 deletions**, executable lines **5,730 -> 5,669** (**-61**); runtime remains
+  **489**, total **31,225**. Cumulative renderer reduction from the 6,616-line cleanup baseline is **947 lines**.
+- Complete host image census remains byte-identical (`37ae9593...4380`); unchanged UOp tests: **89 passed** with
+  `-n12`.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** cases in
+  **784.10 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`80cb0529...a7f`) exactly matches the fully tested `/tmp` worktree. No tests,
+tolerances, runtime code, or core code changed. There is no cached tensor value or address, host tensor arithmetic,
+CPU/GPU fallback, CMAC, LUT, reset, reboot, or push.

@@ -372,9 +372,10 @@ def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKG
   return RKGather(source.index, out_slot, count, base=source.addend, axes=((1, count, stride),),
                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
 
-def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
-                         int32_output:bool=False, int32_input:bool=False,
-                         int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False, fp32_input:bool=False) -> RKStage:
+@functools.lru_cache(maxsize=256)
+def _stateful_stage_template(count:int, ew_cfg:int, compare:bool=False, int32_output:bool=False, int32_input:bool=False,
+                             int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False, fp32_input:bool=False) \
+                             -> tuple[tuple[int, ...], tuple[int, ...]]:
   """Emit a self-contained DPU EW stage, optionally consuming or producing native integers."""
   native_int16, native_int32 = int16_input and int16_output, int32_input and int32_output
   int16_to_int32 = int16_input and int32_output and not int16_output and not int32_input
@@ -416,14 +417,21 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
   commands = [_cmd(*x) for x in regs]
-  relocs:list[RKReloc] = []
-  for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
-                           (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
-    relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
+  relocs:list[int] = []
+  for target,reg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR),
+                     (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR)):
+    relocs.append(len(commands)); commands.append(_cmd(target, reg, 0))
   rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if int16_input else 2
   rdma_feature = (rdma_precision<<15)|(15<<11)|(rdma_precision<<5)|(0 if is_div or int16_input or fp32_input else 1<<3)|1
   commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature))
-  return RKStage(tuple(commands), tuple(relocs))
+  return tuple(commands), tuple(relocs)
+
+def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
+                         int32_output:bool=False, int32_input:bool=False,
+                         int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False, fp32_input:bool=False) -> RKStage:
+  commands, words = _stateful_stage_template(count, ew_cfg, compare, int32_output, int32_input,
+    int16_output, int16_input, fp32_output, fp32_input)
+  return RKStage(commands, tuple(RKReloc(word, arg) for word,arg in zip(words, (dst, lhs, rhs))))
 
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                   stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
@@ -5998,66 +6006,6 @@ def _dpu_sin(source:UOp) -> UOp:
     result = result.alu(Ops.ADD, residual.alu(Ops.MUL, cosine))
   return result.alu(Ops.ADD, invalid)
 
-def _dpu_cos(source:UOp) -> UOp:
-  """Approximate FP16 COS after reducing the original angle, preserving large-input phase."""
-  source = source.cast(dtypes.half)
-  one = UOp.const(1.0, dtypes.half)
-  _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
-  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
-  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
-    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
-  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
-  square = angle.alu(Ops.MUL, angle)
-  polynomial = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320))
-  sign = one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
-  return polynomial.alu(Ops.MUL, sign).alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(0.0, dtypes.half)))
-
-def _dpu_tan_magnitude(angle:UOp, pole_magnitude:UOp) -> UOp:
-  """Evaluate positive tangent magnitude directly or through reciprocal pole distance."""
-  one = UOp.const(1.0, dtypes.half)
-  near_pole = _positive_mask(angle.alu(Ops.SUB, UOp.const(0.75, dtypes.half)))
-  local = _mask_mul(angle, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, _mask_mul(pole_magnitude, near_pole))
-  square = local.alu(Ops.MUL, local)
-  polynomial = UOp.const(1382/155925, dtypes.half)
-  for coefficient in (62/2835, 17/315, 2/15, 1/3, 1.0):
-    polynomial = polynomial.alu(Ops.MUL, square).alu(Ops.ADD, UOp.const(coefficient, dtypes.half))
-  tangent = local.alu(Ops.MUL, polynomial)
-  safe_tangent = tangent.alu(Ops.ADD, one.alu(Ops.SUB, near_pole))
-  return _mask_mul(tangent, one.alu(Ops.SUB, near_pole)).alu(Ops.ADD, near_pole.alu(Ops.FDIV, safe_tangent))
-
-def _dpu_tan(source:UOp) -> UOp:
-  """Approximate FP16 TAN with precise near-pole and large-angle reductions."""
-  source = source.cast(dtypes.half)
-  zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
-  bounded, multiple, reduced = _dpu_periodic_reduce(source, 1/math.pi,
-    (2.0, 1.0, 0.125, 0.015625, math.pi-3.140625), math.pi/2)
-  magnitude = UOp(Ops.MAX, dtypes.half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  reduced_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, dtypes.half)))
-  pole_index = multiple.alu(Ops.ADD, reduced_sign.alu(Ops.MUL, UOp.const(0.5, dtypes.half)))
-  distance = bounded
-  for coefficient in (3.0, 0.140625, math.pi-3.140625):
-    distance = distance.alu(Ops.SUB, pole_index.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
-  pole_magnitude = UOp(Ops.MAX, dtypes.half, src=(distance, distance), arg=_NATIVE_ABS)
-  small = _dpu_tan_magnitude(magnitude, pole_magnitude).alu(Ops.MUL, reduced_sign)
-
-  _, _, broad = _dpu_periodic_reduce(source, 1/(2*math.pi),
-    (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125), math.pi)
-  broad_magnitude = UOp(Ops.MAX, dtypes.half, src=(broad, broad), arg=_NATIVE_ABS)
-  reflected = _positive_mask(broad_magnitude.alu(Ops.SUB, UOp.const(math.pi/2, dtypes.half)))
-  pi_minus = UOp.const(3.0, dtypes.half).alu(Ops.SUB, broad_magnitude).alu(Ops.ADD, UOp.const(0.140625, dtypes.half)).alu(
-    Ops.ADD, UOp.const(math.pi-3.140625, dtypes.half))
-  angle = _mask_mul(broad_magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
-  broad_pole = UOp.const(1.5703125, dtypes.half).alu(Ops.SUB, angle).alu(
-    Ops.ADD, UOp.const(math.pi/2-1.5703125, dtypes.half))
-  broad_sign = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, broad)).alu(Ops.MUL, UOp.const(2.0, dtypes.half))).alu(
-    Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, UOp.const(2.0, dtypes.half))))
-  large = _dpu_tan_magnitude(angle, broad_pole).alu(Ops.MUL, broad_sign)
-  use_large = _finite_positive_mask(UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS).alu(
-    Ops.SUB, UOp.const(8.0, dtypes.half)))
-  result = small.alu(Ops.ADD, use_large.alu(Ops.MUL, large.alu(Ops.SUB, small)))
-  return result.alu(Ops.ADD, source.alu(Ops.MUL, zero))
-
 def _dpu_pow2_integer(exponent:UOp) -> UOp:
   """Build `2**exponent` for the FP16 exponent range with exact native DPU arithmetic."""
   zero, one = UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
@@ -6153,29 +6101,11 @@ _pm_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), src=(UPa
 _pm_masked_exp2 = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), name="x"), _fold_masked_exp2)])
 _pm_log2 = PatternMatcher([(UPat(Ops.LOG2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_log2(source))])
 _pm_sin = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sin(source))])
-def _cos_source(x:UOp) -> UOp|None:
-  """Recover x from Tinygrad's casted cos(x) = sin(pi/2-x)."""
-  x = _strip_cast(x)
-  if x.op is not Ops.SIN or len(x.src) != 1 or (phase:=_const_operand(_strip_cast(x.src[0]), Ops.ADD, math.pi/2)) is None: return None
-  negative = _const_operand(phase[0], Ops.MUL, -1.0)
-  return _strip_cast(negative[0]) if negative is not None else None
-def _fold_cos(x:UOp) -> UOp|None:
-  """Recognize cosine before FP16 loses its pi/2 phase shift."""
-  return _dpu_cos(source) if (source:=_cos_source(x)) is not None else None
-_pm_cos = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), name="x"), _fold_cos)])
-def _fold_tan(x:UOp) -> UOp|None:
-  """Recognize Tensor.tan's SIN(x)/SIN(pi/2-x) expansion before either sine is rewritten."""
-  if x.op is not Ops.FDIV or len(x.src) != 2 or (numerator:=_strip_cast(x.src[0])).op is not Ops.SIN: return None
-  source, cosine_source = _strip_cast(numerator.src[0]), _cos_source(x.src[1])
-  return _dpu_tan(source) if cosine_source is not None and source.key == cosine_source.key else None
-_pm_tan = PatternMatcher([(UPat(Ops.FDIV, (dtypes.half, dtypes.float), name="x"), _fold_tan)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
   sink = graph_rewrite(sink, _pm_alt_sigmoid_gradient, name="rockchip alternate sigmoid gradient")
   sink = graph_rewrite(sink, _pm_inverse_hyperbolic, name="rockchip inverse hyperbolic")
   sink = graph_rewrite(sink, _pm_atan, name="rockchip atan")
-  sink = graph_rewrite(sink, _pm_tan, name="rockchip tan")
-  sink = graph_rewrite(sink, _pm_cos, name="rockchip cos")
   sink = graph_rewrite(sink, _pm_sin, name="rockchip sin")
   sink = graph_rewrite(sink, _pm_masked_exp2, name="rockchip masked exp2")
   sink = graph_rewrite(sink, _pm_exp2, name="rockchip exp2")
