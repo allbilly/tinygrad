@@ -154,7 +154,10 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
     if physical_reusable[target]: heapq.heappush(active, (end, target))
     remap[slot] = target
   def remap_arg(arg:RKArg) -> RKArg:
-    return replace(arg, index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg
+    return RKArg(arg.kind, remap[arg.index], arg.addend) if arg.kind is RKBufferKind.SCRATCH else arg
+  def remap_ew(op:RKEWOp) -> RKEWOp:
+    return RKEWOp(remap_arg(op.dst), remap_arg(op.lhs), remap_arg(op.rhs), op.count, op.ew_cfg, op.submit_barrier,
+      op.compare, op.stateful, op.int32_output, op.int32_input, op.bool_output, op.int16_output, op.int16_input)
   def remap_gather(gather:RKGather) -> RKGather:
     return replace(gather,
     src_index=remap[gather.src_index] if not gather.values and gather.src_kind is RKBufferKind.SCRATCH else gather.src_index,
@@ -162,7 +165,7 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   def remap_host(host:RKHostAddress) -> RKHostAddress:
     return replace(host, src=remap_arg(host.src), index=remap_arg(host.index), dst=remap_arg(host.dst))
   gathers = tuple(remap_gather(gather) for gather in image.gathers)
-  ew_ops = tuple(replace(op, dst=remap_arg(op.dst), lhs=remap_arg(op.lhs), rhs=remap_arg(op.rhs)) for op in image.ew_ops)
+  ew_ops = tuple(map(remap_ew, image.ew_ops))
   by_slot:dict[int, bytes] = {}
   for bits,slot in constant_slots.items():
     target = remap[slot]
@@ -5612,19 +5615,6 @@ def _fold_where_abs(x:UOp) -> UOp|None:
       x.src[2].key != condition.src[0].key or not negated): return None
   return UOp(Ops.MAX, x.dtype, src=(condition.src[0], condition.src[0]), arg=_NATIVE_ABS)
 
-def _fold_floor_ceil(x:UOp) -> UOp|None:
-  """Recognize Tinygrad's TRUNC-based floor/ceil expansions and select the native DPU ALU."""
-  if x.op is not Ops.WHERE or len(x.src) != 3: return None
-  condition, adjusted, truncated = x.src
-  if (truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or adjusted.op is not Ops.ADD or
-      truncated not in adjusted.src): return None
-  delta = next((float(u.arg) for u in adjusted.src if u.op is Ops.CONST), None)
-  source = truncated.src[0]
-  if delta == -1.0 and condition.src == (source, truncated): tag = _NATIVE_FLOOR
-  elif delta == 1.0 and condition.src == (truncated, source): tag = _NATIVE_CEIL
-  else: return None
-  return UOp(Ops.MAX, x.dtype, src=(source, source), arg=tag)
-
 def _fold_trunc(x:UOp) -> UOp:
   """Compose truncation from native floor/ceil without mask multiplication on infinities."""
   source, zero = x.src[0], UOp.const(0.0, dtypes.half)
@@ -5633,52 +5623,6 @@ def _fold_trunc(x:UOp) -> UOp:
   floor = UOp(Ops.MAX, x.dtype, src=(positive, positive), arg=_NATIVE_FLOOR)
   ceil = UOp(Ops.MAX, x.dtype, src=(negative, negative), arg=_NATIVE_CEIL)
   return floor.alu(Ops.ADD, ceil)
-
-def _fold_round(x:UOp) -> UOp|None:
-  """Recognize Tinygrad's round-to-even graph and compose it from native FLOOR/TRUNC and DPU masks."""
-  if x.op is not Ops.WHERE or len(x.src) != 3: return None
-  gate, yes, no = x.src
-  floor, ceil = _fold_floor_ceil(yes), _fold_floor_ceil(no)
-  if floor is None or ceil is None or floor.arg != _NATIVE_FLOOR or ceil.arg != _NATIVE_CEIL or gate.op is not Ops.CMPNE: return None
-  floor_shift, ceil_shift = _const_operand(floor.src[0], Ops.ADD, 0.5), _const_operand(ceil.src[0], Ops.ADD, -0.5)
-  source, ceil_source = (None, None) if floor_shift is None or ceil_shift is None else (floor_shift[0], ceil_shift[0])
-  if source is None or ceil_source is None or source.key != ceil_source.key: return None
-  positive = next((u for u in gate.src if u.op is Ops.CMPLT and u.src[1].key == source.key and
-                   u.src[0].op is Ops.CONST and float(u.src[0].arg) == 0.0), None)
-  parity = next((u for u in gate.src if u is not positive), None)
-  if positive is None or parity is None or parity.op is not Ops.CMPNE: return None
-  unequal = next((u for u in parity.src if u.op is Ops.CMPNE), None)
-  truth = next((u for u in parity.src if u.op is Ops.CONST and u.dtype.scalar() is dtypes.bool), None)
-  if unequal is None or truth is None or not bool(truth.arg): return None
-  truncated_half = next((u for u in unequal.src if u.op is Ops.TRUNC), None)
-  half_value = next((u for u in unequal.src if u is not truncated_half), None)
-  truncated = next((u for u in half_value.src if u.op is Ops.TRUNC), None) if half_value is not None and half_value.op is Ops.MUL else None
-  scale = next((u for u in half_value.src if u.op is Ops.CONST), None) if half_value is not None and half_value.op is Ops.MUL else None
-  if (truncated_half is None or half_value is None or truncated_half.src != (half_value,) or truncated is None or
-      truncated.src != (source,) or scale is None or float(scale.arg) != 0.5): return None
-  one, half = (UOp.const(v, dtypes.half) for v in (1.0, 0.5))
-  def native(value:UOp, tag:str) -> UOp: return UOp(Ops.MAX, dtypes.half, src=(value, value), arg=tag)
-  source_floor = native(source, _NATIVE_FLOOR)
-  tie_delta = source.alu(Ops.SUB, source_floor).alu(Ops.SUB, half)
-  tie = one.alu(Ops.SUB, _positive_mask(native(tie_delta, _NATIVE_ABS)))
-  greater = _positive_mask(tie_delta)
-  floor_half = source_floor.alu(Ops.MUL, half)
-  parity_delta = floor_half.alu(Ops.SUB, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(floor_half,))))
-  odd = _positive_mask(native(parity_delta, _NATIVE_ABS))
-  increment = greater.alu(Ops.MAX, _mask_mul(tie, odd))
-  return source_floor.alu(Ops.ADD, increment)
-
-def _fold_sign(x:UOp) -> UOp|None:
-  """Recognize WHERE(x!=0, WHERE(x<0, -1, 1), 0) before general WHERE lowering."""
-  nonzero, signed, zero = x.src
-  if (nonzero.op is not Ops.CMPNE or signed.op is not Ops.WHERE or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or
-      signed.src[0].op is not Ops.CMPLT or signed.src[1].op is not Ops.CONST or float(signed.src[1].arg) != -1.0 or
-      signed.src[2].op is not Ops.CONST or float(signed.src[2].arg) != 1.0): return None
-  source = next((u for u in nonzero.src if u.dtype.scalar() is dtypes.half and u.op is not Ops.CONST), None)
-  if (source is None or not any(u.op is Ops.CONST and float(u.arg) == 0.0 for u in nonzero.src) or
-      signed.src[0].src[0].key != source.key or signed.src[0].src[1].op is not Ops.CONST or
-      float(signed.src[0].src[1].arg) != 0.0): return None
-  return UOp(Ops.SUB, dtypes.half, src=(source, source), arg=_NATIVE_SIGN)
 
 def _fold_minimum(x:UOp) -> UOp|None:
   """Recognize -max(-x,-y); native ALU-MIN mishandles infinities, so lowering expands it through SUB and MAX."""
@@ -5790,11 +5734,6 @@ _pm_generic_storage_precision = PatternMatcher([
 ])
 _pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
                           (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_where_abs)])
-_pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round)])
-_pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_floor_ceil)])
-_pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])
-_pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
-
 def _unit_ratio_source(root:UOp) -> UOp|None:
   """Match Tinygrad's x/sqrt(1+x*x) normalization."""
   candidates = ((root.src[0], root.src[1]),) if root.op is Ops.FDIV else tuple((source, inverse.src[0])
@@ -5887,29 +5826,6 @@ def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
 
 _pm_inverse_hyperbolic = PatternMatcher([
   (UPat(Ops.MUL, (dtypes.half, dtypes.float), name="root"), _fold_inverse_hyperbolic),
-])
-
-def _fold_alt_sigmoid_gradient(root:UOp) -> UOp|None:
-  """Recover the stable sigmoid derivative from exp(x)/(1+exp(x)) differentiation."""
-  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.half or len(root.src) != 1 or
-      (body:=root.src[0]).op is not Ops.MUL or body.dtype.scalar() is not dtypes.float): return None
-  exponential = next((u for u in body.src if u.op is Ops.EXP2), None)
-  correction = next((u for u in body.src if u is not exponential), None)
-  if exponential is None or correction is None or (scaled:=exponential.src[0]).op is not Ops.MUL: return None
-  factor = next((u for u in scaled.src if u.op is Ops.CONST and abs(float(u.arg)-1/math.log(2)) < 1e-12), None)
-  source = next((_strip_cast(u) for u in scaled.src if u is not factor), None)
-  nodes = correction.toposort()
-  if (factor is None or source is None or source.dtype.scalar() is not dtypes.half or
-      sum(u.op is Ops.FDIV for u in nodes) != 3 or
-      not any(u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and u.src[0].key == exponential.key for u in nodes) or
-      not all(any(u.op is Ops.CONST and float(u.arg) == value for u in nodes) for value in (-1.0, 1.0))): return None
-  one = UOp.const(1.0, dtypes.half)
-  denominator = one.alu(Ops.ADD, source.alu(Ops.MUL, UOp.const(-1/math.log(2), dtypes.half)).alu(Ops.EXP2))
-  sigmoid = one.alu(Ops.FDIV, denominator)
-  return sigmoid.alu(Ops.MUL, one.alu(Ops.SUB, sigmoid))
-
-_pm_alt_sigmoid_gradient = PatternMatcher([
-  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_alt_sigmoid_gradient),
 ])
 
 def _dpu_sqrt(source:UOp, reciprocal:bool=False) -> UOp|None:
@@ -6103,7 +6019,6 @@ _pm_log2 = PatternMatcher([(UPat(Ops.LOG2, (dtypes.half, dtypes.float), src=(UPa
 _pm_sin = PatternMatcher([(UPat(Ops.SIN, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_sin(source))])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
-  sink = graph_rewrite(sink, _pm_alt_sigmoid_gradient, name="rockchip alternate sigmoid gradient")
   sink = graph_rewrite(sink, _pm_inverse_hyperbolic, name="rockchip inverse hyperbolic")
   sink = graph_rewrite(sink, _pm_atan, name="rockchip atan")
   sink = graph_rewrite(sink, _pm_sin, name="rockchip sin")
@@ -6112,11 +6027,7 @@ def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = graph_rewrite(sink, _pm_log2, name="rockchip log2")
   sink = graph_rewrite(sink, _pm_rsqrt, name="rockchip rsqrt")
   sink = graph_rewrite(sink, _pm_sqrt, name="rockchip sqrt")
-  sink = graph_rewrite(sink, _pm_round, name="rockchip round")
-  sink = graph_rewrite(sink, _pm_floor_ceil, name="rockchip floor/ceil")
-  sink = graph_rewrite(sink, _pm_trunc, name="rockchip trunc")
   sink = graph_rewrite(sink, _pm_abs, name="rockchip abs")
-  sink = graph_rewrite(sink, _pm_sign, name="rockchip sign")
   return list(graph_rewrite(sink, _pm_fp32_to_fp16, name="rockchip float→half").toposort())
 
 class RockchipRenderer(Renderer):

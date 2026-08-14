@@ -5781,3 +5781,30 @@ preserves exact serialized images. Current 64-lane cos/tan hashes remain `363eff
 The transferred renderer SHA-256 (`80cb0529...a7f`) exactly matches the fully tested `/tmp` worktree. No tests,
 tolerances, runtime code, or core code changed. There is no cached tensor value or address, host tensor arithmetic,
 CPU/GPU fallback, CMAC, LUT, reset, reboot, or push.
+
+---
+
+## 2026-08-14 — streamline scratch remapping and remove obsolete late numeric fallbacks
+
+The current slowest hardware family was profiled before this cleanup. The older nested-convolution duration was stale:
+a fresh run passed in **17.53 s**, with only **4.73 s** in the renderer, so cummin remained the slowest case. In the
+cummin profile, `_reuse_linear_scratch` spent **5.16 s** rebuilding every `RKEWOp` through generic dataclass field
+inspection. Its replacement remaps the three `RKArg` operands directly while explicitly preserving every other
+`RKEWOp` field. Profiled `_reuse_linear_scratch` time fell to **3.43 s**, and total profiled time fell from **66.25 to
+64.31 s**.
+
+The late floor/ceil, round, sign, and alternate-sigmoid-gradient recovery matchers had zero successful matches in the
+complete 89-test host UOp census. Their graphs are already owned by the generic first renderer attempt. The closed
+fallback helpers and matcher rows were deleted; `_fold_trunc` remains because it has live direct callers.
+
+- Exact renderer diff: **5 insertions / 94 deletions**, executable lines **5,669 -> 5,590** (**-79**); runtime remains
+  **489**, total **31,146**. Cumulative renderer reduction from the 6,616-line cleanup baseline is **1,026 lines**.
+- Complete host image census remains byte-identical (`37ae9593...4380`); unchanged UOp tests: **89 passed** with
+  `-n12`.
+- Focused hardware coverage for the removed fallback families: **12 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** collected
+  cases in **806.46 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`e906fe35...6c71`) exactly matches the fully tested `/tmp` worktree. No tests,
+runtime, core code, tolerance, tensor-value execution, CPU/GPU fallback, CMAC, LUT, reset, reboot, or push was used.
