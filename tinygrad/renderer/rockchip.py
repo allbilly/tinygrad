@@ -67,12 +67,6 @@ class RKHostAddress:
 class RKMultiGather: gathers: tuple[RKGather, ...]
 
 @dataclass(frozen=True)
-class RKStatic: expr: UOp
-
-RKLeaf = RKArg|RKStatic|RKGather|RKMultiGather|float|tuple[UOp, UOp, UOp|None, int]|None
-RKInt16Leaf = RKArg|RKStatic|RKGather|RKMultiGather|int|tuple[UOp, UOp, UOp|None, int]|None
-
-@dataclass(frozen=True)
 class RKFill: dst: RKArg; count: int; itemsize: int = 2
 
 @dataclass(frozen=True)
@@ -566,11 +560,8 @@ def _eval_vector(u:UOp, env:Mapping[UOp, np.ndarray|int], cache:dict[UOp, np.nda
 
 _STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.SPECIAL, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.TRUNC, Ops.WHERE,
                Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.XOR, Ops.MAX}
-def _is_static_expr(u:UOp, cache:dict[UOp, bool]|None=None) -> bool:
-  if cache is not None and u in cache: return cache[u]
-  ret = u.op in _STATIC_OPS and all(_is_static_expr(x, cache) for x in u.src)
-  if cache is not None: cache[u] = ret
-  return ret
+def _is_static_expr(u:UOp) -> bool:
+  return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
 
 def _index_ranges(index:UOp) -> list[UOp]:
   """Ranges used as index values, excluding AFTER/END ordering dependencies attached to a RANGE."""
@@ -739,16 +730,13 @@ def _static_int_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
 
 def _static_int_vectors(out_index:UOp, exprs:tuple[UOp, ...], count:int) -> tuple[tuple[int, ...], ...]:
   """Vector-evaluate static integer rows with one shared index-expression cache."""
-  ranges = _index_ranges(out_index)
+  ranges, vector_env, dst = _static_vector_env(out_index, count)
   if any(r not in ranges for expr in exprs for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
-  envs = _iter_range_env(ranges)
-  vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
   cache:dict[UOp, np.ndarray] = {}
-  dst = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
-  if len(envs) != count or np.any((dst < 0) | (dst >= count)) or not np.array_equal(np.sort(dst), np.arange(count)):
+  if len(dst) != count or np.any((dst < 0) | (dst >= count)) or not np.array_equal(np.sort(dst), np.arange(count)):
     return tuple(_static_int_vector(out_index, expr, count) for expr in exprs)
   order = np.argsort(dst)
-  return tuple(tuple(int(x) for x in np.broadcast_to(_eval_vector(expr, vector_env, cache), len(envs))[order]) for expr in exprs)
+  return tuple(tuple(int(x) for x in np.broadcast_to(_eval_vector(expr, vector_env, cache), len(dst))[order]) for expr in exprs)
 
 def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
   if u.op is Ops.CONST: return int(u.arg), {}
@@ -1503,14 +1491,13 @@ def _ew_ieee_positive_mask(ops:list[RKEWOp], arg:Callable[[int], RKArg], value:i
   return arg(result)
 
 def _ew_eq_mask(ops:list[RKEWOp], arg:Callable[[int], RKArg], lhs:int, rhs:int, temps:tuple[int, int, int, int], one:int,
-                lanes:int, barriers:tuple[bool, bool]=(False, True)) -> RKArg:
+                lanes:int, barriers:tuple[bool, bool]=(False, True)) -> None:
   """Append SUB, ABS, nonzero comparison, and inversion for an FP16 equality mask."""
   diff, magnitude, unequal, equal = temps
   ops.extend((RKEWOp(arg(diff), arg(lhs), arg(rhs), lanes, _EW_CFG[Ops.SUB], submit_barrier=barriers[0], stateful=barriers[0]),
               RKEWOp(arg(magnitude), arg(diff), arg(diff), lanes, _EW_CFG_ABS, submit_barrier=barriers[1], stateful=barriers[1]),
               RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), lanes, _EW_CFG[Ops.MAX], compare=True),
               RKEWOp(arg(equal), arg(one), arg(unequal), lanes, _EW_CFG[Ops.SUB], stateful=True)))
-  return arg(equal)
 
 
 def _ew_native_int16_eq_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], lhs:RKArg, rhs:RKArg,
@@ -3753,18 +3740,9 @@ class RKContext:
                        RKLayout.INT32 if dynamic_int_load else
                        RKLayout.INT_FP16 if embedded_half_int else None)
     self.accurate_adds = accurate_adds
-    self.use_counts:dict[UOp, int] = {}
     self.static_nodes:set[UOp] = set()
     for node in self.root.toposort():
       if node.op in _STATIC_OPS and all(src in self.static_nodes for src in node.src): self.static_nodes.add(node)
-    self._register_graph(self.root)
-
-  def _register_graph(self, root:UOp) -> None:
-    local:dict[UOp, int] = {}
-    for node in root.toposort():
-      for src in node.src: local[src] = local.get(src, 0) + 1
-    for node,count in local.items():
-      self.use_counts[node] = max(self.use_counts.get(node, 0), count)
 
   def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None) -> RKValue:
     slot = len(self.scratch)
@@ -4056,10 +4034,8 @@ class RKContext:
       return self._emit(dst, src, src, _EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
     if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None:
-      self._register_graph(recipe)
       return self.lower(recipe)
     if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
-      self._register_graph(recipe)
       return self.lower(recipe)
     dtype = u.dtype.scalar()
     int_range = _exact_int_range(u, self.int_ranges) if dtype is dtypes.int else None
@@ -4107,7 +4083,6 @@ class RKContext:
 
   def _accurate_add(self, u:UOp) -> RKValue:
     recipe = _accurate_add_recipe(u)
-    self._register_graph(recipe)
     return self.lower(recipe)
 
   def _coerce_bool(self, value:RKValue, layout:RKLayout) -> RKValue:
@@ -4257,7 +4232,6 @@ class RKContext:
         bound is not None and -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds
       ):
         recipe = UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in u.src), arg=u.arg)
-        self._register_graph(recipe)
         value = self.lower(recipe)
         if value.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
         return value
@@ -4275,7 +4249,6 @@ class RKContext:
     return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
 
   def _ieee_bool(self, recipe:UOp) -> RKValue:
-    self._register_graph(recipe)
     value = self.lower(recipe)
     if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
     return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
@@ -4515,13 +4488,10 @@ class RKContext:
       return RKValue(self.out, dtype, self.count, expected)
     condition_uop = _strip_cast(u.src[0])
     if (recipe:=_fold_where_abs(u)) is not None:
-      self._register_graph(recipe)
       return self.lower(recipe)
     if (recipe:=_fold_ordered_where(u)) is not None:
-      self._register_graph(recipe)
       return self.lower(recipe)
     if (recipe:=_fold_threshold_where(u)) is not None:
-      self._register_graph(recipe)
       return self.lower(recipe)
     if (u.src[1].op is Ops.EXP2 and u.src[2].op is Ops.CONST and float(u.src[2].arg) == 1.0 and
         len(u.src[1].src) == 1 and (scaled:=u.src[1].src[0]).op is Ops.MUL):
@@ -4614,12 +4584,10 @@ class RKContext:
     self.ew_ops.append(RKEWOp(value.arg, source.arg, zero.arg, self.count, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
     return value
 
-  def _widen_exact_int(self, source:RKValue) -> RKValue:
+  def _widen_exact_int(self, source:RKValue) -> None:
     if self.out_param.dtype.scalar() is not dtypes.int or source.layout is not RKLayout.INT_FP16: raise _RKGenericReject
     tiles = self._scratch(dtypes.int, RKLayout.INT32, _int32_tiles_bytes(self.count))
-    value = RKValue(self.out, dtypes.int, self.count, RKLayout.INT32)
-    self.ew_ops.append(RKEWOp(value.arg, source.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
-    return value
+    self.ew_ops.append(RKEWOp(self.out, source.arg, tiles.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
 
   def _narrow_int32(self, source:RKValue) -> RKValue:
     if source.layout is not RKLayout.INT32: raise _RKGenericReject
@@ -4641,7 +4609,6 @@ class RKContext:
       tagged[node] = node.replace(src=tuple(tagged[src] for src in node.src),
         arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD and node.arg is None else node.arg)
     recipe = tagged[recipe]
-    self._register_graph(recipe)
     value = self.lower(recipe)
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
     if u is self.root and value.arg != self.out:
@@ -4675,19 +4642,16 @@ class RKContext:
         if u.src[0].op is Ops.LOAD: source = self._load(u.src[0])
         else:
           recipe = _fp32_expr_to_half(u.src[0])
-          self._register_graph(recipe)
           source = self.lower(recipe)
       elif dtype is dtypes.half and source_dtype is dtypes.int and int_range is not None and \
            -_FP16_EXACT_INTEGER <= int_range[0] <= int_range[1] <= _FP16_EXACT_INTEGER:
         recipe = _int_fp16_expr(u.src[0])
-        self._register_graph(recipe)
         source = self.lower(recipe)
       else: source = self.lower(u.src[0])
       if dtype is dtypes.half and source.layout is RKLayout.INT32:
         value = self._narrow_int32(source)
       elif dtype is dtypes.half and source.layout is RKLayout.BOOL_INT16:
         recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        self._register_graph(recipe)
         value = self.lower(recipe)
       elif dtype is dtypes.half and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16):
         value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
@@ -4699,7 +4663,6 @@ class RKContext:
         value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
       elif dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT_FP16:
         recipe = u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-        self._register_graph(recipe)
         converted = self.lower(recipe)
         if converted.layout is not RKLayout.FP16: raise _RKGenericReject
         value = RKValue(converted.arg, dtype, self.count, RKLayout.INT_FP16)
@@ -4708,7 +4671,6 @@ class RKContext:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
           else:
             recipe = _int_fp16_expr(u)
-            self._register_graph(recipe)
             converted = self.lower(recipe)
             value = RKValue(converted.arg, dtype, self.count, self.int_layout)
         elif self.int_layout is RKLayout.INT16:
@@ -4731,7 +4693,6 @@ class RKContext:
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
       recipe = _int_fp16_expr(u)
-      self._register_graph(recipe)
       converted = self.lower(recipe)
       value = RKValue(converted.arg, dtype, self.count, self.int_layout)
     elif u.op is Ops.WHERE: value = self._where(u)

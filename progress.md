@@ -5689,3 +5689,32 @@ contracts, and passed **154 subtests**, with zero failures across all **445** co
 All experiments, including the rejected identity shortcut, stayed in `/tmp`. The transferred renderer SHA-256
 matches the fully tested temporary worktree exactly. No tests were changed or weakened; no host tensor arithmetic,
 CPU/GPU fallback, CMAC, LUT, tolerance change, runtime edit, reset, reboot, or push was used.
+
+---
+
+## 2026-08-14 — remove dead RKContext graph accounting and reuse static setup
+
+The next historical 425-source-line prefix-recovery deletion was tested first in `/tmp` and rejected. Although generic
+lowering remained numerically available, unchanged host performance oracles expanded a normalized INT32 prefix from
+**10 to 70 EW stages** and an FP16 predicate prefix from **16 to 333 EW stages**. A focused hardware hit census then
+showed that all seven catalog entry points are live across pool indices, masked-select, nonzero, cumulative extrema,
+argmin/argmax, sorting, and top-k. None of that rejected deletion was transferred.
+
+The safe replacement milestone removes state that is genuinely unobserved. `RKContext._register_graph` recursively
+counted UOp uses for the root and every synthesized recipe, but no production or test code read `use_counts`. Its
+method, field, and sixteen call sites are gone. The unused `RKStatic` leaf type and its two unused aliases are also
+gone. `_is_static_expr` no longer carries a cache argument that no caller supplied, and two physical helpers no longer
+construct ignored return values. Finally, `_static_int_vectors` reuses the bounded `_static_vector_env` lane grid and
+destination ordering rather than rebuilding the same static setup.
+
+- Exact renderer diff: **8 insertions / 47 deletions**, **36 executable lines removed**; **5,782 -> 5,746**.
+- Complete host image census: identical aggregate digest before/after (`37ae9593...4380`).
+- Unchanged UOp tests: **89 passed** with `-n12`; focused hardware: **42 passed**.
+- Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445** collected
+  cases, in **815.43 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,746/489 executable lines**, total **31,302**; cumulative renderer reduction from the
+  6,616-line cleanup baseline is **870 lines**.
+
+The transferred renderer SHA-256 matches the fully tested `/tmp` worktree. No tests, runtime, tolerance, or backend
+semantics changed; no CPU/GPU tensor computation, CMAC, LUT, reboot, reset, or push was used.
