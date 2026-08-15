@@ -6725,3 +6725,36 @@ post forms now fail at the parser boundary and continue through the same later g
 The transferred renderer SHA-256 (`71fba87d...501f821d`) exactly matches the fully tested
 `/tmp/tinygrad-rk-3p9-audit` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
 reset, reboot, or push was used.
+
+---
+
+## 2026-08-16 — reach the 3,800-line renderer milestone
+
+The messiest remaining mechanical layer was the physical image pipeline beneath the live semantic recognizers.
+Grouped boolean paths hand-built scratch, gather, and EW lists even though `_RKBuilder` already owned the same typed
+operations; stateless and stateful DPU stages duplicated nearly the same register program; and scratch coloring walked
+six physical phases separately. Those paths now share the builder, one stage template, and one ordered lifetime
+schedule. Their UOp admission rules, stage ordering, allocation order, and serialized images remain unchanged.
+
+Two obsolete wire features were also removed end to end. No renderer produced `RKFill` or host-address negative
+normalization, and every current image encoded their reserved fields as zero. The encoder still writes zero and the
+decoder now rejects nonzero legacy values, so the current ABI bytes are unchanged and unsupported inputs fail closed.
+One-use scratch helpers, an unused reduction-barrier field, and the unreachable reciprocal branch of `_dpu_sqrt` were
+removed. The final threshold gap was closed by reflowing single Python statements that already fit the repository's
+line limit; no semicolon packing, recognizer deletion, comment deletion, or docstring deletion was used.
+
+- Exact production diff: renderer **203 insertions / 317 deletions**, executable lines **3,900 -> 3,799** (**-101**);
+  runtime **489 -> 483** (**-6**), total **29,457 -> 29,350**, and cumulative renderer reduction from the 6,616-line
+  cleanup baseline is **2,817 lines**.
+- Independent baseline/candidate runs produced byte-for-byte identical complete encoded-image/resource payloads across
+  all **95** UOp tests, SHA-256 `a6f3f7b999818de32a4aa57cbe5778d16318e7ebb77d989ce289e582a0069eb1`.
+  A separate **304-variant** DPU stage-template oracle was also exact, SHA-256
+  `853f7cf9974e0dafa2f11e480f079782c45d6b9ef283b38d3690305ae11bc2b4`.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **1,722.15 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass. Fable-judge verdict: **VERIFIED**; no weakened tests, CPU/GPU/CMAC path, scope creep,
+  dependency change, or debris was found.
+
+The transferred renderer SHA-256 (`897a515f...f80c85`) and runtime SHA-256 (`9c64f8ad...07998`) exactly match the
+fully tested `/tmp/tinygrad-rk-3p8-audit` worktree. No reset, reboot, or push was used.
