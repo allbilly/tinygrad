@@ -6690,3 +6690,38 @@ regression before any NPU run. Only the corrected candidate was transferred.
 
 The transferred renderer SHA-256 (`12f395e1...c31f4`) exactly matches the fully tested isolated worktree. No test,
 runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-16 — reach the 3,900-line renderer milestone
+
+The remaining specialized recognizers still own distinct precision and layout contracts, but their physical image
+assembly repeated scratch allocation, native INT16 EW emission, gather collection, and final `RKImage` construction.
+One `_RKBuilder` now owns that mechanical layer for dynamic raw selection, exact byte equality/nonzero masks, bounded
+coordinates, predicate-gated loads, and striped boolean reduction. The graph proofs and emitted stage order remain
+unchanged. Static gather planning also reuses the existing vector environment, and the dependent scalar-extrema path
+uses the shared image-alias and balanced-row helpers throughout.
+
+The scalar loop reducer exposed a second closed seam. Its one-use `_reduction_image` and
+`_spaced_reduction_gathers` wrappers retained sqrt, reciprocal, cube-root, whole-buffer preparation, custom fill, and
+temporary-scratch modes which their sole caller could never request. The dispatcher already excluded every optional
+post-operation before that call. Those unreachable branches and their private sqrt/cube-root emitters were deleted;
+the live gather, negate, reduction, scale, scratch, and output sequence was folded directly into the caller. Unsupported
+post forms now fail at the parser boundary and continue through the same later generic/mapped paths.
+
+- Exact renderer diff: **201 insertions / 313 deletions**, executable lines **4,000 -> 3,900** (**-100**); runtime
+  remains **489**, total falls **29,557 -> 29,457**, and cumulative renderer reduction from the 6,616-line cleanup
+  baseline is **2,716 lines**.
+- Independent baseline/candidate runs produced the same sorted **169 RKImage emissions / 163 unique images / 5,455,580
+  unique encoded bytes** across all 95 UOp tests. The complete `IMAGE_CENSUS` payload is byte-for-byte identical with
+  SHA-256 `37085a58c28ccff45c830d995231c70471073d441015e1c87ce0c810eb6e8155`.
+- Focused NPU coverage for dynamic gather/masked-select/nonzero/fancy indexing, cumulative and argument extrema,
+  grouped boolean reduction, dot, and scalar reductions: **76 passed** in **291.87 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **778.59 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass. Fable-judge verdict: **VERIFIED**; no weakened checks, scope creep, or debris was found.
+
+The transferred renderer SHA-256 (`71fba87d...501f821d`) exactly matches the fully tested
+`/tmp/tinygrad-rk-3p9-audit` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
+reset, reboot, or push was used.
