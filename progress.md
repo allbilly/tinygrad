@@ -6210,3 +6210,37 @@ dead code.
 The transferred renderer SHA-256 (`343a5adc...33d9`) and focused-test SHA-256 (`e78336c9...ef7`) exactly match the
 fully tested `/tmp/rk-cast-bool.vkKKFs` worktree. No runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — consolidate typed WHERE and raw-layout plumbing
+
+The messiest remaining composable region was `RKContext._where`: boolean selection, INT16 selection, nonfinite FP16
+selection, and raw FP16/INT32 byte selection each repeated mask arithmetic, arm lowering, scratch allocation, and
+split/pack scheduling. That duplication sat beside generic `_raw_parts`/`_pack_raw` helpers which already owned the
+same physical layout semantics.
+
+`_raw_where` now owns lazy nonfinite handling and exact typed raw selection, while one `_masked_where` helper owns
+the shared 0/1 mask arithmetic. `_raw_parts` and `_pack_raw` gained explicit cache/copy/destination controls so the
+WHERE path reuses their physical ABI without changing scheduling. The same cleanup also merges the FP16/integer
+nonzero-load recognizers, directly reuses the generic predicate-count proof, removes a dead static-vector helper and
+two dead constants, collapses identical decode branches, and removes redundant scratch-reusability state. Two larger
+deletions were rejected in `/tmp`: grouped boolean reduction is required by `all_large`, and multi-local reduction is
+required by `std_mean`.
+
+- Exact renderer diff: **83 insertions / 143 deletions**, executable lines **4,549 -> 4,493** (**-56**); runtime remains
+  **489**, total falls **30,106 -> 30,050**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,123 lines**.
+- The baseline/candidate UOp lowering census produced **165 RKImages / 161 unique image records**. Every serialized
+  image, resource count, and occurrence count was byte-for-byte identical; the aggregate JSON-stream SHA-256 is
+  `8a8b7a095be21f3cc3539636e7bee18dee5fe920c685addbfe77f9d69c3a45ff`.
+- Focused hardware covering cumulative extrema, WHERE/nonfinite selection, grouped boolean reduction, and
+  `std_mean`: **12 passed**. `test_simple_cummin` was **36.87 s -> 36.29 s**, treated as effectively unchanged rather
+  than a claimed performance win.
+- UOp tests: **94 passed** with `-n12`. Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero
+  failures across all **445** cases in **832.86 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`d3afc4d4...7522b4`) exactly matches the fully tested
+`/tmp/rk-hot-clean.vT6XjT` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
