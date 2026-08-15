@@ -1036,6 +1036,31 @@ def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
                  gathers=first.gathers, ew_ops=first.ew_ops+tuple(second_ops), mid_gathers=first.mid_gathers+second_mid,
                  gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers))
 
+def _lower_post_image(store:UOp, out_index:UOp, root:UOp, substitutions:dict[UOp, UOp]) -> RKImage|None:
+  range_subs = {axis:axis.replace(src=(axis.src[0],)) for axis in _index_ranges(out_index) if len(axis.src) > 1}
+  post_index = store.src[0].substitute(range_subs) if range_subs else store.src[0]
+  post_value = root.substitute(substitutions)
+  if range_subs: post_value = post_value.substitute(range_subs)
+  post_store = store.replace(src=(post_index, post_value, *store.src[2:]))
+  return _lower_uop_program(_fp16_rewrite(list(UOp(Ops.SINK, src=(post_store,)).toposort())),
+                            vectorize_reductions=False, recipes_ready=True)
+
+def _append_reduction_post(reduced:RKImage, uops:list[UOp], store:UOp, out_index:UOp,
+                           root:UOp, reduction:UOp, rows:int, out_slot:int) -> RKImage|None:
+  """Replay the untouched post-reduction expression through the ordinary typed UOp executor."""
+  if root.key == reduction.key: return reduced
+  fake_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out_slot)
+  fake_source = UOp.param(fake_slot, dtypes.half, (rows,))
+  post_load = UOp(Ops.LOAD, dtypes.half, src=(store.src[0].replace(src=(fake_source, *store.src[0].src[1:])),))
+  if reduction.dtype.scalar() is not dtypes.half: post_load = post_load.cast(reduction.dtype.scalar())
+  post = _lower_post_image(store, out_index, root, {reduction:post_load})
+  if post is None: return None
+  post = _alias_image_args(post, {fake_slot:RKArg(RKBufferKind.ARG, out_slot)})
+  commutative = {_EW_CFG[op] for op in (Ops.ADD, Ops.MUL, Ops.MAX)}
+  post = replace(post, ew_ops=tuple(replace(op, lhs=op.rhs, rhs=op.lhs) if op.dst == op.rhs and op.ew_cfg in commutative else op
+                                    for op in post.ew_ops))
+  return _append_inplace_image(reduced, post)
+
 def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   """Evaluate one fused FP16 map over the whole reduction domain, then reduce its materialized lanes."""
   def reject(_reason:str) -> RKImage|None: return None
@@ -1079,20 +1104,7 @@ def _lower_mapped_add_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if mapped is None: return reject("map")
   reduced = _finish_mapped_add_reduction(mapped, out_slot, rows, groups, post_scale)
   if reduced is None or post_root is None or post_local is None: return reduced
-  fake_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out_slot)
-  fake_source = UOp.param(fake_slot, dtypes.half, (rows,))
-  range_substitutions = {axis:axis.replace(src=(axis.src[0],)) for axis in _index_ranges(out_index) if len(axis.src) > 1}
-  post_index = store.src[0].substitute(range_substitutions) if range_substitutions else store.src[0]
-  fake_index = post_index.replace(src=(fake_source, *post_index.src[1:]))
-  post_load = UOp(Ops.LOAD, dtypes.half, src=(fake_index,))
-  if post_local.dtype.scalar() is not dtypes.half: post_load = post_load.cast(post_local.dtype.scalar())
-  post_value = post_root.substitute({post_local:post_load, **range_substitutions})
-  post_store = store.replace(src=(post_index, post_value, *store.src[2:]))
-  post_uops = _fp16_rewrite(list(UOp(Ops.SINK, src=(post_store,)).toposort()))
-  post = _lower_uop_program(post_uops, vectorize_reductions=False, recipes_ready=True)
-  if post is None: return reject("post")
-  post = _alias_image_args(post, {fake_slot:RKArg(RKBufferKind.ARG, out_slot)})
-  appended = _append_inplace_image(reduced, post)
+  appended = _append_reduction_post(reduced, uops, store, out_index, post_root, post_local, rows, out_slot)
   return appended if appended is not None else reject("append")
 
 def _lower_vectorized_unrolled_add_reduction(uops:list[UOp]) -> RKImage|None:
@@ -1239,18 +1251,18 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   """Execute repeated FP16 MUL UOps with product residuals, then compensate their physical ADD reduction."""
   if (output:=_output_store(uops, dtypes.half)) is None: return None
   store, out, rows, out_index, root = output
-  bias:UOp|None = None
-  summed, post_scale, relu = root, 1.0, False
+  summed, post_scale = root, 1.0
   if root.op is Ops.WHERE and len(root.src) == 3 and root.src[0].op is Ops.CMPLT and \
      len(root.src[0].src) == 2 and root.src[0].src[0].op is Ops.CONST and float(root.src[0].src[0].arg) == 0.0 and \
      root.src[0].src[1].key == root.src[1].key and root.src[2].op is Ops.CONST and float(root.src[2].arg) == 0.0:
-    summed, relu = root.src[1], True
+    summed = root.src[1]
   if summed.op is Ops.ADD:
     for dot,candidate in (summed.src, summed.src[::-1]):
       candidate = _strip_cast(candidate)
       if (candidate.op is Ops.LOAD and candidate.dtype.scalar() is dtypes.half) or \
          (candidate.dtype.scalar() in (dtypes.half, dtypes.float) and _is_static_expr(candidate)):
-        summed, bias = dot, candidate; break
+        summed = dot; break
+  reduction_root = summed
   if (scaled:=_scaled_add_terms(summed)) is None: return None
   terms, post_scale = scaled
   groups, lanes = len(terms), rows*len(terms)
@@ -1301,34 +1313,7 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
   finished = _finish_mapped_add_reduction(mapped, out.arg.slot, rows, groups*2, post_scale,
                                            op_barriers=True, compensated_limit=groups*2, kahan=groups == 8)
   if finished is None: return None
-  if bias is not None:
-    if bias.op is Ops.LOAD:
-      bias_param = _root_param(bias.src[0]) if bias.src and bias.src[0].op is Ops.INDEX else None
-      if bias_param is None or bias_param.src[0].op is not Ops.CONST: return None
-      try: bias_offsets = _gather_offsets(out_index, bias.src[0].src[1], bias.src[2] if len(bias.src) > 2 else None, rows)
-      except RuntimeError: return None
-      if any(not 0 <= offset < int(bias_param.src[0].arg) for offset in bias_offsets): return None
-      if int(bias_param.src[0].arg) == rows and bias_offsets == tuple(range(rows)):
-        bias_arg = RKArg(RKBufferKind.ARG, bias_param.arg.slot)
-      else:
-        bias_arg = RKArg(RKBufferKind.SCRATCH, len(finished.scratch))
-        finished = replace(finished, scratch=(*finished.scratch, RKScratch(_scratch_bytes(rows))),
-                           gathers=(*finished.gathers, RKGather(bias_param.arg.slot, bias_arg.index, rows, offsets=bias_offsets)))
-    else:
-      try: values = _static_values(out_index, bias, rows, _fp16_bits)
-      except RuntimeError: return None
-      bias_arg = RKArg(RKBufferKind.SCRATCH, len(finished.scratch))
-      finished = replace(finished, scratch=(*finished.scratch, RKScratch(_scratch_bytes(rows))),
-                         gathers=(*finished.gathers, RKGather(0, bias_arg.index, rows, values=values)))
-    add_bias = RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.ARG, out.arg.slot),
-                      bias_arg, rows, _EW_CFG[Ops.ADD], submit_barrier=True, stateful=True)
-    finished = replace(finished, ew_ops=(*finished.ew_ops, add_bias))
-  if relu:
-    relu_image = RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(rows)),), struct.pack("<e", 0.0), ew_ops=(
-      RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.ARG, out.arg.slot), RKArg(RKBufferKind.SCRATCH, 0),
-             rows, _EW_CFG[Ops.MAX]),))
-    if (finished:=_append_inplace_image(finished, relu_image)) is None: return None
-  return finished
+  return _append_reduction_post(finished, uops, store, out_index, root, reduction_root, rows, out.arg.slot)
 
 def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None) -> Iterable[UOp]:
   stack = [root]
@@ -3975,13 +3960,7 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
     fake = sources[buffer]
     replacement = fake.index(0).load()
     substitutions[load] = replacement.cast(load.dtype.scalar()) if load.dtype.scalar() is not dtypes.half else replacement
-  post_root = root.substitute(substitutions)
-  range_substitutions = {axis:axis.replace(src=(axis.src[0],)) for axis in _index_ranges(store.src[0].src[1]) if len(axis.src) > 1}
-  if range_substitutions: post_root = post_root.substitute(range_substitutions)
-  post_index = store.src[0].substitute(range_substitutions) if range_substitutions else store.src[0]
-  post_store = store.replace(src=(post_index, post_root, *store.src[2:]))
-  post = _lower_uop_program(_fp16_rewrite(list(UOp(Ops.SINK, src=(post_store,)).toposort())),
-                            vectorize_reductions=False, recipes_ready=True)
+  post = _lower_post_image(store, store.src[0].src[1], root, substitutions)
   if post is None or staged is None or (appended:=_append_inplace_image(staged, post)) is None: return None
   scratch_base = len(appended.scratch)
   slot_to_scratch = {fake.arg.slot:scratch_base+i for i,fake in enumerate(sources.values())}

@@ -6305,3 +6305,38 @@ another private gather/EW remapper. Ordering-only `AFTER` sources remain exclude
 The transferred renderer SHA-256 (`a83d2c8f...b7b7b6`) exactly matches the fully tested
 `/tmp/rk-materialize.5TSRlj` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — centralize post-reduction UOp replay
+
+The mapped-reduction catalog remains the largest messy renderer group, but its active recognizers cannot be deleted:
+the full hardware census exercises mapped-loop ADD, precision MUL+ADD, multi-local, unrolled-ADD, and scalar-extrema
+paths. The duplicated post-reduction ownership was removable. Mapped-loop ADD replayed a general expression through
+the typed UOp executor, vectorized MUL+ADD separately rebuilt bias and ReLU images by hand, and multi-local ADD carried
+a third copy of output-range substitution and post-image construction.
+
+`_lower_post_image` now owns output-range normalization and typed post-expression lowering.
+`_append_reduction_post` materializes one completed reduction, aliases it back to the real output, canonically
+orients commutative in-place stages, and appends the post image. Mapped-loop ADD and vectorized MUL+ADD both use this
+path, while multi-local ADD reuses the same post-image builder. The TwoProduct stages, Kahan/compensated reduction,
+scratch arena, reduction barriers, and fail-closed recognizers are unchanged.
+
+- Exact renderer diff: **32 insertions / 53 deletions**, executable lines **4,414 -> 4,390** (**-24**); runtime remains
+  **489**, total falls **29,971 -> 29,947**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,226 lines**.
+- The serial baseline/candidate UOp census retained every one of the **173** baseline outcomes and every serialized
+  image hash with identical occurrence counts. The candidate records one additional internal post-image lowering;
+  no baseline image was removed or changed.
+- Focused NPU coverage for large GEMM, biased convolution, GQA attention, cross-entropy, binary cross-entropy,
+  `std_mean`, and normalization: **7 passed** in **60.15 s**.
+- The required hardware census in `test/backend/test_rockchip.py` collected all **445** cases and completed with zero
+  failures during a broader serial run using `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`. Every failure in that
+  broader run belonged to the separate 199-case experimental `test_rockchip2.py` suite; its first failure was
+  reproduced unchanged on the clean committed baseline. NPU health subsequently passed the RK3588 elementwise probe.
+- UOp tests: **94 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`defad456...edcb`) exactly matches the fully tested
+`/tmp/rk-post-reduction.OZhty2` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
