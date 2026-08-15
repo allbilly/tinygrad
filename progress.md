@@ -6340,3 +6340,34 @@ scratch arena, reduction barriers, and fail-closed recognizers are unchanged.
 The transferred renderer SHA-256 (`defad456...edcb`) exactly matches the fully tested
 `/tmp/rk-post-reduction.OZhty2` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — prune unreachable comparison recursion
+
+The comparison island mixed two distinct responsibilities: one compact IEEE-aware numeric comparison recipe and a
+recursive boolean-expression interpreter. `RKContext._compare` only invokes the recipe for a single `CMPLT` or
+`CMPNE`; composed boolean expressions already lower through `RKContext._bool_binary`. The analogous recursive
+AND/OR/XOR and boolean-inversion arms in `_native_int16_comparison` were likewise unreachable from its sole caller.
+
+An intentionally broader experiment that deleted the IEEE recipe was rejected in `/tmp`: although its semantics and
+unit tests passed, representative half-backed comparisons grew from 34 to 97 EW stages. The accepted rewrite keeps
+the compact numeric atom construction and its exact allocation/order, removes only the unreachable recursive
+admission, deletes `_ieee_bool`, and routes boolean composition directly to the typed boolean lowerer.
+
+- Exact renderer diff: **17 insertions / 60 deletions**, executable lines **4,390 -> 4,348** (**-42**); runtime remains
+  **489**, total falls **29,947 -> 29,905**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,268 lines**.
+- A complete ordered unit lowering census compared **174 image records** and found every encoded byte string and
+  occurrence count identical. Direct half-backed `CMPLT`, `CMPNE`, and `CMPEQ` retained their exact image hashes and
+  resource counts: 34, 34, and 35 EW stages respectively.
+- Focused hardware comparison, logical, classification, INT16, and argument-extrema coverage: **19 passed** in
+  **11.62 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  cases in **798.55 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **94 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`9d3a23f5...0e16`) exactly matches the fully tested
+`/tmp/rk-ieee-compact.qXt0BV` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.

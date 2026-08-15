@@ -2334,7 +2334,8 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
                  post_gathers=(_int16_low_bytes(int_result, out_slot, count),))
 
 def _ieee_comparison_mask(root:UOp) -> UOp|None:
-  """Build an IEEE-correct FP16 comparison mask without evaluating tensor values on the host."""
+  """Build an IEEE-correct FP16 comparison mask for one numeric comparison."""
+  if root.op not in (Ops.CMPLT, Ops.CMPNE) or len(root.src) != 2: return None
   one = UOp.const(1.0, dtypes.half)
   def inverse(value:UOp) -> UOp: return one.alu(Ops.SUB, value)
   def numeric(value:UOp) -> UOp|None:
@@ -2351,45 +2352,19 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
     low = _positive_mask(negated.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
     nan = _mask_mul(high, low)
     return nan, high.alu(Ops.SUB, nan), low.alu(Ops.SUB, nan), inverse(high.alu(Ops.MAX, low))
-  def atom(op:Ops, lhs:UOp, rhs:UOp, invert:bool=False) -> UOp|None:
-    if (left:=numeric(lhs)) is None or (right:=numeric(rhs)) is None: return None
-    lhs_nan, lhs_pos, lhs_neg, lhs_finite = classes(left)
-    rhs_nan, rhs_pos, rhs_neg, rhs_finite = classes(right)
-    positive = _positive_mask(right.alu(Ops.SUB, left))
-    if op is Ops.CMPLT:
-      valid = inverse(lhs_nan.alu(Ops.MAX, rhs_nan))
-      forced = _mask_mul(lhs_neg, inverse(rhs_neg)).alu(Ops.MAX, _mask_mul(rhs_pos, inverse(lhs_pos)))
-      finite = _mask_mul(_mask_mul(lhs_finite, rhs_finite), positive)
-      comparison = forced.alu(Ops.MAX, finite)
-      return _mask_mul(valid, inverse(comparison) if invert else comparison)
-    unequal = positive.alu(Ops.MAX, _positive_mask(left.alu(Ops.SUB, right)))
-    finite_equal = _mask_mul(_mask_mul(lhs_finite, rhs_finite), inverse(unequal))
-    equal = finite_equal.alu(Ops.MAX, _mask_mul(lhs_pos, rhs_pos)).alu(Ops.MAX, _mask_mul(lhs_neg, rhs_neg))
-    return inverse(equal)
-  def mask(value:UOp) -> UOp|None:
-    value = _unwrap_condition(value)
-    if value.op is Ops.CONST and value.dtype.scalar() is dtypes.bool: return UOp.const(float(bool(value.arg)), dtypes.half)
-    if value.op is Ops.CMPNE:
-      for expression, marker in (value.src, value.src[::-1]):
-        marker = _unwrap_condition(marker)
-        if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool:
-          expression = _unwrap_condition(expression)
-          if bool(marker.arg) and expression.op is Ops.CMPLT:
-            return atom(Ops.CMPLT, expression.src[0], expression.src[1], invert=True)
-          if (inner:=mask(expression)) is None: return None
-          return inverse(inner) if bool(marker.arg) else inner
-    if value.op in (Ops.CMPLT, Ops.CMPNE): return atom(value.op, value.src[0], value.src[1])
-    if value.op in (Ops.OR, Ops.AND, Ops.XOR):
-      lhs, rhs = mask(value.src[0]), mask(value.src[1])
-      if lhs is None or rhs is None: return None
-      if value.op is Ops.OR: return lhs.alu(Ops.MAX, rhs)
-      if value.op is Ops.AND: return _mask_mul(lhs, rhs)
-      delta = lhs.alu(Ops.SUB, rhs)
-      return UOp(Ops.MAX, dtypes.half, src=(delta, delta), arg=_NATIVE_ABS)
-    return None
-  result = mask(root)
-  if result is None: return None
-  return result
+  if (left:=numeric(root.src[0])) is None or (right:=numeric(root.src[1])) is None: return None
+  lhs_nan, lhs_pos, lhs_neg, lhs_finite = classes(left)
+  rhs_nan, rhs_pos, rhs_neg, rhs_finite = classes(right)
+  positive = _positive_mask(right.alu(Ops.SUB, left))
+  if root.op is Ops.CMPLT:
+    valid = inverse(lhs_nan.alu(Ops.MAX, rhs_nan))
+    forced = _mask_mul(lhs_neg, inverse(rhs_neg)).alu(Ops.MAX, _mask_mul(rhs_pos, inverse(lhs_pos)))
+    finite = _mask_mul(_mask_mul(lhs_finite, rhs_finite), positive)
+    return _mask_mul(valid, forced.alu(Ops.MAX, finite))
+  unequal = positive.alu(Ops.MAX, _positive_mask(left.alu(Ops.SUB, right)))
+  finite_equal = _mask_mul(_mask_mul(lhs_finite, rhs_finite), inverse(unequal))
+  equal = finite_equal.alu(Ops.MAX, _mask_mul(lhs_pos, rhs_pos)).alu(Ops.MAX, _mask_mul(lhs_neg, rhs_neg))
+  return inverse(equal)
 
 def _fp16_nonzero_mask(root:UOp) -> UOp|None:
   """Recognize a direct FP16-to-bool cast; ABS then positivity is exact for zero, infinity, and NaN."""
@@ -2440,24 +2415,13 @@ def _int_fp16_expr(u:UOp) -> UOp:
   raise _RKGenericReject(f"INT_FP16 recipe {u.op.name}")
 
 def _native_int16_comparison(root:UOp) -> UOp|None:
-  """Express signed INT16 comparisons and their boolean compositions as saturating integer ALU masks."""
+  """Express one signed INT16 comparison as a saturating integer ALU mask."""
   if root.op in (Ops.CMPLT, Ops.CMPNE) and all(src.dtype.scalar() is dtypes.int16 for src in root.src):
     lhs, rhs = root.src
     delta = rhs.alu(Ops.SUB, lhs) if root.op is Ops.CMPLT else lhs.alu(Ops.SUB, rhs)
     magnitude = delta.alu(Ops.MAX, UOp.const(0, dtypes.int16)) if root.op is Ops.CMPLT else \
                 UOp(Ops.MAX, dtypes.int16, src=(delta, delta), arg=_NATIVE_ABS)
     return UOp(Ops.MAX, dtypes.int16, src=(magnitude, UOp.const(1, dtypes.int16)), arg=_NATIVE_MIN)
-  if root.op in (Ops.AND, Ops.OR, Ops.XOR):
-    left_mask, right_mask = (_native_int16_comparison(src) for src in root.src)
-    if left_mask is None or right_mask is None: return None
-    if root.op is Ops.AND: return left_mask.alu(Ops.MUL, right_mask)
-    if root.op is Ops.OR: return left_mask.alu(Ops.MAX, right_mask)
-    delta = left_mask.alu(Ops.SUB, right_mask)
-    return UOp(Ops.MAX, dtypes.int16, src=(delta, delta), arg=_NATIVE_ABS)
-  if root.op is Ops.CMPNE:
-    for value, marker in (root.src, root.src[::-1]):
-      if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg):
-        if (mask:=_native_int16_comparison(value)) is not None: return UOp.const(1, dtypes.int16).alu(Ops.SUB, mask)
   return None
 
 class _RKGenericReject(Exception): pass
@@ -3192,11 +3156,6 @@ class RKContext:
     if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
     return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
 
-  def _ieee_bool(self, recipe:UOp) -> RKValue:
-    value = self.lower(recipe)
-    if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
-    return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
-
   def _i16(self, lhs:RKArg, rhs:RKArg, cfg:int) -> RKArg:
     dst = self._scratch(dtypes.int16, RKLayout.INT16).arg
     self.ew_ops.append(RKEWOp(dst, lhs, rhs, self.count, cfg, int16_input=True, int16_output=True))
@@ -3608,9 +3567,7 @@ class RKContext:
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype is dtypes.bool:
-      if all(src.dtype.scalar() is dtypes.bool for src in u.src): value = self._bool_binary(u)
-      elif (ieee_recipe:=_ieee_comparison_mask(u)) is not None: value = self._ieee_bool(ieee_recipe)
-      else: value = self._bool_binary(u)
+      value = self._bool_binary(u)
     elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.int16, dtypes.int): value = self._integer_bitwise(u)
     elif u.op in (Ops.SHL, Ops.SHR) and dtype in (dtypes.int, dtypes.uint): value = self._int32_shift(u)
     elif u.op in (Ops.CDIV, Ops.CMOD) and dtype is dtypes.int:
