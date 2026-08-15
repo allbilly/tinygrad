@@ -2270,38 +2270,14 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=ops,
                  post_gathers=(_int16_low_bytes(int_result, out_slot, count),))
 
-def _ieee_comparison_mask(root:UOp) -> UOp|None:
-  """Build an IEEE-correct FP16 comparison mask for one numeric comparison."""
-  if root.op not in (Ops.CMPLT, Ops.CMPNE) or len(root.src) != 2: return None
-  one = UOp.const(1.0, dtypes.half)
-  def inverse(value:UOp) -> UOp: return one.alu(Ops.SUB, value)
-  def numeric(value:UOp) -> UOp|None:
-    original, value = value, _unwrap_condition(value)
-    if value.dtype.scalar() not in (dtypes.half, dtypes.float) and original.dtype.scalar() in (dtypes.half, dtypes.float): value = original
-    if value.dtype.scalar() not in (dtypes.half, dtypes.float): return None
-    loads = [u for u in value.toposort() if u.op is Ops.LOAD]
-    params = [_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads]
-    if any(param is None or param.dtype.scalar() is not dtypes.half for param in params): return None
-    return value if value.dtype.scalar() is dtypes.half else value.cast(dtypes.half)
-  def classes(value:UOp) -> tuple[UOp, UOp, UOp, UOp]:
-    high = _positive_mask(value.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
-    negated = UOp(Ops.NEG, dtypes.half, src=(value,))
-    low = _positive_mask(negated.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
-    nan = _mask_mul(high, low)
-    return nan, high.alu(Ops.SUB, nan), low.alu(Ops.SUB, nan), inverse(high.alu(Ops.MAX, low))
-  if (left:=numeric(root.src[0])) is None or (right:=numeric(root.src[1])) is None: return None
-  lhs_nan, lhs_pos, lhs_neg, lhs_finite = classes(left)
-  rhs_nan, rhs_pos, rhs_neg, rhs_finite = classes(right)
-  positive = _positive_mask(right.alu(Ops.SUB, left))
-  if root.op is Ops.CMPLT:
-    valid = inverse(lhs_nan.alu(Ops.MAX, rhs_nan))
-    forced = _mask_mul(lhs_neg, inverse(rhs_neg)).alu(Ops.MAX, _mask_mul(rhs_pos, inverse(lhs_pos)))
-    finite = _mask_mul(_mask_mul(lhs_finite, rhs_finite), positive)
-    return _mask_mul(valid, forced.alu(Ops.MAX, finite))
-  unequal = positive.alu(Ops.MAX, _positive_mask(left.alu(Ops.SUB, right)))
-  finite_equal = _mask_mul(_mask_mul(lhs_finite, rhs_finite), inverse(unequal))
-  equal = finite_equal.alu(Ops.MAX, _mask_mul(lhs_pos, rhs_pos)).alu(Ops.MAX, _mask_mul(lhs_neg, rhs_neg))
-  return inverse(equal)
+def _half_backed_value(value:UOp) -> UOp|None:
+  """Normalize a half-backed numeric expression for the exact raw FP16 comparator."""
+  original, value = value, _unwrap_condition(value)
+  if value.dtype.scalar() not in (dtypes.half, dtypes.float) and original.dtype.scalar() in (dtypes.half, dtypes.float): value = original
+  if value.dtype.scalar() not in (dtypes.half, dtypes.float) or any(
+    not load.src or load.src[0].op is not Ops.INDEX or (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtypes.half
+    for load in value.toposort() if load.op is Ops.LOAD): return None
+  return value if value.dtype.scalar() is dtypes.half else value.cast(dtypes.half)
 
 def _fp16_nonzero_mask(root:UOp) -> UOp|None:
   """Recognize a direct FP16-to-bool cast; ABS then positivity is exact for zero, infinity, and NaN."""
@@ -2847,11 +2823,12 @@ class RKContext:
     if len(u.src) != 2: raise _RKGenericReject
     if u.op is Ops.CMPNE:
       for expression,marker in (u.src, u.src[::-1]):
-        if (marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and
-            expression.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in expression.src)):
+        if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and expression.op is Ops.CMPLT:
+          sources = tuple(_half_backed_value(src) for src in expression.src)
+          if any(src is None for src in sources): continue
           less = self.lower(expression)
           if less.layout is not RKLayout.BOOL_INT16: raise _RKGenericReject
-          operands = tuple(self._operand(src, dtypes.half) for src in expression.src)
+          operands = tuple(self._operand(src, dtypes.half) for src in typing_cast(tuple[UOp, UOp], sources))
           nan = tuple(self._fp16_component_values(value)[2] for value in operands)
           one = self._constant(UOp.const(1, dtypes.int16))
           inverse, either_nan, numeric = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(3))
@@ -3086,12 +3063,10 @@ class RKContext:
       value = self.lower(int16_recipe)
       if value.layout is not RKLayout.INT16: raise _RKGenericReject
       return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_INT16)
-    predicate = UOp(Ops.CMPNE, src=u.src) if u.op is Ops.CMPEQ else u
-    if (ieee_recipe:=_ieee_comparison_mask(predicate)) is None: raise _RKGenericReject
-    if u.op is Ops.CMPEQ: ieee_recipe = UOp.const(1.0, dtypes.half).alu(Ops.SUB, ieee_recipe)
-    value = self.lower(ieee_recipe)
-    if value.layout not in (RKLayout.FP16, RKLayout.BOOL_MASK): raise _RKGenericReject
-    return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_MASK)
+    sources = tuple(_half_backed_value(src) for src in u.src)
+    if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in sources): raise _RKGenericReject
+    comparison = u.replace(src=typing_cast(tuple[UOp, UOp], sources))
+    return self._fp16_less(comparison) if u.op is Ops.CMPLT else self._fp16_equality(comparison)
 
   def _i16(self, lhs:RKArg, rhs:RKArg, cfg:int) -> RKArg:
     dst = self._scratch(dtypes.int16, RKLayout.INT16).arg

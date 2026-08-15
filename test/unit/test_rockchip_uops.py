@@ -243,6 +243,20 @@ def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
   assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MUL] and image.ew_ops[-1].int16_output
 
 
+def test_half_backed_fp32_inverted_comparison_reuses_exact_raw_path():
+  lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  def image(as_float:bool) -> RKImage:
+    def greater_equal(i:UOp) -> UOp:
+      left, right = lhs.index(i).load(), rhs.index(i).load()
+      if as_float: left, right = left.cast(dtypes.float), right.cast(dtypes.float)
+      less = UOp(Ops.CMPLT, dtypes.bool, src=(left, right))
+      return UOp(Ops.CMPNE, dtypes.bool, src=(less, UOp.const(True, dtypes.bool)))
+    result = _lower_uop_program(_program(dtypes.bool, greater_equal))
+    assert result is not None
+    return result
+  assert encode_image(image(True)) == encode_image(image(False))
+
+
 def test_fp16_equality_uses_exact_raw_bytes_without_compare_resets():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() != rhs.index(i).load()))

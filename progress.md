@@ -6518,3 +6518,39 @@ stages. Neither was transferred.
 The transferred renderer SHA-256 (`fbc9f2c...d21d4`) exactly matches the fully tested
 `/tmp/rk-compare-i16.0KGLFB` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
 reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — retire the legacy IEEE comparison recipe
+
+`_ieee_comparison_mask` duplicated the typed raw comparator by rebuilding IEEE classes as a 31-line graph of FP16
+mask arithmetic. That fallback was especially awkward for half-backed FP32 expressions: it cast them back to half,
+constructed NaN/infinity masks, then re-entered `RKContext`, whose raw-byte comparator already implements the exact
+same IEEE boundary.
+
+`_half_backed_value` now proves that every dynamic LOAD really comes from FP16 storage, normalizes the expression once,
+and sends `<`, `!=`, and `==` directly to `_fp16_less`/`_fp16_equality`. Native FP32 storage remains fail-closed. The
+same normalization extends `_bool_binary`'s inverted-less guard, preserving unordered NaN semantics for `>=`, `<=`,
+and `>`.
+
+The first `/tmp` draft exposed that guard as a real negative twin: direct `<`, `!=`, and `==` passed, but `>=` returned
+true for NaN because the guard only recognized syntactically-half operands. Nothing was transferred until the shared
+normalization fixed all six comparison forms. The new unit regression requires a half-backed FP32 `>=` image to be
+byte-identical to the direct FP16 image.
+
+- Exact renderer diff: **16 insertions / 41 deletions**, executable lines **4,236 -> 4,211** (**-25**); runtime remains
+  **489**, total falls **29,793 -> 29,768**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,405 lines**.
+- The pre-existing **94-test / 167-RKImage / 163-unique-image** census remains byte-for-byte identical with SHA-256
+  `0cb9079af2ac4cbce246507a925f662e6f81d6dc004fa3c50d0f641bbbf5d55a`.
+- A focused NPU edge matrix passed `<`, `!=`, `==`, `>=`, `<=`, and `>` over signed zero, finite limits, infinities,
+  and NaNs. Existing classification/comparison/logical-predicate/argument-extrema hardware coverage: **15 passed** in
+  **11.24 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **788.72 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`c8a83f1f...77c86`) and focused-test SHA-256 (`287bbed7...1d248`) exactly match the
+fully tested `/tmp/rk-half-compare.1JgDA7` worktree. No runtime/core code, host tensor arithmetic, CPU/GPU fallback,
+CMAC, reset, reboot, or push was used.
