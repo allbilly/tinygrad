@@ -2032,38 +2032,66 @@ def _lower_dynamic_load_with_bool_total_gate(output:RKOutput, dtype:DType=dtypes
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=mid, gather_after=gather_after, post_gathers=post)
 
-def _lower_direct_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
-  """Materialize a bounds-masked typed LOAD addressed by one dynamic INT32 index."""
+def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
+  """Materialize one bounded typed LOAD addressed by one or more dynamic INT32 axes."""
   _, out_param, count, out_index, load = output
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
       load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
   data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
-  index_loads = [u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int]
-  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or
-      len(index_loads) != 1): return None
-  index_load = index_loads[0]
-  index_param = _root_param(index_load.src[0]) if index_load.src and index_load.src[0].op is Ops.INDEX else None
-  bool_loads = [u for u in gate.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool]
-  if (index_param is None or index_param.dtype.scalar() is not dtypes.int or index_param.src[0].op is not Ops.CONST or
-      len(bool_loads) > 1 or {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {index_load.key, *(u.key for u in bool_loads)} or
-      gate.op is not Ops.AND): return None
-
-  bounded = data_index if data_index.op is Ops.WHERE else index_load
-  limits = [int(u.src[1].arg) for u in gate.toposort() if u.op is Ops.CMPLT and u.src[0].key == bounded.key and
-            u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0]
-  if len(set(limits)) != 1 or not _bounded_index_gate(gate, bounded, limit:=limits[0]): return None
-  coordinates = tuple(range(limit))
-  if bounded is not index_load:
-    if (normalized:=_negative_normalized_index(bounded)) is None or normalized[0].key != index_load.key or normalized[1] != limit: return None
-    coordinates += tuple(range(-limit, 0))
+  loads = tuple({u.key:u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
+  bool_loads = tuple(u for u in gate.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool)
+  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or not loads or
+      len({load.key for load in loads}) != len(loads) or len(bool_loads) > 1 or bool_loads and len(loads) != 1 or gate.op is not Ops.AND or
+      {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {u.key for u in (*loads, *bool_loads)}): return None
+  normalized = tuple((u, *parsed) for u in data_index.toposort() if (parsed:=_negative_normalized_index(u)) is not None)
+  normalized_by_load = {load.key:(root, extent) for root,load,extent in normalized}
+  axes:list[tuple[UOp, UOp, int, bool]] = []
+  direct = False
+  if len(loads) == 1:
+    dynamic, bounded = loads[0], data_index if data_index.op is Ops.WHERE else loads[0]
+    limits = {int(u.src[1].arg) for u in gate.toposort() if u.op is Ops.CMPLT and u.src[0].key == bounded.key and
+              u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0}
+    parsed = _negative_normalized_index(bounded) if bounded is not dynamic else None
+    if len(limits) == 1 and _bounded_index_gate(gate, bounded, extent:=next(iter(limits))) and \
+       (bounded is dynamic or parsed is not None and parsed[0].key == dynamic.key and parsed[1] == extent):
+      axes, direct = [(bounded, dynamic, extent, bounded is not dynamic)], True
+  if not axes:
+    if bool_loads or len(normalized_by_load) != len(normalized): return None
+    for dynamic in loads:
+      if dynamic.key in normalized_by_load: root, extent, wrapped = *normalized_by_load[dynamic.key], True
+      else:
+        limits = {int(u.src[1].arg) for u in gate.toposort() if u.op is Ops.CMPLT and u.src[0].key == dynamic.key and
+                  u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0}
+        if len(limits) != 1: return None
+        root, extent, wrapped = dynamic, next(iter(limits)), False
+      if not _bounded_index_gate(gate, root, extent): return None
+      axes.append((root, dynamic, extent, wrapped))
+  if any(root.key not in {u.key for u in data_index.toposort()} for root,_,_,_ in axes): return None
+  params = tuple(_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads)
+  if any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params): return None
+  concrete = tuple(param for param in params if param is not None)
+  combinations:tuple[tuple[int, ...], ...]
+  if direct:
+    coordinates = tuple(range(axes[0][2])) + (tuple(range(-axes[0][2], 0)) if axes[0][3] else ())
+    combinations = tuple((value,) for value in coordinates)
+  else:
+    combinations = ((),)
+    for _,_,extent,_ in axes: combinations = tuple(prefix+(value,) for prefix in combinations for value in range(extent))
   try:
-    index_offsets = _gather_offsets(out_index, index_load.src[0].src[1], None, count)
-    plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index,
-      data_index.substitute({index_load:index_load.const_like(candidate)}), None, count) for candidate in coordinates)
+    offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in loads)
+    plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index, data_index.substitute(mapping), None if direct else gate.substitute(mapping), count)
+                  for values in combinations
+                  for mapping in ({load:load.const_like(value) for load,value in zip(loads, values)},))
   except RuntimeError: return None
-  data_count, index_count = int(data_param.src[0].arg), int(index_param.src[0].arg)
-  if (any(not 0 <= offset < index_count for offset in index_offsets) or
+  data_count = int(data_param.src[0].arg)
+  index_counts = tuple(int(param.src[0].arg) for param in concrete)
+  if (any(not 0 <= offset < index_count for axis_offsets,index_count in zip(offsets, index_counts) for offset in axis_offsets) or
       any(not 0 <= offset < data_count for plan in plans for offset in _plan_offsets(plan))): return None
+  indices = tuple((param.arg.slot, index_count, axis_offsets)
+                  for param,index_count,axis_offsets in zip(concrete, index_counts, offsets))
+  coordinate_rows = (coordinates,) if direct else tuple(tuple(values[axis] for values in combinations) for axis in range(len(loads)))
+  alternates = None if direct else tuple((tuple(value-extent for value in axis),) if wrapped else ()
+                                         for axis,(_,_,extent,wrapped) in zip(coordinate_rows, axes))
   external_gate:RKDynamicIndex|None = None
   if bool_loads:
     bool_load = bool_loads[0]
@@ -2075,57 +2103,8 @@ def _lower_direct_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -
     bool_count = int(bool_param.src[0].arg)
     if any(not 0 <= offset < bool_count for offset in bool_offsets): return None
     external_gate = (bool_param.arg.slot, bool_count, bool_offsets)
-  return _dynamic_raw_gather_image(out_param.arg.slot, count, ((index_param.arg.slot, index_count, index_offsets),), plans,
-                                   (coordinates,), gate=external_gate, itemsize=dtype.itemsize)
-
-def _lower_dynamic_multi_index_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
-  """Materialize one typed LOAD addressed by positive or negative-normalized dynamic INT32 axes."""
-  _, out_param, count, out_index, load = output
-  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
-      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
-  data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
-  normalized = tuple((u, *parsed) for u in data_index.toposort() if (parsed:=_negative_normalized_index(u)) is not None)
-  normalized_by_load = {load.key:(root, extent) for root,load,extent in normalized}
-  if len(normalized_by_load) != len(normalized): return None
-  loads = tuple({u.key:u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
-  axes:list[tuple[UOp, UOp, int, bool]] = []
-  for dynamic in loads:
-    if dynamic.key in normalized_by_load:
-      root, extent = normalized_by_load[dynamic.key]; wrapped = True
-    else:
-      limits = {int(u.src[1].arg) for u in gate.toposort() if u.op is Ops.CMPLT and u.src[0].key == dynamic.key and
-                u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0}
-      if len(limits) != 1: return None
-      root, extent, wrapped = dynamic, next(iter(limits)), False
-    if not _bounded_index_gate(gate, root, extent): return None
-    axes.append((root, dynamic, extent, wrapped))
-  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or
-      not axes or len({load.key for load in loads}) != len(loads) or
-      {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {u.key for u in loads} or
-      any(root.key not in {u.key for u in data_index.toposort()} for root,_,_,_ in axes)): return None
-  params = tuple(_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads)
-  if any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params): return None
-  concrete = tuple(param for param in params if param is not None)
-  options = tuple(tuple(range(extent)) for _,_,extent,_ in axes)
-  combinations:tuple[tuple[int, ...], ...] = ((),)
-  for axis in options:
-    combinations = tuple(prefix+(value,) for prefix in combinations for value in axis)
-  try:
-    offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in loads)
-    plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index, data_index.substitute(mapping), gate.substitute(mapping), count)
-                  for values in combinations
-                  for mapping in ({load:load.const_like(value) for load,value in zip(loads, values)},))
-  except RuntimeError: return None
-  data_count = int(data_param.src[0].arg)
-  index_counts = tuple(int(param.src[0].arg) for param in concrete)
-  if (any(not 0 <= offset < index_count for axis_offsets,index_count in zip(offsets, index_counts) for offset in axis_offsets) or
-      any(not 0 <= offset < data_count for plan in plans for offset in _plan_offsets(plan))): return None
-  indices = tuple((param.arg.slot, index_count, axis_offsets)
-                  for param,index_count,axis_offsets in zip(concrete, index_counts, offsets))
-  coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(loads)))
-  alternates = tuple((tuple(value-extent for value in axis),) if wrapped else ()
-                     for axis,(_,_,extent,wrapped) in zip(coordinates, axes))
-  return _dynamic_raw_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
+  return _dynamic_raw_gather_image(out_param.arg.slot, count, indices, plans, coordinate_rows, alternates,
+                                   external_gate, dtype.itemsize if direct else 2)
 
 def _bool_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tuple[tuple[int, ...], ...], op:Ops) -> RKImage:
   window = len(offsets)
@@ -4032,12 +4011,11 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
      (grouped_bool_reduction:=_lower_grouped_bool_reduction(uops, bool_loop_output)) is not None: return grouped_bool_reduction
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):
     if (direct_load:=_output_store(uops, dtype)) is None: continue
-    if (image:=_lower_direct_dynamic_typed_load(direct_load, dtype)) is not None: return image
-    if (image:=_lower_dynamic_multi_index_typed_load(direct_load, dtype)) is not None: return image
+    if (image:=_lower_dynamic_typed_load(direct_load, dtype)) is not None: return image
     root = direct_load[4]
     if root.op is Ops.WHERE and root.src[1].op is Ops.LOAD and root.src[2].op is Ops.CONST and \
        (folded_load:=_fold_masked_load(root.src[0], root.src[1], root.src[2])) is not None and \
-       (image:=_lower_direct_dynamic_typed_load((*direct_load[:4], folded_load), dtype)) is not None: return image
+       (image:=_lower_dynamic_typed_load((*direct_load[:4], folded_load), dtype)) is not None: return image
   for dtype in (dtypes.int16, dtypes.int):
     if ((gated_load:=_output_store(uops, dtype)) is not None and
         (image:=_lower_dynamic_load_with_bool_total_gate(gated_load, dtype)) is not None): return image

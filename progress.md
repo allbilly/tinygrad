@@ -6448,3 +6448,40 @@ reconstructs updates with `definition.term.dtype`.
 The transferred renderer SHA-256 (`d5bc0736...b883cb`) and focused-test SHA-256 (`aeb35e10...bddd`) exactly match the
 fully tested `/tmp/rk-next-messy.RRQfVm/tree` worktree. No assertion was removed or weakened. No runtime/core code,
 host tensor arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — unify bounded dynamic typed-load parsing
+
+Dynamic typed selection had two adjacent parsers for the same physical operation. The direct parser owned one INT32
+axis plus an optional external bool gate; the multi-axis parser independently repeated output LOAD validation, data
+and index PARAM checks, bounds-gate recognition, static candidate planning, source-bound validation, and raw-selector
+dispatch. Only candidate construction and gate ownership differed.
+
+`_lower_dynamic_typed_load` now owns that shared proof once. It first attempts the literal old direct contract, then
+falls through to the old positive/negative-normalized multi-axis contract. Direct candidate order, external bool
+gating, multi-axis Cartesian order, negative alternatives, source bounds, and the existing
+`_dynamic_raw_gather_image` byte emitter are unchanged.
+
+An initially smaller `/tmp` draft was rejected during adversarial review because it returned immediately when a
+one-axis index WHERE was not canonical negative normalization. The old dispatch instead let that graph fall through
+to the multi-axis parser. The corrected version preserves that ordering and also preserves the historical multi-path
+2-byte raw default. A synthetic fallback graph is byte-identical before/after: SHA-256 `9719bc5a...a245`, **4,023
+bytes / 29 gathers / 27 EW stages / 2 post-gathers**.
+
+- Exact renderer diff: **54 insertions / 76 deletions**, executable lines **4,278 -> 4,259** (**-19**); runtime remains
+  **489**, total falls **29,835 -> 29,816**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,357 lines**.
+- The complete committed-baseline/candidate UOp census retained all **167 RKImages / 163 unique images / 5,478,964
+  encoded bytes** byte-for-byte. Its hash/resource multiset SHA-256 remains
+  `0cb9079af2ac4cbce246507a925f662e6f81d6dc004fa3c50d0f641bbbf5d55a`.
+- Focused hardware gather and fancy-index coverage: **11 passed** in **54.37 s**, including direct, collapsed,
+  negative-normalized, and multi-axis forms.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  cases in **827.58 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **94 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`32d10785...2ae8b0`) exactly matches the fully tested
+`/tmp/rk-dynamic-parser.6XXzMN/tree` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback,
+CMAC, reset, reboot, or push was used.
