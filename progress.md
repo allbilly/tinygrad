@@ -6658,3 +6658,35 @@ catalog symbols were removed. All semantic recognizers, resource limits, and fai
 The transferred renderer SHA-256 (`4dbc5c8a...7f1567`) exactly matches the fully tested
 `/tmp/tinygrad-rk-cleanup.36QsxN` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
 reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — reach the 4,000-line renderer milestone
+
+The specialized mapped and dynamic recognizers remain the renderer's messiest live area, but the complete hardware
+census proves they are not dead code: they preserve distinct precision, layout, and task-shape contracts. This
+milestone therefore removed duplication around those algorithms instead of deleting their semantics. The serialized
+EW record is described by one struct instead of three adjacent fragments; native INT16 stages share one flag bundle;
+physical register constants are grouped by ABI role; finite MAX neutral rewriting uses one iterative graph walk; and
+accurate ADD plus FP32 sine use the common iterative binary-tree traversal. Nonfinite raw `WHERE`, CAST routing,
+stateful-stage finalization, and small typed forwarding helpers were also consolidated. The unused `RKMultiGather`
+type and one-use matcher callbacks were removed.
+
+All changes were developed and rejected or accepted in `/tmp/tinygrad-rk-4k.EFJ8M7` before transfer. A first image
+census invocation accidentally imported the clean main checkout because the script itself lived in `/tmp`; the
+corrected command pinned `PYTHONPATH` to the candidate. It then exposed and fixed a tested private-helper naming
+regression before any NPU run. Only the corrected candidate was transferred.
+
+- Exact renderer diff: **138 insertions / 241 deletions**, executable lines **4,099 -> 4,000** (**-99**); runtime
+  remains **489**, total falls **29,656 -> 29,557**, and cumulative renderer reduction from the 6,616-line cleanup
+  baseline is **2,616 lines**.
+- Independent baseline/candidate runs produced the same sorted **169 RKImage emissions / 163 unique images / 5,455,580
+  unique encoded bytes** across all 95 UOp tests. The complete encoded-image hash/resource multiset is byte-for-byte
+  identical with SHA-256 `a6f3f7b999818de32a4aa57cbe5778d16318e7ebb77d989ce289e582a0069eb1`.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **835.65 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`12f395e1...c31f4`) exactly matches the fully tested isolated worktree. No test,
+runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
