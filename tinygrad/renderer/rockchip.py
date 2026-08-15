@@ -3732,87 +3732,43 @@ def _local_buffer(u:UOp) -> UOp|None:
   while u.op is Ops.AFTER: u = u.src[0]
   return u if u.op is Ops.BUFFER else None
 
-def _unroll_static_local(uops:list[UOp], output:RKOutput, root:UOp) -> UOp:
-  """Execute one static local accumulator for ADD/MAX/MUL without recovering a tensor operation."""
+def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
+  """Execute ordered static local accumulators without recovering a tensor operation."""
   local_cache:dict[UOp, tuple[UOp, ...]] = {}
-  local_loads = list(_semantic_local_loads(root, local_cache))
-  buffers = {_local_buffer(load) for load in local_loads}
+  local_loads = _semantic_local_loads(root, local_cache)
   if not local_loads: return root
-  if None in buffers: raise _RKGenericReject
-  typed_buffers = typing_cast(set[UOp], buffers)
+  if any(_local_buffer(load) is None for load in local_loads): raise _RKGenericReject
   definitions:dict[UOp, _RKStaticLocalDef] = {}
-  if len(typed_buffers) == 1:
-    discovered, pending = set(typed_buffers), list(typed_buffers)
-    try:
-      while pending:
-        buffer = pending.pop()
-        definitions.update(_static_local_defs(uops, {buffer}))
-        for expr in (definitions[buffer].initial, definitions[buffer].term):
-          for load in _semantic_local_loads(expr, local_cache):
-            dependency = _local_buffer(load)
-            if dependency is None: raise _RKGenericReject
-            if dependency not in discovered: discovered.add(dependency); pending.append(dependency)
-      typed_buffers = discovered
-    except _RKGenericReject: definitions = {}
-  if len(typed_buffers) > 1:
-    if not definitions: definitions = _static_local_defs(uops, typed_buffers)
-    expanded:dict[tuple[UOp, tuple[tuple[UOp, int], ...]], UOp] = {}
-    active:set[tuple[UOp, tuple[tuple[UOp, int], ...]]] = set()
-    budget = [_MAX_STATIC_LOCAL_STEPS]
-    def expand_dependencies(expr:UOp, owner:UOp, env:dict[UOp, int]) -> UOp:
-      substitutions = {axis:axis.const_like(value) for axis,value in env.items()}
-      substitutions.update({load:expand_buffer(buffer, env) for load in _semantic_local_loads(expr, local_cache)
-                            if (buffer:=_local_buffer(load)) is not None and buffer is not owner})
-      return _substitute_static_ranges(expr, substitutions)
-    def expand_buffer(buffer:UOp, env:dict[UOp, int]) -> UOp:
-      key = buffer, tuple(sorted(env.items(), key=lambda item:item[0].key))
-      if key in expanded: return expanded[key]
-      if key in active: raise _RKGenericReject
-      active.add(key)
-      if buffer not in definitions: definitions.update(_static_local_defs(uops, {buffer}))
-      definition = definitions[buffer]
-      if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
-                                     for loop in definition.loops):
-        raise _RKGenericReject
-      iterations = math.prod(int(loop.src[0].arg) for loop in definition.loops)
-      if iterations > _MAX_GENERIC_UNROLL or iterations > budget[0]: raise _RKGenericReject
-      budget[0] -= iterations
-      accumulator = expand_dependencies(definition.initial, buffer, env)
-      for loop_env in _iter_range_env(list(definition.loops), None, False):
-        term = expand_dependencies(definition.term, buffer, {**env, **loop_env})
-        accumulator = UOp(definition.update_op, buffer.dtype, src=(accumulator, term))
-      expanded[key] = accumulator
-      active.remove(key)
-      if len(expanded[key].toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
-      return expanded[key]
-    substitutions = {load:expand_buffer(typing_cast(UOp, _local_buffer(load)), {}) for load in local_loads}
-    return _substitute_static_ranges(root, substitutions)
-  buffer = next(iter(typed_buffers))
-  stores = [u for u in uops if u.op is Ops.STORE and _local_buffer(u) is buffer]
-  out_ranges = set(_index_ranges(output[3]))
-  updates:list[tuple[UOp, UOp, list[UOp]]] = []
-  initializers:list[UOp] = []
-  for store in stores:
-    value = _strip_cast(store.src[1])
-    accumulator = next((src for src in value.src if _local_load(src) is not None and _local_buffer(src) is buffer), None) \
-      if value.op in (Ops.ADD, Ops.MAX, Ops.MUL) else None
-    if accumulator is None:
-      if not any(r not in out_ranges for r in _index_ranges(value)): initializers.append(store.src[1])
-      continue
-    term = value.src[1 if value.src[0] is accumulator else 0]
-    ranges = [r for r in _index_ranges(term) if r not in out_ranges]
-    updates.append((value, term, ranges))
-  if len(initializers) != 1 or len(updates) != 1: raise _RKGenericReject
-  update, term, ranges = updates[0]
-  if not ranges or any(r.src[0].op is not Ops.CONST for r in ranges): raise _RKGenericReject
-  if any(node.op is Ops.WHERE and node.dtype.scalar() is dtypes.float for node in term.toposort()): raise _RKGenericReject
-  iterations = math.prod(int(r.src[0].arg) for r in ranges)
-  if iterations > _MAX_GENERIC_UNROLL or iterations*len(term.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
-  reduced = initializers[0]
-  for env in _iter_range_env(ranges, None, False):
-    reduced = UOp(update.op, update.dtype, src=(reduced, _substitute_static_ranges(term, {r:r.const_like(env[r]) for r in ranges})))
-  substitutions = {load:reduced for load in local_loads if _local_buffer(load) is buffer}
-  return root.substitute(substitutions)
+  expanded:dict[tuple[UOp, tuple[tuple[UOp, int], ...]], UOp] = {}
+  active:set[tuple[UOp, tuple[tuple[UOp, int], ...]]] = set()
+  budget = [_MAX_STATIC_LOCAL_STEPS]
+  def expand_dependencies(expr:UOp, owner:UOp, env:dict[UOp, int]) -> UOp:
+    substitutions = {axis:axis.const_like(value) for axis,value in env.items()}
+    substitutions.update({load:expand_buffer(buffer, env) for load in _semantic_local_loads(expr, local_cache)
+                          if (buffer:=_local_buffer(load)) is not None and buffer is not owner})
+    return _substitute_static_ranges(expr, substitutions)
+  def expand_buffer(buffer:UOp, env:dict[UOp, int]) -> UOp:
+    key = buffer, tuple(sorted(env.items(), key=lambda item:item[0].key))
+    if key in expanded: return expanded[key]
+    if key in active: raise _RKGenericReject
+    active.add(key)
+    if buffer not in definitions: definitions.update(_static_local_defs(uops, {buffer}))
+    definition = definitions[buffer]
+    if not definition.loops or any(loop.src[0].op is not Ops.CONST or not 0 <= int(loop.src[0].arg) <= _MAX_GENERIC_UNROLL
+                                   for loop in definition.loops): raise _RKGenericReject
+    iterations = math.prod(int(loop.src[0].arg) for loop in definition.loops)
+    if iterations > _MAX_GENERIC_UNROLL or iterations > budget[0]: raise _RKGenericReject
+    budget[0] -= iterations
+    accumulator = expand_dependencies(definition.initial, buffer, env)
+    for loop_env in _iter_range_env(list(definition.loops), None, False):
+      term = expand_dependencies(definition.term, buffer, {**env, **loop_env})
+      accumulator = UOp(definition.update_op, definition.term.dtype, src=(accumulator, term))
+    expanded[key] = accumulator
+    active.remove(key)
+    if len(expanded[key].toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
+    return expanded[key]
+  substitutions = {load:expand_buffer(typing_cast(UOp, _local_buffer(load)), {}) for load in local_loads}
+  return _substitute_static_ranges(root, substitutions)
 
 @dataclass(frozen=True)
 class _RKStaticLocalDef:
@@ -3836,6 +3792,7 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
           raise _RKGenericReject
         base = store.src[0].src[0] if store.src and store.src[0].op is Ops.INDEX else None
         loops = tuple(src for src in base.src[1:] if src.op is Ops.RANGE) if base is not None and base.op is Ops.AFTER else ()
+        if not loops: loops = tuple(r for r in _index_ranges(term) if r.arg[1] is AxisType.REDUCE)
         if not loops: raise _RKGenericReject
         updates.append((value.op, term, loops))
       elif not any(_local_buffer(load) is buffer for node in value.toposort() if (load:=_local_load(node)) is not None):
@@ -4144,7 +4101,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if (_contiguous_output_samples(output[3], output[2]) is None and
         _static_int_vector(output[3], output[3], output[2]) != tuple(range(output[2]))): return None
     reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
-    local_root = _unroll_static_local(uops, output, reduced)
+    local_root = _unroll_static_local(uops, reduced)
     root = _finite_int_max_neutrals(_finite_max_neutral_selectors(local_root))
     root_nodes = root.toposort()
     defer_nodes = storage_uops if storage_uops is not None else root_nodes

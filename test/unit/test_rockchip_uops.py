@@ -1028,7 +1028,7 @@ def test_dependent_reduction_range_preserves_vector_output_axis():
 
   scalar, vector, large = lower(1), lower(45), lower(128, 128)
   assert scalar is not None and vector is not None and large is not None
-  assert len(vector.ew_ops) == len(scalar.ew_ops)
+  assert len(vector.ew_ops) == len(scalar.ew_ops) < 200 and len(large.ew_ops) < 300
 
 
 def test_mapped_loop_reduction_composes_generic_post_uops():

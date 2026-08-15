@@ -6408,3 +6408,43 @@ The transferred renderer SHA-256 (`eb173fa5...16e0b`) and focused-test SHA-256 (
 fully tested `/tmp/rk-extrema-refactor.1JUMHG` worktree. The sole test edit strengthens the constant-table contract;
 no assertion was removed or weakened. No runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC, reset,
 reboot, or push was used.
+
+---
+
+## 2026-08-15 — unify ordered static-local execution
+
+`_unroll_static_local` was two interpreters behind one dispatch: a single-buffer implementation rediscovered
+initializers and updates from STOREs, while a separate recursive implementation expanded multiple dependent local
+buffers. They implemented the same ordered local-accumulator semantics with different loop discovery, dependency,
+dtype, and budget logic.
+
+One recursive executor now handles both cases. `_static_local_defs` remains the single parser, falling back to the
+term's REDUCE ranges only when an AFTER node does not carry explicit local loops. Updates retain literal STORE order
+and use the rewritten term dtype; that detail preserves the physical FP16 accumulator created when storage rewriting
+turns an FP32 local buffer into a half update. Cycles, nonconstant/oversized ranges, expansion budgets, and unsupported
+local programs still reject to the unchanged fallback path.
+
+The first `/tmp` prototype found three useful negative twins before acceptance. It initially missed simple local loops
+whose range existed only in the update term; it then rebuilt rewritten half updates as FP32, expanding mapped images
+from hundreds to thousands of EW stages; finally, filtering explicit AFTER loops to REDUCE axes rejected
+softmax-argmax on hardware. The accepted parser keeps all explicit AFTER ranges, uses REDUCE-only term fallback, and
+reconstructs updates with `definition.term.dtype`.
+
+- Exact renderer diff: **36 insertions / 79 deletions**, executable lines **4,321 -> 4,278** (**-43**); runtime remains
+  **489**, total falls **29,878 -> 29,835**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,338 lines**.
+- A fresh committed-baseline/candidate unit census compared **167 RKImages / 163 unique images / 5,478,964 encoded
+  bytes**. The complete hash/resource multiset is byte-for-byte identical with SHA-256
+  `0cb9079af2ac4cbce246507a925f662e6f81d6dc004fa3c50d0f641bbbf5d55a`.
+- Final focused hardware argument-extrema coverage: **3 passed** in **7.22 s**. The sole unit edit strengthens the
+  dependent mapped-reduction contract with explicit **<200 / <300 EW-stage** ceilings.
+- One first-pass full run saw a transient cross-entropy `NaN`. NPU health passed all elementwise probes; committed and
+  candidate focused reruns both passed, and their ordered **15-image** SHA-256 lists were exactly identical. The clean
+  required rerun then completed with **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  cases in **816.88 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **94 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`d5bc0736...b883cb`) and focused-test SHA-256 (`aeb35e10...bddd`) exactly match the
+fully tested `/tmp/rk-next-messy.RRQfVm/tree` worktree. No assertion was removed or weakened. No runtime/core code,
+host tensor arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
