@@ -6586,3 +6586,39 @@ static fallback sources, and the scalar-extrema child image.
 The transferred renderer SHA-256 (`d75d66e8...e8a7f`) exactly matches the fully tested
 `/tmp/rk-unrolled-zip.EEoWRh` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
 reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — centralize mapped-reduction infrastructure
+
+The mapped-reduction catalog is the renderer's messiest live area. Its recognizers cover materially different UOp
+forms—mapped local ADD, repeated unrolled ADD/product trees, vectorized MUL+ADD, multiple local accumulators, and
+dependent scalar MAX—so deleting or merging their semantic admission rules would lose proven accuracy or performance.
+The duplication was instead in their plumbing: separate semantic LOAD walkers, three copies of static-range flattening,
+inline repeated-index evaluation, hand-appended INT16 stages, condition inversion parsing, and three handwritten Horner
+polynomials.
+
+Those mechanisms now use shared typed/structural helpers while every recognizer and fail-closed proof remains. A first
+`/tmp` experiment that generalized the ADD finisher to MAX was rejected: it saved only five executable lines and changed
+the scalar-extrema constant table. It was never transferred. The accepted candidate preserves every encoded program.
+
+- Exact renderer diff: **86 insertions / 124 deletions**, executable lines **4,194 -> 4,154** (**-40**); runtime remains
+  **489**, total falls **29,751 -> 29,711**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,462 lines**.
+- Independent committed-baseline/current runs produced the same sorted **163 encoded-image/resource records** across
+  all 95 UOp tests. The canonical JSON SHA-256 is
+  `3c48cb16a8578ea523e9f1b7a773bc9bce878bae7e865970a818fb026d139039`.
+- Helper differentials retained the former global/local LOAD traversal, exact range-linearization UOp keys, exact Horner
+  UOp keys, typed/untyped condition inversion, and **1,000** randomized repeated-index tables plus fail-closed rejection
+  of a lane-dependent delta.
+- Focused hardware covering bitwise/INT16, argument extrema, transcendental polynomials, mapped reductions, matmul,
+  GEMM, and convolution: **32 passed** in **100.51 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **784.62 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass. Hardware tests ran serially because concurrent xdist workers on the single NPU are rejected
+  by DRM with `EINVAL`; the post-attempt elementwise health check passed every size and operation.
+
+The transferred renderer SHA-256 (`329aece7...e1c1812`) exactly matches the fully tested
+`/tmp/rk-messy-clean.pqfYa1/tree` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
+reset, reboot, or push was used.
