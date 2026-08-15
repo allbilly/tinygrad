@@ -994,10 +994,7 @@ def _append_mapped_product_residual(mapped:RKImage, out_slot:int, out_index:UOp,
       len(direct.src) > 1 and direct.src[1].op is not Ops.CONST): return None
   base = len(mapped.scratch)
   lhs, rhs, lhs_high, rhs_high, splitter = (RKArg(RKBufferKind.SCRATCH, base+i) for i in range(5))
-  def remap(arg:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, lhs.index, arg.addend) \
-      if arg.kind is RKBufferKind.ARG and arg.index == out_slot else arg
-  mapped = _map_image_args(mapped, remap)
+  mapped = _alias_image_args(mapped, {out_slot:lhs})
   gate = direct.src[2] if len(direct.src) > 2 else None
   fill_bits = _fp16_bits(direct.src[1].arg if len(direct.src) > 1 else 0)
   try:
@@ -1128,37 +1125,28 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp]) -> RKImage|None:
     param = _root_param(index) if index is not None else None
     return (index, param) if index is not None and param is not None and \
       param.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool) else None
-  input_slots = {parsed[1].arg.slot for term in terms for u in term.toposort()
-                 for parsed in (input_leaf(u),) if parsed is not None}
-  if not legacy_shape and len(input_slots) < 2: return reject(f"input_slots:{len(input_slots)}")
   supported_ops = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.RECIPROCAL, Ops.NEG,
                    Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE,
                    Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST, Ops.RANGE)
   if any(u.op not in supported_ops for u in terms[0].toposort()):
     return reject("unsupported:"+",".join(sorted({u.op.name for u in terms[0].toposort() if u.op not in supported_ops})))
-  signature_cache:dict[UOp, tuple] = {}
-  def signature(u:UOp) -> tuple:
-    if u in signature_cache: return signature_cache[u]
-    if (leaf:=input_leaf(u)) is not None: return ("input", leaf[1].arg.slot, u.op, u.dtype.scalar())
-    signature_cache[u] = ret = (u.op, u.dtype.scalar(), u.arg, tuple(signature(src) for src in u.src))
-    return ret
-  template, template_signature = terms[0], signature(terms[0])
-  for term in terms[1:]:
-    if signature(term) == template_signature: continue
-    return reject(f"signature:{len(terms)}")
+  template = terms[0]
   loaded_indices = {u.src[0] for u in template.toposort() if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX}
   leaves = [u for u in template.toposort() if input_leaf(u) is not None and u not in loaded_indices]
   if not leaves: return reject("leaves")
   counterparts:dict[UOp, list[UOp]] = {leaf:[] for leaf in leaves}
   def pair(lhs:UOp, rhs:UOp, found:dict[UOp, UOp]) -> bool:
     if lhs in counterparts:
-      if lhs in found and found[lhs].key != rhs.key: return False
+      if lhs.op is not rhs.op or lhs.dtype.scalar() is not rhs.dtype.scalar() or lhs in found and found[lhs].key != rhs.key: return False
       found[lhs] = rhs; return True
+    if lhs.op is not rhs.op or lhs.dtype.scalar() is not rhs.dtype.scalar() or lhs.arg != rhs.arg or len(lhs.src) != len(rhs.src): return False
     return all(pair(a, b, found) for a,b in zip(lhs.src, rhs.src))
   for term in terms:
     found:dict[UOp, UOp] = {}
     if not pair(template, term, found) or set(found) != set(leaves): return reject("pair")
     for leaf in leaves: counterparts[leaf].append(found[leaf])
+  input_slots = {parsed[1].arg.slot for leaf in leaves for parsed in (input_leaf(leaf),) if parsed is not None}
+  if not legacy_shape and len(input_slots) < 2: return reject(f"input_slots:{len(input_slots)}")
   first = input_leaf(leaves[0]); assert first is not None
   first_index = first[0]
   axis = max((r.arg[0] for r in _index_ranges(out_index) if isinstance(r.arg, tuple)), default=-1)+1
@@ -1227,14 +1215,11 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp]) -> RKImage|None:
       if (mapped:=lower_map(vector)) is None: return reject("mapped_product")
     else: mapped, mapped_groups = residual, len(terms)*2
   if static_fallbacks:
-    fallback_slots = {fake_slot:len(mapped.scratch)+i for i,(fake_slot,_,_) in enumerate(static_fallbacks)}
-    def remap_arg(arg:RKArg) -> RKArg:
-      return RKArg(RKBufferKind.SCRATCH, fallback_slots[arg.index], arg.addend) \
-        if arg.kind is RKBufferKind.ARG and arg.index in fallback_slots else arg
-    fallback_gathers = tuple(RKGather(param.arg.slot, fallback_slots[fake_slot], len(offsets), offsets=offsets,
+    aliases = {fake_slot:RKArg(RKBufferKind.SCRATCH, len(mapped.scratch)+i) for i,(fake_slot,_,_) in enumerate(static_fallbacks)}
+    fallback_gathers = tuple(RKGather(param.arg.slot, aliases[fake_slot].index, len(offsets), offsets=offsets,
                                      itemsize=param.dtype.scalar().itemsize)
                              for fake_slot,param,offsets in static_fallbacks)
-    mapped = _map_image_args(mapped, remap_arg)
+    mapped = _alias_image_args(mapped, aliases)
     mapped = replace(mapped, scratch=mapped.scratch+tuple(
       RKScratch(max(64, len(offsets)*param.dtype.scalar().itemsize)) for _,param,offsets in static_fallbacks),
       gathers=fallback_gathers+mapped.gathers)
@@ -3861,9 +3846,7 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
     scratch.append(RKScratch(_scratch_bytes(lanes)))
     return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
   values = allocate()
-  def map_arg(arg:RKArg) -> RKArg:
-    return RKArg(RKBufferKind.SCRATCH, values.index, arg.addend) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
-  child = _map_image_args(child, map_arg)
+  child = _alias_image_args(child, {fake_slot:values})
   ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers)
   mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)
 

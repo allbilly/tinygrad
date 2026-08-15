@@ -6554,3 +6554,35 @@ byte-identical to the direct FP16 image.
 The transferred renderer SHA-256 (`c8a83f1f...77c86`) and focused-test SHA-256 (`287bbed7...1d248`) exactly match the
 fully tested `/tmp/rk-half-compare.1JgDA7` worktree. No runtime/core code, host tensor arithmetic, CPU/GPU fallback,
 CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — unify repeated-tree matching and mapped aliases
+
+`_lower_vectorized_unrolled_add_reduction` was the largest renderer function at 137 executable lines. Its admission
+logic traversed every repeated term twice: first a recursive signature builder compared the complete trees, then a
+second recursive walker paired the template's dynamic leaves with each term. The two traversals encoded overlapping
+operation, dtype, argument, arity, and leaf-shape constraints.
+
+One structural zipper now checks those invariants while collecting corresponding leaves. The existing per-leaf PARAM,
+address, bounds, affine/periodic, and static-fallback proofs remain unchanged. Three nearby mapped-reduction paths also
+replace one-off ARG-to-scratch callbacks with the existing `_alias_image_args` primitive: non-affine product residuals,
+static fallback sources, and the scalar-extrema child image.
+
+- Exact renderer diff: **10 insertions / 27 deletions**, executable lines **4,211 -> 4,194** (**-17**); runtime remains
+  **489**, total falls **29,768 -> 29,751**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,422 lines**.
+- A seeded differential generated **600** valid and intentionally malformed repeated trees. Committed and candidate
+  admission matched in all 600 cases; all **360 accepted images** were byte-for-byte identical.
+- The complete **95-test** UOp image census is byte-for-byte identical with SHA-256
+  `a6f3f7b999818de32a4aa57cbe5778d16318e7ebb77d989ce289e582a0069eb1`.
+- Focused hardware covering biased convolution, dot/matvec, cumulative extrema, argument extrema, logsumexp, and
+  softmax: **10 passed** in **20.68 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **797.71 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`d75d66e8...e8a7f`) exactly matches the fully tested
+`/tmp/rk-unrolled-zip.EEoWRh` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
+reset, reboot, or push was used.
