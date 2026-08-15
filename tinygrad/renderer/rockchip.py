@@ -2659,17 +2659,27 @@ class RKContext:
       return RKValue(self.out, dtype, self.count, layout)
     return self._scratch(dtype, layout)
 
+  def _static_slot(self, dtype:DType, layout:RKLayout, vector:tuple[int, ...]) -> RKValue:
+    key = (layout, vector)
+    if key not in self.static_slots:
+      value = self._scratch(dtype, layout)
+      self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4 if layout is RKLayout.INT32 else 2))
+      self.static_slots[key] = value
+    cached = self.static_slots[key]
+    return RKValue(cached.arg, dtype, self.count, layout)
+
+  def _gather_slot(self, dtype:DType, layout:RKLayout, plan:RKGather, size:int, key:tuple|None=None) -> RKValue:
+    key = (layout, _gather_cache_key((plan,))) if key is None else key
+    if key not in self.gather_slots:
+      value = self._scratch(dtype, layout, size)
+      self.gathers.append(replace(plan, dst_index=value.arg.index))
+      self.gather_slots[key] = value
+    return self.gather_slots[key]
+
   def _constant(self, u:UOp, dtype_hint:DType|None=None) -> RKValue:
     dtype = dtype_hint or u.dtype.scalar()
     if dtype is dtypes.uint or dtype is dtypes.int and self.int_layout is RKLayout.INT32:
-      vector = (int(u.arg) & 0xffffffff,) * self.count
-      key = (RKLayout.INT32, vector)
-      if key not in self.static_slots:
-        value = self._scratch(dtype, RKLayout.INT32)
-        self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4))
-        self.static_slots[key] = value
-      cached = self.static_slots[key]
-      return RKValue(cached.arg, dtype, self.count, RKLayout.INT32)
+      return self._static_slot(dtype, RKLayout.INT32, (int(u.arg) & 0xffffffff,) * self.count)
     if dtype in (dtypes.half, dtypes.float): bits, layout = struct.pack("<e", float(u.arg)), RKLayout.FP16
     elif dtype is dtypes.int16: bits, layout = struct.pack("<H", _int16_bits(int(u.arg))), RKLayout.INT16
     elif dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
@@ -2713,22 +2723,11 @@ class RKContext:
       if bool_layout is RKLayout.BOOL_INT16: vector, layout = _static_values(self.out_index, u, self.count, int), bool_layout
       else: vector, layout = _static_values(self.out_index, u, self.count, _fp16_bits), RKLayout.BOOL_MASK
     else: raise _RKGenericReject
-    key = (layout, vector)
-    if key not in self.static_slots:
-      value = self._scratch(dtype, layout)
-      self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4 if layout is RKLayout.INT32 else 2))
-      self.static_slots[key] = value
-    cached = self.static_slots[key]
-    return RKValue(cached.arg, dtype, self.count, layout)
+    return self._static_slot(dtype, layout, vector)
 
   def _static_int32(self, u:UOp) -> RKValue:
-    vector = tuple(value & 0xffffffff for value in _static_values(self.out_index, u, self.count, int))
-    key = (RKLayout.INT32, vector)
-    if key not in self.static_slots:
-      value = self._scratch(dtypes.int, RKLayout.INT32)
-      self.gathers.append(RKGather(0, value.arg.index, self.count, values=vector, itemsize=4))
-      self.static_slots[key] = value
-    return self.static_slots[key]
+    return self._static_slot(dtypes.int, RKLayout.INT32,
+      tuple(value & 0xffffffff for value in _static_values(self.out_index, u, self.count, int)))
 
   def _load(self, u:UOp, fill_override:int|None=None) -> RKValue:
     dtype = u.dtype.scalar()
@@ -2764,11 +2763,7 @@ class RKContext:
       _validate_gather_bounds(plan, int(param.src[0].arg))
       groups = tuple(range(0, self.count, _EW_ELEMS_32BIT))
       raw_key = ("fp32_raw", _gather_cache_key((replace(plan, itemsize=4),)))
-      if raw_key not in self.gather_slots:
-        raw = self._scratch(dtype, RKLayout.FP16, len(groups)*16)
-        self.gathers.append(replace(plan, dst_index=raw.arg.index, itemsize=4))
-        self.gather_slots[raw_key] = raw
-      raw = self.gather_slots[raw_key]
+      raw = self._gather_slot(dtype, RKLayout.FP16, replace(plan, itemsize=4), len(groups)*16, raw_key)
       aligned = self._scratch(dtypes.half, RKLayout.FP16, len(groups)*16)
       zero = self._scratch(dtype, RKLayout.FP16, 16)
       self.gathers.append(RKGather(0, zero.arg.index, _EW_ELEMS_32BIT, values=(0,)*_EW_ELEMS_32BIT, itemsize=4))
@@ -2788,12 +2783,7 @@ class RKContext:
       plan = RKGather(param.arg.slot, 0, self.count, offsets=offsets, fill_bits=int(bool(default.arg)) if default is not None else 0,
                       dst_stride=2, itemsize=1)
       _validate_gather_bounds(plan, int(param.src[0].arg))
-      key = (RKLayout.BOOL_INT16, _gather_cache_key((plan,)))
-      if key not in self.gather_slots:
-        value = self._scratch(dtype, RKLayout.BOOL_INT16, self.count*2)
-        self.gathers.append(replace(plan, dst_index=value.arg.index))
-        self.gather_slots[key] = value
-      return self.gather_slots[key]
+      return self._gather_slot(dtype, RKLayout.BOOL_INT16, plan, self.count*2)
     layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else RKLayout.INT32
     itemsize = 4 if layout is RKLayout.INT32 else 2
     if runtime_address:
@@ -2829,12 +2819,7 @@ class RKContext:
         offsets = tuple(candidates[candidate][lane] for lane in range(self.count) for candidate in range(index_limit))
         plan = RKGather(param.arg.slot, 0, len(offsets), offsets=offsets, itemsize=itemsize)
         _validate_gather_bounds(plan, source_count)
-        key = (layout, _gather_cache_key((plan,)))
-        if key not in self.gather_slots:
-          matrix = self._scratch(dtype, layout, len(offsets)*itemsize)
-          self.gathers.append(replace(plan, dst_index=matrix.arg.index))
-          self.gather_slots[key] = matrix
-        source, source_count = self.gather_slots[key].arg, len(offsets)
+        source, source_count = self._gather_slot(dtype, layout, plan, len(offsets)*itemsize).arg, len(offsets)
         base, index_scale, lane_stride = 0, 1, index_limit
       value = self._scratch(dtype, layout, self.count*itemsize)
       fill_bits = fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
@@ -2851,12 +2836,7 @@ class RKContext:
       _int16_bits(0 if default is None else default.arg) if dtype is dtypes.int16 else int(0 if default is None else default.arg) & 0xffffffff
     plan = _gather_plan(param.arg.slot, 0, self.out_index, index, gate, self.count, fill_bits)
     _validate_gather_bounds(plan, int(param.src[0].arg))
-    key = (layout, _gather_cache_key((plan,)))
-    if key not in self.gather_slots:
-      value = self._scratch(dtype, layout, self.count*itemsize)
-      self.gathers.append(replace(plan, dst_index=value.arg.index, itemsize=itemsize))
-      self.gather_slots[key] = value
-    return self.gather_slots[key]
+    return self._gather_slot(dtype, layout, replace(plan, itemsize=itemsize), self.count*itemsize)
 
   def _emit(self, dst:RKValue, lhs:RKValue, rhs:RKValue, cfg:int, *, compare:bool=False) -> RKValue:
     integer16, integer32 = dst.layout in (RKLayout.INT16, RKLayout.BOOL_INT16), dst.layout is RKLayout.INT32
@@ -3958,11 +3938,7 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
   """Materialize independent scalar FP32 local ADD programs, then execute their shared output UOps."""
   if (output:=_output_store(uops, dtypes.half, allow_local=True)) is None: return None
   store, out, count, _, root = output
-  def semantic_local_loads(expr:UOp) -> list[UOp]:
-    if expr.op in (Ops.RANGE, Ops.SPECIAL): return []
-    if expr.op is Ops.LOAD and _local_buffer(expr) is not None: return [expr]
-    return [load for src in expr.src for load in semantic_local_loads(src)]
-  local_loads = list(dict.fromkeys(semantic_local_loads(root)))
+  local_loads = list(_semantic_local_loads(root))
   buffers = list(dict.fromkeys(buffer for load in local_loads if (buffer:=_local_buffer(load)) is not None))
   if not 1 < len(buffers) <= count: return None
   try: definitions = _static_local_defs(uops, set(buffers))
@@ -3971,7 +3947,7 @@ def _lower_multi_scalar_local_reductions(uops:list[UOp]) -> RKImage|None:
          definition.initial.op is not Ops.CONST or float(definition.initial.arg) != 0.0 or not definition.loops or
          any(loop.src[0].op is not Ops.CONST or int(loop.src[0].arg) <= 0 for loop in definition.loops)
          for buffer,definition in definitions.items()): return None
-  if any(semantic_local_loads(definition.term) for definition in definitions.values()): return None
+  if any(_semantic_local_loads(definition.term) for definition in definitions.values()): return None
   next_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out.arg.slot)
   staged:RKImage|None = None
   sources:dict[UOp, UOp] = {}
@@ -4062,10 +4038,7 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   except RuntimeError: return None
   if len(coordinates) != total or any(not 0 <= value <= 32767 for value in coordinates): return None
 
-  def semantic_local_loads(expr:UOp) -> list[UOp]:
-    if (load:=_local_load(expr)) is not None: return [load]
-    return [load for src in expr.src for load in semantic_local_loads(src)]
-  final_loads = list(dict.fromkeys(load for load in semantic_local_loads(root) if _local_buffer(load) is index_buffer))
+  final_loads = [load for load in _semantic_local_loads(root) if _local_buffer(load) is index_buffer]
   if len(final_loads) != 1: return None
   final_load = final_loads[0]
   try: mapped_outputs = tuple(_eval_int(root.substitute({final_load:final_load.const_like(value)}), {}) for value in coordinates)
@@ -4098,14 +4071,9 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   values = allocate()
   def map_arg(arg:RKArg) -> RKArg:
     return RKArg(RKBufferKind.SCRATCH, values.index, arg.addend) if arg.kind is RKBufferKind.ARG and arg.index == fake_slot else arg
-  def map_gather(gather:RKGather, *, after:int|None=None) -> RKGather:
-    src, dst = map_arg(RKArg(gather.src_kind, gather.src_index)), map_arg(RKArg(gather.dst_kind, gather.dst_index))
-    return replace(gather, src_kind=src.kind, src_index=src.index, dst_kind=dst.kind, dst_index=dst.index,
-                   after=gather.after if after is None else after)
-  ops = [replace(op, dst=map_arg(op.dst), lhs=map_arg(op.lhs), rhs=map_arg(op.rhs)) for op in child.ew_ops]
-  gathers = [map_gather(gather) for gather in child.gathers]
-  mid = [map_gather(gather) for gather in child.mid_gathers]
-  mid.extend(map_gather(gather, after=len(ops)) for gather in child.post_gathers)
+  child = _map_image_args(child, map_arg)
+  ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers)
+  mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)
 
   scalar_stride = _reduction_stride(1)
   reduction_values = allocate(total*scalar_stride//2)

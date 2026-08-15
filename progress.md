@@ -6275,3 +6275,33 @@ All recognizers, Kahan/TwoProduct arithmetic, task ordering, barriers, scratch l
 The transferred renderer SHA-256 (`ad664554...df787`) exactly matches the fully tested
 `/tmp/rk-reduction-clean.buWVb3` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — centralize typed scratch materialization
+
+`RKContext` repeated the same cache/materialization transaction for INT32 constants, static vectors, boolean loads,
+ordinary typed gathers, dynamic candidate matrices, and raw FP32 input groups: construct a key, allocate scratch,
+append a gather, store the value, and return it. The copies had already drifted into separate local variable names and
+return conventions even though their insertion order and physical behavior were identical.
+
+Two small typed helpers now own static-vector and gather-plan materialization while preserving every existing cache
+key, layout, allocation size, gather, and insertion point. The same milestone reuses the established semantic-local
+walker in the multi-local and scalar-extrema paths, and uses `_map_image_args` for the extrema child image instead of
+another private gather/EW remapper. Ordering-only `AFTER` sources remain excluded from value dependency discovery.
+
+- Exact renderer diff: **31 insertions / 63 deletions**, executable lines **4,448 -> 4,414** (**-34**); runtime remains
+  **489**, total falls **30,005 -> 29,971**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,202 lines**.
+- A serial baseline/candidate lowering census recorded **173 outcomes / 165 RKImages / 161 unique image hashes**.
+  The complete ordered hash lists are identical, with SHA-256
+  `d26e786c680022763fc2bbb5e002d4eb5f53c5e89531b2ba575eaa25df82115e`.
+- Focused hardware covering dynamic gather, collapsed fancy indexing, FP32 casts, argmax/argmin, `std_mean`, and
+  permuted WHERE: **7 passed** in **23.92 s**.
+- UOp tests: **94 passed** with `-n12`. Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero
+  failures across all **445** cases in **819.94 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`a83d2c8f...b7b7b6`) exactly matches the fully tested
+`/tmp/rk-materialize.5TSRlj` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
