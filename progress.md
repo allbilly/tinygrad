@@ -6622,3 +6622,39 @@ the scalar-extrema constant table. It was never transferred. The accepted candid
 The transferred renderer SHA-256 (`329aece7...e1c1812`) exactly matches the fully tested
 `/tmp/rk-messy-clean.pqfYa1/tree` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
 reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — unify static evaluation and physical reduction plumbing
+
+The semantic recognizers remain the renderer's largest live area, but another coherent layer of duplication sat below
+them. Scalar and vector static-UOp evaluators separately implemented constants, ranges, casts, `WHERE`, and arithmetic;
+row reductions separately rebuilt the balanced arena reducer; stateful and stateless EW emitters separately assembled
+the same three relocation commands; and four precision paths separately walked a UOp graph to mark compensated ADDs.
+
+One evaluator now handles scalar and vector compiler-known expressions while preserving scalar `WHERE` laziness and
+vector eager selection. `_reduce_rows` delegates to the common balanced arena reducer with the original first-stage
+barrier semantics, both EW emitters share one command finalizer, and precision recipes share one iterative ADD tagger.
+Static and gather materialization also use one typed cache without changing allocation or gather order. Two unused
+catalog symbols were removed. All semantic recognizers, resource limits, and fail-closed checks remain in place.
+
+- Exact renderer diff: **75 insertions / 126 deletions**, executable lines **4,154 -> 4,099** (**-55**); runtime remains
+  **489**, total falls **29,711 -> 29,656**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,517 lines**.
+- Independent committed-baseline/candidate runs produced the same sorted **163 encoded-image/resource records** across
+  all 95 UOp tests. The canonical digest is
+  `b6910d7dd0222365c9f8fb8445ed51a7d0b319ed305a2a0631db892511e08b7a` over **5,455,580** unique encoded bytes.
+- A separate **166-record** mechanism differential covered scalar/vector static evaluation, compiler LOAD callbacks,
+  range substitution, precise-product recipes, FP16/INT16/INT32 balanced reductions, and stateful/stateless EW command
+  variants. Baseline and candidate both produced digest
+  `4caa3066eb60c755d27540bbad35af55bb4448bf84d7a44c430af8f7eb941e9b`.
+- Focused NPU coverage for bitwise, INT16 EW, dot, cumulative extrema, argument extrema, and fancy indexing:
+  **42 passed** in **144.41 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **842.52 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- UOp tests: **95 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`4dbc5c8a...7f1567`) exactly matches the fully tested
+`/tmp/tinygrad-rk-cleanup.36QsxN` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
+reset, reboot, or push was used.
