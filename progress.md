@@ -6371,3 +6371,40 @@ admission, deletes `_ieee_bool`, and routes boolean composition directly to the 
 The transferred renderer SHA-256 (`9d3a23f5...0e16`) exactly matches the fully tested
 `/tmp/rk-ieee-compact.qXt0BV` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — reuse typed FP16 equality in scalar extrema
+
+The scalar-extrema path had the messiest remaining comparison tail: after computing the maximum value, it manually
+split both FP16 vectors into bytes, rebuilt signed-zero canonicalization and NaN classification, compared the bytes,
+and multiplied the resulting mask by static coordinates. This duplicated the same typed raw-FP16 comparison already
+owned by `RKContext`, including two global INT16/FP16 helper implementations used only by that context and tail.
+
+The tail now describes its real semantics as ordinary UOps (`CMPEQ`, boolean-to-INT16 cast, coordinate multiply),
+lowers that small image through `RKContext`, and composes it with the existing extrema prefix. Native INT16 equality is
+one context method, and FP16 component classification uses those typed context primitives directly. The reduction,
+first-index tie rule, coordinate transform, barriers, and terminal INT32 widening are unchanged.
+
+An initial `/tmp` candidate exposed a real composition bug on hardware: argmax expected lane 149 but returned 200
+because the final image accidentally restored the child constant table after appending the typed comparison image.
+The accepted version retains `combined.constants`; the focused unit now asserts the six comparison constants and an
+exact encode/decode round trip, so this failure no longer depends on hardware to detect.
+
+- Exact production renderer diff: **42 insertions / 73 deletions**, executable lines **4,348 -> 4,321** (**-27**);
+  runtime remains **489**, total falls **29,905 -> 29,878**, and cumulative renderer reduction from the 6,616-line
+  cleanup baseline is **2,295 lines**.
+- The scalar-extrema unit image retains **73 EW stages / 7 synchronized gathers** while shrinking from **11 to 5
+  initial gathers** and **84 to 27 scratch slots**; its final encoded size is **3,698 bytes**. All non-extrema images
+  in the ordered UOp census remained byte-for-byte identical.
+- Focused hardware covering cumulative extrema, argmax/argmin, softmax-argmax, sort indices, top-k, and elementwise
+  extrema: **15 passed** in **94.32 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  cases in **790.36 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **94 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`eb173fa5...16e0b`) and focused-test SHA-256 (`c42e5d7d...436b`) exactly match the
+fully tested `/tmp/rk-extrema-refactor.1JUMHG` worktree. The sole test edit strengthens the constant-table contract;
+no assertion was removed or weakened. No runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC, reset,
+reboot, or push was used.

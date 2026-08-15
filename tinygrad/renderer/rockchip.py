@@ -1378,48 +1378,6 @@ def _ew_eq_mask(ops:list[RKEWOp], arg:Callable[[int], RKArg], lhs:int, rhs:int, 
               RKEWOp(arg(equal), arg(one), arg(unequal), lanes, _EW_CFG[Ops.SUB], stateful=True)))
 
 
-def _ew_native_int16_eq_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], lhs:RKArg, rhs:RKArg,
-                             one:RKArg, lanes:int) -> RKArg:
-  """Compare native INT16 lanes whose subtraction is proven not to overflow."""
-  diff, magnitude, unequal, equal = (allocate() for _ in range(4))
-  integer = dict(int16_input=True, int16_output=True)
-  ops.extend((RKEWOp(diff, lhs, rhs, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(magnitude, diff, diff, lanes, _EW_CFG_ABS, **integer),
-              RKEWOp(unequal, magnitude, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(equal, one, unequal, lanes, _EW_CFG[Ops.SUB], **integer)))
-  return equal
-
-def _fp16_high_and_nan(ops:list[RKEWOp], allocate:Callable[[], RKArg], high:RKArg, low:RKArg,
-                       zero:RKArg, one:RKArg, const123:RKArg, const124:RKArg, const127:RKArg, const128:RKArg,
-                       lanes:int) -> tuple[RKArg, RKArg]:
-  """Canonicalize signed zero's FP16 high byte and classify NaNs with native INT16 byte arithmetic."""
-  integer = dict(int16_input=True, int16_output=True)
-  sign_delta, sign_positive, sign, sign_scale, magnitude = (allocate() for _ in range(5))
-  ops.extend((RKEWOp(sign_delta, high, const127, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(sign_positive, sign_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(sign, sign_positive, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(sign_scale, sign, const128, lanes, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(magnitude, high, sign_scale, lanes, _EW_CFG[Ops.SUB], **integer)))
-  high_zero = _ew_native_int16_eq_mask(ops, allocate, magnitude, zero, one, lanes)
-  low_zero = _ew_native_int16_eq_mask(ops, allocate, low, zero, one, lanes)
-  zero_value, zero_sign, canonical = (allocate() for _ in range(3))
-  exponent_delta, exponent_positive, exponent_all = (allocate() for _ in range(3))
-  mantissa_delta, mantissa_positive, mantissa_high, mantissa_low, mantissa, nan = (allocate() for _ in range(6))
-  ops.extend((RKEWOp(zero_value, high_zero, low_zero, lanes, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(zero_sign, sign_scale, zero_value, lanes, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(canonical, high, zero_sign, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(exponent_delta, magnitude, const123, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(exponent_positive, exponent_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(exponent_all, exponent_positive, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(mantissa_delta, magnitude, const124, lanes, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(mantissa_positive, mantissa_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(mantissa_high, mantissa_positive, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(mantissa_low, low, one, lanes, _EW_CFG_MIN, **integer),
-              RKEWOp(mantissa, mantissa_high, mantissa_low, lanes, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(nan, exponent_all, mantissa, lanes, _EW_CFG[Ops.MUL], **integer)))
-  return canonical, nan
-
-
 RKIndexEquality = tuple[int, int, tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]
 RKCoordinateRows = tuple[tuple[int, ...], ...]
 
@@ -3161,6 +3119,11 @@ class RKContext:
     self.ew_ops.append(RKEWOp(dst, lhs, rhs, self.count, cfg, int16_input=True, int16_output=True))
     return dst
 
+  def _i16_equal(self, lhs:RKArg, rhs:RKArg) -> RKArg:
+    diff = self._i16(lhs, rhs, _EW_CFG[Ops.SUB])
+    magnitude = self._i16(diff, diff, _EW_CFG_ABS)
+    return self._i16(self._i16_const(1), self._i16(magnitude, self._i16_const(1), _EW_CFG_MIN), _EW_CFG[Ops.SUB])
+
   def _i16_const(self, value:int) -> RKArg: return self._constant(UOp.const(value, dtypes.int16)).arg
 
   def _i16_clamp_one(self, value:RKArg) -> RKArg:
@@ -3246,7 +3209,7 @@ class RKContext:
     else:
       equal = constants[1]
       for left,right in zip(lhs_bytes, rhs_bytes):
-        byte_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, left.arg, right.arg, constants[1], self.count)
+        byte_equal = self._i16_equal(left.arg, right.arg)
         selected = allocate()
         self.ew_ops.append(RKEWOp(selected, equal, byte_equal, self.count, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
         equal = selected
@@ -3265,8 +3228,7 @@ class RKContext:
     def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
     lhs_low,lhs_high,lhs_nan = self._fp16_component_values(values[0])
     rhs_low,rhs_high,rhs_nan = self._fp16_component_values(values[1])
-    low_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_low.arg, rhs_low.arg, constants[1].arg, self.count)
-    high_equal = _ew_native_int16_eq_mask(self.ew_ops, allocate, lhs_high, rhs_high, constants[1].arg, self.count)
+    low_equal, high_equal = self._i16_equal(lhs_low.arg, rhs_low.arg), self._i16_equal(lhs_high, rhs_high)
     either_nan, numeric, bits_equal, equal = (allocate() for _ in range(4))
     integer = dict(int16_input=True, int16_output=True)
     self.ew_ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, self.count, _EW_CFG[Ops.MAX], **integer),
@@ -3284,11 +3246,17 @@ class RKContext:
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
     if value.arg in self.fp16_components: return self.fp16_components[value.arg]
     low, high = self._raw_parts(value)
-    constants = {number:self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 123, 124, 127, 128)}
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-    clean_high,nan = _fp16_high_and_nan(self.ew_ops, allocate, high.arg, low.arg,
-      constants[0].arg, constants[1].arg, constants[123].arg, constants[124].arg,
-      constants[127].arg, constants[128].arg, self.count)
+    zero, one, const123, const124, const127, const128 = (self._i16_const(number) for number in (0, 1, 123, 124, 127, 128))
+    sign = self._i16_clamp_one(self._i16(high.arg, const127, _EW_CFG[Ops.SUB]))
+    sign_scale = self._i16(sign, const128, _EW_CFG[Ops.MUL])
+    magnitude = self._i16(high.arg, sign_scale, _EW_CFG[Ops.SUB])
+    high_zero, low_zero = self._i16_equal(magnitude, zero), self._i16_equal(low.arg, zero)
+    zero_value = self._i16(high_zero, low_zero, _EW_CFG[Ops.MUL])
+    clean_high = self._i16(high.arg, self._i16(sign_scale, zero_value, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB])
+    exponent = self._i16_clamp_one(self._i16(magnitude, const123, _EW_CFG[Ops.SUB]))
+    mantissa_high = self._i16_clamp_one(self._i16(magnitude, const124, _EW_CFG[Ops.SUB]))
+    mantissa = self._i16(mantissa_high, self._i16(low.arg, one, _EW_CFG_MIN), _EW_CFG[Ops.MAX])
+    nan = self._i16(exponent, mantissa, _EW_CFG[Ops.MUL])
     self.fp16_components[value.arg] = low, clean_high, nan
     return self.fp16_components[value.arg]
 
@@ -4021,29 +3989,30 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   best_values = allocate()
   mid.append(RKGather(best.index, best_values.index, total, offsets=(best.addend//2,)*total,
                       src_kind=RKBufferKind.SCRATCH, after=equality_after))
-  raw = tuple((allocate(), allocate()) for _ in range(2))
-  for source,parts in ((values, raw[0]), (best_values, raw[1])):
-    for byte,part in enumerate(parts):
-      mid.append(RKGather(source.index, part.index, total, base=source.addend+byte, axes=((1, total, 2),), dst_stride=2,
-                          src_kind=RKBufferKind.SCRATCH, itemsize=1, after=equality_after))
-  constants = {number:allocate() for number in (0, 1, 123, 124, 127, 128)}
-  for number,dst in constants.items(): gathers.append(RKGather(out_param.arg.slot, dst.index, total, values=(number,)*total))
-  def alloc() -> RKArg: return allocate()
-  lhs_high,lhs_nan = _fp16_high_and_nan(ops, alloc, raw[0][1], raw[0][0], constants[0], constants[1],
-    constants[123], constants[124], constants[127], constants[128], total)
-  rhs_high,rhs_nan = _fp16_high_and_nan(ops, alloc, raw[1][1], raw[1][0], constants[0], constants[1],
-    constants[123], constants[124], constants[127], constants[128], total)
-  low_equal = _ew_native_int16_eq_mask(ops, alloc, raw[0][0], raw[1][0], constants[1], total)
-  high_equal = _ew_native_int16_eq_mask(ops, alloc, lhs_high, rhs_high, constants[1], total)
+  fake_base = max(global_slots, default=out_param.arg.slot)+1
+  fake_out, fake_values, fake_best, fake_coordinates = range(fake_base, fake_base+4)
+  lane = UOp.range(total, max((u.arg[0] for u in (*value_def.loops, *index_def.loops) if isinstance(u.arg, tuple)), default=-1)+1)
+  lhs = UOp.param(fake_values, dtypes.half, (total,)).index(lane).load()
+  rhs = UOp.param(fake_best, dtypes.half, (total,)).index(lane).load()
+  coordinate_values = UOp.param(fake_coordinates, dtypes.int16, (total,)).index(lane).load()
+  equal = UOp(Ops.CMPEQ, dtypes.bool, src=(lhs, rhs))
+  selected_store = UOp.param(fake_out, dtypes.int16, (total,)).index(lane).store(equal.cast(dtypes.int16)*coordinate_values).end(lane)
+  selected_image = _lower_uop_program(list(selected_store.sink().toposort()), vectorize_reductions=False)
+  if selected_image is None: return None
+  coordinate_arg = allocate(); gathers.append(RKGather(out_param.arg.slot, coordinate_arg.index, total, values=coordinates))
+  prefix = RKImage(RKTarget.RK3588, tuple(scratch), child.constants, gathers=tuple(gathers), ew_ops=tuple(ops),
+                   mid_gathers=tuple(mid), gather_after=child.gather_after)
+  if (combined:=_append_inplace_image(prefix, selected_image)) is None: return None
+  prefix_constants = len(prefix.constants)//2
+  def retained(arg:RKArg) -> RKArg:
+    return replace(arg, index=arg.index+len(selected_image.constants)//2) \
+      if arg.kind is RKBufferKind.SCRATCH and arg.index >= prefix_constants else arg
+  weighted = RKArg(RKBufferKind.SCRATCH, len(combined.scratch))
+  combined = _alias_image_args(combined, {fake_values:retained(values), fake_best:retained(best_values),
+                                          fake_coordinates:retained(coordinate_arg), fake_out:weighted})
+  scratch, gathers, ops, mid = list(combined.scratch)+[RKScratch(_scratch_bytes(total))], list(combined.gathers), \
+                                   list(combined.ew_ops), list(combined.mid_gathers)
   integer = dict(int16_input=True, int16_output=True)
-  either_nan, numeric, bits_equal, equal = (alloc() for _ in range(4))
-  ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, total, _EW_CFG[Ops.MAX], **integer),
-              RKEWOp(numeric, constants[1], either_nan, total, _EW_CFG[Ops.SUB], **integer),
-              RKEWOp(bits_equal, low_equal, high_equal, total, _EW_CFG[Ops.MUL], **integer),
-              RKEWOp(equal, bits_equal, numeric, total, _EW_CFG[Ops.MUL], **integer)))
-  coordinate_values, weighted = allocate(), allocate()
-  gathers.append(RKGather(out_param.arg.slot, coordinate_values.index, total, values=coordinates))
-  ops.append(RKEWOp(weighted, equal, coordinate_values, total, _EW_CFG[Ops.MUL], **integer))
   weighted_spaced = allocate(total*scalar_stride//2)
   mid.append(RKGather(weighted.index, weighted_spaced.index, total, axes=((1, total, 1),), dst_stride=scalar_stride//2,
                       src_kind=RKBufferKind.SCRATCH, after=len(ops)))
@@ -4059,7 +4028,7 @@ def _lower_vectorized_scalar_local_extrema(uops:list[UOp], output:RKOutput) -> R
   zero = allocate(1); gathers.append(RKGather(out_param.arg.slot, zero.index, 1, values=(0,)))
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, zero, 1, _EW_CFG[Ops.ADD],
                     int16_input=True, int32_output=True))
-  image = RKImage(RKTarget.RK3588, tuple(scratch), child.constants, gathers=tuple(gathers), ew_ops=tuple(ops),
+  image = RKImage(RKTarget.RK3588, tuple(scratch), combined.constants, gathers=tuple(gathers), ew_ops=tuple(ops),
                   mid_gathers=tuple(mid), gather_after=child.gather_after)
   return image if all(len(items) <= _RKIMAGE_U16_MAX for items in
                       (image.scratch, image.gathers, image.ew_ops, image.mid_gathers)) else None
