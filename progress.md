@@ -6485,3 +6485,36 @@ bytes / 29 gathers / 27 EW stages / 2 post-gathers**.
 The transferred renderer SHA-256 (`32d10785...2ae8b0`) exactly matches the fully tested
 `/tmp/rk-dynamic-parser.6XXzMN/tree` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback,
 CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — centralize native comparison stages
+
+The largest messy Rockchip area remains the specialized mapped-reduction catalog, but its recognizers are all live
+in the full hardware census and their numeric/performance contracts differ. The safest messy slice was instead the
+raw FP16/INT32 comparison block inside `RKContext`: four methods manually allocated scratch and appended native
+INT16 EW stages even though `_i16`, `_i16_const`, `_i16_equal`, and `_i16_clamp_one` already expressed the same
+typed operation and allocation order.
+
+`_int32_compare`, `_fp16_equality`, `_fp16_ordered_values`, and `_fp16_less` now use those shared helpers. Constant,
+scratch, and EW-stage ordering remains exact, including IEEE NaN gating and signed FP16 lexical ordering. Two broader
+`/tmp` alternatives were rejected first: a grouped-bool merge saved only three executable lines, while an output-major
+reducer saved 26 but changed a noncontiguous reduction from roughly five vector stages to about 90 scalar-output
+stages. Neither was transferred.
+
+- Exact renderer diff: **22 insertions / 45 deletions**, executable lines **4,259 -> 4,236** (**-23**); runtime remains
+  **489**, total falls **29,816 -> 29,793**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,380 lines**.
+- A fresh committed-baseline/candidate unit census compared all **167 RKImages / 163 unique images**. The complete
+  encoded-image hash/resource multiset is byte-for-byte identical with SHA-256
+  `0cb9079af2ac4cbce246507a925f662e6f81d6dc004fa3c50d0f641bbbf5d55a`.
+- Focused hardware classification, comparison, logical-predicate, and argument-extrema coverage: **15 passed** in
+  **11.49 s**.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **833.05 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- UOp tests: **94 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`fbc9f2c...d21d4`) exactly matches the fully tested
+`/tmp/rk-compare-i16.0KGLFB` worktree. No test, runtime/core code, host tensor arithmetic, CPU/GPU fallback, CMAC,
+reset, reboot, or push was used.
