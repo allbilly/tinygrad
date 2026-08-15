@@ -6244,3 +6244,34 @@ required by `std_mean`.
 The transferred renderer SHA-256 (`d3afc4d4...7522b4`) exactly matches the fully tested
 `/tmp/rk-hot-clean.vT6XjT` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
 arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
+
+---
+
+## 2026-08-15 — share mapped-reduction precision and image plumbing
+
+The largest messy renderer group is the mapped-reduction catalog. It is not dead: an instrumented full hardware
+census observed 24 successful unrolled-ADD lowerings, 10 vectorized MUL+ADD lowerings, 19 mapped-loop ADD lowerings,
+four scalar-extrema lowerings, and two multi-local lowerings. A wholesale deletion would therefore remove active
+precision and performance contracts. The safe seam was their duplicated plumbing rather than their recognizers.
+
+The exact 17-stage FP16 TwoProduct residual recipe now has one physical-stage constructor, and the two ADD-family
+recognizers share one outer CAST/constant-scale parser. `_finish_mapped_add_reduction`, `_append_inplace_image`, and
+linear scratch reuse now delegate complete argument relocation to `_map_image_args` instead of maintaining parallel
+gather/EW/host/fill remappers. A duplicate RKContext destination allocator whose operands were unused is also removed.
+All recognizers, Kahan/TwoProduct arithmetic, task ordering, barriers, scratch layouts, and native execution remain.
+
+- Exact renderer diff: **53 insertions / 96 deletions**, executable lines **4,493 -> 4,448** (**-45**); runtime remains
+  **489**, total falls **30,050 -> 30,005**, and cumulative renderer reduction from the 6,616-line cleanup baseline is
+  **2,168 lines**.
+- The baseline/candidate UOp lowering census produced **165 RKImages / 161 unique image records**. Every serialized
+  image and occurrence count remained byte-for-byte identical; the aggregate JSON-stream SHA-256 is
+  `8a8b7a095be21f3cc3539636e7bee18dee5fe920c685addbfe77f9d69c3a45ff`.
+- Focused hardware covering GEMM, biased convolution, attention, loss reductions, `std_mean`, and normalization:
+  **7 passed** in **105.83 s**.
+- UOp tests: **94 passed** with `-n12`. Full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero
+  failures across all **445** cases in **824.68 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass.
+
+The transferred renderer SHA-256 (`ad664554...df787`) exactly matches the fully tested
+`/tmp/rk-reduction-clean.buWVb3` worktree. No tests, runtime/core code, hardware assertion, tolerance, host tensor
+arithmetic, CPU/GPU fallback, CMAC, reset, reboot, or push was used.
