@@ -7,7 +7,7 @@ from enum import IntEnum
 from typing import Callable, Iterable, Mapping, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16
-from tinygrad.helpers import Target, ceildiv, round_up
+from tinygrad.helpers import ceildiv, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, python_alu
@@ -274,11 +274,6 @@ def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKG
   return RKGather(source.index, out_slot, count, base=source.addend, axes=((1, count, stride),), dst_kind=RKBufferKind.ARG,
                   src_kind=RKBufferKind.SCRATCH, itemsize=1)
 
-def _finish_ew_stage(regs:tuple[tuple[int, int, int], ...], rdma_feature:int) -> tuple[tuple[int, ...], tuple[int, ...]]:
-  bindings = ((_DPU, rk.REG_DPU_DST_BASE_ADDR), (_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR), (_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR))
-  commands = tuple(_cmd(*reg) for reg in regs)+tuple(_cmd(target, reg, 0) for target,reg in bindings)
-  return commands+(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature),), tuple(range(len(regs), len(commands)))
-
 @functools.lru_cache(maxsize=256)
 def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
                     int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False, fp32_input:bool=False) \
@@ -325,7 +320,9 @@ def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=Fal
     (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
   rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if int16_input else 2
   rdma_feature = (rdma_precision<<15)|(15<<11)|(rdma_precision<<5)|(0 if is_div or int16_input or fp32_input else 1<<3)|1
-  return _finish_ew_stage(regs, rdma_feature)
+  bindings = ((_DPU, R.REG_DPU_DST_BASE_ADDR), (_RDMA, R.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR), (_RDMA, R.REG_DPU_RDMA_RDMA_EW_BASE_ADDR))
+  commands = tuple(_cmd(*reg) for reg in regs)+tuple(_cmd(target, reg, 0) for target,reg in bindings)
+  return commands+(_cmd(_RDMA, R.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature),), tuple(range(len(regs), len(commands)))
 
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                   stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
@@ -461,19 +458,6 @@ def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, 
     envs = [{**env, r: i} for env in envs for i in range(bound)]
   return envs
 
-def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, list[dict[UOp, int]], UOp, int]|None:
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  rows = int(out_param.src[0].arg)
-  out_ranges = _index_ranges(store.src[0].src[1])
-  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
-  if rows <= 0 or len(reduce_ranges) != 1: return None
-  reduce_range = reduce_ranges[0]
-  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
-  try: envs = _iter_range_env(out_ranges)
-  except RuntimeError: return None
-  if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
-  return rows, envs, reduce_range, groups
-
 @dataclass(frozen=True)
 class RKLoopReduction:
   store:UOp; out:UOp; nodes:list[UOp]; rows:int; envs:list[dict[UOp, int]]; reduce_range:UOp; groups:int; update:UOp; post_scale:float
@@ -483,8 +467,16 @@ def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
   if (output:=_output_store(uops, (dtypes.half, dtypes.float), allow_local=True)) is None: return None
   store, out, _, _, root = output
   nodes = list(root.toposort())
-  if (shape:=_loop_reduction_shape(store, out, nodes)) is None: return None
-  rows, envs, reduce_range, groups = shape
+  if out.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  rows = int(out.src[0].arg)
+  out_ranges = _index_ranges(store.src[0].src[1])
+  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
+  if rows <= 0 or len(reduce_ranges) != 1: return None
+  reduce_range = reduce_ranges[0]
+  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
+  try: envs = _iter_range_env(out_ranges)
+  except RuntimeError: return None
+  if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
   updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
   if len(updates) != 1: return None
   value_root = root
@@ -630,6 +622,20 @@ def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
       if stride < 0: low += (limit-1)*stride
       else: high += (limit-1)*stride
   if low < -1 or high >= source_count: raise RuntimeError("RKPLAN_REJECT:gather_index")
+
+def _half_load_plan(load:UOp, out_index:UOp, count:int) -> tuple[UOp, RKGather]|None:
+  load = _strip_cast(load)
+  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX: return None
+  param = _root_param(load.src[0])
+  if param is None or param.dtype.scalar() is not dtypes.half or not param.src or param.src[0].op is not Ops.CONST or \
+     len(load.src) > 1 and load.src[1].op is not Ops.CONST: return None
+  gate = load.src[2] if len(load.src) > 2 else None
+  fill_bits = _fp16_bits(load.src[1].arg if len(load.src) > 1 else 0)
+  try: plan = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, count, fill_bits)
+  except RuntimeError: return None
+  try: _validate_gather_bounds(plan, int(param.src[0].arg))
+  except RuntimeError: return None
+  return param, plan
 
 def _gather_cache_key(plans:Iterable[RKGather]) -> tuple: return tuple((p.src_index, p.count, p.base, p.axes, p.offsets,
   p.fill_bits, p.values, p.partial, p.dst_stride, p.dst_addend, p.itemsize, p.src_kind) for p in plans)
@@ -812,11 +818,10 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
                        dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
   gather_after = len(mapped.ew_ops)
   destination = RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, scaled_slot)
+  def temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, index*stride)
   if kahan:
-    def temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, index*stride)
     reduced = _kahan_add(ops, [group*stride for group in range(inner)], outer, arena, temporary, destination, op_barriers=op_barriers)
   elif 2 <= inner <= compensated_limit:
-    def temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, index*stride)
     reduced = _compensated_add(ops, [group*stride for group in range(inner)], outer, arena, temporary, destination, op_barriers=op_barriers)
   else:
     reduced = _reduce_arena(ops, [group*stride for group in range(inner)], outer, _EW_CFG[Ops.ADD], arena, destination, op_barriers=op_barriers)
@@ -837,19 +842,12 @@ def _append_mapped_product_residual(mapped:RKImage, out_slot:int, out_index:UOp,
   if product.op is not Ops.MUL or product.arg is not None or mapped.post_gathers or mapped.host_scatters: return None
   direct, expression = next(((_strip_cast(load), other) for load,other in (product.src, product.src[::-1])
     if _strip_cast(load).op is Ops.LOAD), (None, None))
-  if (direct is None or expression is None or direct.dtype.scalar() is not dtypes.half or not direct.src or
-      direct.src[0].op is not Ops.INDEX or (param:=_root_param(direct.src[0])) is None or
-      param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST or
-      len(direct.src) > 1 and direct.src[1].op is not Ops.CONST): return None
+  if direct is None or expression is None or (parsed:=_half_load_plan(direct, out_index, lanes)) is None: return None
+  param, rhs_gather = parsed
   base = len(mapped.scratch)
   lhs, rhs, lhs_high, rhs_high, splitter = (RKArg(RKBufferKind.SCRATCH, base+i) for i in range(5))
   mapped = _alias_image_args(mapped, {out_slot:lhs})
-  gate = direct.src[2] if len(direct.src) > 2 else None
-  fill_bits = _fp16_bits(direct.src[1].arg if len(direct.src) > 1 else 0)
-  try:
-    rhs_gather = _gather_plan(param.arg.slot, rhs.index, out_index, direct.src[0].src[1], gate, lanes, fill_bits)
-    _validate_gather_bounds(rhs_gather, int(param.src[0].arg))
-  except RuntimeError: return None
+  rhs_gather = replace(rhs_gather, dst_index=rhs.index)
   product_arg, error_arg = RKArg(RKBufferKind.ARG, out_slot), RKArg(RKBufferKind.ARG, out_slot, lanes*2)
   stages = _product_residual_stages(product_arg, lhs, rhs, lhs_high, rhs_high, error_arg, splitter)
   ops = mapped.ew_ops+tuple(
@@ -962,11 +960,9 @@ def _lower_vectorized_unrolled_add_reduction(uops:list[UOp]) -> RKImage|None:
   if len(terms) < 2 or count*len(terms) > _MAX_STATIC_RANGE_ENVS: return None
   mapped_math = any(u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) for u in terms[0].toposort())
   if count > 1 and not mapped_math: return None
-  out_ranges = _index_ranges(out_index)
-  try: out_envs = _iter_range_env(out_ranges)
+  try: out_ranges, vector_env, out_lanes = _static_vector_env(out_index, count)
   except RuntimeError: return None
-  if len(out_envs) != count or tuple(_eval_int(out_index, env) for env in out_envs) != tuple(range(count)): return None
-  vector_env = {r:np.fromiter((env[r] for env in out_envs), dtype=np.int64, count=count) for r in out_ranges}
+  if len(out_lanes) != count or tuple(out_lanes) != tuple(range(count)): return None
   def input_leaf(u:UOp) -> tuple[UOp, UOp]|None:
     index = u if u.op is Ops.INDEX else u.src[0] if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX else None
     param = _root_param(index) if index is not None else None
@@ -1093,17 +1089,8 @@ def _lower_vectorized_mul_add_reduction(uops:list[UOp]) -> RKImage|None:
     if term.op is not Ops.MUL or term.arg is not None: return None
     operands:list[tuple[UOp, RKGather]] = []
     for src in term.src:
-      load = _strip_cast(src)
-      if (load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX or
-          (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtypes.half or
-          not param.src or param.src[0].op is not Ops.CONST or len(load.src) > 1 and load.src[1].op is not Ops.CONST): return None
-      gate = load.src[2] if len(load.src) > 2 else None
-      fill_bits = _fp16_bits(load.src[1].arg if len(load.src) > 1 else 0)
-      try:
-        plan = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, rows, fill_bits)
-        _validate_gather_bounds(plan, int(param.src[0].arg))
-      except RuntimeError: return None
-      operands.append((param, plan))
+      if (parsed_load:=_half_load_plan(src, out_index, rows)) is None: return None
+      operands.append(parsed_load)
     parsed.append((operands[0], operands[1]))
   slots = (parsed[0][0][0].arg.slot, parsed[0][1][0].arg.slot)
   normalized:list[tuple[tuple[UOp, RKGather], tuple[UOp, RKGather]]] = []
@@ -1445,48 +1432,6 @@ def _select_int16_rows(builder:_RKBuilder, equal:RKArg, values:tuple[RKArg, ...]
     builder.i16(fill, remaining, count, _EW_CFG[Ops.MUL], fill_part)
     results.append(builder.i16(guarded, fill_part, count, _EW_CFG[Ops.ADD], result))
   return tuple(results)
-
-def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
-  """Lower canonical positive-only or negative-normalized INT32 index bounds to one exact bool mask."""
-  _, out_param, count, out_index, root = output
-  if count <= 0: return None
-  if (axes_info:=_bounded_dynamic_axes(root, root)) is None: return None
-  specs:list[tuple[UOp, UOp, int, bool, UOp]] = []
-  for bounded,load,extent,wrapped in axes_info:
-    gates = [node for node in root.toposort() if _bounded_index_gate(node, bounded, extent) and
-             {u.key for u in node.toposort() if u.op is Ops.LOAD} == {load.key}]
-    if len(gates) != 1: return None
-    specs.append((bounded, load, extent, wrapped, gates[0]))
-  terms = [term for *_,term in specs]
-  actual_leaves, expected_leaves = _flatten_binary(root, Ops.AND), tuple(x for term in terms for x in _flatten_binary(term, Ops.AND))
-  if len(actual_leaves) != len(expected_leaves) or {x.key for x in actual_leaves} != {x.key for x in expected_leaves}: return None
-  axes:list[tuple[UOp, int, UOp, tuple[int, ...], int, bool]] = []
-  for bounded,load,extent,wrapped,term in specs:
-    param = _root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None
-    if (not _bounded_index_gate(term, bounded, extent) or param is None or param.dtype.scalar() is not dtypes.int or
-        param.src[0].op is not Ops.CONST or {u.key for u in term.toposort() if u.op is Ops.LOAD} != {load.key}): return None
-    try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
-    except RuntimeError: return None
-    index_count = int(param.src[0].arg)
-    if any(not 0 <= offset < index_count for offset in offsets): return None
-    axes.append((param, index_count, load, offsets, extent, wrapped))
-  if {u.key for u in root.toposort() if u.op is Ops.LOAD} != {load.key for _,_,load,_,_,_ in axes}: return None
-
-  layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_ in axes)
-  if any(matrix_lanes > _MAX_EW_ELEMS_FP16 for _,_,matrix_lanes,_ in layouts): return None
-  builder = _RKBuilder()
-  valid_axes:list[RKArg] = []
-  for (param,_,_,offsets,extent,wrapped),(_,vector_lanes,_,_) in zip(axes, layouts):
-    positive = tuple((coordinate,)*count for coordinate in range(extent))
-    negative = tuple((coordinate,)*count for coordinate in range(-extent, 0))
-    if (mask:=_native_int16_byte_mask(builder, param.arg.slot, offsets,
-                                      (positive, negative) if wrapped else (positive,), count, vector_lanes)) is None: return None
-    valid_axes.append(_reduce_rows(builder.ops, [RKArg(mask.kind, mask.index, mask.addend+row*vector_lanes*2)
-                                        for row in range(extent)], count, _EW_CFG[Ops.MAX], int16=True))
-  result = valid_axes[0]
-  for valid in valid_axes[1:]: result = builder.i16(result, valid, count, _EW_CFG[Ops.MUL])
-  post = (_int16_low_bytes(result, out_param.arg.slot, count),)
-  return builder.image(post_gathers=post)
 
 def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predicate:Callable[[UOp], UOp|None],
                           max_scale:int=1) -> tuple[UOp, int]|None:
@@ -2926,8 +2871,7 @@ class RKContext:
 
   def _math(self, u:UOp) -> RKValue:
     if len(u.src) != 1 or u.dtype.scalar() is not dtypes.half: raise _RKGenericReject
-    lower = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin}.get(u.op)
-    if lower is None or (recipe:=lower(u.src[0])) is None: raise _RKGenericReject
+    if (recipe:=_DPU_MATH[u.op](u.src[0])) is None: raise _RKGenericReject
     recipe = _tag_precise_adds(recipe)
     value = self.lower(recipe)
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
@@ -3058,15 +3002,6 @@ class RKContext:
                     host_gathers=tuple(self.host_gathers))
     return _reuse_linear_scratch(image, self.constants)
 
-def _structural_reduce(reduce_op:Ops, dtype:DType, terms:list[UOp]) -> UOp:
-  if reduce_op is Ops.ADD and dtype.scalar() is dtypes.half:
-    nonzero = [term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)]
-    if nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero):
-      return _precise_mul_sum(nonzero)
-  while len(terms) > 1:
-    terms = [UOp(reduce_op, dtype, src=(terms[i], terms[i+1])) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
-  return terms[0]
-
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
   bounded_recipes = len(root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES
@@ -3098,14 +3033,10 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
     if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
     if exact_static_selection and mapped.op is Ops.MUL and (minimum:=_fold_minimum(mapped)) is not None:
       mapped = minimum.replace(arg=_NATIVE_RAW_MIN)
-    if mapped.op is Ops.SQRT:
-      if (recipe:=_dpu_sqrt(mapped.src[0])) is None: raise _RKGenericReject
+    elif mapped.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
+      if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
+      if (recipe:=_DPU_MATH[mapped.op](mapped.src[0])) is None: raise _RKGenericReject
       mapped = rewrite(physical_recipe(recipe, (mapped.src[0],)))
-    elif mapped.op is Ops.EXP2: mapped = rewrite(physical_recipe(_dpu_exp2(mapped.src[0]), (mapped.src[0],)))
-    elif mapped.op is Ops.LOG2:
-      if mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
-      mapped = rewrite(physical_recipe(_dpu_log2(mapped.src[0]), (mapped.src[0],)))
-    elif mapped.op is Ops.SIN: mapped = rewrite(physical_recipe(_dpu_sin(mapped.src[0]), (mapped.src[0],)))
     elif mapped.op is Ops.TRUNC and mapped.dtype.scalar() is dtypes.half and not _is_static_expr(mapped):
       mapped = rewrite(_fold_trunc(mapped))
     cache[u] = mapped
@@ -3163,7 +3094,13 @@ def _unroll_static_reduces(root:UOp) -> UOp:
       envs = _iter_range_env(ranges, None, False)
       if not envs: raise _RKGenericReject
       terms = [_substitute_static_ranges(mapped.src[0], {r:r.const_like(env[r]) for r in ranges}) for env in envs]
-      mapped = _structural_reduce(reduce_op, u.dtype, terms)
+      nonzero = [term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)] \
+        if reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.half else []
+      if nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero): mapped = _precise_mul_sum(nonzero)
+      else:
+        while len(terms) > 1:
+          terms = [UOp(reduce_op, u.dtype, src=(terms[i], terms[i+1])) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
+        mapped = terms[0]
     cache[u] = mapped
     return mapped
   return rewrite(root)
@@ -3485,8 +3422,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject("output store")
     return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
-  if output[1].dtype.scalar() is dtypes.bool:
-    if (bounds_mask:=_lower_int32_bounds_mask(output)) is not None: return bounds_mask
   if output[1].dtype.scalar() is dtypes.int:
     for source_dtype in (dtypes.int16, dtypes.int):
       if (coordinates:=_lower_bounded_integer_predicate_coordinates(output, source_dtype)) is not None: return coordinates
@@ -3918,6 +3853,7 @@ def _dpu_log2(source:UOp) -> UOp:
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
   return result.alu(Ops.ADD, zero_correction).alu(Ops.ADD, negative_correction).alu(Ops.ADD, inf_correction)
 
+_DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin}
 _pm_exp2_fallback = PatternMatcher([(UPat(Ops.EXP2, (dtypes.half, dtypes.float), src=(UPat.var("source"),)), lambda source:_dpu_exp2(source))])
 def _fp16_fallback(uops:list[UOp]) -> list[UOp]:
   sink = graph_rewrite(next(u for u in uops if u.op is Ops.SINK), _pm_exp2_fallback, name="rockchip exp2 fallback")
@@ -3928,7 +3864,6 @@ class RockchipRenderer(Renderer):
   code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None,
                  Ops.FDIV: lambda: None, Ops.SQRT: lambda: None, Ops.EXP2: lambda: None, Ops.LOG2: lambda: None, Ops.SIN: lambda: None}
   compiler = RockchipCompiler("rockchip")
-  def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     image = _lower_uop_program(uops)

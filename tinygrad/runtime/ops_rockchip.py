@@ -22,6 +22,10 @@ _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMM
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) & ~(alignment - 1)
 def _task_command_bytes(body_qwords:int) -> int: return _align_up(body_qwords + _PC_TAIL, 2) * 8
+def _offset_stage(op:RKEWOp, count:int, offset:int, *, dst_step:int=1, src_step:int=1, **flags):
+  dst, lhs, rhs = (RKArg(arg.kind, arg.index, arg.addend+offset*(dst_step if i == 0 else src_step))
+                   for i,arg in enumerate((op.dst, op.lhs, op.rhs)))
+  return emit_ew_stage(dst, lhs, rhs, count, op.ew_cfg, **flags)
 def _pcchain_sizes(body_qwords:list[int]) -> tuple[int, int]:
   """Exact command and descriptor BO sizes for one PC-chain, including prefetch guard."""
   if not body_qwords or any(not 0 < amount <= _PC_DATA_AMOUNT_MAX for amount in body_qwords): raise ValueError("invalid EW PC-chain body")
@@ -220,10 +224,7 @@ class RockchipProgram(Program['RockchipDevice']):
         for op in ops:
           for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
             count, offset = min(_MAX_EW_ELEMS_FP16, op.count-start), start*2
-            stages.append(patch_stage(emit_ew_stage(
-              RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset), RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
-              RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
-              stateful=True, int16_output=True, int16_input=True), address))
+            stages.append(patch_stage(_offset_stage(op, count, offset, stateful=True, int16_output=True, int16_input=True), address))
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return
@@ -254,11 +255,8 @@ class RockchipProgram(Program['RockchipDevice']):
           else:
             for tile_start in range(0, group[0].count, _MAX_EW_ELEMS_FP16):
               count, offset = min(_MAX_EW_ELEMS_FP16, group[0].count-tile_start), tile_start*2
-              tile_bodies = [patch_stage(emit_ew_stage(
-                RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
-                RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
-                RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
-                stateful=op.stateful or i == 0), address) for i,op in enumerate(group)]
+              tile_bodies = [patch_stage(_offset_stage(op, count, offset, stateful=op.stateful or i == 0), address)
+                             for i,op in enumerate(group)]
               self._submit_pcchain(tile_bodies)
         return
     bodies:list[tuple[int, ...]] = []
@@ -289,11 +287,8 @@ class RockchipProgram(Program['RockchipDevice']):
         stages = []
         for start in range(0, op.count, 8):
           count = min(8, op.count-start)
-          stages.append(patch_stage(emit_ew_stage(
-            RKArg(op.dst.kind, op.dst.index, op.dst.addend+start*4),
-            RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+start*2),
-            RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+start*2), count, op.ew_cfg,
-            stateful=True, int32_output=True, int16_input=True), address))
+          stages.append(patch_stage(_offset_stage(op, count, start, dst_step=4, src_step=2,
+                                                  stateful=True, int32_output=True, int16_input=True), address))
         bodies.extend(stages)
         body_precision = 0
         continue
@@ -306,10 +301,7 @@ class RockchipProgram(Program['RockchipDevice']):
         limit = _MAX_EW_ELEMS_FP16 if precision == 16 else _MAX_EW_ELEMS_FP16//2
         for start in range(0, op.count, limit):
           count, offset = min(limit, op.count-start), start*itemsize
-          stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
-                                RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
-                                RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
-                                stateful=True, int32_output=precision == 32, int32_input=precision == 32,
+          stage = _offset_stage(op, count, offset, stateful=True, int32_output=precision == 32, int32_input=precision == 32,
                                 int16_output=precision == 16, int16_input=precision == 16)
           bodies.append(patch_stage(stage, address))
         continue
@@ -336,9 +328,7 @@ class RockchipProgram(Program['RockchipDevice']):
         for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
           count = min(_MAX_EW_ELEMS_FP16, op.count-start)
           offset = start*2
-          stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
-                                RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
-                                RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg, compare=True)
+          stage = _offset_stage(op, count, offset, compare=True)
           self.dev.reset_npu()
           self._submit_standalone(patch_stage(stage, address))
           self.dev.reset_npu()
@@ -346,10 +336,7 @@ class RockchipProgram(Program['RockchipDevice']):
       for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
         count = min(_MAX_EW_ELEMS_FP16, op.count-start)
         offset = start*2
-        stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
-                              RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
-                              RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
-                              stateful=op.stateful or op.int16_output, int16_output=op.int16_output)
+        stage = _offset_stage(op, count, offset, stateful=op.stateful or op.int16_output, int16_output=op.int16_output)
         bodies.append(patch_stage(stage, address))
     if bodies: self._submit_pcchain(bodies)
 
