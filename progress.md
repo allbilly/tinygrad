@@ -6758,3 +6758,50 @@ line limit; no semicolon packing, recognizer deletion, comment deletion, or docs
 
 The transferred renderer SHA-256 (`897a515f...f80c85`) and runtime SHA-256 (`9c64f8ad...07998`) exactly match the
 fully tested `/tmp/tinygrad-rk-3p8-audit` worktree. No reset, reboot, or push was used.
+
+---
+
+## 2026-08-16 — reach the 3,700-line renderer milestone
+
+The largest poorly factored live block was dynamic candidate selection. Typed dynamic loads and bool-total gated loads
+parsed nearly the same bounded INT32 axes, while a separate raw-gather emitter rebuilt candidate byte matrices,
+negative-index alternatives, external gates, row reductions, channel repetition, block combination, and terminal
+packing. One fail-closed `_lower_dynamic_typed_load` now owns that semantic and physical path. It selects raw
+FP16/INT16/INT32 bytes exactly, including signed zero and NaN payloads, and handles multiple axes, negative
+normalization, external boolean gates, repeated trailing channels, blocked candidate sets, and exact total/fill gates.
+Candidate, allocation, ARG-slot, u16 image-field, and signed-i32 raw-address limits are checked before table allocation.
+
+The unified selector uses compact affine candidate gathers when the active rectangle permits them, otherwise retaining
+exact offset tables. This intentionally changes one direct dynamic-INT32 image from 77 gathers to 13 while preserving
+its 55 EW stages and raw output semantics. All other pre-existing UOp images remain byte-for-byte identical. One-use
+integer comparison/conversion wrappers, duplicate offset planning, and several mechanical forwarding paths were folded
+into their callers. Large range-independent contiguous outputs retain a compact affine proof. No semicolon packing,
+recognizer deletion, comment deletion, or docstring deletion was used.
+
+- Exact production diff: renderer **222 insertions / 331 deletions**, executable lines **3,799 -> 3,700** (**-99**);
+  runtime remains **483**, total falls **29,350 -> 29,251**, and cumulative renderer reduction from the 6,616-line
+  cleanup baseline is **2,916 lines**. Tests add **177 lines** and delete none.
+- Across the original 95 UOp tests, **168 of 169** emitted-image/resource records are byte-for-byte identical. The
+  intended direct dynamic-INT32 image changes from SHA-256
+  `25cd9bc8c2104d910731e5d00a255fbce6def3db1761520f174c43b3eddf4bdc`, **9,225 bytes / 77 gathers / 55 EW**, to
+  `047361e9989a11cd182c64cbd8ea4a0cf86fc613ce0a00d43bc60e94320ec314`, **6,153 bytes / 13 gathers / 55 EW**.
+  A test-only physical raw-byte executor proves FP16/INT16/INT32, negative, multi-axis, gated, repeated,
+  1,001-candidate blocked, and total/fill semantics, with encode/decode round trips.
+- Focused selector hardware: FancyIndex **10 passed** in **156.37 s**; MaskedSelect and Nonzero **4 passed** in
+  **214.80 s**.
+- Full required hardware census after reboot: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all
+  **445** collected cases in **837.08 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- UOp tests: **103 passed** with `-n12`. Repository Ruff, `mypy tinygrad/` (**216 files**), and
+  `git diff --check`: pass. Fable-judge verdict: **VERIFIED**; no weakened checks, host tensor arithmetic,
+  CPU/GPU/CMAC path, scope creep, or debris was found.
+
+The first full census reached **125 passed + 6 expected skips** with zero failures before the native driver crashed in
+the next collected test and the required elementwise health probe reported an unusable device. An out-of-band soft
+reset attempt did not recover it; the user rebooted the board. The reboot cleared the uncommitted `/tmp` worktree, so
+the patch was recovered from the local session rollout and replayed into a fresh detached worktree. Its renderer,
+test, and full-diff SHA-256 values exactly reproduced the pre-reboot values
+`3c29cfcbb95ac851a171d9880e09e168b50edd5b5d163a39cdee6625c5f8f75d`,
+`9d590c386f606126e1b19d2bdf49fa40d861d89149ebb8e6f6b14f0bd51721dd`, and
+`ca59ea61c9629b6c1029feec13dcbf5ad664aa8e0de8487a5253a307394898f6`. The post-reboot elementwise health probe
+passed every operation and size before the authoritative census. No runtime reset path, tolerance change, or push was
+added or performed.
