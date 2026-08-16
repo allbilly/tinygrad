@@ -6805,3 +6805,36 @@ test, and full-diff SHA-256 values exactly reproduced the pre-reboot values
 `ca59ea61c9629b6c1029feec13dcbf5ad664aa8e0de8487a5253a307394898f6`. The post-reboot elementwise health probe
 passed every operation and size before the authoritative census. No runtime reset path, tolerance change, or push was
 added or performed.
+
+---
+
+## 2026-08-16 — reach the 3,600-line renderer milestone
+
+The obsolete late FP16 fallback had become a second catalog layered behind the composable typed-UOp renderer. Its
+masked arithmetic/MAX, ABS, SQRT, and LOG2 rules no longer owned any admitted image in the host census. Those rules,
+their retry plumbing, and their private condition helpers were removed. Hardware validation proved that two narrow
+contracts remain live: dynamic fancy indexing needs outer/inner mask normalization, and causal attention needs a late
+EXP2 expansion followed by the existing storage-precision rules. Mask normalization now lives directly in
+`_lower_dynamic_typed_load`, and the fallback contains only EXP2 plus the shared storage matcher.
+
+The physical cleanup also removes the two-use stripe-gather wrapper, simplifies exact typed-load/repeated-index
+planning, shares square-plus-constant parsing across atan and inverse-hyperbolic recognition, unifies LOG2's two
+mantissa-normalization loops, and deletes unreachable pre-ReLU configuration. Related wire dataclass declarations and
+constant tables were compacted without changing field order, comments, docstrings, serialized layouts, or stage order.
+
+- Exact production diff: renderer **112 insertions / 216 deletions**, executable lines **3,700 -> 3,600** (**-100**);
+  runtime remains **483**, total falls **29,251 -> 29,151**, and cumulative renderer reduction from the 6,616-line
+  cleanup baseline is **3,016 lines**. No tests were changed.
+- All **103** UOp tests pass. Their complete **100-image** encoded/resource census remains byte-for-byte identical,
+  with ordered-record SHA-256 `33ff8d379f93348dc0acd942a6dbc0da700ad30ce19bfb86aaeba3b7faa60cf0` and
+  unique-image SHA-256 `ef248b698668cb718ed675892d0226a9da69ebe40c0864baa2f52f81359a29e7`.
+- Full required hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **783.53 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and serial `-n0`.
+- Repository Ruff, `mypy tinygrad/` (**216 files**), and `git diff --check`: pass. The final renderer SHA-256 is
+  `ad5901e3c17aa09585f28c764e8325ad3886ab47e5c015b4200dad60cb8ffab2`, exactly matching the fully tested isolated
+  `/tmp/tinygrad-rk-3p6.07Z5Zn` worktree.
+
+The first candidate census was stopped at 31% after six fancy-index failures and one causal-attention failure exposed
+the two live contracts above. Only those contracts were restored; all seven focused cases then passed and the complete
+census was restarted from zero. No test weakening, tolerance change, host tensor arithmetic, CPU/GPU/CMAC path,
+runtime change, reset, or push was introduced.
