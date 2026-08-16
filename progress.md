@@ -6838,3 +6838,24 @@ The first candidate census was stopped at 31% after six fancy-index failures and
 the two live contracts above. Only those contracts were restored; all seven focused cases then passed and the complete
 census was restarted from zero. No test weakening, tolerance change, host tensor arithmetic, CPU/GPU/CMAC path,
 runtime change, reset, or push was introduced.
+
+---
+
+## 2026-08-16 — reach the 3,500-line renderer milestone
+
+Starting from committed `79b73acea` (renderer **3,540**, runtime **470**), this renderer-only pass reaches renderer
+**3,500** with runtime unchanged at **470**. A typed load plan now feeds gather construction and exact-offset
+consumers; reduction `_ew_ops` and precision paths share their mechanical emission; Horner polynomial construction is
+reused; and wrapper, predicate, and probe plumbing is consolidated without changing the admitted semantics.
+
+The initial GQA candidate failed because it eagerly materialized million-lane offset vectors. The final fix makes
+offset materialization optional and uses `require_offsets` only for the exact-offset consumers, including the BOOL
+path. No CPU/GPU/CMAC numeric cheat was used.
+
+- `sz.py`: renderer/runtime **3,500/470**. Host UOp tests: **103 passed** with `-n12`; Ruff, `mypy tinygrad/`
+  (**216 files**), and `git diff --check`: pass.
+- Exact full hardware census: **433 passed, 12 skipped, 154 subtests passed**, zero failures across all **445**
+  collected cases in **783.88 s** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`; log
+  `/tmp/rk-main-445-census.txt`; recorded run SHA-256 `d280...`.
+- Final renderer blob SHA-256: `2b014edd998b1f8773121e640e08f7ac99c92858`. The run was forward-only; no reset,
+  reboot, or push was used.
