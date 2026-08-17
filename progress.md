@@ -6951,3 +6951,53 @@ Proposed local commit subject:
     WIP rockchip: reach 3.4k renderer milestone
 
 Commit remains pending; no commit or push was made.
+
+---
+
+## 2026-08-18 — reach the 3,299-line renderer milestone
+
+Starting from committed `18cd6f60e` (renderer 3,360, runtime 470), the accepted
+closed cleanup reaches exactly 3,299 executable renderer lines (**−61**) while
+runtime remains 470. Byteplane materialization now uses one gather helper;
+static-local child/reduction/extrema lowering shares one bounded child builder;
+static gather/remap forwarding and typed storage matcher construction are
+consolidated without changing the existing allocation, gather, barrier, or
+serialized-image contracts. Argument slots outside the u16 wire range now
+reject before encoding, with a focused unit regression for both overflow
+values. No unrelated matcher deletion was included in this milestone.
+
+- Exact production diff: `tinygrad/renderer/rockchip.py` **102 insertions / 161
+  deletions**; `test/unit/test_rockchip_uops.py` **8 insertions / 0 deletions**;
+  executable renderer **3,360 -> 3,299 (−61)**, runtime remains **470**. The
+  renderer SHA-256 is
+  `a1a2cda1f64c3130881be0dcb5e2e75b47a6dfa99ace9e5453ff834be6df1258`; the
+  focused-test SHA-256 is
+  `d975706dd7dd982f016a16b36ca29909f77cfc08f02e30ee9a06be43001f4f6e`; the
+  combined source diff SHA-256 is
+  `8e4f5b8f620015c0c7dda24b5f3e1018417c9fc279cbebf1b7a6ffc277ddb7d6`.
+- Host gates: `test/unit/test_rockchip_uops.py -q -n12` **111 passed**;
+  repository Ruff passed; `mypy tinygrad/` passed for **216 source files**;
+  `git diff --check` passed; `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP
+  .venv/bin/python -m pytest test/backend/test_rockchip.py --collect-only -q
+  -n12` collected exactly **445** cases.
+- The NPU census followed the corrected boot CMA configuration: the duplicate
+  boot `extraargs` assignment was fixed so the intended 128 MiB CMA pool was
+  effective (`CmaTotal: 131072 kB`), avoiding the prior fragmented 8 MiB pool
+  and its 4 MiB RKNPU allocation failure chain. This was board configuration
+  context, not a renderer/runtime workaround.
+- Authoritative hardware command:
+
+      FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -q -n0
+
+  The pytest process reported **433 passed, 12 skipped, 154 subtests passed**,
+  **0 failed**, across **445 collected** cases. The log is
+  `/home/orangepi/rk-artifacts-current/full445-exact3299-post-cma-20260818.log`.
+  Its wrapper metadata records a bookkeeping `CENSUS_WRAPPER_EXIT: 2` because
+  the orchestration escaped `PIPESTATUS`; the pytest result itself completed
+  normally with `CENSUS_PYTEST_EXIT: 0`. No wrapper exit is used to overclaim
+  hardware success.
+
+No test or tolerance was weakened, and no CPU/GPU/CMAC path, host tensor
+numeric computation, or fallback was added. No runtime/core change was made;
+all tensor arithmetic remains on the DPU EW path. Commit remains pending; no
+push was made.

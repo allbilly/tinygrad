@@ -16,6 +16,14 @@ def _program(dtype, value, count:int=4):
   out, axis = UOp.param(0, dtype, (count,)), UOp.range(count, 0)
   return list(out.index(axis).store(value(axis)).end(axis).sink().toposort())
 
+def _slot_program(slot:int) -> list[UOp]:
+  out, axis = UOp.param(slot, dtypes.half, (1,)), UOp.range(1, 0)
+  return list(out.index(axis).store(UOp.const(0.0, dtypes.half)).end(axis).sink().toposort())
+
+def test_argument_slots_reject_wire_overflow_before_encoding():
+  for slot in (1 << 16, (1 << 16) + 1):
+    assert _lower_uop_program(_slot_program(slot)) is None
+
 def _int32_binary_program(value:Callable[[UOp, UOp], UOp], count:int=4) -> list[UOp]:
   out, lhs, rhs = (UOp.param(slot, dtypes.int, (count,)) for slot in range(3))
   axis = UOp.range(count, 0)

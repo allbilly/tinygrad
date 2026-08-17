@@ -93,13 +93,10 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
     source = () if gather.values else (RKArg(gather.src_kind, gather.src_index),)
     return source+(RKArg(gather.dst_kind, gather.dst_index),)
   mid_by_point:dict[int, list[RKGather]] = {}
-  for gather in image.mid_gathers:
-    mid_by_point.setdefault(gather.after if gather.after >= 0 else image.gather_after, []).append(gather)
+  for gather in image.mid_gathers: mid_by_point.setdefault(gather.after if gather.after >= 0 else image.gather_after, []).append(gather)
   schedule = [tuple(RKArg(RKBufferKind.SCRATCH, slot) for slot in constant_slots.values())] + [gather_args(gather) for gather in image.gathers]
   schedule += [(host.src, host.index, host.dst) for host in image.host_gathers]
-  for index,op in enumerate(image.ew_ops):
-    schedule += [gather_args(gather) for gather in mid_by_point.get(index, ())]
-    schedule.append((op.lhs, op.rhs, op.dst))
+  for index,op in enumerate(image.ew_ops): schedule += [gather_args(gather) for gather in mid_by_point.get(index, ())] + [(op.lhs, op.rhs, op.dst)]
   schedule += [gather_args(gather) for gather in mid_by_point.get(len(image.ew_ops), ())] + [gather_args(gather) for gather in image.post_gathers]
   schedule += [(host.src, host.index, host.dst) for host in image.host_scatters]
   events:dict[int, tuple[int, int]] = {}
@@ -362,14 +359,12 @@ def _static_alu(op:Ops, dtype:DType, values:tuple, vector:bool):
   if vector:
     lhs = values[0]
     if op in (Ops.CDIV, Ops.CMOD):
-      rhs = values[1]
-      with np.errstate(divide="ignore", invalid="ignore"): quotient = np.where(rhs != 0, np.trunc(lhs / rhs), 0)
-      value = quotient if op is Ops.CDIV else lhs-quotient*rhs
+      with np.errstate(divide="ignore", invalid="ignore"): quotient = np.where(values[1] != 0, np.trunc(lhs / values[1]), 0)
+      value = quotient if op is Ops.CDIV else lhs-quotient*values[1]
     elif op in (Ops.FLOORDIV, Ops.FLOORMOD):
-      rhs = values[1]
-      quotient = np.zeros(np.broadcast_shapes(lhs.shape, rhs.shape), dtype=np.result_type(lhs, rhs))
-      np.floor_divide(lhs, rhs, out=quotient, where=rhs != 0)
-      value = quotient if op is Ops.FLOORDIV else lhs-quotient*rhs
+      quotient = np.zeros(np.broadcast_shapes(lhs.shape, values[1].shape), dtype=np.result_type(lhs, values[1]))
+      np.floor_divide(lhs, values[1], out=quotient, where=values[1] != 0)
+      value = quotient if op is Ops.FLOORDIV else lhs-quotient*values[1]
     elif op is Ops.MAX: value = np.where(lhs < values[1], values[1], lhs)
     elif op is Ops.WHERE: value = np.where(*values)
     elif op is Ops.TRUNC: value = np.vectorize(int, otypes=[np.int64])(lhs)
@@ -394,8 +389,7 @@ def _eval_expr(u:UOp, env:Mapping[UOp, _StaticValue], cache:dict[UOp, _StaticVal
   elif u.op is Ops.AFTER: ret = _eval_expr(u.src[0], env, cache, vector)
   elif u.op is Ops.CAST: ret = _static_cast(_eval_expr(u.src[0], env, cache, vector), u.dtype, vector)
   elif u.op is Ops.WHERE and not vector:
-    condition = _eval_expr(u.src[0], env, cache)
-    ret = _static_cast(_eval_expr(u.src[1] if condition else u.src[2], env, cache), u.dtype)
+    ret = _static_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype)
   else: ret = _static_alu(u.op, u.dtype, tuple(_eval_expr(src, env, cache, vector) for src in u.src), vector)
   cache[u] = ret
   return ret
@@ -501,8 +495,7 @@ def _loop_reduction_match(output:RKOutput) -> RKLoopReduction|None:
 
 @functools.lru_cache(maxsize=8)
 def _static_vector_env(out_index:UOp, count:int) -> tuple[tuple[UOp, ...], dict[UOp, np.ndarray], np.ndarray]:
-  ranges = tuple(_index_ranges(out_index))
-  envs = _iter_range_env(list(ranges))
+  ranges = tuple(_index_ranges(out_index)); envs = _iter_range_env(list(ranges))
   vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
   dst_lanes = np.broadcast_to(_eval_vector(out_index, vector_env, {}), len(envs)).astype(np.int64)
   return ranges, vector_env, dst_lanes
@@ -554,14 +547,12 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
   ranges, vector_env, dst = _static_vector_env(out_index, count)
   if any(r not in ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
     raise RuntimeError("RKPLAN_REJECT:gather_index")
-  cache:dict[UOp, np.ndarray] = {}
-  src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(dst)).astype(np.int64)
+  cache:dict[UOp, np.ndarray] = {}; src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(dst)).astype(np.int64)
   active = np.ones(len(dst), dtype=np.bool_) if gate is None else np.broadcast_to(_eval_vector(gate, vector_env, cache), len(dst))
   if np.any((src < 0) & active): raise RuntimeError("RKPLAN_REJECT:gather_index")
   values = src if gate is None else np.where(active, src, -1)
   if np.any((dst < 0) | (dst >= count)) or np.any(values < -1): raise RuntimeError("RKPLAN_REJECT:gather_index")
-  offsets = np.full(count, -2, dtype=np.int64)
-  offsets[dst] = values
+  offsets = np.full(count, -2, dtype=np.int64); offsets[dst] = values
   if np.any(offsets == -2): raise RuntimeError("RKPLAN_REJECT:gather_index")
   return tuple(int(x) for x in offsets)
 
@@ -578,9 +569,8 @@ def _repeated_index_offsets(indices:Iterable[UOp], vector_env:dict[UOp, np.ndarr
 def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None:
   ordered = tuple(sorted(affine[1].items(), key=lambda item:item[1]))
   limits = tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered)
-  return tuple((r, stride, limit) for (r,stride),limit in zip(ordered, limits)) if \
-    all(limit > 0 and stride == math.prod(limits[:i])
-        for i,((_,stride),limit) in enumerate(zip(ordered, limits))) and math.prod(limits) == count else None
+  return tuple((r, stride, limit) for (r,stride),limit in zip(ordered, limits)) if all(limit > 0 and stride == math.prod(limits[:i])
+    for i,((_,stride),limit) in enumerate(zip(ordered, limits))) and math.prod(limits) == count else None
 
 def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
   out_affine, load_affine = tuple(typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(index)) for index in (out_index, load_index))
@@ -615,8 +605,8 @@ class RKTypedLoadPlan:
 
 def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, strip_cast:bool=False,
                      require_default:bool=False, fill_bits:int|None=None, require_offsets:bool=False) -> RKTypedLoadPlan|None:
-  load = _strip_cast(load) if strip_cast else load
-  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX: return None
+  if (load:=_strip_cast(load) if strip_cast else load).op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or \
+     load.src[0].op is not Ops.INDEX: return None
   param = _root_param(load.src[0])
   if param is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST or \
      require_default and len(load.src) > 1 and load.src[1].op is not Ops.CONST: return None
@@ -828,10 +818,8 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
   """Retarget a vector map image into scratch, then append a row-wise ADD reduction."""
   if mapped.post_gathers or not mapped.ew_ops: return None
   lanes = rows*groups
-  scratch_shift, value_slot = 1, len(mapped.scratch)+1
-  def remap_arg(arg:RKArg) -> RKArg:
-    if arg.kind is RKBufferKind.SCRATCH: return replace(arg, index=arg.index+scratch_shift)
-    return replace(arg, kind=RKBufferKind.SCRATCH, index=value_slot) if arg.index == out_slot else arg
+  scratch_shift, value_slot = 1, len(mapped.scratch)+1; ss,vs,os,kind = scratch_shift,value_slot,out_slot,RKBufferKind.SCRATCH
+  def remap_arg(arg): return replace(arg,index=arg.index+ss) if arg.kind is kind else replace(arg,kind=kind,index=vs) if arg.index==os else arg
   mapped = _map_image_args(mapped, remap_arg)
   ops = list(mapped.ew_ops)
   arena_slot = value_slot+1
@@ -876,18 +864,16 @@ def _append_mapped_product_residual(mapped:RKImage, out_slot:int, out_index:UOp,
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append an in-place EW image, scheduling its input materialization after the first image completes."""
   if first.post_gathers or not second.ew_ops or second.host_gathers or second.host_scatters: return None
-  first_constants, second_constants = len(first.constants)//2, len(second.constants)//2
-  def first_arg(arg:RKArg) -> RKArg: return replace(arg, index=arg.index+second_constants) \
-    if arg.kind is RKBufferKind.SCRATCH and arg.index >= first_constants else arg
-  def second_arg(arg:RKArg) -> RKArg: return arg if arg.kind is not RKBufferKind.SCRATCH else replace(
-    arg, index=first_constants+arg.index if arg.index < second_constants else len(first.scratch)+arg.index)
+  fc,sc,kind = len(first.constants)//2, len(second.constants)//2, RKBufferKind.SCRATCH
+  def first_arg(arg): return replace(arg, index=arg.index+sc) if arg.kind is kind and arg.index >= fc else arg
+  def second_arg(arg): return arg if arg.kind is not kind else replace(arg, index=fc+arg.index if arg.index < sc else len(first.scratch)+arg.index)
   first, second = _map_image_args(first, first_arg), _map_image_args(second, second_arg)
   second_ops = list(second.ew_ops)
   second_ops[0] = replace(second_ops[0], submit_barrier=True, stateful=True)
   split = len(first.ew_ops)
   second_mid = tuple(replace(gather, after=split) for gather in second.gathers)+tuple(
     replace(gather, after=split+(gather.after if gather.after >= 0 else second.gather_after)) for gather in second.mid_gathers)
-  scratch = first.scratch[:first_constants] + second.scratch[:second_constants] + first.scratch[first_constants:] + second.scratch[second_constants:]
+  scratch = first.scratch[:fc] + second.scratch[:sc] + first.scratch[fc:] + second.scratch[sc:]
   return RKImage(RKTarget.RK3588, scratch, first.constants+second.constants,
                  gathers=first.gathers, ew_ops=first.ew_ops+tuple(second_ops), mid_gathers=first.mid_gathers+second_mid,
                  gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers))
@@ -1795,11 +1781,8 @@ def _nested_fp32_storage_cast(x:UOp) -> UOp|None:
   try: return _fp32_expr_to_half(x)
   except _RKGenericReject: return None
 
-_pm_half_storage_algebra = PatternMatcher([
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.float, name="x"),)), _nested_fp32_storage_cast),
-  (UPat(Ops.FDIV, dtypes.half, src=(UPat.var("x"), UPat.var("y"))),
-   lambda x,y:x.alu(Ops.MUL, UOp(Ops.RECIPROCAL, dtypes.half, src=(y,)))),
-])
+_pm_half_storage_algebra = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.float, name="x"),)), _nested_fp32_storage_cast),
+  (UPat(Ops.FDIV, dtypes.half, src=(UPat.var("x"), UPat.var("y"))), lambda x,y:x.alu(Ops.MUL, UOp(Ops.RECIPROCAL, dtypes.half, src=(y,))))])
 
 def _canonical_half_storage(source:UOp) -> UOp:
   """Commit one FP32 storage expression, then reuse Tinygrad's ordinary algebra on its now-identical half values."""
@@ -2098,6 +2081,12 @@ class RKContext:
     dst = self._dst(u, dtypes.half, RKLayout.FP16) if u is self.root else neg_lhs
     return self._emit(dst, zero, neg_lhs, _EW_CFG[Ops.SUB])
 
+  def _byte_gather(self, source:RKArg, dest:RKArg, count:int, *, base:int=0, source_stride:int=1,
+                   source_limit:int|None=None, dst_stride:int=1, dst_addend:int=0, itemsize:int=2, after:int=-1) -> RKArg:
+    self.mid_gathers.append(RKGather(source.index, dest.index, count, base=base,
+      axes=((1, count if source_limit is None else source_limit, source_stride),), dst_stride=dst_stride, dst_addend=dst_addend,
+      dst_kind=dest.kind, src_kind=source.kind, itemsize=itemsize, after=after)); return dest
+
   def _raw_parts(self, value:RKValue, cache:bool=True, copy_wide:bool=True) -> tuple[RKValue, ...]:
     if value.layout not in (RKLayout.FP16, RKLayout.INT16, RKLayout.INT_FP16, RKLayout.INT32): raise _RKGenericReject
     if cache and value.arg in self.raw_components: return self.raw_components[value.arg]
@@ -2106,11 +2095,8 @@ class RKContext:
       source = self._scratch(dtypes.int, RKLayout.INT32)
       self._emit(source, value, value, _EW_CFG[Ops.MAX])
     parts = tuple(self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(itemsize))
-    split_after = len(self.ew_ops)
-    for byte,part in enumerate(parts):
-      self.mid_gathers.append(RKGather(source.arg.index, part.arg.index, self.count,
-        base=source.arg.addend+byte, axes=((1, self.count, itemsize),), dst_stride=2,
-        src_kind=source.arg.kind, itemsize=1, after=split_after))
+    for byte,part in enumerate(parts): self._byte_gather(source.arg, part.arg, self.count, base=source.arg.addend+byte, source_stride=itemsize,
+                                                         dst_stride=2, itemsize=1, after=len(self.ew_ops))
     if cache: self.raw_components[value.arg] = parts
     return parts
 
@@ -2120,11 +2106,8 @@ class RKContext:
     itemsize = 4 if layout is RKLayout.INT32 else 2
     if len(parts) != itemsize: raise _RKGenericReject
     result = self._dst(u, u.dtype.scalar(), layout) if dst is None else dst
-    pack_after = len(self.ew_ops)
-    for byte,source in enumerate(parts):
-      self.mid_gathers.append(RKGather(source.arg.index, result.arg.index, self.count,
-        base=source.arg.addend, axes=((1, self.count, 2),), dst_stride=itemsize, dst_addend=byte,
-        dst_kind=result.arg.kind, src_kind=source.arg.kind, itemsize=1, after=pack_after))
+    for byte,source in enumerate(parts): self._byte_gather(source.arg, result.arg, self.count, base=source.arg.addend, source_stride=2,
+                                                           dst_stride=itemsize, dst_addend=byte, itemsize=1, after=len(self.ew_ops))
     if cache: self.raw_components[result.arg] = parts
     if mask is not None: self.int16_masks[result.arg] = mask
     return result
@@ -2284,15 +2267,11 @@ class RKContext:
     lanes = self.count*(4 if layout is RKLayout.INT32 else 2)
     if not 1 <= lanes <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
     def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16, _scratch_bytes(lanes)).arg
-    raw:list[RKArg] = []
-    for value in values:
-      expanded = allocate(); raw.append(expanded)
-      self.mid_gathers.append(RKGather(value.arg.index, expanded.index, lanes, base=value.arg.addend,
-        axes=((1, lanes, 1),), dst_stride=2, src_kind=value.arg.kind, itemsize=1, after=len(self.ew_ops)))
-    constants:dict[int, RKArg] = {}
-    for number in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128):
-      constants[number] = constant = allocate()
-      self.gathers.append(RKGather(self.out_param.arg.slot, constant.index, lanes, values=(number,)*lanes))
+    raw = tuple(self._byte_gather(value.arg, allocate(), lanes, base=value.arg.addend, dst_stride=2, itemsize=1,
+                                  after=len(self.ew_ops)) for value in values)
+    constants = {number:allocate() for number in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128)}
+    self.gathers.extend(RKGather(self.out_param.arg.slot, constant.index, lanes, values=(number,)*lanes)
+                        for number,constant in constants.items())
     lhs_bits, rhs_bits = (_int16_byte_bits(self.ew_ops, allocate, constants, value, lanes) for value in raw)
     weighted:list[RKArg] = []
     for bit,(left,right) in enumerate(zip(lhs_bits, rhs_bits)):
@@ -2305,9 +2284,7 @@ class RKContext:
       weighted.append(combined)
     combined = _reduce_rows(self.ew_ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True)
     result = self._dst(u, dtype, layout)
-    self.mid_gathers.append(RKGather(combined.index, result.arg.index, lanes, base=combined.addend,
-      axes=((1, lanes, 2),), dst_stride=1, dst_kind=result.arg.kind,
-      src_kind=RKBufferKind.SCRATCH, itemsize=1, after=len(self.ew_ops)))
+    self._byte_gather(combined, result.arg, lanes, base=combined.addend, source_stride=2, itemsize=1, after=len(self.ew_ops))
     return result
 
   def _int32_shift(self, u:UOp) -> RKValue:
@@ -2319,54 +2296,40 @@ class RKContext:
     vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(self.count, 32)
     pre_lanes = vector_lanes*5
     if self.count < 1 or matrix_lanes > _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    pre_arena, pre_row = self._scratch(dtypes.int16, RKLayout.INT16, 51*pre_lanes*2).arg, 0
-    def pre_allocate() -> RKArg:
-      nonlocal pre_row
-      result = replace(pre_arena, addend=pre_row*pre_lanes*2); pre_row += 1
-      return result
+    pre_arena = self._scratch(dtypes.int16, RKLayout.INT16, 51*pre_lanes*2).arg
+    pre_allocate = iter(replace(pre_arena, addend=row*pre_lanes*2) for row in range(51)).__next__
     raw, value_parts = pre_allocate(), self._raw_parts(value)
     shift = None if u.src[1].op is Ops.CONST else self.lower(u.src[1])
     if shift is not None and shift.layout is not RKLayout.INT32: raise _RKGenericReject
     shift_part = None if shift is None else self._raw_parts(shift)[0]
-    raw_after = len(self.ew_ops)
-    for byte,part in enumerate(value_parts):
-      self.mid_gathers.append(RKGather(part.arg.index, raw.index, self.count, base=part.arg.addend//2,
-        axes=((1, self.count, 1),), dst_addend=byte*vector_lanes,
-        src_kind=part.arg.kind, after=raw_after))
+    for byte,part in enumerate(value_parts): self._byte_gather(part.arg, raw, self.count, base=part.arg.addend//2,
+                                                               dst_addend=byte*vector_lanes, after=len(self.ew_ops))
     if shift_part is None:
       self.mid_gathers.append(RKGather(self.out_param.arg.slot, raw.index, self.count,
-        values=(int(u.src[1].arg)&0xff,)*self.count, dst_addend=4*vector_lanes, after=raw_after))
+        values=(int(u.src[1].arg)&0xff,)*self.count, dst_addend=4*vector_lanes, after=len(self.ew_ops)))
     else:
-      self.mid_gathers.append(RKGather(shift_part.arg.index, raw.index, self.count, base=shift_part.arg.addend//2,
-        axes=((1, self.count, 1),), dst_addend=4*vector_lanes,
-        src_kind=shift_part.arg.kind, after=raw_after))
+      self._byte_gather(shift_part.arg, raw, self.count, base=shift_part.arg.addend//2,
+                        dst_addend=4*vector_lanes, after=len(self.ew_ops))
     constants = {number:pre_allocate() for number in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128)}
-    for number,dst in constants.items():
-      self.gathers.append(RKGather(self.out_param.arg.slot, dst.index, pre_lanes, values=(number,)*pre_lanes, dst_addend=dst.addend//2))
+    self.gathers.extend(RKGather(self.out_param.arg.slot, dst.index, pre_lanes, values=(number,)*pre_lanes, dst_addend=dst.addend//2)
+                        for number,dst in constants.items())
     planes = _int16_byte_bits(self.ew_ops, pre_allocate, constants, raw, pre_lanes)
 
-    post_arena, post_row = self._scratch(dtypes.int16, RKLayout.INT16, 20*matrix_lanes*2).arg, 0
-    def post_allocate() -> RKArg:
-      nonlocal post_row
-      result = replace(post_arena, addend=post_row*matrix_lanes*2); post_row += 1
-      return result
+    post_arena = self._scratch(dtypes.int16, RKLayout.INT16, 20*matrix_lanes*2).arg
+    post_allocate = iter(replace(post_arena, addend=row*matrix_lanes*2) for row in range(20)).__next__
     bits, masks, sign, zero, weights = post_allocate(), tuple(post_allocate() for _ in range(5)), post_allocate(), post_allocate(), post_allocate()
-    post_after = len(self.ew_ops)
     for absolute_bit in range(32):
       plane,byte = absolute_bit&7, absolute_bit>>3
-      self.mid_gathers.append(RKGather(planes[plane].index, bits.index, self.count,
-        base=planes[plane].addend//2+byte*vector_lanes, axes=((1, self.count, 1),),
-        dst_addend=absolute_bit*vector_lanes, src_kind=RKBufferKind.SCRATCH, after=post_after))
+      self._byte_gather(planes[plane], bits, self.count, base=planes[plane].addend//2+byte*vector_lanes,
+                        dst_addend=absolute_bit*vector_lanes, after=len(self.ew_ops))
     for bit,mask in enumerate(masks):
-      self.mid_gathers.append(RKGather(planes[bit].index, mask.index, matrix_lanes,
-        base=planes[bit].addend//2+4*vector_lanes, axes=((1, vector_lanes, 1),),
-        dst_addend=mask.addend//2, src_kind=RKBufferKind.SCRATCH, after=post_after))
-    self.mid_gathers.append(RKGather(planes[7].index, sign.index, matrix_lanes,
-      base=planes[7].addend//2+3*vector_lanes, axes=((1, vector_lanes, 1),),
-      dst_addend=sign.addend//2, src_kind=RKBufferKind.SCRATCH, after=post_after))
+      self._byte_gather(planes[bit], mask, matrix_lanes, base=planes[bit].addend//2+4*vector_lanes,
+                        source_limit=vector_lanes, dst_addend=mask.addend//2, after=len(self.ew_ops))
+    self._byte_gather(planes[7], sign, matrix_lanes, base=planes[7].addend//2+3*vector_lanes,
+                      source_limit=vector_lanes, dst_addend=sign.addend//2, after=len(self.ew_ops))
     self.mid_gathers.append(RKGather(self.out_param.arg.slot, weights.index, matrix_lanes,
       values=tuple(1 << (row&7) if lane < self.count else 0 for row in range(32) for lane in range(vector_lanes)),
-      dst_addend=weights.addend//2, after=post_after))
+      dst_addend=weights.addend//2, after=len(self.ew_ops)))
     current = bits
     for bit,amount in enumerate((1, 2, 4, 8, 16)):
       temp, result = post_allocate(), post_allocate()
@@ -2374,13 +2337,11 @@ class RKContext:
       boundary_rows,boundary_dst = (amount, 0) if u.op is Ops.SHL else (amount, 32-amount)
       for rows,dst_row,src,fill in ((normal_rows, normal_dst, current, shifted_src),
                                     (boundary_rows, boundary_dst, sign if u.op is Ops.SHR and u.dtype.scalar() is dtypes.int else zero, 0)):
-        addend = dst_row*vector_bytes
-        dst,old,selected = (replace(arg, addend=arg.addend+addend) for arg in (temp, current, result))
-        source = replace(src, addend=src.addend+(fill*vector_bytes if src is current else addend))
-        mask = replace(masks[bit], addend=masks[bit].addend+addend)
-        count = rows*vector_lanes
+        dst,old,selected = (replace(arg, addend=arg.addend+dst_row*vector_bytes) for arg in (temp, current, result))
+        source = replace(src, addend=src.addend+(fill*vector_bytes if src is current else dst_row*vector_bytes))
+        mask = replace(masks[bit], addend=masks[bit].addend+dst_row*vector_bytes)
         self.ew_ops.extend(_ew_ops(((dst, source, old, Ops.SUB), (dst, dst, mask, Ops.MUL),
-          (selected, old, dst, Ops.ADD)), count, **_INT16_EW))
+          (selected, old, dst, Ops.ADD)), rows*vector_lanes, **_INT16_EW))
       current = result
     weighted = post_allocate()
     self.ew_ops.append(RKEWOp(weighted, current, weights, matrix_lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
@@ -2869,8 +2830,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
 
 _pm_fp32_sin_storage = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat(Ops.SIN, dtypes.float),)),
-   lambda root:_expand_math_uops(root)),
-])
+   lambda root:_expand_math_uops(root))])
 
 def _finite_int_max_neutrals(root:UOp) -> UOp:
   """Canonicalize finite physical neutrals for FP selectors and exact INT32 MAX arithmetic."""
@@ -3030,6 +2990,16 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
     definitions[buffer] = _RKStaticLocalDef(initializers[0], *updates[0])
   return definitions
 
+def _lower_static_local_child(definition:_RKStaticLocalDef, slot:int, dtype:DType=dtypes.half, *, end:bool=False,
+                              recipes_ready:bool=False, materialize:int|None=None) -> tuple[UOp, RKImage, int]|None:
+  flat, groups = _flat_static_ranges(definition.loops)
+  if groups > _MAX_STATIC_RANGE_ENVS: return None
+  fake = UOp.param(slot, dtype, (groups,)); store = fake.index(flat).store(definition.term).end(*definition.loops) if end else fake.index(flat).store(definition.term)  # noqa: E501
+  child = _lower_uop_program(list(store.sink().toposort()), vectorize_reductions=False, recipes_ready=recipes_ready)
+  if child is None or materialize is not None and (child.host_gathers or child.host_scatters): return None
+  if materialize is not None: target = RKArg(RKBufferKind.SCRATCH, len(child.scratch)); child = replace(_alias_image_args(child, {slot:target}), scratch=child.scratch+(RKScratch(_scratch_bytes(materialize)),))  # noqa: E501
+  return fake, child, groups
+
 def _lower_multi_scalar_local_reductions(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Materialize independent scalar FP32 local ADD programs, then execute their shared output UOps."""
   store, out, count, _, root = output
@@ -3043,32 +3013,21 @@ def _lower_multi_scalar_local_reductions(output:RKOutput, uops:list[UOp]) -> RKI
          any(loop.src[0].op is not Ops.CONST or int(loop.src[0].arg) <= 0 for loop in definition.loops)
          for buffer,definition in definitions.items()): return None
   if any(_semantic_loads(definition.term, local=True) for definition in definitions.values()): return None
-  next_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out.arg.slot)
-  staged:RKImage|None = None
-  sources:dict[UOp, UOp] = {}
+  next_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out.arg.slot); staged:RKImage|None = None; sources:dict[UOp, UOp] = {}
   for buffer in buffers:
-    definition = definitions[buffer]
-    flat, groups = _flat_static_ranges(definition.loops)
-    if groups > _MAX_STATIC_RANGE_ENVS: return None
-    fake_slot, next_slot = next_slot, next_slot+1
-    fake = UOp.param(fake_slot, dtypes.half, (groups,))
-    map_store = fake.index(flat).store(definition.term)
-    mapped = _lower_uop_program(list(UOp(Ops.SINK, src=(map_store,)).toposort()), vectorize_reductions=False, recipes_ready=True)
+    fake_slot, next_slot = next_slot, next_slot+1; child = _lower_static_local_child(definitions[buffer], fake_slot, recipes_ready=True)
+    if child is None: return None
+    fake, mapped, groups = child
     if mapped is None or (reduced:=_finish_mapped_add_reduction(mapped, fake_slot, 1, groups, 1.0)) is None: return None
-    staged = reduced if staged is None else _append_inplace_image(staged, reduced)
+    staged = reduced if staged is None else _append_inplace_image(staged, reduced); sources[buffer] = fake
     if staged is None: return None
-    sources[buffer] = fake
-  substitutions:dict[UOp, UOp] = {}
-  for load in local_loads:
-    buffer = _local_buffer(load)
-    if buffer is None: return None
-    fake = sources[buffer]
-    replacement = fake.index(0).load()
-    substitutions[load] = replacement.cast(load.dtype.scalar()) if load.dtype.scalar() is not dtypes.half else replacement
+  if any(_local_buffer(load) is None for load in local_loads): return None
+  substitutions = {load: sources[typing_cast(UOp, _local_buffer(load))].index(0).load().cast(load.dtype.scalar())
+                   if load.dtype.scalar() is not dtypes.half else sources[typing_cast(UOp, _local_buffer(load))].index(0).load()
+                   for load in local_loads}
   post = _lower_post_image(store, store.src[0].src[1], root, substitutions)
   if post is None or (appended:=_append_inplace_image(typing_cast(RKImage, staged), post)) is None: return None
-  aliases = {fake.arg.slot:RKArg(RKBufferKind.SCRATCH, len(appended.scratch)+i) for i,fake in enumerate(sources.values())}
-  return replace(_alias_image_args(appended, aliases), scratch=appended.scratch+tuple(RKScratch(64) for _ in sources))
+  aliases = {fake.arg.slot:RKArg(RKBufferKind.SCRATCH, len(appended.scratch)+i) for i,fake in enumerate(sources.values())}; return replace(_alias_image_args(appended, aliases), scratch=appended.scratch+tuple(RKScratch(64) for _ in sources))  # noqa: E501
 
 def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Vectorize two dependent scalar local MAX accumulators without assigning meaning to their tensor source."""
@@ -3101,8 +3060,7 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   if current is None or candidate is None: return None
   if _strip_cast(_substitute_static_ranges(candidate, dict(zip(index_def.loops, value_def.loops)))).key != \
      _strip_cast(value_def.term).key: return None
-  try:
-    coordinates = tuple(_eval_int(coordinate, env) for env in _iter_range_env(list(index_def.loops), None, False))
+  try: coordinates = tuple(_eval_int(coordinate, env) for env in _iter_range_env(list(index_def.loops), None, False))
   except RuntimeError: return None
   if len(coordinates) != total or any(not 0 <= value <= 32767 for value in coordinates): return None
   final_loads = [load for load in _semantic_loads(root, local=True) if _local_buffer(load) is index_buffer]
@@ -3118,25 +3076,16 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   baseline = mapped_outputs[0]-slope*coordinates[0]
   if any(result != baseline+slope*value for value,result in zip(coordinates, mapped_outputs)) or \
      not all(-32768 <= value <= 32767 for value in (*mapped_outputs, slope, baseline)): return None
-  fake_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None), default=out_param.arg.slot)
-  fake_out = UOp.param(fake_slot, dtypes.half, (total,))
-  linear, _ = _flat_static_ranges(value_def.loops)
-  child = _lower_uop_program(list(fake_out.index(linear).store(value_def.term).end(*value_def.loops).sink().toposort()), vectorize_reductions=False)
-  if child is None or child.host_gathers or child.host_scatters: return None
-  scratch = list(child.scratch)
-  def allocate(lanes:int=total) -> RKArg:
-    scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
-  values = allocate()
-  child = _alias_image_args(child, {fake_slot:values})
-  ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers)
-  mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)
+  child_data = _lower_static_local_child(value_def, 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None), default=out_param.arg.slot), end=True, materialize=total)  # noqa: E501
+  if child_data is None: return None
+  fake_param, child, _ = child_data; scratch = list(child.scratch); values = RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
+  def allocate(lanes:int=total) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
+  ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers); mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)  # noqa: E501
   best = _spaced_reduction(ops, mid, values, total, allocate, _EW_CFG[Ops.MAX])
-  best_values = allocate()
-  mid.append(RKGather(best.index, best_values.index, total, offsets=(best.addend//2,)*total, src_kind=RKBufferKind.SCRATCH, after=len(ops)))
-  fake_out, fake_values, fake_best, fake_coordinates = range(fake_slot, fake_slot+4)
+  best_values = allocate(); mid.append(RKGather(best.index, best_values.index, total, offsets=(best.addend//2,)*total, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
+  fake_out, fake_values, fake_best, fake_coordinates = range(fake_param.arg.slot, fake_param.arg.slot+4)
   lane = UOp.range(total, max((u.arg[0] for u in (*value_def.loops, *index_def.loops) if isinstance(u.arg, tuple)), default=-1)+1)
-  lhs = UOp.param(fake_values, dtypes.half, (total,)).index(lane).load()
-  rhs = UOp.param(fake_best, dtypes.half, (total,)).index(lane).load()
+  lhs = UOp.param(fake_values, dtypes.half, (total,)).index(lane).load(); rhs = UOp.param(fake_best, dtypes.half, (total,)).index(lane).load()
   coordinate_values = UOp.param(fake_coordinates, dtypes.int16, (total,)).index(lane).load()
   equal = UOp(Ops.CMPEQ, dtypes.bool, src=(lhs, rhs)).cast(dtypes.int16)*coordinate_values
   selected = UOp.param(fake_out, dtypes.int16, (total,)).index(lane).store(equal).end(lane)
@@ -3152,9 +3101,7 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   weighted = RKArg(RKBufferKind.SCRATCH, len(combined.scratch))
   combined = _alias_image_args(combined, {fake_values:retained(values), fake_best:retained(best_values),
                                           fake_coordinates:retained(coordinate_arg), fake_out:weighted})
-  scratch, gathers = list(combined.scratch), list(combined.gathers)
-  ops, mid = list(combined.ew_ops), list(combined.mid_gathers)
-  scratch.append(RKScratch(_scratch_bytes(total)))
+  scratch, gathers = list(combined.scratch), list(combined.gathers); ops, mid = list(combined.ew_ops), list(combined.mid_gathers); scratch.append(RKScratch(_scratch_bytes(total)))  # noqa: E501
   result = _spaced_reduction(ops, mid, weighted, total, allocate, _EW_CFG[Ops.MAX], int16=True)
   if slope != 1:
     scale = allocate(1); gathers.append(RKGather(out_param.arg.slot, scale.index, 1, values=(_int16_bits(slope),)))
@@ -3164,8 +3111,7 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
     translated = allocate(1); ops.append(RKEWOp(translated, result, offset, 1, _EW_CFG[Ops.ADD], **_INT16_EW)); result = translated
   zero = allocate(1); gathers.append(RKGather(out_param.arg.slot, zero.index, 1, values=(0,)))
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, zero, 1, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
-  image = RKImage(RKTarget.RK3588, tuple(scratch), combined.constants, gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid),
-                  gather_after=child.gather_after)
+  image = RKImage(RKTarget.RK3588, tuple(scratch), combined.constants, gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid), gather_after=child.gather_after)  # noqa: E501
   return image if all(len(items) <= _RKIMAGE_U16_MAX for items in (image.scratch, image.gathers, image.ew_ops, image.mid_gathers)) else None
 
 def _lower_host_scatter(output:RKOutput) -> RKImage|None:
@@ -3190,6 +3136,7 @@ def _same_condition(a:UOp, b:UOp) -> bool: return a.key == b.key or a.op is b.op
 
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
+  if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return None
   accepted = (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool, dtypes.uchar)
   strict_output, local_output, output_stores = _outs(uops)
   if len(output_stores) > 1:
@@ -3433,22 +3380,16 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
   unit = UOp.const(-1.0 if value < 0 else 1.0, dtypes.half)
   return unit.alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
 
-_pm_storage_common = PatternMatcher([
-  (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"),
-   lambda x:None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
-  (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
-  (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
-  (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
+_pm_storage_common = PatternMatcher([(UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"),
+  lambda x:None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
+  *[(UPat(op, dtypes.half, name="x"), callback) for op,callback in (
+    (Ops.ADD, _fold_relu_cap), (Ops.MUL, _fold_minimum), (Ops.MUL, _fold_abs),
+    (Ops.MUL, _replace_infinite_multiply), (Ops.FDIV, _preserve_infinite_division_sign))],
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
-])
-_pm_generic_storage_precision = PatternMatcher([
-  (UPat(Ops.WHERE, dtypes.float, name="x"), lambda x:None if _is_static_expr(x) else
-   UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg)),
-]) + _pm_storage_common
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),])
+_pm_generic_storage_precision = PatternMatcher([(UPat(Ops.WHERE, dtypes.float, name="x"), lambda x:None if _is_static_expr(x) else
+  UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg)),]) + _pm_storage_common
 def _square_offset(radicand:UOp, source:UOp, values:tuple[float, ...]) -> float|None:
   if radicand.op is not Ops.ADD or not any(u.op is Ops.MUL and len(u.src) == 2 and all(x.key == source.key for x in u.src)
                                              for u in radicand.src): return None
