@@ -6859,3 +6859,95 @@ path. No CPU/GPU/CMAC numeric cheat was used.
   `/tmp/rk-main-445-census.txt`; recorded run SHA-256 `d280...`.
 - Final renderer blob SHA-256: `2b014edd998b1f8773121e640e08f7ac99c92858`. The run was forward-only; no reset,
   reboot, or push was used.
+---
+
+## 2026-08-17 — reach the 3,360-line renderer milestone
+
+Starting from committed 97ce7aafa (renderer 3,500, runtime 470), this
+renderer/unit-test candidate reaches 3,360 executable renderer lines while
+runtime remains 470. The pass consolidates the grouped BOOL path into the
+typed local executor: the old block/grouped BOOL catalog is not restored.
+Bounded indexed local BOOL accumulators and their bridge are admitted only
+with one consistent AND/OR update, identity initialization, static positive
+extents, complete source coverage, one store/load mapping, and valid worker
+bounds. FP16 and stored-BOOL sources, barriers, raw BOOL-byte output,
+partial-buffer identity fill, and malformed/non-BOOL carriers stay explicit
+fail-closed cases. The all_large shape is therefore handled by the compact
+native mapper without raising a generic EW or unroll budget.
+
+The MaxUnpool2D regression exposed a separate range-dependency bug. Static-local
+rewriting had stripped the source-bearing dependency from a WEAK RANGE before
+later static planning. Preserving the original dependent RANGE identity avoids
+the 80 * 24 * 2350 = 4,512,000-environment path against the unchanged
+_MAX_STATIC_RANGE_ENVS = 262,144 limit; it is a dependency correction, not a
+budget relaxation. The direct-substitution form emits the same normal-mode
+programs as clean HEAD and the expanded-root comparison. The focused
+test_max_unpool2d probe passes.
+
+The NLL 3D aggregate correction is retained and documented at this boundary:
+the image header's total EW-op field and each EW record count are u32 fields,
+while _RKIMAGE_U16_MAX applies only to serialized scratch/gather/host resource
+counts. The failing NLL image has 147,733 valid small EW stages, so treating
+the aggregate as a u16 resource is incorrect. The generic-image regression
+constructs more than _RKIMAGE_U16_MAX stages, round-trips encode/decode, and
+keeps the per-stage _MAX_EW_ELEMS_FP16 limit intact. No NLL tolerance or
+numeric reference path changed.
+
+The compact direct-INDEX BOOL mapper normalizes rangeify INDEX nodes through
+the existing INDEX.load path, recognizes direct FP16 nonzero predicates, and
+maps BOOL MUL/MAX spellings to semantic AND/OR. Typed-load/layout checks,
+active-lane bounds, malformed BOOL ADD, mixed integer carriers, and resource
+over-bounds remain fail-closed. The final v2f bounds/sentinel correction
+requires low >= 0 for affine/scalar plans, permits only the explicit -1
+offset sentinel, rejects values below that sentinel, rejects negative source
+indices on active lanes, and normalizes arbitrary negative inactive lanes
+(including -31..-28) to the -1 fill sentinel before the final guard.
+
+The accepted result is deliberately narrower than several investigated
+alternatives. A dedicated grouped-BOOL restoration added 113 executable
+renderer lines (3,348 -> 3,461) and was rejected in favor of the generic
+typed mapper. Deleting the dot reducer changed 292 of 20,250 values with
+maximum error 0.02148 and was rejected. The multi-local FP32 adapter exposed
+a scratch access at offset 64 in a 64-byte allocation for n=2,3,7,32, while
+the generic fallback changed ordered-FP32 cancellation; no adapter was
+exported. A shared math-recipe helper grew the renderer by four executable
+lines instead of reducing it. The first typed-load/offset draft eagerly
+materialized million-lane GQA offsets; the final plan keeps materialization
+optional and requires offsets only for exact-offset consumers.
+
+- Exact production diff: tinygrad/renderer/rockchip.py 284 insertions / 426
+  deletions; test/unit/test_rockchip_uops.py 136 insertions / 2 deletions;
+  total 420 / 428. sz.py reports renderer/runtime 3,360/470, a net renderer
+  reduction of 140 executable lines from 3,500.
+- Host gates: test/unit/test_rockchip_uops.py 110 passed with -n12;
+  repository Ruff, mypy tinygrad/ (216 source files), and git diff --check
+  pass. No assertion was removed or weakened.
+- Isolated final-artifact evidence includes the required elementwise health
+  probe (the standalone run initially passed), focused MaxUnpool2D hardware 1
+  passed, and focused all_large hardware 1 passed. The authoritative backend
+  census collected and ran exactly 445 cases: 433 passed, 12 skipped, 0
+  failed, and 154 subtests passed in pytest 857.52s (0:14:17), with wrapper
+  wall time 918.752s, using
+  FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest
+  test/backend/test_rockchip.py -q -n0. The final log is
+  /home/orangepi/rk-artifacts-current/full445-3360-20260817.log; its
+  SHA-256 is 8d6962196f8ddeffb56a0228d0c64faf8ed91ac47ebea2b91f5910534e6c4940.
+  Later standalone 4MiB retries can fail with ENXIO when fragmented 8MiB CMA
+  cannot satisfy the allocation; this did not invalidate the successful
+  census, which exited 0 with pre/post holder checks passing.
+
+The current final source diff is limited to the renderer and unit test. No
+input-dependent host numeric execution, CPU/GPU/CMAC path, tolerance
+relaxation, runtime/core change, reset, reboot, or push was used. Current
+blob IDs are renderer a9fb0db85893401ccd5eae7246d77522c96e5596, unit test
+8fe3aa62b36d80f9ce137ba936a6eddb18b7bf76, and unchanged runtime
+b9aa3842afb95edd2de7ea57bf2de2bfde1475df. The combined source diff SHA-256
+(git diff --binary HEAD -- tinygrad/renderer/rockchip.py
+test/unit/test_rockchip_uops.py) is
+1bb927f9d1f953f6f0822a1aa8c0e81f47d8d1a790f2c2aa83777060f45683b8.
+
+Proposed local commit subject:
+
+    WIP rockchip: reach 3.4k renderer milestone
+
+Commit remains pending; no commit or push was made.

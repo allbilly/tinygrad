@@ -4,9 +4,9 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
-  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _lower_uop_program, _reuse_linear_scratch, decode_image, encode_image)
+  _lower_uop_program, _reuse_linear_scratch, _unroll_static_local, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 import tinygrad.renderer.rockchip as rockchip_renderer
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -61,6 +61,9 @@ def _dynamic_total_load_program(dtype=dtypes.int, count:int=4, source_count:int=
 def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -> bytes:
   """Execute the selector's raw gathers plus native INT16 mask/reduction subset."""
   args, scratch = [bytearray(output_bytes), *(bytearray(value) for value in inputs)], [bytearray(spec.size) for spec in image.scratch]
+  for slot in range(len(image.constants)//2):
+    lane = image.constants[slot*2:slot*2+2]
+    scratch[slot][:] = lane*(len(scratch[slot])//2)
   def buffer(kind:RKBufferKind, index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
   def apply_gathers(items) -> None:
     for gather in items:
@@ -655,6 +658,19 @@ def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   assert image.ew_ops[-1].ew_cfg == _EW_CFG[Ops.MAX]
 
 
+def test_generic_image_allows_many_small_ew_stages():
+  count = 1080
+  out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.int, (count,)), UOp.param(2, dtypes.int, (count,))
+  value = UOp.const(0.0, dtypes.half)
+  for index in range(count):
+    value = value + (lhs.index(index).load() < rhs.index(index).load()).where(
+      UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
+  uops = list(out.index(0).store(value).sink().toposort())
+  image = _lower_uop_program(uops)
+  assert image is not None and len(image.ew_ops) > _RKIMAGE_U16_MAX > _MAX_EW_ELEMS_FP16
+  assert decode_image(encode_image(image)) == image
+
+
 def test_fp32_add_mul_tree_uses_half_expansion_at_output_boundary():
   out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   lane = UOp.range(2, 0)
@@ -794,6 +810,78 @@ def test_static_local_accumulator_is_structurally_executed():
     output = out.index(row).store(local.load())
     image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 3
+
+
+def test_static_local_unroll_preserves_range_order_dependencies():
+  """Range AFTER edges remain semantic inputs to later static planning."""
+  out = UOp.param(0, dtypes.half, (2,))
+  dependency = UOp.range(4, 0, AxisType.WEAK)
+  lane = UOp.range(2, 1, AxisType.WEAK, src=(dependency,))
+  reduce_axis = UOp.range(3, 2, AxisType.REDUCE, src=(lane,))
+  local = UOp.placeholder((1,), dtypes.half, 0, addrspace=AddrSpace.REG)
+  initialize = local.index(0).store(0.0)
+  update = local.after(initialize, reduce_axis).index(0).store(local.index(0).load()+reduce_axis.cast(dtypes.half))
+  result = local.after(update.end(reduce_axis)).index(0).load()
+  root = result + lane.cast(dtypes.half)*UOp.const(0.0, dtypes.half)
+  uops = list(UOp.sink(initialize, update, out.index(lane).store(root)).toposort())
+  expanded = _unroll_static_local(uops, root)
+  assert dependency in expanded.toposort()
+  assert any(node.key == lane.key and len(node.src) > 1 and node.src[1].key == dependency.key
+             for node in expanded.toposort() if node.op is Ops.RANGE)
+
+
+def _indexed_local_bridge_program(source_dtype, op:Ops, *, groups:int=2, workers:int=1, local_size:int=2, reduce:int=2, carrier=dtypes.bool):
+  out, source = UOp.param(0, carrier, (groups,)), UOp.param(1, source_dtype, (groups*local_size*reduce,))
+  group, worker = UOp.special(groups, "gidx0", dtypes.int), UOp.special(workers, "lidx0", dtypes.int)
+  initial = (op is Ops.AND) if carrier is dtypes.bool else (-1 if op is Ops.AND else 0)
+  first = UOp.placeholder((1,), carrier, 0, addrspace=AddrSpace.REG)
+  first_init = first.index(0).store(initial)
+  first_axis = UOp.range(reduce, 0, AxisType.REDUCE)
+  first_ptr = first.after(first_init, first_axis).index(0)
+  loaded = source.index(group*(local_size*reduce)+worker*reduce+first_axis).load()
+  present = loaded != UOp.const(0.0, dtypes.half) if source_dtype is dtypes.half else loaded
+  if carrier is not dtypes.bool: present = present.cast(carrier)
+  def combine(lhs:UOp, rhs:UOp) -> UOp: return lhs & rhs if op is Ops.AND else lhs | rhs
+  first_update = first_ptr.store(combine(first_ptr.load(), present))
+  first_end = first_update.end(first_axis)
+  bridge = UOp.placeholder((local_size,), carrier, 0, addrspace=AddrSpace.LOCAL)
+  bridge_store = bridge.index(worker).store(first.after(first_end).index(0).load())
+  second = UOp.placeholder((1,), carrier, 1, addrspace=AddrSpace.REG)
+  second_init = second.index(0).store(initial)
+  second_axis = UOp.range(local_size, 1, AxisType.REDUCE, src=(first_end,))
+  second_ptr = second.after(second_init, second_axis).index(0)
+  second_update = second_ptr.store(combine(second_ptr.load(), bridge.after(bridge_store.barrier()).index(second_axis).load()))
+  result = second.after(second_update.end(second_axis)).index(0).load()
+  output = out.index(group).store(result)
+  return list(UOp.sink(first_init, first_update, bridge_store, second_init, second_update, output).toposort())
+
+def test_indexed_local_bridge_and_boolean_accumulators_are_physically_executed():
+  for source_dtype,op in ((dtypes.half, Ops.AND), (dtypes.half, Ops.OR), (dtypes.bool, Ops.AND), (dtypes.bool, Ops.OR)):
+    for local_size,workers in ((1, 1), (2, 1), (4, 3), (4, 4), (4, 0)):
+      image = _lower_uop_program(_indexed_local_bridge_program(source_dtype, op, workers=workers, local_size=local_size))
+      if workers == 0:
+        assert image is None
+        continue
+      assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+      values = []
+      for group in range(2):
+        for lane in range(local_size):
+          for _ in range(2):
+            values.append((lane >= workers) if op is Ops.OR and group == 0 else
+                          (lane < workers) if op is Ops.AND and group == 0 else
+                          (lane == 0) if op is Ops.OR else (lane != 0))
+      source = np.asarray(values, dtype=np.float16 if source_dtype is dtypes.half else np.uint8)
+      expected = bytes((1, 0)) if op is Ops.AND else bytes((0, 1))
+      assert _execute_raw_dynamic_image(image, 2, source.tobytes()) == expected
+      assert decode_image(encode_image(image)) == image
+
+    counterexample = _lower_uop_program(_indexed_local_bridge_program(source_dtype, Ops.OR, local_size=2, workers=1))
+    assert counterexample is not None
+    values = np.asarray((0, 0, 1, 1, 0, 0, 1, 1), dtype=np.float16 if source_dtype is dtypes.half else np.uint8)
+    assert _execute_raw_dynamic_image(counterexample, 2, values.tobytes()) == bytes((0, 0))
+
+  integer = _lower_uop_program(_indexed_local_bridge_program(dtypes.int, Ops.AND, carrier=dtypes.int))
+  assert integer is None
 
 
 def test_dependent_scalar_local_extrema_is_vectorized_from_uop_structure():
@@ -980,6 +1068,52 @@ def test_dynamic_candidate_selector_normalizes_negative_indices_exactly():
   assert image is not None and not image.host_gathers
   expected = np.asarray((source[8], source[0], source[4], 0), dtype="<u2")
   assert _execute_raw_dynamic_image(image, 8, source.tobytes(), indices.tobytes()) == expected.tobytes()
+
+
+def test_affine_gather_bounds_reject_negative_low_but_keep_offset_sentinel():
+  for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
+    for count in (1, 2):
+      invalid = RKGather(1, 0, count, base=-1, axes=((1, count, 1),), itemsize=dtype.itemsize)
+      try: rockchip_renderer._validate_gather_bounds(invalid, count)
+      except RuntimeError: pass
+      else: raise AssertionError(f"negative affine low admitted for {dtype} lane{count}")
+      rockchip_renderer._validate_gather_bounds(RKGather(1, 0, count, base=0, axes=((1, count, 1),), itemsize=dtype.itemsize), count)
+      rockchip_renderer._validate_gather_bounds(RKGather(1, 0, count, offsets=(-1,)+(0,)*(count-1)), 1)
+      try: rockchip_renderer._validate_gather_bounds(RKGather(1, 0, count, offsets=(-2, 0)[:count]), count)
+      except RuntimeError: pass
+      else: raise AssertionError(f"offset below sentinel admitted for {dtype} lane{count}")
+      if dtype is not dtypes.bool:
+        assert _lower_uop_program(_dynamic_load_program(count=count, dtype=dtype, normalized=True)) is not None
+
+
+def test_scalar_gather_bounds_reject_negative_low_for_all_typed_lanes():
+  for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
+    try: rockchip_renderer._validate_gather_bounds(RKGather(1, 0, 1, base=-1, itemsize=dtype.itemsize), 1)
+    except RuntimeError: pass
+    else: raise AssertionError(f"negative scalar low admitted for {dtype}")
+    rockchip_renderer._validate_gather_bounds(RKGather(1, 0, 1, itemsize=dtype.itemsize), 1)
+
+
+def test_gather_offsets_reject_true_gate_negative_and_allow_false_sentinel():
+  for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
+    out, source, lane = UOp.param(0, dtype, (4,)), UOp.param(1, dtype, (4,)), UOp.range(4, 0)
+    default = UOp.const(0.0, dtype) if dtype is dtypes.half else UOp.const(0, dtype)
+    counterexample = list(out.index(lane).store(source.index(lane-1).load(default, lane < 4)).end(lane).sink().toposort())
+    assert _lower_uop_program(counterexample) is None
+    for gate in (lane < 0, lane > 0):
+      valid = list(out.index(lane).store(source.index(lane-1).load(default, gate)).end(lane).sink().toposort())
+      image = _lower_uop_program(valid)
+      assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+
+
+def test_gather_offsets_normalize_inactive_raw_negative_to_fill():
+  for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
+    out, source, lane = UOp.param(0, dtype, (4,)), UOp.param(1, dtype, (4,)), UOp.range(4, 0)
+    default = UOp.const(0.0, dtype) if dtype is dtypes.half else UOp.const(0, dtype)
+    padded = list(out.index(lane).store(source.index(lane-31).load(default, lane < 0)).end(lane).sink().toposort())
+    image = _lower_uop_program(padded)
+    assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers
+    assert image.gathers and image.gathers[-1].offsets == (-1, -1, -1, -1)
 
 
 def test_dynamic_candidate_selector_composes_multiple_axes_and_external_gate():
