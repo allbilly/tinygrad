@@ -7045,3 +7045,47 @@ No CPU/GPU/CMAC path, host tensor numeric computation, fallback, or tolerance
 relaxation was used; tensor arithmetic remains on the DPU EW path. The exact
 3,200-line renderer milestone is complete and recorded locally; no push was
 made.
+
+---
+
+## 2026-08-19 — pending reboot checkpoint
+
+The shared checkout is at HEAD after WIP commit
+`a6e9f7c3bd64b52c63edaadd8e1ab0c661ffa5dd` (`WIP rockchip: preserve 3.195k
+renderer cuts`). The shared renderer is **3,195 executable lines** and host-
+verified; no new hardware census has been run for it.
+
+Offline composition records remain separate from the shared checkout:
+
+- The exact-3,128 isolated tree is
+  `/home/orangepi/tinygrad-compose-exact3133-to-3128-int32-shift-luna-max-20260818`.
+  Its INT32-shift cut was verified offline only; no NPU or hardware execution
+  was used.
+- The exact-3,124 composition is
+  `/home/orangepi/tinygrad-compose-shared3195-into-exact3128-luna-max-20260819`.
+  `sz.py` reports renderer/runtime **3,124/470**. Recorded host gates are
+  `test/unit/test_rockchip_uops.py` **111 passed** with `-n12`, repository Ruff
+  passed, `mypy tinygrad/` passed for **216 files**, `py_compile` passed,
+  `git diff --check` passed, and backend collection gathered exactly **445**
+  cases. No hardware gate was run for this composition.
+- `/home/orangepi/rk-artifacts-current/audit-next28-exact3128-luna-max-20260819.report.md`
+  identifies a projected exact-3,100 chain (`3128 -> 3117 -> 3105 -> 3100`).
+  That exact-3,100 chain is not implemented, judged, or hardware-tested.
+- The rejected micro experiment report is
+  `/home/orangepi/tinygrad-micro-cleanup-exact3213-luna-max-20260818/host-scatter-cleanup-exact3213-rejected-20260818.report.md`;
+  it retained no patch.
+
+The prior exact-3,200 result remains the last complete 445-case hardware
+census: **433 passed, 12 skipped, 154 subtests passed, 0 failed**, recorded in
+`/home/orangepi/rk-artifacts-current/full445-repaired-exact3200-post-reboot-20260818.log`.
+
+Current health blocker: `simple_add.py` passed once after reboot then failed
+on 4MiB CMA fallback `ENXIO`; dmesg proves built-in RKNPU0.9.8 missing
+`num_pages` + refcount underflow. **Do not retry.** The durable driver patch is
+`/home/orangepi/rknpu-driver-fix-20260818/rknpu-0.9.8-fallback-mmap-fix.patch`.
+Pending next action is patched-kernel install/reboot. The elementwise
+`NON_CONTIGUOUS` experiment was reverted; `simple_add.py` remains the health
+gate.
+
+This is a pending-reboot checkpoint: no new tests, hardware retries, or push
+were performed.
