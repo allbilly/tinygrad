@@ -309,6 +309,16 @@ def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
   assert decode_image(encode_image(image)) == image
 
 
+def test_zero_count_raw_fp16_bitcast_uses_empty_generic_image():
+  lhs, rhs = UOp.param(1, dtypes.half, (0,)), UOp.param(2, dtypes.half, (0,))
+  def packed(i):
+    low = lhs.index(i).load().bitcast(dtypes.ushort).cast(dtypes.uint)
+    high = rhs.index(i).load().bitcast(dtypes.ushort).cast(dtypes.uint).alu(Ops.SHL, UOp.const(16, dtypes.int))
+    return (low + high).bitcast(dtypes.int)
+  image = _lower_uop_program(_program(dtypes.int, packed, count=0))
+  assert image is not None and not image.gathers and not image.ew_ops and len(encode_image(image)) == 40
+
+
 def test_generic_bool_where_uses_canonical_int16_ternary():
   lhs, rhs = UOp.param(1, dtypes.int, (4,)), UOp.param(2, dtypes.int, (4,))
   def select(i):
