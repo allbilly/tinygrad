@@ -7001,3 +7001,54 @@ No test or tolerance was weakened, and no CPU/GPU/CMAC path, host tensor
 numeric computation, or fallback was added. No runtime/core change was made;
 all tensor arithmetic remains on the DPU EW path. Commit remains pending; no
 push was made.
+
+---
+
+## 2026-08-18 — NON-MILESTONE local WIP checkpoint: exact 3,200-line renderer, hardware pending
+
+This is an honest local checkpoint, not a hardware milestone. The worktree
+starts at committed exact-3,299 HEAD `3814d0439d473e367e5b541b2361a97f2cf2cc21`.
+The repaired working renderer is SHA-256
+`fd730545a7b11ee52e880f7b81d4e4e0bd06b893dd0ec59888379405bbd850ba`, and
+`sz.py` reports **3,200 executable renderer lines** (runtime remains **470**).
+The tracked checkpoint changes are the renderer and this progress entry. The
+unrelated untracked `raw-cast-unification-3272-luna-max-20260818.reject.md`
+remains untouched and is excluded from the local commit.
+
+Existing offline/host evidence carried into this checkpoint is: focused
+`test/unit/test_rockchip_uops.py -q -n12` **111 passed**, repository Ruff
+passed, `mypy tinygrad/` passed for **216 source files**, `git diff --check`
+passed, and the backend collection command collected **445** cases. These
+host gates are recorded evidence; no host test rerun is part of this pending
+hardware checkpoint.
+
+The initial physical census is recorded only by
+`/home/orangepi/rk-artifacts-current/full445-exact3200-20260818.log`. It
+reported **424 passed, 12 skipped, 9 failed, and 154 subtests passed** across
+445 collected cases. The nine failures fall into these categories:
+
+- MaxUnpool2D: `test_max_unpool2d`;
+- scatter: `test_scatter_add` and `test_scatter_reduce`;
+- cumulative log-sum-exp: `test_logcumsumexp` and
+  `test_logcumsumexp_numerical`;
+- transcendental: `test_tan`;
+- reductions: `test_sum_dtype_arg`, `test_sum_full`, and `test_sum_relu`.
+
+The forward repair restored the exact-3,299 offline images for all nine
+affected cases and applied the final candidate-B four-line inlines. Hardware
+was **not rerun** after that repair, so this entry does not claim that the
+3,200-line renderer passes or that all 445 cases pass.
+
+NPU health is currently blocked after the probes: the vendor fallback GEM
+path leaves `num_pages == 0`, causing the observed `ENXIO`. The read-only
+forensic explanation is `/home/orangepi/npu-forensic-explanation-20260818.md`.
+A reboot is required before a trustworthy physical rerun; no reboot or
+hardware rerun was performed for this checkpoint.
+
+Isolated future work is recorded separately and is not staged: the verified
+exact-3,200 -> 3,184 patch has recorded SHA prefix `43ae...` (no hardware
+evidence), while the possible 3,184 -> 3,173 composition has no completed
+artifact here and remains pending-only. Neither item is a milestone claim or
+part of this commit.
+
+Commit remains a local WIP checkpoint; no push was made.
