@@ -466,15 +466,14 @@ def _loop_reduction_match(output:RKOutput) -> RKLoopReduction|None:
   return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale)
 
 @functools.lru_cache(maxsize=8)
-def _static_vector_env(out_index:UOp, count:int) -> tuple[tuple[UOp, ...], dict[UOp, np.ndarray], np.ndarray]:
+def _static_vector_env(out_index:UOp, count:int, *expressions:UOp, reject:str="static_index") -> tuple[dict[UOp, np.ndarray], np.ndarray]:
   ranges = tuple(_index_ranges(out_index)); envs = _iter_range_env(list(ranges))
   vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
-  dst_lanes = np.broadcast_to(_eval_vector(out_index, vector_env, {}), len(envs)).astype(np.int64)
-  return ranges, vector_env, dst_lanes
+  if any(r not in ranges for expression in expressions for r in _index_ranges(expression)): raise RuntimeError(f"RKPLAN_REJECT:{reject}")
+  return vector_env, np.broadcast_to(_eval_vector(out_index, vector_env, {}), len(envs)).astype(np.int64)
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
-  ranges, vector_env, dst_lanes = _static_vector_env(out_index, count)
-  if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
+  vector_env, dst_lanes = _static_vector_env(out_index, count, expr)
   expr_lanes = np.broadcast_to(_eval_vector(expr, vector_env, {}), len(dst_lanes))
   encoded:np.ndarray
   if encode is _fp16_bits:
@@ -515,9 +514,7 @@ def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, i
   return lhs[0]+sign*rhs[0], terms
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
-  ranges, vector_env, dst = _static_vector_env(out_index, count)
-  if any(r not in ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
-    raise RuntimeError("RKPLAN_REJECT:gather_index")
+  vector_env, dst = _static_vector_env(out_index, count, load_index, *((gate,) if gate is not None else ()), reject="gather_index")
   cache:dict[UOp, np.ndarray] = {}; src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(dst)).astype(np.int64)
   active = np.ones(len(dst), dtype=np.bool_) if gate is None else np.broadcast_to(_eval_vector(gate, vector_env, cache), len(dst))
   if np.any((src < 0) & active): raise RuntimeError("RKPLAN_REJECT:gather_index")
@@ -904,7 +901,7 @@ def _lower_vectorized_unrolled_add_reduction(output:RKOutput, uops:list[UOp]) ->
   if len(terms) < 2 or count*len(terms) > _MAX_STATIC_RANGE_ENVS: return None
   mapped_math = any(u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) for u in terms[0].toposort())
   if count > 1 and not mapped_math: return None
-  try: out_ranges, vector_env, out_lanes = _static_vector_env(out_index, count)
+  try: vector_env, out_lanes = _static_vector_env(out_index, count)
   except RuntimeError: return None
   if len(out_lanes) != count or tuple(out_lanes) != tuple(range(count)): return None
   def input_leaf(u:UOp) -> tuple[UOp, UOp]|None:
@@ -3378,14 +3375,12 @@ def _dpu_sqrt(source:UOp) -> UOp|None:
   """Approximate FP16 sqrt with range-independent Babylonian iterations on DPU EW."""
   if any(_local_load(u) is not None for u in source.toposort()): return None
   source, zero, one, _ = _dpu_math_base(source)
-  negative = UOp(Ops.MAX, dtypes.half, src=((difference:=zero.alu(Ops.SUB, source)), difference), arg=_NATIVE_POSITIVE_MASK)
   finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)
   safe = finite.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))
   estimate = safe.alu(Ops.MAX, one)
   for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
-  valid = one.alu(Ops.SUB, negative)
-  invalid_factor = valid.alu(Ops.FDIV, valid)
-  return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, invalid_factor.alu(Ops.SUB, one))
+  valid = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, source)))
+  return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one))
 
 def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float, ...], half_period:float) -> tuple[UOp, UOp, UOp]:
   """Reduce a finite FP16 angle with split constants so large products do not erase the residual."""
