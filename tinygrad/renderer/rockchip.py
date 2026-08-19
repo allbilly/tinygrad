@@ -784,6 +784,7 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
                        dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
   destination = RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, arena_slot+1)
   def temporary(index:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, value_slot, index*stride)
+  value_count = 4 if kahan else 2 if 2 <= len(active) <= compensated_limit else 1
   reduced = _kahan_add(ops, active, rows, arena, temporary, destination, op_barriers=op_barriers) if kahan else \
     _compensated_add(ops, active, rows, arena, temporary, destination, op_barriers=op_barriers) if 2 <= len(active) <= compensated_limit else \
     _reduce_arena(ops, active, rows, _EW_CFG[Ops.ADD], arena, destination, op_barriers=op_barriers)
@@ -791,7 +792,8 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
     ops.extend(_ew_ops(((RKArg(RKBufferKind.ARG, out_slot), reduced, RKArg(RKBufferKind.SCRATCH, 0), Ops.MUL),), rows,
       op_barriers, op_barriers))
   if stateful and len(mapped.ew_ops) < len(ops): ops[len(mapped.ew_ops)] = replace(ops[len(mapped.ew_ops)], stateful=True)
-  scratch = (RKScratch(_scratch_bytes(lanes)), *mapped.scratch, RKScratch(_scratch_bytes(lanes)), RKScratch(groups*stride))
+  scratch = (RKScratch(_scratch_bytes(lanes)), *mapped.scratch,
+             RKScratch(max(_scratch_bytes(lanes), value_count*stride)), RKScratch(groups*stride))
   if post_scale != 1.0: scratch += (RKScratch(_scratch_bytes(rows)),)
   mid = mapped.mid_gathers+tuple(replace(gather, after=len(mapped.ew_ops)) for gather in mid)
   result:RKImage|None = replace(mapped, scratch=scratch, constants=struct.pack("<e", post_scale)+mapped.constants, ew_ops=tuple(ops), mid_gathers=mid,
@@ -1343,16 +1345,16 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   _, source_vector_lanes, _ = _stripe_layout(1, source_count)
   source_rows = tuple((lane,) for lane in range(source_count))
   if not source_rows or any(len(row) != 1 for row in source_rows): return None
-  matrix_lanes = len(source_rows)*source_vector_lanes
-  one = builder.scratch(matrix_lanes*2)
-  byte_masks = tuple(builder.scratch(matrix_lanes*2) for _ in range(dtype.itemsize))
-  builder.gathers.append(RKGather(source.arg.slot, one.index, matrix_lanes, values=(1,)*matrix_lanes, itemsize=2))
+  source_matrix_lanes = len(source_rows)*source_vector_lanes
+  one = builder.scratch(source_matrix_lanes*2)
+  byte_masks = tuple(builder.scratch(source_matrix_lanes*2) for _ in range(dtype.itemsize))
+  builder.gathers.append(RKGather(source.arg.slot, one.index, source_matrix_lanes, values=(1,)*source_matrix_lanes, itemsize=2))
   for byte,value in enumerate(byte_masks):
     builder.gathers.extend(RKGather(source.arg.slot, value.index, 1,
       offsets=tuple(offset*dtype.itemsize+byte if offset >= 0 else -1 for offset in row), dst_addend=i*source_vector_lanes*2,
       dst_stride=2, itemsize=1) for i,row in enumerate(source_rows))
-  for value in byte_masks: builder.i16(value, one, matrix_lanes, _EW_CFG_MIN, value)
-  source_mask = _reduce_byte_masks(builder, byte_masks, matrix_lanes, _EW_CFG[Ops.MAX], in_place=True)
+  for value in byte_masks: builder.i16(value, one, source_matrix_lanes, _EW_CFG_MIN, value)
+  source_mask = _reduce_byte_masks(builder, byte_masks, source_matrix_lanes, _EW_CFG[Ops.MAX], in_place=True)
   total = _reduce_rows(builder.ops, [replace(source_mask, addend=source_mask.addend+row*64) for row in range(source_count)],
                        1, _EW_CFG[Ops.ADD], int16=True)
   if rank != 1:

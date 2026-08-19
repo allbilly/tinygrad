@@ -1,12 +1,15 @@
-import itertools, math, struct
+import hashlib, itertools, math, struct
 import numpy as np
 from collections.abc import Callable
 from types import SimpleNamespace
+from tinygrad import Tensor
+from tinygrad.codegen import to_program
 from tinygrad.dtype import AddrSpace, dtypes
+from tinygrad.helpers import Target, round_up
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
-  _lower_uop_program, _reuse_linear_scratch, _unroll_static_local, decode_image, encode_image)
+  _lower_uop_program, _reuse_linear_scratch, _unroll_static_local, RockchipRenderer, decode_image, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 import tinygrad.renderer.rockchip as rockchip_renderer
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -160,12 +163,84 @@ def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
     view(op.dst, destination_dtype, op.count)[:] = result.astype(destination_dtype)
   apply_gathers(image.gathers)
   mid:dict[int, list[RKGather]] = {}
-  for gather in image.mid_gathers: mid.setdefault(gather.after, []).append(gather)
+  for gather in image.mid_gathers: mid.setdefault(gather.after if gather.after >= 0 else image.gather_after, []).append(gather)
   for index in range(len(image.ew_ops)+1):
     apply_gathers(tuple(mid.get(index, ())))
     if index < len(image.ew_ops): execute(image.ew_ops[index])
   apply_gathers(image.post_gathers)
   return np.frombuffer(args[0], dtype="<i4").copy()
+
+def _assert_scratch_extent(image:RKImage, arg:RKArg, need:int) -> None:
+  if arg.kind is RKBufferKind.SCRATCH:
+    assert 0 <= arg.index < len(image.scratch)
+    assert arg.addend >= 0 and need <= image.scratch[arg.index].size
+
+def _assert_decoded_image_bounds(image:RKImage) -> RKImage:
+  decoded = decode_image(encode_image(image))
+  def gather_indices(gather:RKGather) -> tuple[int, ...]:
+    if gather.offsets: return tuple(index for index in gather.offsets if index >= 0)
+    return tuple(gather.base+sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
+  for gather in (*decoded.gathers, *decoded.mid_gathers, *decoded.post_gathers):
+    if gather.count <= 0: continue
+    _assert_scratch_extent(decoded, RKArg(gather.dst_kind, gather.dst_index),
+      (gather.dst_addend+(gather.count-1)*gather.dst_stride+1)*gather.itemsize)
+    if not gather.values:
+      indices = gather_indices(gather)
+      if indices: _assert_scratch_extent(decoded, RKArg(gather.src_kind, gather.src_index), (max(indices)+1)*gather.itemsize)
+  for op in decoded.ew_ops:
+    source_width = 4 if op.int32_input or op.ew_cfg & _EW_STAGE_FP32_IN else 2
+    destination_width = (1 if op.bool_output else 4) if op.int32_output else 4 if op.ew_cfg & _EW_STAGE_FP32_OUT else 2
+    _assert_scratch_extent(decoded, op.lhs, op.lhs.addend+op.count*source_width)
+    _assert_scratch_extent(decoded, op.rhs, op.rhs.addend+op.count*source_width)
+    _assert_scratch_extent(decoded, op.dst, op.dst.addend+op.count*destination_width)
+  return decoded
+
+def _execute_fp16_reduction_tail(image:RKImage, values:np.ndarray) -> np.ndarray:
+  args = [np.zeros(max(64, image.ew_ops[-1].count), dtype=np.float16)]
+  scratch = [bytearray(spec.size) for spec in image.scratch]
+  for slot in range(len(image.constants)//2): scratch[slot][:] = image.constants[slot*2:slot*2+2]*(len(scratch[slot])//2)
+  source = np.frombuffer(scratch[image.mid_gathers[0].src_index], dtype="<f2")
+  source[:len(values)] = values
+  def buffer(arg:RKArg) -> np.ndarray: return args[arg.index] if arg.kind is RKBufferKind.ARG else np.frombuffer(scratch[arg.index], dtype="<f2")
+  def read(arg:RKArg, count:int) -> np.ndarray: return buffer(arg)[arg.addend//2:arg.addend//2+count].copy()
+  def write(arg:RKArg, value:np.ndarray) -> None: buffer(arg)[arg.addend//2:arg.addend//2+len(value)] = value.astype(np.float16)
+  def apply_gather(gather:RKGather) -> None:
+    src, dst, lanes = buffer(RKArg(gather.src_kind, gather.src_index)), buffer(RKArg(gather.dst_kind, gather.dst_index)), np.arange(gather.count)
+    indices = np.asarray(gather.offsets) if gather.offsets else np.asarray(
+      [gather.base+sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes) for lane in lanes])
+    destination = gather.dst_addend+lanes*gather.dst_stride
+    if gather.offsets and gather.partial:
+      valid = indices >= 0
+      dst[destination[valid]] = src[indices[valid]]
+    else: dst[destination] = gather.values or src[indices]
+  def execute(op:RKEWOp) -> None:
+    lhs, rhs = read(op.lhs, op.count), read(op.rhs, op.count)
+    value = (lhs+rhs if op.ew_cfg == _EW_CFG[Ops.ADD] else lhs-rhs if op.ew_cfg == _EW_CFG[Ops.SUB] else
+             lhs*rhs if op.ew_cfg == _EW_CFG[Ops.MUL] else np.maximum(lhs, rhs) if op.ew_cfg == _EW_CFG[Ops.MAX] else
+             lhs/rhs if op.ew_cfg == _EW_CFG[Ops.FDIV] else np.floor(lhs) if op.ew_cfg == _EW_CFG_FLOOR else
+             np.minimum(lhs, rhs) if op.ew_cfg == _EW_CFG_MIN else np.abs(lhs) if op.ew_cfg == _EW_CFG_ABS else None)
+    assert value is not None, hex(op.ew_cfg)
+    write(op.dst, value)
+  for gather in image.mid_gathers:
+    if (gather.after if gather.after >= 0 else image.gather_after) == image.gather_after: apply_gather(gather)
+  for op in image.ew_ops[image.gather_after:]: execute(op)
+  return args[0]
+
+def test_mapped_reduction_temp_slices_are_full_aligned_abi_tiles():
+  expected_sizes = {(1, 1):64, (1, 2):128, (1, 4):256, (33, 1):132, (33, 2):256, (33, 4):512}
+  for rows in (1, 33):
+    for value_count, groups, kwargs in ((1, 2, {"compensated_limit": 1}), (2, 2, {}), (4, 4, {"kahan": True})):
+      mapped = RKImage(RKTarget.RK3588, ew_ops=(RKEWOp(RKArg(RKBufferKind.ARG, 0), RKArg(RKBufferKind.ARG, 1),
+        RKArg(RKBufferKind.ARG, 2), rows, _EW_CFG[Ops.ADD]),))
+      image = rockchip_renderer._finish_mapped_add_reduction(mapped, 0, rows, groups, 1.0, **kwargs)
+      assert image is not None
+      image = _assert_decoded_image_bounds(image)
+      stride = round_up(rows*2, 64)
+      value_slot = len(mapped.scratch)+1
+      assert image.scratch[value_slot].size == expected_sizes[(rows, value_count)] == max(rows*groups*2, 64, value_count*stride)
+      values = (np.arange(rows*groups, dtype=np.float16).reshape(groups, rows) % 7 - 3).astype(np.float16)
+      np.testing.assert_array_equal(_execute_fp16_reduction_tail(image, values.reshape(-1))[:rows],
+                                    np.sum(values, axis=0, dtype=np.float16))
 
 def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
   rng = np.random.default_rng(0x3588)
@@ -623,8 +698,16 @@ def test_unrolled_math_reduction_vectorizes_periodic_indices():
   for term in terms[1:]: value = value + term
   image = _lower_uop_program(list(out.index(0).store(value).sink().toposort()))
   assert image is not None and image.mid_gathers
+  image = _assert_decoded_image_bounds(image)
+  assert hashlib.sha256(encode_image(image)).hexdigest() == "71bdd9880b8442100cf2a7f5a03302d37583d6f0257752ffd34efcad9cb9d723"
+  assert image.scratch[image.mid_gathers[0].src_index].size == 128
   assert any(gather.src_index == 3 and gather.offsets == (0, 1, 0, 1, 0, 1, 0, 1) for gather in image.gathers)
   assert len(image.ew_ops) < 300
+  lhs_values = np.asarray((0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 0.25), dtype=np.float16)
+  rhs_values = np.asarray((1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0), dtype=np.float16)
+  weights = np.asarray((1.0, 0.5), dtype=np.float16)
+  values = (np.exp2(lhs_values)*rhs_values*np.resize(weights, 8)).astype(np.float16)
+  np.testing.assert_array_equal(_execute_fp16_reduction_tail(image, values)[:1], np.asarray([np.sum(values, dtype=np.float16)]))
 
 
 def test_batched_unrolled_math_reduction_materializes_each_uop_result():
@@ -636,7 +719,14 @@ def test_batched_unrolled_math_reduction_materializes_each_uop_result():
   for term in terms[1:]: value = value + term
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and len(image.mid_gathers) == groups
+  image = _assert_decoded_image_bounds(image)
+  assert hashlib.sha256(encode_image(image)).hexdigest() == "f1f4e475f80e2e699b78a55611aad3d3488b8b5d69179d346b24703a983169d7"
+  assert image.scratch[image.mid_gathers[0].src_index].size == 128
   assert image.gather_after > 1 and image.ew_ops[image.gather_after].dst.kind is RKBufferKind.SCRATCH
+  source_values = np.linspace(-1.0, 1.0, rows*groups, dtype=np.float16).reshape(rows, groups)
+  normalizer = np.linspace(-0.1, 0.2, rows, dtype=np.float16)
+  values = np.exp2((source_values-normalizer[:, None]).astype(np.float16)).astype(np.float16)
+  np.testing.assert_array_equal(_execute_fp16_reduction_tail(image, values.T.reshape(-1))[:rows], np.sum(values, axis=1, dtype=np.float16))
 
 
 def test_static_reduce_uops_are_structurally_executed():
@@ -1035,6 +1125,37 @@ def test_fp16_predicate_prefix_executes_generic_uops():
   image = _lower_uop_program(_program(dtypes.int, prefix))
   assert image is not None and image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
   assert any(op.int32_output for op in image.ew_ops) and decode_image(encode_image(image)) == image
+
+
+def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds():
+  source = Tensor([[1, 0], [0, 2]], device="ROCKCHIP")
+  result = source.nonzero(size=2)
+  linear, var_vals = result.linear_with_vars()
+  assert not var_vals
+  renderer = RockchipRenderer(Target.parse("ROCKCHIP"))
+  images = [decode_image(to_program(call.src[0], renderer).src[-1].arg) for call in linear.src if call.src[0].op is Ops.SINK]
+  assert len(images) == 4
+  for image in images:
+    assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+    assert decode_image(encode_image(image)) == image
+    for gather in (*image.gathers, *image.mid_gathers, *image.post_gathers):
+      if gather.dst_kind is RKBufferKind.SCRATCH:
+        assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst_index].size//gather.itemsize
+
+  coordinate = images[-1]
+  coordinate_rows = [g for g in coordinate.gathers if g.dst_kind is RKBufferKind.SCRATCH and g.itemsize == 2 and
+                    g.count == result.numel() and len(g.values) == result.numel()]
+  row_slots = {g.dst_index for g in coordinate_rows}
+  assert len(coordinate_rows) == 10 and len(row_slots) == 3
+  matrix_slot = next(slot for slot in row_slots if sum(g.dst_index == slot for g in coordinate_rows) == 8)
+  matrix_rows = [g for g in coordinate_rows if g.dst_index == matrix_slot]
+  assert coordinate.scratch[matrix_slot].size == 512
+  assert tuple(g.dst_addend for g in matrix_rows) == tuple(range(0, 256, 32))
+  assert tuple(g.values for g in matrix_rows) == ((0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (1, 1, 1, 1),
+                                                  (1, 1, 1, 1), (0, 0, 0, 0), (1, 1, 1, 1), (1, 1, 1, 1))
+  np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
+                                                       np.asarray([0, 1, 6, 7], dtype=np.int32)),
+                                np.asarray([0, 0, 1, 1], dtype=np.int32))
 
 
 def test_normalized_int_prefix_executes_generic_int32_uops():
