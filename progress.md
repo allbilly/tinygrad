@@ -7191,3 +7191,54 @@ The progress checkpoint is saved in commit subject
     WIP rockchip: save 2.998k candidate before reboot
 
 The pre-existing untracked reject note remains untracked; no push was made.
+
+---
+
+## 2026-08-19 — exact 2,998 renderer experiment rejected
+
+The exact-2,998 candidate from WIP code commit `e16b4ac18` and saved in
+checkpoint commit `7c5836e3c` was run through the authoritative full backend
+census. The run reported **427 passed, 12 skipped, 6 failed, and 154 subtests**
+across 445 collected cases, with pytest exit code **1**. The canonical log is
+`/home/orangepi/rk-artifacts-exact2998-final-20260819/final_hardware_gate.log`.
+The six failed IDs were:
+
+- `test/backend/test_rockchip.py::TestRockchipDotOps::test_broadcastdot`
+- `test/backend/test_rockchip.py::TestRockchipDotOps::test_dot`
+- `test/backend/test_rockchip.py::TestRockchipDotOps::test_dot_1d`
+- `test/backend/test_rockchip.py::TestRockchipDotOps::test_multidot`
+- `test/backend/test_rockchip.py::TestRockchipReductionOps::test_sum_dtype_arg`
+- `test/backend/test_rockchip.py::TestRockchipReductionOps::test_sum_full`
+
+The exact six-graph host-only differential proves these are not a
+zero-acceptance case. Their pre-render schedules and AST/call UOps are equal,
+while the base's exact old routes accept the graphs: `_loop_reduction_match` accepts
+all six; `_lower_dot_loop_reduction` accepts the four dot graphs
+(`broadcastdot`, `dot`, `dot_1d`, `multidot`); and
+`_lower_scalar_loop_reduction` accepts the two reduction graphs
+(`sum_dtype_arg`, `sum_full`). The serialized images materially change from
+the old loop-reduction form to the generic mapped-add form (for example,
+`broadcastdot` changes from 168,490 bytes / 4,011 EW ops to 5,769 bytes / 66
+EW ops), despite the earlier broad 1,499-return corpus being byte-identical.
+The route acceptance counts are `1/1` for `_loop_reduction_match` on every
+graph, `1/1` for the dot lowerer on the four dot graphs and `0/1` on the two
+reduction graphs, and `1/1` for the scalar lowerer on the two reduction graphs.
+See the [six-failure host-only differential report](/home/orangepi/rk-artifacts-exact2998-final-20260819/six-failure-host-diff-20260819.md),
+the [exact-2,998 integration report](/home/orangepi/rk-artifacts-exact2998-final-20260819/exact2998-deadroute-loop-reduction-removal-20260819.report.md),
+and the [full hardware log](/home/orangepi/rk-artifacts-exact2998-final-20260819/final_hardware_gate.log).
+
+The 2,998 candidate is **rejected** and the 3,000-line renderer milestone is
+**NOT achieved**. Forward restore commit `9c2799c1b` (`rockchip: restore
+precision reduction routes`) is current. The renderer is back at exact
+**3,099/470** executable lines with SHA-256
+`fa07e25891d1c0ade44bbc802a2be1776ca696e9c8ca7a93e39e6bf3342be349`, matching
+the previously hardware-verified 3.1k source.
+
+OpenNPU audit conclusion: **no line-negative transplant**. OpenNPU was used
+only as an external reference; no OpenNPU code was transplanted into this
+renderer. The retained [OpenNPU architecture report](/home/orangepi/opennpu-rk3588-audit-Qqy5uQ/repo/docs/ARCHITECTURE.md),
+[operator-lowering report](/home/orangepi/opennpu-rk3588-audit-Qqy5uQ/repo/docs/OP_LOWERING.md),
+and [register-command reference](/home/orangepi/opennpu-rk3588-audit-Qqy5uQ/repo/docs/NPU_REGCMD_REFERENCE.md)
+are reference links only; they provide no line-negative transplant.
+
+No further hardware retry or push was performed.

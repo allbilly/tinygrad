@@ -8,4 +8,4 @@
 - Run `python -m ruff check .` to lint
 - Read `./tinygrad/viz/README.md` for profiling and debugging rewrite rules
 - Run Rockchip hardware census tests with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`
-- Use `.venv/bin/python ~/rk3588/examples/simple_add.py` as the authoritative Rockchip NPU health gate; do not use `elementwise.py` as the health gate
+- Use `.venv/bin/python ~/rk3588/examples/simple_add.py` as the authoritative Rockchip NPU health gate; do not run `elementwise.py` as a health check
