@@ -434,6 +434,33 @@ def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, 
     envs = [{**env, r: i} for env in envs for i in range(bound)]
   return envs
 
+@dataclass(frozen=True)
+class RKLoopReduction:
+  store:UOp; out:UOp; nodes:list[UOp]; rows:int; envs:list[dict[UOp, int]]; reduce_range:UOp; groups:int; update:UOp; post_scale:float
+
+def _loop_reduction_match(output:RKOutput) -> RKLoopReduction|None:
+  """Parse the output, accumulator update, shape, and optional final scale of a loop reduction."""
+  store, out, _, _, root = output
+  nodes = list(root.toposort())
+  rows = int(out.src[0].arg)
+  out_ranges = _index_ranges(store.src[0].src[1])
+  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
+  if rows <= 0 or len(reduce_ranges) != 1: return None
+  reduce_range = reduce_ranges[0]
+  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
+  try: envs = _iter_range_env(out_ranges)
+  except RuntimeError: return None
+  if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
+  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
+  if len(updates) != 1: return None
+  if root.op is Ops.MAX:
+    unclamped, epsilon = next(((value, const) for value,const in (root.src, root.src[::-1]) if const.op is Ops.CONST), (None, None))
+    if unclamped is None or epsilon is None or _fp16_bits(float(epsilon.arg)) != 0: return None
+    root = unclamped
+  if (post:=_reduction_post_parts(root, out.dtype, strict=True)) is None: return None
+  post_scale = post[0]
+  return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale)
+
 @functools.lru_cache(maxsize=8)
 def _static_vector_env(out_index:UOp, count:int, *expressions:UOp, reject:str="static_index") -> tuple[dict[UOp, np.ndarray], np.ndarray]:
   ranges = tuple(_index_ranges(out_index)); envs = _iter_range_env(list(ranges))
@@ -629,6 +656,11 @@ def _reduction_store(store:UOp, out:UOp, index:UOp, lanes:int, value:UOp) -> tup
   fake_index = store.src[0].replace(src=(out.replace(src=(out.src[0].const_like(lanes),)), index))
   return fake_index, store.replace(src=(fake_index, value, *store.src[2:]))
 
+def _loop_reduction_load(u:UOp, out_slot:int|None=None) -> tuple[UOp, UOp]|None:
+  if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.half or not u.src or u.src[0].op is not Ops.INDEX: return None
+  return (u, param) if (param:=_root_param(u.src[0])) is not None and param.src and param.src[0].op is Ops.CONST and \
+    (out_slot is None or param.arg.slot != out_slot) else None
+
 def _reduction_post_parts(value:UOp, output_dtype:DType, *, strict:bool=False) -> tuple[float, UOp|None, UOp|None]|None:
   local_refs = [u for u in value.toposort() if _local_load(u) is not None]
   if strict and (value.op is Ops.SQRT and len(value.src) == 1 or
@@ -660,6 +692,81 @@ def _lower_composed_uops(uops:list[UOp], *, recipes_ready:bool=False) -> RKImage
 
 def _lower_mapped_uops(store:UOp) -> RKImage|None:
   return _lower_uop_program(list(UOp(Ops.SINK, src=(store,)).toposort()), vectorize_reductions=False, recipes_ready=True)
+
+def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
+  """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
+  if loop.out.dtype.scalar() is not dtypes.half or loop.post_scale != 1.0: return None
+  store, update, reduce_range, groups = loop.store, loop.update, loop.reduce_range, loop.groups
+  if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None: return None
+  product = _strip_cast(update.src[1 if update.src[0] is acc else 0])
+  if product.op is not Ops.MUL or product.arg is not None or product.dtype.scalar() is not dtypes.half: return None
+  if any(_loop_reduction_load(operand) is None for operand in product.src): return None
+  terms = [product.substitute({reduce_range:reduce_range.const_like(r)}) for r in range(groups)]
+  if groups >= _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS:
+    try: return _lower_composed_uops([store.replace(src=(store.src[0], _precise_mul_sum(terms), *store.src[2:]))])
+    except RuntimeError: pass
+  summed = terms[0]
+  for term in terms[1:]: summed = summed.alu(Ops.ADD, term)
+  precise_uops = list(UOp(Ops.SINK, src=(store.replace(src=(store.src[0], summed, *store.src[2:])),)).toposort())
+  if (precise:=_try(_output_store(precise_uops, dtypes.half), dtypes.half,
+                    _lower_vectorized_mul_add_reduction, precise_uops)) is not None: return precise
+  # Materialize bounded dot domains so the arena reduction preserves a real balanced tree instead of a rewritten ADD chain.
+  lanes, out_index = loop.rows*groups, store.src[0].src[1]
+  if lanes <= _MAX_EW_ELEMS_FP16*(round_up(2, 64)//2):
+    linear_index = reduce_range.alu(Ops.MUL, reduce_range.const_like(loop.rows)).alu(Ops.ADD, out_index)
+    _, fake_store = _reduction_store(store, loop.out, linear_index, lanes, product)
+    try: mapped = _lower_composed_uops(list(UOp(Ops.SINK, src=(fake_store,)).toposort()), recipes_ready=True)
+    except RuntimeError: mapped = None
+    if mapped is not None and (finished:=_finish_mapped_add_reduction(mapped, loop.out.arg.slot, loop.rows, groups, 1.0)) is not None:
+      return finished
+  while len(terms) > 1:
+    terms = [terms[i].alu(Ops.ADD, terms[i+1]) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
+  return _lower_composed_uops([store.replace(src=(store.src[0], terms[0], *store.src[2:]))])
+
+def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
+  """Turn a compact scalar register reduction into balanced FP16 DPU EW stages."""
+  out_param, nodes = loop.out, loop.nodes
+  rows, envs, reduce_range, groups, update, post_scale = loop.rows, loop.envs, loop.reduce_range, loop.groups, loop.update, loop.post_scale
+  fp32_out = out_param.dtype.scalar() is dtypes.float
+  loads = [parsed for u in nodes if (parsed:=_loop_reduction_load(u, out_param.arg.slot)) is not None]
+  if not loads or len({param.key for _,param in loads}) != 1: return None
+  in_param = loads[0][1]
+  update_nodes = update.toposort()
+  reduce_ops = {u.op for u in update_nodes if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}
+  negate_inputs = reduce_ops == {Ops.MUL, Ops.MAX} and any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.half and
+                                                            float(u.arg) == -1.0 for u in update_nodes)
+  accumulator = next((x for x in update.src if _local_load(x) is not None), None)
+  term = next((x for x in update.src if x is not accumulator), None)
+  if not negate_inputs and (term is None or _strip_cast(term).op is not Ops.LOAD): return None
+  reduce_op = Ops.MAX if negate_inputs else update.op
+  if not negate_inputs and (reduce_op not in (Ops.ADD, Ops.MUL, Ops.MAX) or reduce_ops not in (set(), {reduce_op})): return None
+  try:
+    blocks = [tuple(_eval_int(load.src[0].src[1], {**env, reduce_range:r}) for env in envs) for load,_ in loads for r in range(groups)]
+  except RuntimeError: return None
+  input_count = int(in_param.src[0].arg)
+  if input_count != rows*len(blocks) or sorted(offset for block in blocks for offset in block) != list(range(input_count)): return None
+  if input_count < 2: return None
+
+  constants = tuple(dict.fromkeys(x for x in ((-1.0,) if negate_inputs else ()) + ((post_scale,) if post_scale != 1.0 else ())))
+  slots, data_slot = {value:i for i,value in enumerate(constants)}, len(constants)
+  stride, stride_lanes, arena, active = _reduction_arena(rows, len(blocks), data_slot)
+  if rows != 1:
+    gathers = tuple(RKGather(in_param.arg.slot, data_slot, rows, offsets=block, dst_addend=i*stride_lanes) for i,block in enumerate(blocks))
+  else:
+    offsets = tuple(block[0] for block in blocks); direct = offsets == tuple(range(len(blocks)))
+    gathers = (RKGather(in_param.arg.slot, data_slot, len(blocks), axes=((1, len(blocks), 1),) if direct else (),
+                        offsets=() if direct else offsets, dst_stride=stride_lanes),)
+  ops:list[RKEWOp] = []
+  out = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  if negate_inputs:
+    negative = RKArg(RKBufferKind.SCRATCH, slots[-1.0])
+    ops.extend(_ew_ops(((arena(offset), arena(offset), negative, Ops.MUL) for offset in active), rows))
+  reduced = _reduce_arena(ops, active, rows, _EW_CFG[reduce_op], arena, out if post_scale == 1.0 else None, fp32_out)
+  if post_scale != 1.0:
+    scale_value, scale_cfg = (0.0, _EW_CFG[Ops.FDIV]) if math.isinf(post_scale) else (post_scale, _EW_CFG[Ops.MUL])
+    ops.append(RKEWOp(out, reduced, RKArg(RKBufferKind.SCRATCH, slots[scale_value]), rows, scale_cfg | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
+  scratch = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(len(blocks)*stride),)
+  return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=gathers, ew_ops=tuple(ops))
 
 def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:int, post_scale:float,
                                  op_barriers:bool=False, compensated_limit:int=round_up(2, 64)//2, kahan:bool=False,
@@ -2879,6 +2986,10 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
         if u.op is Ops.CAST and u.dtype is dtypes.half and len(u.src) == 1 and u.src[0].op is Ops.SIN and u.src[0].dtype is dtypes.float})
       storage_uops = list(graph_rewrite(storage_sink, _pm_storage_common, name="rockchip generic storage precision").toposort())
   if (mul_add:=_try(strict_output, dtypes.half, _lower_vectorized_mul_add_reduction, uops, v=vectorize_reductions)) is not None: return mul_add
+  if vectorize_reductions and (loop_output:=_admit(local_output, (dtypes.half, dtypes.float))) is not None and \
+     (scalar_loop:=_loop_reduction_match(loop_output)) is not None:
+    if (dot_reduction:=_lower_dot_loop_reduction(scalar_loop)) is not None: return dot_reduction
+    if (scalar_reduction:=_lower_scalar_loop_reduction(scalar_loop)) is not None: return scalar_reduction
   if (mapped:=_try(local_output, dtypes.half, _lower_mapped_add_loop_reduction, uops, v=vectorize_reductions)) is not None: return mapped
   if (red:=_try(strict_output, dtypes.half, _lower_vectorized_unrolled_add_reduction, uops, v=vectorize_reductions)) is not None: return red
   if (output:=local_output if storage_uops is None else _output_store(uops:=storage_uops, accepted, allow_local=True)) is None or \
