@@ -7089,3 +7089,28 @@ gate.
 
 This is a pending-reboot checkpoint: no new tests, hardware retries, or push
 were performed.
+
+---
+
+## 2026-08-19 — exact 3,099 renderer gate, pending reboot
+
+WIP code commits `6e036b997` and `54acddaa4` produce renderer/runtime
+**3,099/470**. Host gates are UOps **114 passed** with `-n12`, repository Ruff
+pass, `mypy tinygrad/` pass, backend collection **445**, and the bounds census
+reported **zero OOB** images. The `source_matrix_lanes` repair and the
+full-stride mapped-temporary scratch repair were independently verified.
+
+The first exact-3,097 hardware census log reported **432 passed, 12 skipped,
+1 failed, and 154 subtests**. Its rank-2 failure was nonzero scratch
+underallocation introduced by inlining. The latest `simple_add.py` health
+sequence had exactly one failure: the fourth 4 MiB allocation hit the CMA
+fallback with `ENXIO`; there was no retry. Reboot is pending and the durable
+driver patch remains uninstalled.
+
+After reboot, run exactly one `.venv/bin/python ~/rk3588/examples/simple_add.py`
+health check, then exactly one serial full-445 census with a fresh isolated
+`CACHEDB` and `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`; do not run
+`elementwise.py`.
+
+The next local checkpoint is `WIP rockchip: save repaired 3.1k gate before
+reboot`. No tests, hardware retries, or push are part of this checkpoint.
