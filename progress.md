@@ -7119,11 +7119,12 @@ reboot`. No tests, hardware retries, or push are part of this checkpoint.
 
 ## 2026-08-19 — complete exact 3,099-line renderer milestone
 
-The repaired exact-3.1k gate is complete. The authoritative checkout is
-`HEAD 194f94bc0522528d70f4f537ed00da0777752168` (`WIP rockchip: save repaired
-3.1k gate before reboot`), with code parent
-`54acddaa49aa9ca84e4c6ced872d192c4677180b`. The renderer/runtime sizes are
-exactly **3,099/470**; the renderer SHA-256 is
+The repaired exact-3.1k gate is complete in milestone commit
+`30d3af7c2` (`rockchip: complete 3.1k renderer milestone`). Its code
+checkpoint is `54acddaa49aa9ca84e4c6ced872d192c4677180b` (`WIP rockchip: fix
+scratch bounds for 3.1k gate`); the earlier `194f94bc` commit was only the
+pre-completion checkpoint. The renderer/runtime sizes are exactly **3,099/470**;
+the renderer SHA-256 is
 `fa07e25891d1c0ade44bbc802a2be1776ca696e9c8ca7a93e39e6bf3342be349`, and the
 runtime is unchanged.
 
@@ -7135,16 +7136,18 @@ runtime is unchanged.
   12 skipped, 1 failed, 154 subtests**). Its rank-2 failure was diagnosed as
   nonzero scratch underallocation introduced by inlining; the full-stride
   mapped-temporary scratch repair fixed that case.
-- After reboot, the authoritative `.venv/bin/python
-  ~/rk3588/examples/simple_add.py` health check passed.
 - Exactly one fresh-cache serial census was run with cache directory
   `cache-dwzkyM`. The authoritative log is
   `/home/orangepi/rk-artifacts-exact3099-final-20260819/final_hardware_gate_repaired.log`.
-  It recorded **433 passed, 12 skipped, 0 failed, and 154 subtests** across
-  all **445** cases, with exit code **0**.
-- The run's dmesg observations retain a caveat of **1,369 resets**, **10
-  timeout messages**, **5 IOMMU-related strings**, and **0 kernel oops**;
-  these are recorded observations, not census failures.
+  The canonical pytest log proves **433 passed, 12 skipped, 0 failed, and
+  154 subtests** across all **445** cases, with pytest exit code **0**.
+- Separately, agent-captured evidence outside that pytest log records that the
+  post-reboot `.venv/bin/python ~/rk3588/examples/simple_add.py` health check
+  passed.
+- Separately, agent-captured dmesg evidence outside that pytest log records a
+  caveat of **1,369 resets**, **10 timeout messages**, **5 IOMMU-related
+  strings**, and **0 kernel oops**; these are recorded observations, not
+  census failures.
 
 The exact 3,099-line renderer milestone is complete and recorded locally; no
 push was made.
