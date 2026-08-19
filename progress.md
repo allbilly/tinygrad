@@ -7151,3 +7151,43 @@ runtime is unchanged.
 
 The exact 3,099-line renderer milestone is complete and recorded locally; no
 push was made.
+
+---
+
+## 2026-08-19 — exact 2,998 renderer candidate, pending reboot
+
+WIP code commit `e16b4ac18` (`WIP rockchip: stage 2.998k renderer candidate`)
+deletes the dead `RKLoopReduction` family: `RKLoopReduction`, its matcher and
+load helper, both loop-reduction lowerers, and the dead dispatcher branch. The
+candidate is exactly **2,998/470** renderer/runtime executable lines. The
+candidate renderer SHA-256 is
+`ef50de4e8b2d97e6e2e6f85d1a936b431ec633cda3ba13e6becdd86461e141c6`; runtime
+remains unchanged. The deletion is **111 physical lines / 101 executable
+`sz.py` lines**.
+
+- Host gates: UOps **114 passed** with `-n12`, repository Ruff passed,
+  `mypy tinygrad/` passed for **216 source files**, backend collection gathered
+  exactly **445** cases, and `git diff --check` passed.
+- Independent baseline/candidate image capture returned exactly **1,499**
+  lowerer results on each side (1,320 accepted images each). The complete
+  return-sequence digest is byte-identical on both sides:
+  `6e8f143fd417267f084645ab8a371eb9a7cb1e5c24ff7c26b7e99831404e5f2d`.
+  The independent image differential reported no first mismatch; independent
+  judges returned **VERIFIED**.
+- The host-only bounds census covered **2,006 unique images / 2,770 image
+  occurrences**, with **0 issues**, 0 lower failures, and 0 compile
+  exceptions. It also checked 1,314 cache rows with 0 malformed rows; no
+  hardware state was touched.
+
+The health sequence made exactly one `.venv/bin/python
+~/rk3588/examples/simple_add.py` attempt; it failed at the 4 MiB CMA fallback
+with `ENXIO`. **No retry** was made. Reboot is pending, and no hardware census
+was run for this candidate. After reboot, run exactly one `simple_add.py` health
+check, then exactly one fresh-cache serial full-445 census; do not retry either
+step.
+
+The progress checkpoint is saved in commit subject
+
+    WIP rockchip: save 2.998k candidate before reboot
+
+The pre-existing untracked reject note remains untracked; no push was made.
