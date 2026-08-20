@@ -106,15 +106,12 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   # destination once per physical slot, so these stateful materialization slots must not alias.
   pinned = {gather.dst_index for gather in image.mid_gathers if gather.dst_kind is RKBufferKind.SCRATCH}
   intervals = sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2]))
-  remap:dict[int, int] = {}
-  physical:list[RKScratch] = []
-  active:list[tuple[int, int]] = []
-  available:list[int] = []
+  remap, physical, active, available = typing_cast(dict[int, int], {}), typing_cast(list[RKScratch], []), \
+    typing_cast(list[tuple[int, int]], []), typing_cast(list[int], [])
   for start,end,slot in intervals:
     while active and active[0][0] < start:
       heapq.heappush(available, heapq.heappop(active)[1])
-    spec = image.scratch[slot]
-    target = heapq.heappop(available) if slot not in pinned and available else len(physical)
+    spec, target = image.scratch[slot], heapq.heappop(available) if slot not in pinned and available else len(physical)
     if target == len(physical):
       physical.append(spec)
     else:
@@ -820,8 +817,7 @@ def _lower_mapped_add_loop_reduction(output:RKOutput, uops:list[UOp]) -> RKImage
   except RuntimeError: return None
   if len(envs) != rows or tuple(int(_eval_expr(out_index, env, {})) for env in envs) != tuple(range(rows)): return None
   updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and any(r in u.toposort() for r in reduce_ranges)]
-  if len(updates) != 1: return None
-  if (parts:=_reduction_post_parts(root, out.dtype)) is None: return None
+  if len(updates) != 1 or (parts:=_reduction_post_parts(root, out.dtype)) is None: return None
   post_scale, post_root, post_local = parts
   if not math.isfinite(post_scale): return None
   update = _strip_cast(updates[0].src[1])
@@ -876,8 +872,7 @@ def _lower_vectorized_unrolled_add_reduction(output:RKOutput, uops:list[UOp]) ->
   for leaf in leaves:
     paired = counterparts[leaf]
     concrete = [item for node in paired if (item:=input_leaf(node)) is not None]
-    if len(concrete) != len(paired): return None
-    if len({item[1].key for item in concrete}) != 1: return None
+    if len(concrete) != len(paired) or len({item[1].key for item in concrete}) != 1: return None
     if any(_runtime_index(node) is not None for item in concrete for node in item[0].src[1].toposort()): return None
     try:
       cache:dict[UOp, int|float|bool|np.ndarray] = {}
@@ -1447,9 +1442,8 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   store, out_param, count, _, _ = output
   if count <= 0: return RKImage(RKTarget.RK3588)
   out_slot = out_param.arg.slot
-  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
-  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
-  replacement = store.replace(src=(half_index, value, *store.src[2:]))
+  replacement = store.replace(src=(store.src[0].replace(dtype=dtypes.half,
+    src=(out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half)), *store.src[0].src[1:])), value, *store.src[2:]))
   image = _lower_composed_uops(list(replacement.toposort())) if int32 else \
     _lower_composed_uops(list(UOp(Ops.SINK, src=(replacement,)).toposort()), recipes_ready=True)
   terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
@@ -1676,8 +1670,7 @@ class RKContext:
       plan = RKGather(0, 0, self.count, values=source, itemsize=4 if layout is RKLayout.INT32 else 2)
       cache_key:bytes|tuple = ("static", layout, source)
     elif isinstance(source, RKGather):
-      plan = source
-      cache_key = ("gather", layout, _gather_cache_key((source,))) if key is None else ("gather", key)
+      plan, cache_key = source, ("gather", layout, _gather_cache_key((source,))) if key is None else ("gather", key)
     else:
       plan, cache_key = None, source
     if cache_key not in cache:
@@ -1948,8 +1941,7 @@ class RKContext:
     if u.op in (Ops.XOR, Ops.CMPNE): return self._emit(dst, delta, delta, _EW_CFG_ABS)
     if u.op is Ops.CMPEQ:
       raw_one = self._constant(UOp.const(1, dtypes.int16)) if preferred is RKLayout.BOOL_INT16 else self.lower(UOp.const(True, dtypes.bool))
-      one = RKValue(raw_one.arg, dtypes.bool, self.count, preferred)
-      unequal = self._scratch(dtypes.bool, preferred)
+      one, unequal = RKValue(raw_one.arg, dtypes.bool, self.count, preferred), self._scratch(dtypes.bool, preferred)
       self._emit(unequal, delta, delta, _EW_CFG_ABS)
       return self._emit(dst, one, unequal, _EW_CFG[Ops.SUB])
     raise _RKGenericReject
@@ -1996,8 +1988,7 @@ class RKContext:
         if rhs.layout is not layout: raise _RKGenericReject
         if layout is RKLayout.INT32:
           components, const255 = self._raw(rhs), self._constant(UOp.const(255, dtypes.int16))
-          inverted = tuple(self._i16(const255.arg, component.arg, _EW_CFG[Ops.SUB]) for component in components)
-          return self._raw(inverted, RKLayout.INT32, u=u)
+          return self._raw(tuple(self._i16(const255.arg, component.arg, _EW_CFG[Ops.SUB]) for component in components), RKLayout.INT32, u=u)
         lhs = self._constant(UOp.const(-1, dtype))
         return self._emit(self._scratch(dtype, layout, u=u), lhs, rhs, _EW_CFG[Ops.SUB])
     dtype = u.dtype.scalar()
@@ -2075,9 +2066,8 @@ class RKContext:
       current = result
     weighted = post_allocate()
     self.ew_ops.append(RKEWOp(weighted, current, weights, matrix_lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
-    byte_results = tuple(_reduce_rows(self.ew_ops, [replace(weighted, addend=weighted.addend+(byte*8+bit)*vector_bytes) for bit in range(8)],
-      vector_lanes, _EW_CFG[Ops.ADD], int16=True) for byte in range(4))
-    return self._raw(byte_results, RKLayout.INT32, u=u)
+    return self._raw(tuple(_reduce_rows(self.ew_ops, [replace(weighted, addend=weighted.addend+(byte*8+bit)*vector_bytes) for bit in range(8)],
+      vector_lanes, _EW_CFG[Ops.ADD], int16=True) for byte in range(4)), RKLayout.INT32, u=u)
 
   def _compare(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
@@ -2231,8 +2221,7 @@ class RKContext:
     exponent = self._i16_clamp_one(self._i16(magnitude, const123, _EW_CFG[Ops.SUB]))
     mantissa = self._i16(self._i16_clamp_one(self._i16(magnitude, const124, _EW_CFG[Ops.SUB])),
       self._i16(low.arg, one, _EW_CFG_MIN), _EW_CFG[Ops.MAX])
-    nan = self._i16(exponent, mantissa, _EW_CFG[Ops.MUL])
-    return self.fp16_components.setdefault(value.arg, (low, clean_high, nan))
+    return self.fp16_components.setdefault(value.arg, (low, clean_high, self._i16(exponent, mantissa, _EW_CFG[Ops.MUL])))
 
   def _fp16_ordered_values(self, value:RKValue) -> tuple[RKArg, RKArg]:
     """Map a classified FP16 lane to two unsigned bytes whose lexical order is IEEE numeric order."""
@@ -2595,8 +2584,7 @@ def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
       if len(updates) != 1: raise _RKGenericReject
       expanded = expand_dependencies(stores[0].src[1], buffer, env).substitute({axes[0]:load_index}, walk=True)
       if store_extent < int(buffer.src[0].arg):
-        identity = UOp.const(updates.pop() is Ops.AND, buffer.dtype.scalar())
-        expanded = (load_index < UOp.const(store_extent, load_index.dtype)).where(expanded, identity)
+        expanded = (load_index < UOp.const(store_extent, load_index.dtype)).where(expanded,UOp.const(updates.pop() is Ops.AND, buffer.dtype.scalar()))
       return expanded.substitute({axis:axis.const_like(value) for axis,value in env.items()}, walk=True) if env else expanded
     return expand_buffer(buffer, env)
   def expand_buffer(buffer:UOp, env:dict[UOp, int]) -> UOp:
