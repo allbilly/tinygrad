@@ -141,8 +141,8 @@ def encode_image(image:RKImage) -> bytes:
                                image.gather_after, 0))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in gathers:
-    kind = 3 if g.partial else 2 if g.values else 1 if g.offsets else 0
-    out += _GATHER.pack(g.dst_index, g.src_index, g.count, kind, len(g.axes), g.itemsize, int(g.dst_kind), int(g.src_kind),
+    out += _GATHER.pack(g.dst_index, g.src_index, g.count, kind := 3 if g.partial else 2 if g.values else 1 if g.offsets else 0,
+      len(g.axes), g.itemsize, int(g.dst_kind), int(g.src_kind),
       g.base, g.fill_bits, g.dst_stride, g.dst_addend, g.after) + (struct.pack(f"<{g.count}{_ITEM_FORMAT[g.itemsize]}", *g.values) if kind == 2 else
       struct.pack(f"<{g.count}i", *g.offsets) if kind in (1, 3) else b"".join(_GATHER_AXIS.pack(*axis) for axis in g.axes))
   for host in image.host_gathers + image.host_scatters:
@@ -184,9 +184,7 @@ def decode_image(blob:bytes) -> RKImage:
   host_addresses:list[RKHostAddress] = []
   for _ in range(nhost_gather+nhost_scatter):
     src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \
-      fill_bits, host_flags, index_limit, src_addend, index_addend, dst_addend, base, index_scale, lane_stride = \
-      _HOST_ADDRESS.unpack_from(blob, off)
-    off += _HOST_ADDRESS.size
+      fill_bits, host_flags, index_limit, src_addend, index_addend, dst_addend, base, index_scale, lane_stride = _HOST_ADDRESS.unpack_from(blob, off); off += _HOST_ADDRESS.size  # noqa: E501
     if (src_kind not in (0, 1) or index_kind not in (0, 1) or dst_kind not in (0, 1) or itemsize not in _ITEM_FORMAT or
         index_itemsize not in (2, 4) or host_flags or min(count, src_count, dst_count, index_limit) < 0):
       raise ValueError("invalid RKHostAddress")
@@ -202,9 +200,8 @@ def decode_image(blob:bytes) -> RKImage:
     ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
       RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg, *(bool(op_flags & 1<<bit) for bit in range(8))))
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
-  pre_count = ngather-mid_count-post_count
-  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:pre_count]), tuple(ew_ops),
-                 tuple(gathers[pre_count:pre_count+mid_count]), gather_after, tuple(gathers[-post_count:] if post_count else ()),
+  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:ngather-mid_count-post_count]), tuple(ew_ops),
+                 tuple(gathers[ngather-mid_count-post_count:ngather-post_count]), gather_after, tuple(gathers[-post_count:] if post_count else ()),
                  tuple(host_addresses[:nhost_gather]), tuple(host_addresses[nhost_gather:]))
 
 def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tuple[int, ...]:
@@ -753,10 +750,10 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
   mid = tuple(RKGather(value_slot, arena_slot, rows, base=group*rows, axes=((1, rows, 1),),
                        dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
   dest = RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, arena_slot+1)
-  def temporary(index:int) -> RKArg: return RKArg(kind, value_slot, index*stride)
-  reduced = _kahan_add(ops, active, rows, arena, temporary, dest, op_barriers=op_barriers) if kahan else \
-    _compensated_add(ops, active, rows, arena, temporary, dest, op_barriers=op_barriers) if 2 <= len(active) <= compensated_limit else \
-    _reduce_arena(ops, active, rows, _EW_CFG[Ops.ADD], arena, dest, op_barriers=op_barriers)
+  reduced = (_kahan_add(ops, active, rows, arena, lambda i:RKArg(kind,value_slot,i*stride), dest, op_barriers) if kahan else
+    _compensated_add(ops, active, rows, arena, lambda i:RKArg(kind,value_slot,i*stride), dest, op_barriers)
+    if 2 <= len(active) <= compensated_limit else
+    _reduce_arena(ops, active, rows, _EW_CFG[Ops.ADD], arena, dest, op_barriers=op_barriers))
   if post_scale != 1.0:
     ops.extend(_ew_ops(((RKArg(RKBufferKind.ARG, out_slot), reduced, RKArg(RKBufferKind.SCRATCH, 0), Ops.MUL),), rows,
       op_barriers, op_barriers))
@@ -1690,8 +1687,6 @@ class RKContext:
                                   _scratch_bytes(self.count) if size is None else size))
     return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
 
-  def _int32_tiles(self) -> RKArg: return self._scratch(dtypes.int, RKLayout.INT32, ceildiv(self.count, 4)*64).arg
-
   def _slot(self, cache:dict, source:bytes|RKGather|tuple, dtype:DType, layout:RKLayout,
             size:int|None=None, key:tuple|None=None) -> RKValue:
     if isinstance(source, tuple):
@@ -2432,8 +2427,8 @@ class RKContext:
         self.lower(_int_fp16_expr(u.src[0])) if dtype is dtypes.half and source_dtype is dtypes.int and int_range is not None and \
         -_FP16_EXACT_INTEGER <= int_range[0] <= int_range[1] <= _FP16_EXACT_INTEGER else self.lower(u.src[0])
       if source.layout is RKLayout.INT32 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.int):
-        value = self._scratch(dtypes.half, RKLayout.FP16)
-        self.ew_ops.append(RKEWOp(value.arg, source.arg, self._int32_tiles(), self.count, _EW_CFG[Ops.MAX], int32_input=True))
+        value, tile = self._scratch(dtypes.half, RKLayout.FP16), self._scratch(dtypes.int, RKLayout.INT32, (self.count+3)//4<<6).arg
+        self.ew_ops.append(RKEWOp(value.arg, source.arg, tile, self.count, _EW_CFG[Ops.MAX], int32_input=True))
       elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.bool or
                                                      dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16):
         value = self.lower(u.src[0].where(UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half)))
@@ -2490,9 +2485,10 @@ class RKContext:
         dtype is dtypes.int16 and result.layout is RKLayout.INT16):
       layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16
       if result.arg != self.out: self._emit(RKValue(self.out, dtype, self.count, layout), result, result, _EW_CFG[Ops.MAX])
-    elif (dtype is dtypes.bool and result.layout is RKLayout.BOOL_MASK or
-          dtype is dtypes.int and result.layout is RKLayout.INT_FP16):
-      self.ew_ops.append(RKEWOp(self.out, result.arg, self._int32_tiles(), self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True,
+    elif ((dtype is dtypes.bool and result.layout is RKLayout.BOOL_MASK or
+           dtype is dtypes.int and result.layout is RKLayout.INT_FP16) and
+          (tile:=self._scratch(dtypes.int, RKLayout.INT32, (self.count+3)//4<<6).arg)):
+      self.ew_ops.append(RKEWOp(self.out, result.arg, tile, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True,
                                 bool_output=dtype is dtypes.bool))
     elif (dtype is dtypes.bool and result.layout is RKLayout.BOOL_INT16 or dtype is dtypes.int and result.layout is RKLayout.INT32):
       if dtype is dtypes.bool or result.arg != self.out:
@@ -2929,8 +2925,6 @@ def _const_operand(u:UOp, op:Ops, value:float|None=None) -> tuple[UOp, UOp]|None
 
 def _positive_mask(u:UOp) -> UOp: return UOp(Ops.MAX, dtypes.half, src=(u, u), arg=_NATIVE_POSITIVE_MASK)
 
-def _positive_distance(v:UOp,b:UOp)->UOp: return _positive_mask(v.alu(Ops.SUB,b)).alu(Ops.SUB,_positive_mask(b.const_like(-b.arg).alu(Ops.SUB,v)))
-
 def _mask_mul(a:UOp, b:UOp) -> UOp: return a.alu(Ops.MUL, b, arg=_NATIVE_MASK_MUL)
 
 def _half(value:float) -> UOp: return UOp.const(value, dtypes.half)
@@ -3005,13 +2999,11 @@ def _fold_relu_cap(x:UOp) -> UOp|None:
   def relu(u:UOp) -> UOp|None:
     if (source:=_relu_operand(u)) is not None: return source
     return _relu_operand(folded) if u.op is Ops.WHERE and (folded:=_fold_ordered_where(u)) is not None else None
-  def shifted(u:UOp) -> tuple[UOp, float]:
-    return (term[0], float(term[1].arg)) if (term:=_const_operand(u, Ops.ADD)) is not None else (u, 0.0)
   for positive, negative in (x.src, x.src[::-1]):
     source, scaled = relu(positive), _const_operand(negative, Ops.MUL, -1.0)
     if source is None or scaled is None or (upper:=relu(scaled[0])) is None: continue
-    source_base, source_shift = shifted(source)
-    upper_base, upper_shift = shifted(upper)
+    source_base, source_shift = (source, 0.0) if (term:=_const_operand(source, Ops.ADD)) is None else (term[0], float(term[1].arg))
+    upper_base, upper_shift = (upper, 0.0) if (term:=_const_operand(upper, Ops.ADD)) is None else (term[0], float(term[1].arg))
     if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: continue
     if cap == 6.0: return UOp(Ops.MAX, x.dtype, src=(source, UOp.const(0.0, dtypes.half)), arg=_NATIVE_RELU6)
     return UOp(Ops.MAX, positive.dtype, src=(positive, UOp.const(cap, dtypes.half)), arg=_NATIVE_MIN)
@@ -3133,6 +3125,9 @@ def _poly_horner(source:UOp, coefficients:tuple[float, ...]) -> UOp:
   return functools.reduce(lambda r,c: r.alu(Ops.MUL, source).alu(Ops.ADD, source.const_like(c)),
                           coefficients[-2::-1], source.const_like(coefficients[-1]))
 
+def _dpu_region(value:UOp, threshold:UOp, small:UOp, large:UOp, mask:Callable[[UOp], UOp]=_finite_positive_mask, reverse:bool=False) -> UOp:
+  return small.alu(Ops.ADD, mask(threshold.alu(Ops.SUB, value) if reverse else value.alu(Ops.SUB, threshold)).alu(Ops.MUL, large.alu(Ops.SUB, small)))
+
 def _hyperbolic_tail(magnitude:UOp, coefficients:tuple[float, ...]) -> UOp:
   """Approximate log(2*x) plus an inverse-even-power correction for large positive x."""
   one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
@@ -3140,27 +3135,18 @@ def _hyperbolic_tail(magnitude:UOp, coefficients:tuple[float, ...]) -> UOp:
   correction = inverse_square.alu(Ops.MUL, _poly_horner(inverse_square, coefficients))
   return magnitude.alu(Ops.LOG2).alu(Ops.MUL, ln2).alu(Ops.ADD, ln2).alu(Ops.ADD, correction)
 
+def _dpu_inverse_hyperbolic(source:UOp, offset:int, one:UOp, ln2:UOp) -> UOp:
+  asinh, threshold = offset == 1, _half(1.5 if offset == 1 else 2.0); magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS) if asinh else source  # noqa: E501
+  bounded = _native_min(magnitude, threshold) if asinh else _native_min(source, threshold).alu(Ops.MAX, _half(-2.0)); square = bounded.alu(Ops.MUL, bounded)  # noqa: E501
+  small = bounded.alu(Ops.MUL, _poly_horner(square, (0.99989513, -0.16376462, 0.06135906, -0.01879756, 0.00268578))) if asinh else bounded.alu(Ops.ADD, square.alu(Ops.SUB, one).sqrt()).alu(Ops.LOG2).alu(Ops.MUL, ln2)  # noqa: E501
+  safe = (magnitude if asinh else source).alu(Ops.MAX, threshold); large = _hyperbolic_tail(safe, (0.25, -3/32, 5/96) if asinh else (-0.25, -3/32, -5/96))  # noqa: E501
+  selected = _dpu_region(magnitude if asinh else source, threshold, small, large); return selected.alu(Ops.MUL, source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, _half(2**-24)))) if asinh else selected  # noqa: E501
+
 def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
   """Stabilize Tinygrad's FP16 asinh/acosh expansions without LUT or CMAC."""
   if (matched:=_hyperbolic_log_source(root)) is None: return None
-  source, offset = matched; source = source.cast(dtypes.half)
-  one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
-  if offset == 1:
-    magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS)
-    bounded = UOp(Ops.MAX, magnitude.dtype, src=(magnitude, UOp.const(1.5, dtypes.half)), arg=_NATIVE_MIN)
-    square = bounded.alu(Ops.MUL, bounded)
-    small = bounded.alu(Ops.MUL, _poly_horner(square, (0.99989513, -0.16376462, 0.06135906, -0.01879756, 0.00268578)))
-    safe = magnitude.alu(Ops.MAX, UOp.const(1.5, dtypes.half))
-    large = _hyperbolic_tail(safe, (0.25, -3/32, 5/96))
-    selected = small.alu(Ops.ADD, _finite_positive_mask(magnitude.alu(Ops.SUB, UOp.const(1.5, dtypes.half))).alu(Ops.MUL, large.alu(Ops.SUB, small)))
-    sign = source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)))
-    return selected.alu(Ops.MUL, sign)
-  bounded = UOp(Ops.MAX, source.dtype, src=(source, UOp.const(2.0, dtypes.half)), arg=_NATIVE_MIN).alu(Ops.MAX, UOp.const(-2.0, dtypes.half))
-  square = bounded.alu(Ops.MUL, bounded)
-  small = bounded.alu(Ops.ADD, square.alu(Ops.SUB, one).sqrt()).alu(Ops.LOG2).alu(Ops.MUL, ln2)
-  safe = source.alu(Ops.MAX, UOp.const(2.0, dtypes.half))
-  large = _hyperbolic_tail(safe, (-0.25, -3/32, -5/96))
-  return small.alu(Ops.ADD, _finite_positive_mask(source.alu(Ops.SUB, UOp.const(2.0, dtypes.half))).alu(Ops.MUL, large.alu(Ops.SUB, small)))
+  source, offset = matched; source = source.cast(dtypes.half); one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
+  return _dpu_inverse_hyperbolic(source, offset, one, ln2)
 
 def _dpu_math_base(source:UOp) -> tuple[UOp, UOp, UOp, Callable[[UOp], UOp]]:
   source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0)
@@ -3169,72 +3155,56 @@ def _dpu_math_base(source:UOp) -> tuple[UOp, UOp, UOp, Callable[[UOp], UOp]]:
 def _dpu_sqrt(source:UOp) -> UOp|None:
   """Approximate FP16 sqrt with range-independent Babylonian iterations on DPU EW."""
   if any(_local_load(u) is not None for u in source.toposort()): return None
-  source, zero, one, _ = _dpu_math_base(source)
-  finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)
+  source, zero, one, _ = _dpu_math_base(source); finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)  # noqa: E501
   safe = finite.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))
   estimate = safe.alu(Ops.MAX, one)
   for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
-  valid = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, source)))
-  return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one))
+  valid = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, source))); return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one))  # noqa: E501
 
 def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float, ...], half_period:float) -> tuple[UOp, UOp, UOp]:
   """Reduce a finite FP16 angle with split constants so large products do not erase the residual."""
-  half, one = dtypes.half, UOp.const(1.0, dtypes.half)
-  bounded = UOp(Ops.MAX, half, src=(source.cast(half).alu(Ops.MAX, UOp.const(-10000.0, half)), UOp.const(10000.0, half)), arg=_NATIVE_MIN)
-  quotient = bounded.alu(Ops.MUL, UOp.const(reciprocal_period, half))
-  magnitude = UOp(Ops.MAX, half, src=(quotient, quotient), arg=_NATIVE_ABS)
+  half, one = dtypes.half, UOp.const(1.0, dtypes.half); bounded = UOp(Ops.MAX, half, src=(source.cast(half).alu(Ops.MAX, UOp.const(-10000.0, half)), UOp.const(10000.0, half)), arg=_NATIVE_MIN)  # noqa: E501
+  quotient = bounded.alu(Ops.MUL, UOp.const(reciprocal_period, half)); magnitude = UOp(Ops.MAX, half, src=(quotient, quotient), arg=_NATIVE_ABS)
   multiple = _native_same(magnitude.alu(Ops.ADD, _half(0.5)), _NATIVE_FLOOR).alu(
     Ops.MUL, _positive_mask(quotient).alu(Ops.MUL, _half(2.0)).alu(Ops.SUB, one))
   reduced = bounded
   for coefficient in split: reduced = reduced.alu(Ops.SUB, multiple.alu(Ops.MUL, UOp.const(coefficient, dtypes.half)))
   # The rounded FP16 quotient can be a few periods off at large magnitudes. Normalize the small residual instead.
   for _ in range(3):
-    correction = _positive_distance(reduced, UOp.const(half_period, half))
-    multiple = multiple.alu(Ops.ADD, correction)
+    correction = _positive_mask(reduced.alu(Ops.SUB,_half(half_period))).alu(Ops.SUB,_positive_mask(_half(-half_period).alu(Ops.SUB,reduced))); multiple = multiple.alu(Ops.ADD, correction)  # noqa: E501
     for coefficient in split: reduced = reduced.alu(Ops.SUB, correction.alu(Ops.MUL, UOp.const(coefficient, half)))
   return bounded, multiple, reduced
 
 def _dpu_sin(source:UOp) -> UOp:
   """Approximate FP16 SIN without LUTs using Cody-Waite reduction and an odd polynomial."""
-  half, one = dtypes.half, UOp.const(1.0, dtypes.half)
-  period_split = (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125)
+  half, one = dtypes.half, UOp.const(1.0, dtypes.half); period_split = (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125)
   if source.dtype.scalar() is dtypes.float:
-    terms:list[UOp] = []
-    residuals:list[UOp] = []
+    terms:list[UOp] = []; residuals:list[UOp] = []
     for u in _iter_binary(source, Ops.ADD, dtypes.float):
       if u.op is Ops.CONST:
-        high = struct.unpack("<e", struct.pack("<e", float(u.arg)))[0]
-        terms.append(UOp.const(high, half))
+        high = struct.unpack("<e", struct.pack("<e", float(u.arg)))[0]; terms.append(UOp.const(high, half))
         if (low:=float(u.arg)-high) != 0.0: residuals.append(UOp.const(low, half))
       else: terms.append(_fp32_expr_to_half(u))
     reduced_parts = [_precise_add_parts([bounded, *(multiple.alu(Ops.MUL, UOp.const(-coefficient, half)) for coefficient in period_split)])
       for term in terms for bounded, multiple, _ in (_dpu_periodic_reduce(term, 1/(2*math.pi), period_split, math.pi),)]
-    residuals.extend(part[1] for part in reduced_parts)
-    reduced, addition_residual = _precise_sum_parts([part[0] for part in reduced_parts])
+    residuals.extend(part[1] for part in reduced_parts); reduced, addition_residual = _precise_sum_parts([part[0] for part in reduced_parts])
     residuals.append(addition_residual)
     for _ in range(3):
-      correction = _positive_distance(reduced, UOp.const(math.pi, half))
-      reduced, normalization_residual = _precise_add_parts(
-        [reduced, *(correction.alu(Ops.MUL, UOp.const(-coefficient, half)) for coefficient in period_split)])
+      correction = _positive_mask(reduced.alu(Ops.SUB,_half(math.pi))).alu(Ops.SUB,_positive_mask(_half(-math.pi).alu(Ops.SUB,reduced))); reduced, normalization_residual = _precise_add_parts([reduced, *(correction.alu(Ops.MUL, UOp.const(-coefficient, half)) for coefficient in period_split)])  # noqa: E501
       residuals.append(normalization_residual)
     invalid = terms[0].alu(Ops.MUL, UOp.const(0.0, half))
     for term in terms[1:]: invalid = invalid.alu(Ops.ADD, term.alu(Ops.MUL, UOp.const(0.0, half)))
   else:
-    source = source.cast(half)
-    _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), period_split, math.pi)
+    source = source.cast(half); _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), period_split, math.pi)
     invalid = source.alu(Ops.MUL, UOp.const(0.0, half))
-  magnitude = UOp(Ops.MAX, half, src=(reduced, reduced), arg=_NATIVE_ABS)
-  reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, half)))
-  pi_minus = _half(3.0).alu(Ops.SUB, magnitude).alu(Ops.ADD, _half(0.140625)).alu(Ops.ADD, _half(math.pi-3.140625))
-  angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))
-  square = angle.alu(Ops.MUL, angle)
-  sign = one.alu(Ops.SUB, _positive_mask(UOp.const(0.0, half).alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, half)))
+  magnitude = UOp(Ops.MAX, half, src=(reduced, reduced), arg=_NATIVE_ABS); reflected = _positive_mask(magnitude.alu(Ops.SUB, UOp.const(math.pi/2, half)))  # noqa: E501
+  pi_minus = _half(3.0).alu(Ops.SUB, magnitude).alu(Ops.ADD, _half(0.140625)).alu(Ops.ADD, _half(math.pi-3.140625)); angle = _mask_mul(magnitude, one.alu(Ops.SUB, reflected)).alu(Ops.ADD, _mask_mul(pi_minus, reflected))  # noqa: E501
+  square = angle.alu(Ops.MUL, angle); sign = one.alu(Ops.SUB, _positive_mask(UOp.const(0.0, half).alu(Ops.SUB, reduced)).alu(Ops.MUL, UOp.const(2.0, half)))  # noqa: E501
   result = angle.alu(Ops.MUL, _poly_horner(square, (1.0, -1/6, 1/120, -1/5040, 1/362880))).alu(Ops.MUL, sign)
   if source.dtype.scalar() is dtypes.float and residuals:
     residual = residuals[0]
     for term in residuals[1:]: residual = residual.alu(Ops.ADD, term)
-    cosine = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320)).alu(Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, _half(2.0))))
-    result = result.alu(Ops.ADD, residual.alu(Ops.MUL, cosine))
+    cosine = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320)).alu(Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, _half(2.0)))); result = result.alu(Ops.ADD, residual.alu(Ops.MUL, cosine))  # noqa: E501
   return result.alu(Ops.ADD, invalid)
 
 def _dpu_pow2_integer(exponent:UOp) -> UOp:
