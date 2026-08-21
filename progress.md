@@ -7366,3 +7366,52 @@ No CPU/GPU/CMAC/host numeric production path, runtime/core workaround, or
 tolerance relaxation was added. The unit NumPy image simulator remains
 test-only evidence. This documentation pass ran no new NPU test and changed
 only `progress.md` in the isolated checkout.
+
+---
+
+## 2026-08-21 — exact 2,860 renderer milestone hardware-verified
+
+The exact-2,860 lineage is exact-2,870 `01e59d5d8` → current HEAD
+`309da765e` (`WIP rockchip: readable cleanup to 2.860k`). `sz.py` reports
+renderer/runtime **2,860/470**; the [exact2860 judge report](/home/orangepi/rk-artifacts-next2860-20260821/final-judge-exact2860/VERDICT.md)
+and [size manifest](/home/orangepi/rk-artifacts-next2860-20260821/final-judge-exact2860/sz.log)
+record the isolated one-file reconstruction and exact renderer image.
+The [milestone report](/home/orangepi/rk-artifacts-next2860-20260821/milestone2860-progress/report.md)
+and [progress patch](/home/orangepi/rk-artifacts-next2860-20260821/milestone2860-progress/progress.patch)
+preserve this documentation delta.
+
+- Host gates/evidence record Rockchip UOps **115** with `-n12`, b79d scalar
+  oracle **1**, Ruff, mypy with no issues in **216 source files**,
+  compileall/diff check, and backend collection **445**; these results are
+  summarized in the [exact2860 judge report](/home/orangepi/rk-artifacts-next2860-20260821/final-judge-exact2860/VERDICT.md).
+- The [persisted replay manifest](/home/orangepi/rk-artifacts-next2860-20260821/final-judge-exact2860/replay-exact2870-exact2860.json)
+  records **2,073** normalized cases: 64 `native` records were cross-encoded
+  by the reference and candidate renderers (the only candidate renderer
+  encodings in this replay), while 1,000 `mapped` records were persisted-record
+  normalization/digest comparisons, not candidate replays. The 1,500 full-
+  capture and 1,226 compile-only checks are persisted JSON/digest equality
+  checks, not exact-HEAD generator reruns; the 4 Kahan, 5 reduce, and 1,000
+  stage groups in the manifest were not candidate-replayed.
+- Before reboot, the one current-head `simple_add.py` health attempt failed
+  with `OSError: [Errno 6]` (`ENXIO`) while mapping the 4 MiB buffer and was
+  stopped without retry, reset, or census; see the [pre-reboot manifest](/home/orangepi/rk-artifacts-next2860-20260821/hardware-exact2860/simple_add-health-gate.txt).
+  After reboot, current-head `simple_add.py` passed (exit 0); see the
+  [post-reboot timestamps/HEAD manifest](/home/orangepi/rk-artifacts-next2860-20260821/hardware-exact2860-postreboot/timestamps.txt),
+  [exit manifest](/home/orangepi/rk-artifacts-next2860-20260821/hardware-exact2860-postreboot/exit_code.txt),
+  and [captured output](/home/orangepi/rk-artifacts-next2860-20260821/hardware-exact2860-postreboot/simple_add.log).
+- The sole full census used `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`,
+  serial pytest `-n0`, a fresh cache, and explicit
+  `ROCKCHIP_SUBMIT_TIMEOUT_MS=6000 ROCKCHIP_SUBMIT_RETRIES=4`. It completed
+  **433 passed + 12 skipped = 445** nodes, **154 subtests passed**, exit 0;
+  see the [census command](/home/orangepi/rk-artifacts-next2860-20260821/hardware-full445-exact2860/command.txt),
+  [counts](/home/orangepi/rk-artifacts-next2860-20260821/hardware-full445-exact2860/counts.txt),
+  and [run metadata](/home/orangepi/rk-artifacts-next2860-20260821/hardware-full445-exact2860/run-metadata.txt).
+  Only aggregate accounting is evidenced; no per-node manifest is persisted.
+  The marker manifest records exactly zero captured
+  `retry|timeout|resubmit|submit` markers while four retries were configured;
+  see the [marker manifest](/home/orangepi/rk-artifacts-next2860-20260821/hardware-full445-exact2860/retry-markers.txt);
+  this does not prove zero attempts.
+
+No CPU/GPU/CMAC or production host-numeric path, runtime/core workaround, or
+tolerance relaxation was added. This documentation pass changed only
+`progress.md` in the isolated checkout and ran no additional NPU test.
