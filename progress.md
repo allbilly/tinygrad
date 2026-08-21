@@ -7316,3 +7316,53 @@ host gathers/scatters. The unit regression's NumPy image simulator is
 host-only test evidence, not a production execution path. This draft only
 records the captured gates above; it did not modify the shared checkout or
 run another NPU test.
+
+---
+
+## 2026-08-21 — exact 2,892 renderer milestone hardware-verified
+
+Starting from clean `1ece167a2` (renderer/runtime **2,898/470** by `sz.py`),
+current HEAD `e9afa79617bd66e928528ec3836dee7793a077f8`
+(`WIP rockchip: readable cleanup to 2.892k`) measures
+exactly **2,892/470** executable lines, with renderer SHA-256
+`e4a0c4eece7970bf33686f9633b3488f72616134629ea706d4474d44af488cdb`. Since
+**2,892 ≤ 2,900**, this is the exact **2.9k-or-lower** renderer milestone.
+The v2 [milestone report](/home/orangepi/rk-artifacts-exact2900-20260821/milestone2892-progress/report.v2.md),
+[progress patch](/home/orangepi/rk-artifacts-exact2900-20260821/milestone2892-progress/progress.v2.patch),
+and [patch SHA](/home/orangepi/rk-artifacts-exact2900-20260821/milestone2892-progress/progress.v2.patch.sha256)
+record the corrected provenance.
+
+- The host-only UOps/Ruff/mypy/collection and scalar evidence were captured
+  in an isolated reconstruction rooted at clean `1ece167a2`; its renderer
+  content hash matches current HEAD
+  `e9afa79617bd66e928528ec3836dee7793a077f8`; these are not separately
+  captured git-e9afa worktrees. The gates are Rockchip UOps **115 passed**
+  with `-n12`, Ruff passed, `mypy tinygrad/` reported no issues in **216
+  source files**, and backend collection **445**. The canonical scalar
+  half→float route preserves the exact 5,453-byte image SHA-256
+  `b79d23fe6c1f99b3e28b2ed7758e02c89f1d23c6d838465123065e8eedae1f1c`; see
+  the [isolated host verdict](/home/orangepi/rk-artifacts-exact2900-20260821/final-judge-exact2892/VERDICT.md)
+  and [candidate capture manifest](/home/orangepi/rk-artifacts-exact2900-20260821/final-judge-exact2892/corpora/capture-candidate.json).
+- Before reboot, the one current-head `simple_add.py` attempt failed while
+  mapping the 4 MiB buffer with `OSError: [Errno 6] No such device or address`
+  (`ENXIO`), exit 1; it was stopped with no retry, reset, or census. See the
+  [pre-reboot health manifest](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-exact2892/health-gate.log).
+- After reboot, the current-head `simple_add.py` health gate passed (exit 0);
+  see its [post-reboot manifest](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-exact2892-postreboot/result.txt),
+  [captured output](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-exact2892-postreboot/output.log),
+  and [HEAD record](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-exact2892-postreboot/head.txt).
+- The sole full current-head census used `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF
+  DEV=ROCKCHIP`, serial pytest `-n0`, a fresh cache, and explicit
+  `ROCKCHIP_SUBMIT_TIMEOUT_MS=6000 ROCKCHIP_SUBMIT_RETRIES=4`. It completed
+  **433 passed + 12 skipped = 445** nodes, **154 subtests passed**, exit 0;
+  see the [census command manifest](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-exact2892/command.txt),
+  [run manifest](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-exact2892/run-metadata.txt),
+  and [count manifest](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-exact2892/count-accounting.txt).
+  The captured log contains zero retry/timeout/reset markers, as recorded in
+  the [marker manifest](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-exact2892/retry-reset-evidence.txt);
+  this is not a claim of zero retry attempts—four retries were configured.
+
+No CPU/GPU/CMAC/host numeric production path, runtime/core workaround, or
+tolerance relaxation was added. The unit NumPy image simulator remains
+test-only evidence. This documentation pass ran no new NPU test and changed
+only `progress.md` in the isolated checkout.
