@@ -105,10 +105,9 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   # Mid-program gathers may populate one logical slot in several partial phases. The runtime clears a
   # destination once per physical slot, so these stateful materialization slots must not alias.
   pinned = {gather.dst_index for gather in image.mid_gathers if gather.dst_kind is RKBufferKind.SCRATCH}
-  intervals = sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2]))
   remap, physical, active, available = typing_cast(dict[int, int], {}), typing_cast(list[RKScratch], []), \
     typing_cast(list[tuple[int, int]], []), typing_cast(list[int], [])
-  for start,end,slot in intervals:
+  for start,end,slot in sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2])):
     while active and active[0][0] < start:
       heapq.heappush(available, heapq.heappop(active)[1])
     spec, target = image.scratch[slot], heapq.heappop(available) if slot not in pinned and available else len(physical)
@@ -499,13 +498,12 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
   out_affine, load_affine = tuple(typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(index)) for index in (out_index, load_index))
   if gate is None and out_affine is not None and out_affine[0] == 0 and (output_axes:=_affine_output_axes(out_affine, count)) is not None:
     if load_affine is not None and all(r in out_affine[1] for r in load_affine[1]):
-      axes = tuple((dst_stride, limit, load_affine[1][r]) for r,dst_stride,limit in output_axes if load_affine[1].get(r, 0))
-      return RKGather(src_index, dst_index, count, load_affine[0], axes)
+      return RKGather(src_index,dst_index,count,load_affine[0],tuple((d,l,load_affine[1][r]) for r,d,l in output_axes if load_affine[1].get(r,0)))
     if (load_divided:=typing_cast(tuple[int, dict[tuple[UOp, int], int]]|None, _linear_index(load_index, True))) is not None and \
        all(r in out_affine[1] and divisor <= int(r.src[0].arg) for r,divisor in load_divided[1]):
-      divided_axes = tuple((out_affine[1][r]*divisor, (int(r.src[0].arg)+divisor-1)//divisor, stride)
-                           for (r,divisor),stride in load_divided[1].items() if stride)
-      return RKGather(src_index, dst_index, count, load_divided[0], divided_axes)
+      return RKGather(src_index, dst_index, count, load_divided[0],
+                      tuple((out_affine[1][r]*divisor, (int(r.src[0].arg)+divisor-1)//divisor, stride)
+                            for (r,divisor),stride in load_divided[1].items() if stride))
   return RKGather(src_index, dst_index, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
 def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
@@ -672,8 +670,7 @@ def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   if groups >= _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS:
     try: return _lower_composed_uops([store.replace(src=(store.src[0], _precise_mul_sum(terms), *store.src[2:]))])
     except RuntimeError: pass
-  summed = functools.reduce(lambda value, term: value.alu(Ops.ADD, term), terms[1:], terms[0])
-  precise_uops = list(UOp(Ops.SINK, src=(store.replace(src=(store.src[0], summed, *store.src[2:])),)).toposort())
+  precise_uops = list(UOp.sink(store.replace(src=(store.src[0],functools.reduce(lambda v,t:v.alu(Ops.ADD,t),terms),*store.src[2:]))).toposort())
   if (precise:=_try(_output_store(precise_uops, dtypes.half), dtypes.half,
                     _lower_vectorized_mul_add_reduction, precise_uops)) is not None: return precise
   # Materialize bounded dot domains so the arena reduction preserves a real balanced tree instead of a rewritten ADD chain.
@@ -809,9 +806,8 @@ def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
                  gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers))
 
 def _lower_post_image(store:UOp, out_index:UOp, root:UOp, substitutions:dict[UOp, UOp]) -> RKImage|None:
-  range_subs = {axis:axis.replace(src=(axis.src[0],)) for axis in _index_ranges(out_index) if len(axis.src) > 1}
-  post_store = store.replace(src=(store.src[0].substitute(range_subs), root.substitute(substitutions).substitute(range_subs), *store.src[2:]))
-  return _lower_uop_program(list(UOp(Ops.SINK, src=(post_store,)).toposort()), vectorize_reductions=False, recipes_ready=True)
+  rs = {axis:axis.replace(src=(axis.src[0],)) for axis in _index_ranges(out_index) if len(axis.src) > 1}
+  return _lower_mapped_uops(store.replace(src=(store.src[0].substitute(rs),root.substitute(substitutions).substitute(rs),*store.src[2:])))
 
 def _flat_static_ranges(ranges:Iterable[UOp], dtype:DType=dtypes.int) -> tuple[UOp, int]:
   flat, groups = UOp.const(0, dtype), 1
@@ -1672,10 +1668,9 @@ class RKContext:
     if u is self.root and self.out_param.dtype.scalar() is dtype and \
         (dtype is dtypes.half and layout is RKLayout.FP16 or dtype is dtypes.int16 and layout is RKLayout.INT16 or
          dtype is dtypes.int and layout is RKLayout.INT32): return RKValue(self.out, dtype, self.count, layout)
-    slot = len(self.scratch)
     self.scratch.append(RKScratch(self.count*4 if size is None and layout is RKLayout.INT32 else
                                   _scratch_bytes(self.count) if size is None else size))
-    return RKValue(RKArg(RKBufferKind.SCRATCH, slot), dtype, self.count, layout)
+    return RKValue(RKArg(RKBufferKind.SCRATCH, len(self.scratch)-1), dtype, self.count, layout)
 
   def _slot(self, cache:dict, source:bytes|RKGather|tuple, dtype:DType, layout:RKLayout,
             size:int|None=None, key:tuple|None=None) -> RKValue:
@@ -2475,10 +2470,9 @@ class RKContext:
     else: raise _RKGenericReject
     constants = b"" if not self.constants else b"".join(
       {slot:bits for bits,slot in self.constants.items()}.get(i, b"\0\0") for i in range(max(self.constants.values())+1))
-    gather_after = min((g.after for g in self.mid_gathers if g.after >= 0), default=0)
-    image = RKImage(RKTarget.RK3588, tuple(self.scratch), constants, gathers=tuple(self.gathers), ew_ops=tuple(self.ew_ops),
-                    mid_gathers=tuple(self.mid_gathers), gather_after=gather_after, post_gathers=tuple(self.post_gathers),
-                    host_gathers=tuple(self.host_gathers))
+    image = RKImage(RKTarget.RK3588, tuple(self.scratch), constants, RKIMAGE_VERSION, tuple(self.gathers), tuple(self.ew_ops),
+                    tuple(self.mid_gathers), min((g.after for g in self.mid_gathers if g.after >= 0), default=0),
+                    tuple(self.post_gathers), tuple(self.host_gathers))
     return _reuse_linear_scratch(image, self.constants)
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
