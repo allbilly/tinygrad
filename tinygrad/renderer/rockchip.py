@@ -170,10 +170,10 @@ def decode_image(blob:bytes) -> RKImage:
       _GATHER.unpack_from(blob, off); off += _GATHER.size
     if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in _ITEM_FORMAT or dst_kind not in (0, 1) or src_kind not in (0, 1) or
         dst_stride < 1 or dst_addend < 0): raise ValueError("invalid RKGather")
-    axes:tuple[tuple[int, int, int], ...] = (); offsets:tuple[int, ...] = (); values:tuple[int, ...] = ()
-    if kind == 2: values = struct.unpack_from(f"<{count}{_ITEM_FORMAT[itemsize]}", blob, off); off += itemsize*count
-    elif kind in (1, 3): offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
-    else: axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
+    axes, offsets, values = (((), (), struct.unpack_from(f"<{count}{_ITEM_FORMAT[itemsize]}", blob, off)) if kind == 2 else
+      ((), struct.unpack_from(f"<{count}i", blob, off), ()) if kind in (1, 3) else
+      (tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)), (), ()))
+    off += itemsize*count if kind == 2 else 4*count if kind in (1, 3) else naxes*_GATHER_AXIS.size
     gathers.append(RKGather(src_index, dst_index, count, base if kind == 0 else 0, axes, offsets, fill_bits, values, kind == 3,
       dst_stride, dst_addend, RKBufferKind(dst_kind), itemsize, RKBufferKind(src_kind), after))
   host_addresses, ew_ops = typing_cast(list[RKHostAddress], []), typing_cast(list[RKEWOp], [])
@@ -188,8 +188,8 @@ def decode_image(blob:bytes) -> RKImage:
       count, src_count, dst_count, itemsize, index_itemsize, fill_bits, index_limit, base, index_scale, lane_stride))
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri, count, ew_cfg, da, la, ra = _EWOP.unpack_from(blob, off); off += _EWOP.size
-    int16_to_int32 = op_flags & 0x88 == 0x88 and not op_flags & 0x50
-    if op_flags & ~0xff or op_flags & 0x20 and not op_flags & 0x08 or op_flags & 0xc0 and op_flags & 0x18 and not int16_to_int32:
+    if op_flags & ~0xff or op_flags & 0x20 and not op_flags & 0x08 or \
+       op_flags & 0xc0 and op_flags & 0x18 and not (op_flags & 0x88 == 0x88 and not op_flags & 0x50):
       raise ValueError("invalid RKEWOp flags")
     ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
       RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg, *(bool(op_flags & 1<<bit) for bit in range(8))))
@@ -228,9 +228,7 @@ _DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4
  _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RAW_MIN, _NATIVE_RELU6, _NATIVE_SIGN) = tuple(
    "rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add raw_min relu6 sign".split())
 _EW_RELUX_CMP_RELU6, _INT16_EW = struct.unpack("<I", struct.pack("<f", 6.0))[0], dict(int16_input=True, int16_output=True)
-_EW_CFG = {Ops.ADD:_EW_CFG_COMMON|_EW_RELU_BYPASS|_EW_ALU_ADD, Ops.SUB:_EW_CFG_COMMON|_EW_RELU_BYPASS|_EW_ALU_SUB,
-  Ops.MUL:_EW_CFG_COMMON|_EW_RELU_BYPASS|_EW_OP_CVT_BYPASS|_EW_OP_TYPE_MUL, Ops.MAX:_EW_CFG_COMMON|_EW_RELU_BYPASS,
-  Ops.FDIV:_EW_CFG_COMMON|_EW_RELU_BYPASS|_EW_OP_CVT_BYPASS|_EW_ALU_FDIV}
+_EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,_EW_ALU_ADD), (Ops.SUB,_EW_ALU_SUB), (Ops.MUL,_EW_OP_CVT_BYPASS|_EW_OP_TYPE_MUL), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|_EW_ALU_FDIV))}  # noqa: E501
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
@@ -337,9 +335,9 @@ def _static_alu(op:Ops, dtype:DType, values:tuple, vector:bool):
       quotient = np.zeros(np.broadcast_shapes(values[0].shape, values[1].shape), dtype=np.result_type(values[0], values[1]))
       np.floor_divide(values[0], values[1], out=quotient, where=values[1] != 0)
       value = quotient if op is Ops.FLOORDIV else values[0]-quotient*values[1]
-    elif op is Ops.MAX: value = np.where(values[0] < values[1], values[1], values[0])
-    elif op is Ops.WHERE: value = np.where(*values)
-    elif op is Ops.TRUNC or op is Ops.RECIPROCAL: value = np.vectorize(int, otypes=[np.int64])(values[0]) if op is Ops.TRUNC else 1.0 / values[0]
+    elif op is Ops.MAX or op is Ops.WHERE or op is Ops.TRUNC or op is Ops.RECIPROCAL:
+      value = np.where(*values) if op is Ops.WHERE else np.where(values[0] < values[1], values[1], values[0]) if op is Ops.MAX else \
+        np.vectorize(int, otypes=[np.int64])(values[0]) if op is Ops.TRUNC else 1.0 / values[0]
     else:
       try: value = python_alu[op](*values)
       except KeyError: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {op.name}")
@@ -354,8 +352,8 @@ def _eval_expr(u:UOp, env:Mapping[UOp, int|float|bool|np.ndarray], cache:dict[UO
   if u.op is Ops.CONST: return cache.setdefault(u, _static_cast(u.arg, u.dtype, vector))
   elif u.op in (Ops.RANGE, Ops.SPECIAL): return cache.setdefault(u, _static_cast(env[u], u.dtype, True) if vector else env[u])
   elif u.op is Ops.PARAM: raise RuntimeError("RKPLAN_REJECT:dynamic_static_expr")
-  elif u.op is Ops.AFTER: return cache.setdefault(u, _eval_expr(u.src[0], env, cache, vector))
-  elif u.op is Ops.CAST: return cache.setdefault(u, _static_cast(_eval_expr(u.src[0], env, cache, vector), u.dtype, vector))
+  elif u.op is Ops.AFTER or u.op is Ops.CAST: return cache.setdefault(u, _eval_expr(u.src[0], env, cache, vector) if u.op is Ops.AFTER else
+    _static_cast(_eval_expr(u.src[0], env, cache, vector), u.dtype, vector))
   elif u.op is Ops.WHERE and not vector:
     return cache.setdefault(u, _static_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype))
   else: return cache.setdefault(u, _static_alu(u.op, u.dtype, tuple(_eval_expr(src, env, cache, vector) for src in u.src), vector))
@@ -414,8 +412,7 @@ class RKLoopReduction:
 
 def _loop_reduction_match(output:RKOutput) -> RKLoopReduction|None:
   """Parse the output, accumulator update, shape, and optional final scale of a loop reduction."""
-  store, out, _, _, root = output
-  nodes, rows, out_ranges = list(root.toposort()), int(out.src[0].arg), _index_ranges(store.src[0].src[1])
+  store, out, _, _, root = output; nodes, rows, out_ranges = list(root.toposort()), int(out.src[0].arg), _index_ranges(store.src[0].src[1])
   reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
   if rows <= 0 or len(reduce_ranges) != 1: return None
   reduce_range = reduce_ranges[0]
@@ -458,7 +455,7 @@ def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, i
   """Represent static address arithmetic as a sum of scaled RANGE or RANGE//constant terms."""
   if u.op is Ops.CONST: return int(u.arg), {}
   if divided and u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int, dtypes.uint): return _linear_index(u.src[0], divided)
-  term:UOp|tuple[UOp, int]|None = (u, 1) if divided and u.op in (Ops.RANGE, Ops.SPECIAL) else u if u.op in (Ops.RANGE, Ops.SPECIAL) else None
+  term:UOp|tuple[UOp, int]|None = ((u, 1) if divided else u) if u.op in (Ops.RANGE, Ops.SPECIAL) else None
   if divided and u.op is Ops.CDIV and len(u.src) == 2 and u.src[0].op in (Ops.RANGE, Ops.SPECIAL) and \
      u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0: term = (u.src[0], int(u.src[1].arg))
   if term is not None: return 0, {term:1}
@@ -502,10 +499,9 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
   return RKGather(src_index, dst_index, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
 def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
-  if plan.offsets: low, high = min(plan.offsets, default=0), max(plan.offsets, default=-1)
-  else:
-    deltas = tuple((limit-1)*stride for _,limit,stride in plan.axes)
-    low, high = plan.base+sum(min(delta, 0) for delta in deltas), plan.base+sum(max(delta, 0) for delta in deltas)
+  deltas = tuple((limit-1)*stride for _,limit,stride in plan.axes) if not plan.offsets else ()
+  low, high = (min(plan.offsets, default=0), max(plan.offsets, default=-1)) if plan.offsets else \
+    (plan.base+sum(min(delta, 0) for delta in deltas), plan.base+sum(max(delta, 0) for delta in deltas))
   if low < (0 if not plan.offsets else -1) or high >= source_count: raise RuntimeError("RKPLAN_REJECT:gather_index")
 
 @dataclass(frozen=True)
@@ -608,9 +604,7 @@ def _reduction_store(store:UOp, out:UOp, index:UOp, lanes:int, value:UOp) -> UOp
   return store.replace(src=(store.src[0].replace(src=(out.replace(src=(out.src[0].const_like(lanes),)), index)), value, *store.src[2:]))
 
 def _reduction_input(u:UOp, load_dtype:DType|None=None, out_slot:int|None=None, param_dtypes:tuple[DType, ...]|None=None) -> tuple[UOp, UOp]|None:
-  if u.op is Ops.LOAD and len(u.src) == 1 and u.src[0].op is Ops.INDEX: index = u.src[0]
-  elif u.op is Ops.INDEX and len(u.src) == 2: index = u
-  else: return None
+  index = u.src[0] if u.op is Ops.LOAD and len(u.src) == 1 and u.src[0].op is Ops.INDEX else u if u.op is Ops.INDEX and len(u.src) == 2 else None
   if index is None or len(index.src) != 2 or (param:=index.src[0]).op is not Ops.PARAM: return None
   return (index, param) if (load_dtype is None or u.dtype.scalar() is load_dtype) and \
     (param_dtypes is None or param.dtype.scalar() in param_dtypes) and param.src and param.src[0].op is Ops.CONST and \
@@ -635,8 +629,7 @@ def _reduction_arena(rows:int, groups:int, slot:int) -> tuple[int, int, Callable
 
 def _spaced_reduction(ops:list[RKEWOp], mid:list[RKGather], source:RKArg, count:int, allocate:Callable[[int], RKArg], cfg:int,
                       *, int16:bool=False) -> RKArg:
-  stride = round_up(2, 64)
-  spaced = allocate(count*stride//2)
+  stride = round_up(2, 64); spaced = allocate(count*stride//2)
   mid.append(RKGather(source.index, spaced.index, count, axes=((1, count, 1),), dst_stride=stride//2, src_kind=RKBufferKind.SCRATCH, after=len(ops)))
   return _reduce_rows(ops, [replace(spaced, addend=lane*stride) for lane in range(count)], 1, cfg, int16=int16)
 
@@ -727,8 +720,7 @@ def _finish_mapped_add_reduction(mapped:RKImage, out_slot:int, rows:int, groups:
   lanes = rows*groups
   scratch_shift, value_slot = 1, len(mapped.scratch)+1; ss,vs,os,kind = scratch_shift,value_slot,out_slot,RKBufferKind.SCRATCH
   mapped = _map_image_args(mapped, lambda a: replace(a,index=a.index+ss) if a.kind is kind else replace(a,kind=kind,index=vs) if a.index==os else a)
-  ops, arena_slot = list(mapped.ew_ops), value_slot+1
-  stride, _, arena, active = _reduction_arena(rows, groups, arena_slot)
+  ops, arena_slot = list(mapped.ew_ops), value_slot+1; stride, _, arena, active = _reduction_arena(rows, groups, arena_slot)
   mid = tuple(RKGather(value_slot, arena_slot, rows, base=group*rows, axes=((1, rows, 1),),
                        dst_addend=group*(stride//2), src_kind=RKBufferKind.SCRATCH) for group in range(groups))
   dest = RKArg(RKBufferKind.ARG, out_slot) if post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, arena_slot+1)
@@ -802,8 +794,7 @@ def _flat_static_ranges(ranges:Iterable[UOp], dtype:DType=dtypes.int) -> tuple[U
 
 def _lower_mapped_add_loop_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Evaluate one fused FP16 map over the whole reduction domain, then reduce its materialized lanes."""
-  store, out, rows, out_index, root = output
-  nodes, out_ranges = list(root.toposort()), _index_ranges(out_index)
+  store, out, rows, out_index, root = output; nodes, out_ranges = list(root.toposort()), _index_ranges(out_index)
   reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
   if not reduce_ranges or any(r.src[0].op is not Ops.CONST or int(r.src[0].arg) <= 0 for r in reduce_ranges): return None
   try: envs = _iter_range_env(out_ranges)
@@ -837,8 +828,7 @@ def _lower_vectorized_unrolled_add_reduction(output:RKOutput, uops:list[UOp]) ->
                    Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.AND, Ops.OR, Ops.XOR, Ops.WHERE,
                    Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.LOAD, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.CAST, Ops.RANGE)
   if any(u.op not in supported_ops for u in terms[0].toposort()): return None
-  template = terms[0]
-  loaded_indices = {u.src[0] for u in template.toposort() if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX}
+  template = terms[0]; loaded_indices = {u.src[0] for u in template.toposort() if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX}
   leaves = [u for u in template.toposort() if input_leaf(u) is not None and u not in loaded_indices]
   if not leaves: return None
   counterparts:dict[UOp, list[UOp]] = {leaf:[] for leaf in leaves}
@@ -857,8 +847,7 @@ def _lower_vectorized_unrolled_add_reduction(output:RKOutput, uops:list[UOp]) ->
   if (first:=input_leaf(leaves[0])) is None: return None
   first_index, axis = first[0], max((r.arg[0] for r in _index_ranges(out_index) if isinstance(r.arg, tuple)), default=-1)+1
   lane = UOp(Ops.RANGE, first_index.src[1].dtype, src=(first_index.src[1].const_like(len(terms)),), arg=(axis, AxisType.LOOP))
-  substitutions:dict[UOp, UOp] = {}
-  static_fallbacks:list[tuple[int, UOp, tuple[int, ...]]] = []
+  substitutions:dict[UOp, UOp] = {}; static_fallbacks:list[tuple[int, UOp, tuple[int, ...]]] = []
   next_fake_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out.arg.slot)
   for leaf in leaves:
     paired = counterparts[leaf]
@@ -916,8 +905,7 @@ def _lower_vectorized_unrolled_add_reduction(output:RKOutput, uops:list[UOp]) ->
 
 def _lower_vectorized_mul_add_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Execute repeated FP16 MUL UOps with product residuals, then compensate their physical ADD reduction."""
-  store, out, rows, out_index, root = output
-  summed, post_scale = root, 1.0
+  store, out, rows, out_index, root = output; summed, post_scale = root, 1.0
   if root.op is Ops.WHERE and len(root.src) == 3 and root.src[0].op is Ops.CMPLT and \
      len(root.src[0].src) == 2 and root.src[0].src[0].op is Ops.CONST and float(root.src[0].src[0].arg) == 0.0 and \
      root.src[0].src[1].key == root.src[1].key and root.src[2].op is Ops.CONST and float(root.src[2].arg) == 0.0:
@@ -929,8 +917,7 @@ def _lower_vectorized_mul_add_reduction(output:RKOutput, uops:list[UOp]) -> RKIm
          (candidate.dtype.scalar() in (dtypes.half, dtypes.float) and _is_static_expr(candidate)):
         summed = dot; break
   if (scaled:=_scaled_add_terms(summed)) is None: return None
-  terms, post_scale = scaled
-  groups, lanes, chunk_lanes = len(terms), rows*len(terms), _MAX_EW_ELEMS_FP16*(round_up(2, 64)//2)
+  terms, post_scale = scaled; groups, lanes, chunk_lanes = len(terms), rows*len(terms), _MAX_EW_ELEMS_FP16*(round_up(2, 64)//2)
   if groups != 8 and (groups < _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS or groups < 256 and rows <= _MAX_EW_ELEMS_FP16) or \
      8*_scratch_bytes(lanes)+_scratch_bytes(min(chunk_lanes, lanes)) > _MAX_MAPPED_DOT_SCRATCH_BYTES: return None
 
@@ -983,14 +970,12 @@ def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
 class _RKBuilder:
   """Allocate physical scratch and append native stages without owning semantic lowering."""
   def __init__(self, minimum:int=0):
-    self.minimum = minimum
-    self.sizes,self.gathers,self.ops = typing_cast(tuple[list[int], list[RKGather], list[RKEWOp]], ([], [], []))
+    self.minimum = minimum; self.sizes,self.gathers,self.ops = typing_cast(tuple[list[int], list[RKGather], list[RKEWOp]], ([], [], []))
   def scratch(self, size:int, addend:int=0) -> RKArg:
     self.sizes.append(max(self.minimum, size)); return RKArg(RKBufferKind.SCRATCH, len(self.sizes)-1, addend)
   def constant(self, source:int, count:int, value:int, itemsize:int=2, dst:RKArg|None=None) -> RKArg:
     if dst is None: dst = self.scratch(count*itemsize)
-    self.gathers.append(RKGather(source, dst.index, count, values=(value,)*count, itemsize=itemsize))
-    return dst
+    self.gathers.append(RKGather(source, dst.index, count, values=(value,)*count, itemsize=itemsize)); return dst
   def i16(self, lhs:RKArg, rhs:RKArg, count:int, cfg:int, dst:RKArg|None=None) -> RKArg:
     if dst is None: dst = self.scratch(count*2)
     self.ops.append(RKEWOp(dst, lhs, rhs, count, cfg, **_INT16_EW)); return dst
@@ -1056,8 +1041,7 @@ def _kahan_add(ops:list[RKEWOp], active:list[int], count:int, arena:Callable[[in
 
 def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
-  root, zero = output[4], UOp.const(0.0, dtypes.half)
-  source = _typed_cast_source(root, dtypes.uchar, dtypes.half)
+  root, zero = output[4], UOp.const(0.0, dtypes.half); source = _typed_cast_source(root, dtypes.uchar, dtypes.half)
   if source is None and root.op is Ops.WHERE and root.dtype.scalar() is dtypes.uchar and len(root.src) == 3:
     condition, positive, fallback = root.src
     source = _typed_cast_source(positive, dtypes.uchar, dtypes.half)
@@ -1167,9 +1151,8 @@ def _native_int16_byte_mask(builder:_RKBuilder, index_slot:int, index_offsets:tu
         tuple(tuple(offset*4+byte for offset in offsets) for offsets in offset_rows), vector_lanes))
       builder.gathers.append(RKGather(index_slot, static.index, matrix_lanes,
         values=tuple((value >> (byte*8)) & 0xff for row in coordinates for value in (*row, *((0,)*(vector_lanes-count)))), itemsize=2))
-      builder.i16(dynamic, static, matrix_lanes, _EW_CFG[Ops.SUB], diff)
-      builder.i16(diff, diff, matrix_lanes, _EW_CFG_ABS, magnitude)
-      builder.i16(magnitude, one, matrix_lanes, _EW_CFG_MIN, unequal)
+      for lhs,rhs,cfg,dst in ((dynamic, static, _EW_CFG[Ops.SUB], diff), (diff, diff, _EW_CFG_ABS, magnitude),
+                              (magnitude, one, _EW_CFG_MIN, unequal)): builder.i16(lhs, rhs, matrix_lanes, cfg, dst)
       byte_masks.append(builder.i16(one, unequal, matrix_lanes, _EW_CFG[Ops.SUB], equal))
     masks.append(_reduce_byte_masks(builder, byte_masks, matrix_lanes, _EW_CFG[Ops.MUL]))
   return _reduce_byte_masks(builder, masks, matrix_lanes, _EW_CFG[Ops.MAX])
@@ -1179,10 +1162,9 @@ def _reduce_byte_masks(builder:_RKBuilder, masks:list[RKArg]|tuple[RKArg, ...], 
 
 def _prefix_valid(builder:_RKBuilder, total:RKArg, coordinate:RKArg, zero:RKArg, one:RKArg, count:int) -> tuple[RKArg, RKArg]:
   delta, positive, valid, remaining = (builder.scratch(count*2) for _ in range(4))
-  builder.i16(total, coordinate, count, _EW_CFG[Ops.SUB], delta)
-  builder.i16(delta, zero, count, _EW_CFG[Ops.MAX], positive)
-  builder.i16(positive, one, count, _EW_CFG_MIN, valid)
-  builder.i16(one, valid, count, _EW_CFG[Ops.SUB], remaining)
+  for lhs,rhs,cfg,dst in ((total, coordinate, _EW_CFG[Ops.SUB], delta), (delta, zero, _EW_CFG[Ops.MAX], positive),
+                          (positive, one, _EW_CFG_MIN, valid), (one, valid, _EW_CFG[Ops.SUB], remaining)):
+    builder.i16(lhs, rhs, count, cfg, dst)
   return valid, remaining
 
 def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predicate:Callable[[UOp], UOp|None],
@@ -1205,8 +1187,7 @@ def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predi
       scales.append(scale)
   except RuntimeError: return None
   if source is None or not scales or len(set(scales)) != 1: return None
-  source_count = int(source.src[0].arg)
-  if source_count <= 0 or len(terms)%source_count or any(offsets.count(i) != len(terms)//source_count for i in range(source_count)): return None
+  if (source_count:=int(source.src[0].arg)) <= 0 or len(terms)%source_count or any(offsets.count(i) != len(terms)//source_count for i in range(source_count)): return None  # noqa: E501
   return (source, scales[0]*(len(terms)//source_count)) if 1 <= scales[0]*(len(terms)//source_count) <= max_scale else None
 
 def _bounded_predicate_coordinate_plan(output:RKOutput, dtype:DType, predicate:Callable[[UOp], UOp|None],
@@ -1244,12 +1225,10 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   if (plan:=_bounded_predicate_coordinate_plan(output, dtype, lambda u:_nonzero_load(u, dtype),
                                                lambda value:-32768 <= value <= 32767)) is None: return None
   source, rank, index_param, index_offsets, coordinate_rows, fill_value = plan
-  source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows)
-  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)
+  source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows); _, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)  # noqa: E501
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
 
-  builder, source_vector_lanes = _RKBuilder(64), _stripe_layout(1, source_count)[1]
-  source_matrix_lanes = source_count*source_vector_lanes
+  builder, source_vector_lanes = _RKBuilder(64), _stripe_layout(1, source_count)[1]; source_matrix_lanes = source_count*source_vector_lanes
   one, byte_masks = builder.constant(source.arg.slot, source_matrix_lanes, 1), tuple(builder.scratch(source_matrix_lanes*2) for _ in range(dtype.itemsize))  # noqa: E501
   for byte,value in enumerate(byte_masks):
     builder.gathers.extend(RKGather(source.arg.slot, value.index, 1,
@@ -1274,9 +1253,8 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
   valid, remaining, reduced = (*_prefix_valid(builder, total_vector, output_coordinate, zero, one, count),
                                _masked_rows(builder, coordinate_matrix, equal, coordinate_count, vector_lanes, count))
   guarded, fill_part, result = (builder.scratch(matrix_lanes*2) for _ in range(3))
-  builder.i16(reduced, valid, count, _EW_CFG[Ops.MUL], guarded)
-  builder.i16(fill_value_arg, remaining, count, _EW_CFG[Ops.MUL], fill_part)
-  builder.i16(guarded, fill_part, count, _EW_CFG[Ops.ADD], result)
+  for lhs,rhs,cfg,dst in ((reduced, valid, _EW_CFG[Ops.MUL], guarded), (fill_value_arg, remaining, _EW_CFG[Ops.MUL], fill_part),
+                          (guarded, fill_part, _EW_CFG[Ops.ADD], result)): builder.i16(lhs, rhs, count, cfg, dst)
   builder.ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out.arg.slot), result, result, count, _EW_CFG[Ops.MAX], int16_input=True, int32_output=True))
   return builder.image(mid_gathers=mid, gather_after=gather_after)
 
@@ -1304,8 +1282,7 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
   data_param, data_index, gate, gate_nodes = _root_param(load.src[0]), load.src[0].src[1], load.src[2], load.src[2].toposort()
   bool_loads = tuple(u for u in gate_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool)
   if (axes:=_bounded_dynamic_axes(data_index, gate)) is None: return None
-  loads = tuple(axis[1] for axis in axes)
-  params = typing_cast(tuple[UOp, ...], tuple(_root_param(u.src[0]) if u.src and u.src[0].op is Ops.INDEX else None for u in loads))
+  loads = tuple(axis[1] for axis in axes); params = typing_cast(tuple[UOp, ...], tuple(_root_param(u.src[0]) if u.src and u.src[0].op is Ops.INDEX else None for u in loads))  # noqa: E501
   if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or len(bool_loads) > 1 or
       any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params) or
       {u.key for u in gate_nodes if u.op is Ops.LOAD} != {u.key for u in (*loads, *bool_loads)}): return None
@@ -1431,8 +1408,7 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
   if terminal != [len(image.ew_ops)-1] or image.mid_gathers or image.post_gathers:
     raise RuntimeError("RKPLAN_REJECT:predicate_terminal" if int32 else "RKPLAN_REJECT:uint8_terminal")
-  result_slot, auxiliary_slot = len(image.scratch), len(image.scratch)+1
-  result = RKArg(RKBufferKind.SCRATCH, result_slot)
+  result_slot, auxiliary_slot = len(image.scratch), len(image.scratch)+1; result = RKArg(RKBufferKind.SCRATCH, result_slot)
   if int32:
     ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
            RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, RKArg(RKBufferKind.SCRATCH, auxiliary_slot), count, _EW_CFG[Ops.MAX],
@@ -1523,8 +1499,8 @@ def _runtime_affine_index(u:UOp, out_index:UOp, count:int) -> tuple[UOp, UOp, in
     zero, one = (_static_values(out_index, u.substitute({load:load.const_like(value)}), count, int) for value in (0, 1))
   except RuntimeError: return None
   lane_stride = zero[1]-zero[0] if count > 1 else 0
-  valid = len({a-b for a,b in zip(one, zero)}) == 1 and zero == tuple(zero[0]+lane*lane_stride for lane in range(count))
-  return (load, param, itemsize, lane_offset, zero[0], one[0]-zero[0], lane_stride) if valid else None
+  return (load, param, itemsize, lane_offset, zero[0], one[0]-zero[0], lane_stride) if \
+    len({a-b for a,b in zip(one, zero)}) == 1 and zero == tuple(zero[0]+lane*lane_stride for lane in range(count)) else None
 
 def _runtime_load_address(index:UOp, out_index:UOp, count:int, loads:tuple[UOp, ...]) -> tuple[tuple[UOp, UOp, int, int, int, int, int], bool]|None:
   """Resolve a runtime address and retain whether it is affine or table-addressed."""
@@ -1584,11 +1560,9 @@ def _fp32_ratio_to_half(u:UOp) -> UOp|None:
   return _tag_precise_adds(quotient.alu(Ops.ADD, residual.alu(Ops.FDIV, denominator)))
 
 def _accurate_add_recipe(u:UOp) -> UOp:
-  terms:list[UOp] = []
-  for x in _iter_binary(u, Ops.ADD, plain=True):
-    if (source:=_typed_cast_source(x, dtypes.half, dtypes.float)) is not None and source.op is Ops.ADD:
-      terms.extend(_fp32_add_terms(source))
-    else: terms.append(x)
+  terms = [part for x in _iter_binary(u, Ops.ADD, plain=True) for part in
+           next((_fp32_add_terms(source) for source in (_typed_cast_source(x, dtypes.half, dtypes.float),)
+                 if source is not None and source.op is Ops.ADD), (x,))]
   if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2: raise _RKGenericReject
   if any(any(node.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) for node in term.toposort()) for term in terms):
     raise _RKGenericReject
@@ -1770,8 +1744,7 @@ class RKContext:
     if dtype not in (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool) or not u.src or u.src[0].op is not Ops.INDEX or \
        (param:=_root_param(u.src[0])) is None or param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST:
       raise _RKGenericReject
-    index, gate = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None
-    default = u.src[1] if len(u.src) > 1 else None
+    index, gate = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None; default = u.src[1] if len(u.src) > 1 else None
     index_loads, gate_loads = _semantic_loads(index), () if gate is None else _semantic_loads(gate)
     runtime_address = bool(index_loads or gate_loads)
     layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else RKLayout.INT32
@@ -1796,8 +1769,7 @@ class RKContext:
     self.ew_ops.append(RKEWOp(dst.arg, lhs.arg, rhs.arg, self.count, cfg, submit_barrier=barrier,
       compare=compare, stateful=integer32 or not integer16 and (self.mask_program and not compare or barrier),
       int16_output=integer16, int16_input=integer16, int32_output=integer32, int32_input=integer32))
-    self.mask_program |= compare
-    return dst
+    self.mask_program |= compare; return dst
 
   def _byte_gather(self, source:RKArg, dest:RKArg, count:int, *, base:int=0, source_stride:int=1,
                    source_limit:int|None=None, dst_stride:int=1, dst_addend:int=0, itemsize:int=2, after:int=-1) -> RKArg:
@@ -1887,8 +1859,7 @@ class RKContext:
     if value.layout is layout: return value
     if (value.layout, layout) != (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
     result = self._scratch(dtypes.bool, RKLayout.BOOL_INT16)
-    self.ew_ops.append(RKEWOp(result.arg, value.arg, value.arg, self.count, _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True, int16_output=True))
-    return result
+    self.ew_ops.append(RKEWOp(result.arg, value.arg, value.arg, self.count, _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True, int16_output=True)); return result  # noqa: E501
 
   def _bool_binary(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
@@ -2223,9 +2194,8 @@ class RKContext:
   def _masked_where(self, u:UOp, dtype:DType, layout:RKLayout, selector:RKValue,
                     yes:RKValue, no:RKValue, one:RKValue) -> RKValue:
     selected_yes, inverse, selected_no = (self._scratch(one.dtype, one.layout) for _ in range(3))
-    self._emit(selected_yes, selector, yes, _EW_CFG[Ops.MUL])
-    self._emit(inverse, one, selector, _EW_CFG[Ops.SUB])
-    self._emit(selected_no, inverse, no, _EW_CFG[Ops.MUL])
+    for dst,lhs,rhs,cfg in ((selected_yes, selector, yes, _EW_CFG[Ops.MUL]), (inverse, one, selector, _EW_CFG[Ops.SUB]),
+                            (selected_no, inverse, no, _EW_CFG[Ops.MUL])): self._emit(dst, lhs, rhs, cfg)
     return self._emit(self._scratch(dtype, layout, u=u), selected_yes, selected_no, _EW_CFG[Ops.ADD])
 
   def _raw_where(self, u:UOp) -> RKValue:
@@ -2265,8 +2235,7 @@ class RKContext:
     selected_bytes:list[RKValue] = []
     for yes_byte,no_byte in zip(yes_bytes, no_bytes):
       delta, selected, result = (self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(3))
-      self._emit(delta, yes_byte, no_byte, _EW_CFG[Ops.SUB])
-      self._emit(selected, mask, delta, _EW_CFG[Ops.MUL])
+      for dst,lhs,rhs,cfg in ((delta, yes_byte, no_byte, _EW_CFG[Ops.SUB]), (selected, mask, delta, _EW_CFG[Ops.MUL])): self._emit(dst, lhs, rhs, cfg)
       selected_bytes.append(self._emit(result, no_byte, selected, _EW_CFG[Ops.ADD]))
     return self._raw(selected_bytes, yes.layout, u=u, dst=self._scratch(u.dtype.scalar(), yes.layout), cache=False)
 
@@ -2326,8 +2295,7 @@ class RKContext:
        (u is self.root and self.out_param.dtype.scalar() is not dtypes.int):
       raise _RKGenericReject
     zero, value = self._i16_const(0), self._scratch(dtypes.int,RKLayout.INT32,u=u)
-    self.ew_ops.append(RKEWOp(value.arg, source.arg, zero, self.count, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
-    return value
+    self.ew_ops.append(RKEWOp(value.arg, source.arg, zero, self.count, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True)); return value
 
   def lower(self, u:UOp) -> RKValue:
     if u in self.values: return self.values[u]
@@ -2898,10 +2866,9 @@ def _fold_threshold_where(x:UOp) -> UOp|None:
   if gate.op is not Ops.CMPLT or gate.src[1].op is not Ops.CONST or not math.isfinite(float(gate.src[1].arg)): return None
   lhs, threshold, yes, no = gate.src[0], float(gate.src[1].arg), *(_unwrap_condition(u) for u in x.src[1:])
   if (mask:=_mask_expr(x.src[0])) is None: return None
-  inverse = UOp.const(1.0, dtypes.half).alu(Ops.SUB, mask)
   if yes.key == lhs.key and no.op is Ops.CONST and math.isfinite(float(no.arg)) and float(no.arg) != threshold:
     return _native_min(lhs.cast(dtypes.half), _half(threshold), dtype=lhs.dtype).alu(
-      Ops.ADD, _mask_mul(inverse, _half(float(no.arg)-threshold)))
+      Ops.ADD, _mask_mul(UOp.const(1.0, dtypes.half).alu(Ops.SUB, mask), _half(float(no.arg)-threshold)))
   if no.key == lhs.key and yes.op is Ops.CONST and math.isfinite(float(yes.arg)) and float(yes.arg) != threshold:
     return lhs.cast(dtypes.half).alu(Ops.MAX, _half(threshold)).alu(
       Ops.ADD, _mask_mul(mask, _half(float(yes.arg)-threshold)))
@@ -3008,9 +2975,8 @@ def _fold_atan(root:UOp) -> UOp|None:
   for u in nodes:
     if u.op in (Ops.MUL, Ops.FDIV) and (source:=_unit_ratio_source(u)) is not None: sources[source.key] = source
   constants = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float)}
-  if (len(sources) != 1 or not any(abs(v-math.pi/2) < 1e-12 for v in constants) or
-      not any(abs(v-1.570796305) < 1e-10 for v in constants) or
-      not any(abs(v+0.0012624911) < 1e-8 for v in constants)): return None
+  if len(sources) != 1 or any(not any(abs(v-target) < tolerance for v in constants) for target,tolerance in
+                              ((math.pi/2, 1e-12), (1.570796305, 1e-10), (-0.0012624911, 1e-8))): return None
   source, one = next(iter(sources.values())).cast(dtypes.half), UOp.const(1.0, dtypes.half)
   magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS)
   reduced = UOp(Ops.MAX, magnitude.dtype, src=(magnitude, one.alu(Ops.FDIV, magnitude)), arg=_NATIVE_MIN)
@@ -3035,15 +3001,14 @@ def _poly_horner(source:UOp, coefficients:tuple[float, ...]) -> UOp:
   return functools.reduce(lambda r,c: r.alu(Ops.MUL, source).alu(Ops.ADD, source.const_like(c)),
                           coefficients[-2::-1], source.const_like(coefficients[-1]))
 
-def _dpu_region(value:UOp, threshold:UOp, small:UOp, large:UOp, mask:Callable[[UOp], UOp]=_finite_positive_mask, reverse:bool=False) -> UOp:
-  return small.alu(Ops.ADD, mask(threshold.alu(Ops.SUB, value) if reverse else value.alu(Ops.SUB, threshold)).alu(Ops.MUL, large.alu(Ops.SUB, small)))
-
 def _hyperbolic_tail(magnitude:UOp, coefficients:tuple[float, ...]) -> UOp:
   """Approximate log(2*x) plus an inverse-even-power correction for large positive x."""
   one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
   inverse = one.alu(Ops.FDIV, magnitude); inverse_square = inverse.alu(Ops.MUL, inverse)
   correction = inverse_square.alu(Ops.MUL, _poly_horner(inverse_square, coefficients))
   return magnitude.alu(Ops.LOG2).alu(Ops.MUL, ln2).alu(Ops.ADD, ln2).alu(Ops.ADD, correction)
+
+def _dpu_region(value:UOp, threshold:UOp, small:UOp, large:UOp, mask:Callable[[UOp], UOp]=_finite_positive_mask, reverse:bool=False) -> UOp: return small.alu(Ops.ADD, mask(threshold.alu(Ops.SUB, value) if reverse else value.alu(Ops.SUB, threshold)).alu(Ops.MUL, large.alu(Ops.SUB, small)))  # noqa: E501
 
 def _dpu_inverse_hyperbolic(source:UOp, offset:int, one:UOp, ln2:UOp) -> UOp:
   asinh, threshold = offset == 1, _half(1.5 if offset == 1 else 2.0); magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS) if asinh else source  # noqa: E501
