@@ -7415,3 +7415,84 @@ preserve this documentation delta.
 No CPU/GPU/CMAC or production host-numeric path, runtime/core workaround, or
 tolerance relaxation was added. This documentation pass changed only
 `progress.md` in the isolated checkout and ran no additional NPU test.
+
+---
+
+## 2026-08-22 — exact 2,825 renderer milestone hardware-proven
+
+The code milestone is commit `444561b3c30c37e2201fd512e5040fe9627e3368`
+(`WIP rockchip: readable cleanup to 2.825k`), directly descended from
+`4bdf6f46fa7671cda110c621e391f76356da8a5b` (the exact-2,860 documentation
+commit). This is the `4bdf -> 444` source lineage. `sz.py` reports renderer/
+runtime **2,825/470**. The code commit tree is
+`4ca3fa9de047af393d12345269d728a4633fb6ce`; the renderer blob is
+`725e025a2ad6257c165a055b33ab6520d890f750` (SHA-256
+`9a82477963d4ea26fd26a4b599917bbfb2da599090f02bfadf955fa34dda799e`), and
+the unchanged runtime blob is `b9aa3842afb95edd2de7ea57bf2de2bfde1475df`
+(SHA-256 `da7ef1b98ac1658ddbd19b44b41c7f6d451e93acc43904b2bcd4523dd1ec683e`).
+The source diff from `4bdf` is renderer-only (**57 insertions, 92 deletions,
+net -35**). The tracked tree for the hardware artifacts was clean; five
+pre-existing untracked files (`cut-oracle.json`, `loop-reduction-refactor-judge`,
+`raw-cast-unification-3272-luna-max-20260818.reject.md`,
+`rockchip-2911-ast-audit.reject.md`, and `rockchip-2911-horner-audit.reject.md`)
+were preserved and are not part of this patch. The isolated combined-2825
+provenance/application record has
+final source commit `0ae93773786c223c2d6cb380a8f8dba5a8df36af`, the same final
+tree/renderer blob, and union-patch SHA-256
+`d4a174233133cb7adb09eb48cd895bea05c193181919a9b7b84ba359379930b7`;
+see the [combined report](/home/orangepi/rk-artifacts-next2830-20260821/combined-2825/REPORT.md)
+and [provenance verdict](/home/orangepi/rk-artifacts-next2830-20260821/combined-2825-judge-provenance/VERDICT.md).
+
+- Independent host gates on the combined-2825 candidate are Rockchip UOps
+  **115 passed** with `-q -x -n12`, Ruff pass, compileall pass,
+  `mypy tinygrad/` with no issues in **216 source files**, `git diff --check`
+  pass, and backend collection of exactly **445** tests. Candidate/baseline
+  normalized semantic payloads are equal; raw b79d differences are metadata-only;
+  their exact limits are b79d **11 graphs** (**10 compile successes** plus the
+  intentional requested-double rejection), ABI/image/malformed **4 images,
+  20 malformed blobs, 110 stages**, decode flags **256 cases (2 accepted,
+  254 rejected)**, random ABI mutation/truncation **781 records**, and a
+  function/class signature inventory of **268 entries**. The corrected
+  top-level b79d normalization record is authoritative; the older intermediate
+  `/home/orangepi/rk-artifacts-next2830-20260821/combined-2825/evidence/b79d-normalized.json`
+  is not used for this result.
+  The strict-v2 component evidence, persisted from the independently verified
+  `16ac8bf` history rather than freshly replayed after the exact-444
+  composition, adds selector **262,162 cases/0 mismatches**, shift **272
+  cases/0 errors**, RKContext **2,755 records/0 exceptions**, and **six**
+  exhaustive families with zero mismatches. These are host/provenance checks;
+  no NPU execution is implied.
+- The pre-reboot health artifact records a captured current-head
+  `.venv/bin/python ~/rk3588/examples/simple_add.py` failure with
+  `OSError: [Errno 6] No such device or address` (`ENXIO`) while mapping the
+  4 MiB buffer and exit 1. Its artifact does not persist a reboot event or an
+  invocation/retry counter; see the [pre-reboot health artifact](/home/orangepi/rk-artifacts-next2825-20260821/hardware-health/health-gate-metadata.txt)
+  and its [captured stderr](/home/orangepi/rk-artifacts-next2825-20260821/hardware-health/simple_add.stderr.log).
+  Following the user-reported reboot, the later recorded current-head
+  invocation passed (exit 0), ending with `ADD ... PASS`; see the
+  [post-reboot metadata](/home/orangepi/rk-artifacts-next2825-20260822/hardware-health-postreboot/health-gate-metadata.txt)
+  and [captured output](/home/orangepi/rk-artifacts-next2825-20260822/hardware-health-postreboot/simple_add.stdout.log).
+- The authoritative full census was one serial invocation with a fresh
+  dedicated cache: `env -u SKIP_SLOW_TEST FORWARD_ONLY=1 DEFAULT_FLOAT=HALF
+  DEV=ROCKCHIP ROCKCHIP_SUBMIT_TIMEOUT_MS=6000 ROCKCHIP_SUBMIT_RETRIES=4
+  CACHEDB=/home/orangepi/rk-artifacts-next2825-20260822/hardware-full445/cache.db
+  .venv/bin/python -m pytest test/backend/test_rockchip.py -q -x -rs -n0`.
+  Collection and
+  observation were both **445** (`collected_total=445`, `observed_total=445`);
+  the result was **433 passed + 12 skipped = 445**, **154 subtests passed**,
+  exit 0, in **998.06 s**. Execution accounting is aggregate, with the 445
+  collection names persisted; no per-node outcome manifest is present. See
+  the [census command](/home/orangepi/rk-artifacts-next2825-20260822/hardware-full445/command.txt),
+  [counts](/home/orangepi/rk-artifacts-next2825-20260822/hardware-full445/counts.txt),
+  and [run metadata](/home/orangepi/rk-artifacts-next2825-20260822/hardware-full445/run-metadata.txt).
+  The captured log has zero `retry|timeout|resubmit|submit` markers while
+  four retries were configured; marker absence does not prove zero attempts.
+  See the [marker scan](/home/orangepi/rk-artifacts-next2825-20260822/hardware-full445/retry-markers.txt).
+
+No CPU/GPU/CMAC/host production numeric fallback, runtime/core workaround, or
+tolerance relaxation was added by the audited `4bdf`-to-`444` source diff,
+and none was identified in the host/provenance/semantic evidence. This
+documentation pass ran no `elementwise.py`, rerun, reset, or additional NPU
+test (the captured health program output itself records `reset_npu ret=0`).
+Commit `444561b3c` is the code milestone; this progress-only documentation
+patch is pending.
