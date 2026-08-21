@@ -615,9 +615,16 @@ def _reduction_store(store:UOp, out:UOp, index:UOp, lanes:int, value:UOp) -> UOp
   return store.replace(src=(store.src[0].replace(src=(out.replace(src=(out.src[0].const_like(lanes),)), index)), value, *store.src[2:]))
 
 def _reduction_input(u:UOp, load_dtype:DType|None=None, out_slot:int|None=None, param_dtypes:tuple[DType, ...]|None=None) -> tuple[UOp, UOp]|None:
-  index = u if u.op is Ops.INDEX else u.src[0] if u.op is Ops.LOAD and u.src and u.src[0].op is Ops.INDEX else None
-  param = _root_param(index) if index is not None else None
-  return (index, param) if index is not None and param is not None and (load_dtype is None or u.dtype.scalar() is load_dtype) and \
+  if u.op is Ops.LOAD:
+    if len(u.src) != 1 or u.src[0].op is not Ops.INDEX: return None
+    index = u.src[0]
+  elif u.op is Ops.INDEX:
+    if len(u.src) != 2: return None
+    index = u
+  else: return None
+  if len(index.src) != 2 or index.src[0].op is not Ops.PARAM: return None
+  param = index.src[0]
+  return (index, param) if (load_dtype is None or u.dtype.scalar() is load_dtype) and \
     (param_dtypes is None or param.dtype.scalar() in param_dtypes) and param.src and param.src[0].op is Ops.CONST and \
     (out_slot is None or param.arg.slot != out_slot) else None
 
@@ -687,7 +694,13 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   out_param, nodes = loop.out, loop.nodes
   rows, envs, reduce_range, groups, update, post_scale = loop.rows, loop.envs, loop.reduce_range, loop.groups, loop.update, loop.post_scale
   fp32_out = out_param.dtype.scalar() is dtypes.float
-  loads = [parsed for u in nodes if (parsed:=_reduction_input(u, load_dtype=dtypes.half, out_slot=out_param.arg.slot)) is not None]
+  loads, seen_indexes = [], set()
+  for u in nodes:
+    if u.op is not Ops.LOAD or len(u.src) != 1: continue
+    if (parsed:=_reduction_input(u, load_dtype=dtypes.half, out_slot=out_param.arg.slot)) is None or \
+       len(parsed[0].src) != 2 or parsed[0].src[0] is not parsed[1] or parsed[0].key in seen_indexes: continue
+    seen_indexes.add(parsed[0].key)
+    loads.append(parsed)
   if not loads or len({param.key for _,param in loads}) != 1: return None
   in_param, update_nodes = loads[0][1], update.toposort()
   reduce_ops = {u.op for u in update_nodes if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}

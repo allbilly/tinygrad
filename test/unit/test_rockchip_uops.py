@@ -1,11 +1,12 @@
 import hashlib, itertools, math, struct
 import numpy as np
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from tinygrad import Tensor
-from tinygrad.codegen import to_program
+from tinygrad.codegen import to_program, to_program_cache
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import Target, round_up
+from tinygrad.helpers import Context, Target, round_up
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp, RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
@@ -225,6 +226,32 @@ def _execute_fp16_reduction_tail(image:RKImage, values:np.ndarray) -> np.ndarray
     if (gather.after if gather.after >= 0 else image.gather_after) == image.gather_after: apply_gather(gather)
   for op in image.ew_ops[image.gather_after:]: execute(op)
   return args[0]
+
+def _execute_scalar_reduction_image(image:RKImage, values:np.ndarray) -> float:
+  """Execute the native scalar FP16 reduction subset without opening a device."""
+  args = [bytearray(4), bytearray(np.asarray(values, dtype="<f2").tobytes())]
+  scratch = [bytearray(spec.size) for spec in image.scratch]
+  for slot in range(len(image.constants)//2):
+    np.frombuffer(scratch[slot], dtype="<f2")[:] = np.frombuffer(image.constants[slot*2:slot*2+2], dtype="<f2")[0]
+  def storage(arg:RKArg) -> bytearray: return args[arg.index] if arg.kind is RKBufferKind.ARG else scratch[arg.index]
+  def read(arg:RKArg, dtype:np.dtype, count:int) -> np.ndarray:
+    return np.frombuffer(storage(arg), dtype=dtype, count=count, offset=arg.addend).copy()
+  def write(arg:RKArg, dtype:np.dtype, value:np.ndarray) -> None:
+    np.frombuffer(storage(arg), dtype=dtype, count=len(value), offset=arg.addend)[:] = value.astype(dtype)
+  for gather in image.gathers:
+    source, destination = np.frombuffer(storage(RKArg(gather.src_kind, gather.src_index)), dtype="<f2"), \
+      np.frombuffer(storage(RKArg(gather.dst_kind, gather.dst_index)), dtype="<f2")
+    for lane in range(gather.count):
+      index = gather.offsets[lane] if gather.offsets else gather.base + sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes)
+      destination[gather.dst_addend+lane*gather.dst_stride] = source[index]
+  for op in image.ew_ops:
+    input_dtype = np.dtype("<f4") if op.ew_cfg & _EW_STAGE_FP32_IN else np.dtype("<f2")
+    output_dtype = np.dtype("<f4") if op.ew_cfg & _EW_STAGE_FP32_OUT else np.dtype("<f2")
+    lhs, rhs = read(op.lhs, input_dtype, op.count), read(op.rhs, input_dtype, op.count)
+    if output_dtype == np.dtype("<f4"): lhs, rhs = lhs.astype(np.float32), rhs.astype(np.float32)
+    assert op.ew_cfg & ~(_EW_STAGE_FP32_IN | _EW_STAGE_FP32_OUT) == _EW_CFG[Ops.ADD]
+    write(op.dst, output_dtype, lhs+rhs)
+  return float(np.frombuffer(args[0], dtype="<f4")[0])
 
 def test_mapped_reduction_temp_slices_are_full_aligned_abi_tiles():
   expected_sizes = {(1, 1):64, (1, 2):128, (1, 4):256, (33, 1):132, (33, 2):256, (33, 4):512}
@@ -737,6 +764,62 @@ def test_static_reduce_uops_are_structurally_executed():
     reduced = UOp(Ops.REDUCE, dtypes.half, src=(term, axis), arg=(op,))
     image = _lower_uop_program(list(out.index(row).store(reduced).end(row, axis).sink().toposort()))
     assert image is not None and len(image.gathers) == 3 and len(image.ew_ops) == 2
+
+def test_scalar_half_to_float_reduction_dedups_index_load_uops(monkeypatch):
+  values = np.random.RandomState(0).uniform(-2, 2, size=(45, 3)).astype(np.float16).reshape(-1)
+  routes:list[RKImage|None] = []
+  loops = []
+  lower = rockchip_renderer._lower_scalar_loop_reduction
+  def traced(loop):
+    loops.append(loop)
+    image = lower(loop)
+    routes.append(image)
+    return image
+  monkeypatch.setattr(rockchip_renderer, "_lower_scalar_loop_reduction", traced)
+  with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP", values.size, dtypes.half, num=1001).reshape((45, 3)))
+    output = source.sum(dtype=dtypes.float32)
+    ast = output.schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast, RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert len(routes) == 1 and routes[0] is not None
+  assert hashlib.sha256(encode_image(image)).hexdigest() == "b79d23fe6c1f99b3e28b2ed7758e02c89f1d23c6d838465123065e8eedae1f1c"
+  assert len(encode_image(image)) == 5453 and image.constants == b"" and len(image.scratch) == 1
+  assert len(image.gathers) == 1 and image.gathers[0].count == values.size and image.gathers[0].dst_stride == 32
+  assert len(image.ew_ops) == 134 and image.ew_ops[-1].ew_cfg & _EW_STAGE_FP32_OUT
+  assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+  physical = _execute_scalar_reduction_image(image, values)
+  expected = float(np.asarray(values, dtype=np.float32).sum(dtype=np.float32))
+  assert physical == -2.771484375
+  np.testing.assert_allclose(physical, expected, atol=0.005, rtol=0.005)
+
+  assert len(loops) == 1
+  loop = loops[0]
+  source_load = next(u for u in loop.update.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
+                     u.src[0].op is Ops.INDEX)
+  index, param = source_load.src[0], source_load.src[0].src[0]
+  assert rockchip_renderer._reduction_input(source_load, load_dtype=dtypes.half, out_slot=loop.out.arg.slot) == (index, param)
+  def replace_source(load):
+    update = loop.update.substitute({source_load: load})
+    return replace(loop, update=update, nodes=list(update.toposort()))
+  defaulted = index.load(UOp.const(0.0, dtypes.half))
+  gated = index.load(UOp.const(0.0, dtypes.half), UOp.const(True, dtypes.bool))
+  alias = index.replace(src=(UOp(Ops.AFTER, dtypes.half, src=(param,)), index.src[1])).load()
+  runtime_index = UOp.param(9, dtypes.int, (values.size,)).index(loop.reduce_range)
+  dynamic = index.replace(src=(param, runtime_index)).load()
+  out_of_bounds = index.replace(src=(param, UOp.const(values.size, dtypes.int))).load()
+  assert all(rockchip_renderer._reduction_input(load, load_dtype=dtypes.half, out_slot=loop.out.arg.slot) is None
+             for load in (defaulted, gated, alias))
+  assert all(lower(replace_source(load)) is None for load in (defaulted, gated, alias, dynamic, out_of_bounds))
+  distinct_index = index.replace(src=(param, index.src[1]+1))
+  assert distinct_index.key != index.key
+  distinct_loop = replace(loop, nodes=[*loop.nodes, distinct_index, distinct_index.load()])
+  assert lower(distinct_loop) is None
+  assert lower(replace(loop, groups=loop.groups-1)) is None
+  tagged = index.replace(tag="contract-tag")
+  assert tagged.key == index.key and tagged is not index
+  assert lower(replace(loop, nodes=[*loop.nodes, tagged])) is not None
 
 
 def test_static_dot_reduce_owns_accurate_physical_recipe():
