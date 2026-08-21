@@ -613,15 +613,10 @@ def _reduction_store(store:UOp, out:UOp, index:UOp, lanes:int, value:UOp) -> UOp
   return store.replace(src=(store.src[0].replace(src=(out.replace(src=(out.src[0].const_like(lanes),)), index)), value, *store.src[2:]))
 
 def _reduction_input(u:UOp, load_dtype:DType|None=None, out_slot:int|None=None, param_dtypes:tuple[DType, ...]|None=None) -> tuple[UOp, UOp]|None:
-  if u.op is Ops.LOAD:
-    if len(u.src) != 1 or u.src[0].op is not Ops.INDEX: return None
-    index = u.src[0]
-  elif u.op is Ops.INDEX:
-    if len(u.src) != 2: return None
-    index = u
+  if u.op is Ops.LOAD and len(u.src) == 1 and u.src[0].op is Ops.INDEX: index = u.src[0]
+  elif u.op is Ops.INDEX and len(u.src) == 2: index = u
   else: return None
-  if len(index.src) != 2 or index.src[0].op is not Ops.PARAM: return None
-  param = index.src[0]
+  if index is None or len(index.src) != 2 or (param:=index.src[0]).op is not Ops.PARAM: return None
   return (index, param) if (load_dtype is None or u.dtype.scalar() is load_dtype) and \
     (param_dtypes is None or param.dtype.scalar() in param_dtypes) and param.src and param.src[0].op is Ops.CONST and \
     (out_slot is None or param.arg.slot != out_slot) else None
@@ -691,15 +686,12 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   out_param, nodes = loop.out, loop.nodes
   rows, envs, reduce_range, groups, update, post_scale = loop.rows, loop.envs, loop.reduce_range, loop.groups, loop.update, loop.post_scale
   fp32_out = out_param.dtype.scalar() is dtypes.float
-  loads, seen_indexes = [], set()
+  loads:dict[bytes, tuple[UOp, UOp]] = {}
   for u in nodes:
-    if u.op is not Ops.LOAD or len(u.src) != 1: continue
-    if (parsed:=_reduction_input(u, load_dtype=dtypes.half, out_slot=out_param.arg.slot)) is None or \
-       len(parsed[0].src) != 2 or parsed[0].src[0] is not parsed[1] or parsed[0].key in seen_indexes: continue
-    seen_indexes.add(parsed[0].key)
-    loads.append(parsed)
-  if not loads or len({param.key for _,param in loads}) != 1: return None
-  in_param, update_nodes = loads[0][1], update.toposort()
+    if u.op is Ops.LOAD and len(u.src) == 1 and (parsed:=_reduction_input(u, load_dtype=dtypes.half, out_slot=out_param.arg.slot)) is not None:
+      loads.setdefault(parsed[0].key, parsed)
+  if not loads or len({param.key for _,param in loads.values()}) != 1: return None
+  in_param, update_nodes = next(iter(loads.values()))[1], update.toposort()
   reduce_ops = {u.op for u in update_nodes if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}
   negate_inputs = reduce_ops == {Ops.MUL, Ops.MAX} and any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.half and
                                                             float(u.arg) == -1.0 for u in update_nodes)
@@ -709,7 +701,7 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   reduce_op = Ops.MAX if negate_inputs else update.op
   if not negate_inputs and (reduce_op not in (Ops.ADD, Ops.MUL, Ops.MAX) or reduce_ops not in (set(), {reduce_op})): return None
   try:
-    blocks = [tuple(int(_eval_expr(load.src[1], {**env, reduce_range:r}, {})) for env in envs) for load,_ in loads for r in range(groups)]
+    blocks = [tuple(int(_eval_expr(load.src[1], {**env, reduce_range:r}, {})) for env in envs) for load,_ in loads.values() for r in range(groups)]
   except RuntimeError: return None
   input_count = int(in_param.src[0].arg)
   if input_count != rows*len(blocks) or sorted(offset for block in blocks for offset in block) != list(range(input_count)): return None
@@ -831,8 +823,7 @@ def _lower_mapped_add_loop_reduction(output:RKOutput, uops:list[UOp]) -> RKImage
   if not math.isfinite(post_scale): return None
   update = _strip_cast(updates[0].src[1])
   if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None: return None
-  term = update.src[1 if update.src[0] is acc else 0]
-  flat, groups = _flat_static_ranges(reduce_ranges, out_index.dtype)
+  term, (flat, groups) = update.src[1 if update.src[0] is acc else 0], _flat_static_ranges(reduce_ranges, out_index.dtype)
   fake_store = _reduction_store(store, out, flat.alu(Ops.MUL, flat.const_like(rows)).alu(Ops.ADD, out_index), rows*groups, term)
   if (mapped:=_lower_mapped_uops(fake_store)) is None: return None
   return _finish_mapped_add_reduction(mapped, out.arg.slot, rows, groups, post_scale,
@@ -872,8 +863,7 @@ def _lower_vectorized_unrolled_add_reduction(output:RKOutput, uops:list[UOp]) ->
   if not (root.op is Ops.CAST and root.src[0].op is Ops.MUL) and \
      len({parsed[1].arg.slot for leaf in leaves for parsed in (input_leaf(leaf),) if parsed is not None}) < 2: return None
   if (first:=input_leaf(leaves[0])) is None: return None
-  first_index = first[0]
-  axis = max((r.arg[0] for r in _index_ranges(out_index) if isinstance(r.arg, tuple)), default=-1)+1
+  first_index, axis = first[0], max((r.arg[0] for r in _index_ranges(out_index) if isinstance(r.arg, tuple)), default=-1)+1
   lane = UOp(Ops.RANGE, first_index.src[1].dtype, src=(first_index.src[1].const_like(len(terms)),), arg=(axis, AxisType.LOOP))
   substitutions:dict[UOp, UOp] = {}
   static_fallbacks:list[tuple[int, UOp, tuple[int, ...]]] = []
@@ -1324,8 +1314,7 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
       total_gate = mask_info[0], fill
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or load.src[0].op is not Ops.INDEX or
       load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
-  data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
-  gate_nodes = gate.toposort()
+  data_param, data_index, gate, gate_nodes = _root_param(load.src[0]), load.src[0].src[1], load.src[2], load.src[2].toposort()
   bool_loads = tuple(u for u in gate_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool)
   if (axes:=_bounded_dynamic_axes(data_index, gate)) is None: return None
   loads = tuple(axis[1] for axis in axes)
@@ -2761,8 +2750,7 @@ def _lower_host_scatter(output:RKOutput) -> RKImage|None:
   if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1" or len(output[0].src) != 2: return None
   _, out_param, out_count, dynamic_index, value = output
   if (index_info:=_runtime_index(dynamic_index)) is None: return None
-  _, index_param, lane_index, index_itemsize = index_info
-  value = _strip_cast(value)
+  (_, index_param, lane_index, index_itemsize), value = index_info, _strip_cast(value)
   if (value.op is not Ops.LOAD or len(value.src) != 1 or value.src[0].op is not Ops.INDEX or
       (source:=_root_param(value.src[0])) is None or source.src[0].op is not Ops.CONST or
       value.src[0].src[1].key != lane_index.key or source.dtype.scalar() is not out_param.dtype.scalar()): return None
@@ -3175,8 +3163,7 @@ def _dpu_exp2(source:UOp) -> UOp:
   integer = UOp(Ops.MAX, dtypes.half, src=(bounded, bounded), arg=_NATIVE_FLOOR)
   result = _poly_horner(bounded.alu(Ops.SUB, integer), (1, 0.6931471806, 0.2402265069, 0.0555041087, 0.0096181291, 0.0013333558)).alu(
     Ops.MUL, _dpu_pow2_integer(integer))
-  below = mask_fn(UOp.const(-24.0, dtypes.half).alu(Ops.SUB, source))
-  above = mask_fn(source.alu(Ops.SUB, UOp.const(15.9921875, dtypes.half)))
+  below, above = mask_fn(UOp.const(-24.0, dtypes.half).alu(Ops.SUB, source)), mask_fn(source.alu(Ops.SUB, UOp.const(15.9921875, dtypes.half)))
   finite = UOp(Ops.MUL, dtypes.half, src=(result, one.alu(Ops.SUB, below)), arg=_NATIVE_MASK_MUL)
   return finite.alu(Ops.ADD, one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one))
 
@@ -3196,8 +3183,7 @@ def _dpu_log2(source:UOp) -> UOp:
   z = mantissa.alu(Ops.SUB, one).alu(Ops.FDIV, mantissa.alu(Ops.ADD, one))
   result = exponent.alu(Ops.ADD, z.alu(Ops.MUL, _poly_horner(z.alu(Ops.MUL, z), (1, 1/3, 1/5, 1/7, 1/9))).alu(Ops.MUL, _half(2/math.log(2))))
   nonzero = mask_fn(source).alu(Ops.MAX, mask_fn(zero.alu(Ops.SUB, source)))
-  zero_correction = UOp.const(-1.0, dtypes.half).alu(Ops.FDIV, nonzero).alu(Ops.ADD, one)
-  valid = one.alu(Ops.SUB, mask_fn(zero.alu(Ops.SUB, source)))
+  zero_correction, valid = UOp.const(-1.0, dtypes.half).alu(Ops.FDIV, nonzero).alu(Ops.ADD, one), one.alu(Ops.SUB, mask_fn(zero.alu(Ops.SUB, source)))
   negative_correction = valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one)
   above = mask_fn(source.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
