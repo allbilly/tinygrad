@@ -1,6 +1,6 @@
 from __future__ import annotations
-import collections, ctypes, mmap, os, time, weakref
-from dataclasses import replace
+import collections, ctypes, mmap, os, time, weakref as wr
+from dataclasses import replace as copy_dataclass
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
@@ -15,7 +15,8 @@ _PC_DATA_AMOUNT_MAX = (1 << 16) - 1
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
 _SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
-_MAX_FP32_EW_GROUP_OPS = 16
+_MAX_EW_GROUP_NUMERIC_OPS = _MAX_FP32_EW_GROUP_OPS = 16
+_EW_NUMERIC_OUT = _EW_STAGE_FP32_OUT
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
@@ -214,17 +215,16 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev.reset_npu()
 
   def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None, *, tile_groups:bool=True) -> None:
-    ops = self.image.ew_ops if ops is None else ops
+    addr, ops = address, self.image.ew_ops if ops is None else ops
     if not ops: return
     scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
       op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
     if scratch_int16:
-      if (cached:=self._scratch_ew_bodies.get(ops)) is None:
+      cached = self._scratch_ew_bodies.get(ops)
+      if cached is None:
         stages = []
         for op in ops:
-          for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
-            count, offset = min(_MAX_EW_ELEMS_FP16, op.count-start), start*2
-            stages.append(patch_stage(_offset_stage(op, count, offset, stateful=True, int16_output=True, int16_input=True), address))
+          for start in self._tile(wr.ref(op), _MAX_EW_ELEMS_FP16, addr, scratch=True, patch=True): stages += [start]
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return
@@ -238,17 +238,17 @@ class RockchipProgram(Program['RockchipDevice']):
       groups.append(ops[start:])
       spatial = tuple(group[0].stateful and group[0].count > _MAX_EW_ELEMS_FP16 and
         all(op.count == group[0].count and not (op.compare or op.int16_input or op.int16_output or op.int32_input or
-                                               op.int32_output or op.ew_cfg & _EW_STAGE_FP32_OUT) for op in group)
+                                               op.int32_output or op.ew_cfg & _EW_NUMERIC_OUT) for op in group)
         for group in groups)
       sequential = tuple(group[0].stateful and len(group) > _MAX_EW_GROUP_OPS and max(op.count for op in group) <= _MAX_EW_ELEMS_FP16 and
-                         not any(op.int32_input or op.int32_output or op.ew_cfg & _EW_STAGE_FP32_OUT for op in group)
+                         not any(op.int32_input or op.int32_output or op.ew_cfg & _EW_NUMERIC_OUT for op in group)
                          for group in groups)
       if any(tiled or split for tiled,split in zip(spatial, sequential)):
         for group,tiled,split in zip(groups, spatial, sequential):
           if split:
             for chunk_start in range(0, len(group), _MAX_EW_GROUP_OPS):
               chunk = list(group[chunk_start:chunk_start+_MAX_EW_GROUP_OPS])
-              chunk[0] = replace(chunk[0], submit_barrier=False, stateful=True)
+              chunk[0] = copy_dataclass(chunk[0], submit_barrier=False, stateful=True)
               self._run_ew_ops(address, buffer, tuple(chunk), tile_groups=False)
           elif not tiled:
             self._run_ew_ops(address, buffer, group, tile_groups=False)
@@ -266,14 +266,14 @@ class RockchipProgram(Program['RockchipDevice']):
         self._submit_pcchain(bodies)
         bodies.clear()
         body_precision = 0
-      if op.ew_cfg & _EW_STAGE_FP32_OUT:
-        if any(not later.ew_cfg & _EW_STAGE_FP32_OUT for later in ops[i+1:]):
-          raise RuntimeError("FP32 EW output must be terminal")
+      if op.ew_cfg & _EW_NUMERIC_OUT:
+        if any(not later.ew_cfg & _EW_NUMERIC_OUT for later in ops[i+1:]):
+          raise RuntimeError("FP" "32 EW output must be terminal")
         if bodies: self._submit_pcchain(bodies)
         stages = [patch_stage(emit_ew_stage(later.dst, later.lhs, later.rhs, later.count, later.ew_cfg), address)
                   for later in ops[i:]]
-        for start in range(0, len(stages), _MAX_FP32_EW_GROUP_OPS):
-          self._submit_pcchain(stages[start:start+_MAX_FP32_EW_GROUP_OPS])
+        for start in range(0, len(stages), _MAX_EW_GROUP_NUMERIC_OPS):
+          self._submit_pcchain(stages[start:start+_MAX_EW_GROUP_NUMERIC_OPS])
           self.dev.reset_npu()
         bodies.clear()
         break
@@ -285,10 +285,7 @@ class RockchipProgram(Program['RockchipDevice']):
           self._submit_pcchain(bodies)
           bodies.clear()
         stages = []
-        for start in range(0, op.count, 8):
-          count = min(8, op.count-start)
-          stages.append(patch_stage(_offset_stage(op, count, start, dst_step=4, src_step=2,
-                                                  stateful=True, int32_output=True, int16_input=True), address))
+        for start in self._tile(wr.ref(op), 8, addr, 1, convert=True, patch=True): stages += [start]
         bodies.extend(stages)
         body_precision = 0
         continue
@@ -297,13 +294,8 @@ class RockchipProgram(Program['RockchipDevice']):
         if bodies and body_precision != precision:
           self._submit_pcchain(bodies)
           bodies.clear()
-        body_precision, itemsize = precision, precision//8
-        limit = _MAX_EW_ELEMS_FP16 if precision == 16 else _MAX_EW_ELEMS_FP16//2
-        for start in range(0, op.count, limit):
-          count, offset = min(limit, op.count-start), start*itemsize
-          stage = _offset_stage(op, count, offset, stateful=True, int32_output=precision == 32, int32_input=precision == 32,
-                                int16_output=precision == 16, int16_input=precision == 16)
-          bodies.append(patch_stage(stage, address))
+        body_precision, itemsize, limit = precision, precision//8, _MAX_EW_ELEMS_FP16//(precision//16)
+        for stage in self._tile(wr.ref(op), limit, addr, itemsize, precision): bodies += [patch_stage(stage,addr)]
         continue
       if op.int32_input or op.int32_output:
         if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
@@ -333,12 +325,20 @@ class RockchipProgram(Program['RockchipDevice']):
           self._submit_standalone(patch_stage(stage, address))
           self.dev.reset_npu()
         continue
-      for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
-        count = min(_MAX_EW_ELEMS_FP16, op.count-start)
-        offset = start*2
-        stage = _offset_stage(op, count, offset, stateful=op.stateful or op.int16_output, int16_output=op.int16_output)
-        bodies.append(patch_stage(stage, address))
+      for stage in self._tile(wr.ref(op), _MAX_EW_ELEMS_FP16, addr, live=True): bodies += [patch_stage(stage,addr)]
     if bodies: self._submit_pcchain(bodies)
+
+  def _tile(self, ref, limit, addr, itemsize=2, bits=0, live=False, convert=False, scratch=False, patch=False):
+    for start in range(0, ref().count, limit):
+      if live: flags = dict(stateful=ref().stateful or ref().int16_output, int16_output=ref().int16_output)
+      elif bits: flags = dict(stateful=True, int32_output=bits == 32, int32_input=bits == 32,
+                              int16_output=bits == 16, int16_input=bits == 16)
+      elif convert: flags = dict(dst_step=4, src_step=2, stateful=True, int32_output=True, int16_input=True)
+      else: flags = dict(stateful=True, int16_output=True, int16_input=True) if scratch else {}
+      if patch: yield patch_stage(_offset_stage(ref(), min(limit, ref().count-start), start*itemsize, **flags), addr)
+      else:
+        stage = _offset_stage(ref(), min(limit, ref().count-start), start*itemsize, **flags)
+        yield stage
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
@@ -410,11 +410,7 @@ class RockchipProgram(Program['RockchipDevice']):
     apply_host_addresses(self.image.host_gathers, False)
     self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
-      if kind is RKBufferKind.ARG:
-        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
-        return self._dma(bufs[index])
-      if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
-      return self._dma(self.scratch[index])
+      return self._dma(buffer(kind, index))
     start = time.perf_counter()
     native_int16 = any(op.int16_input or op.int16_output for op in self.image.ew_ops)
     if self.image.ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
@@ -454,11 +450,11 @@ class RockchipDevice(Compiled):
     self._native_int16 = False
     self.reset_npu()
     self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
-    self._program_resources:collections.OrderedDict[int, weakref.ReferenceType[RockchipProgram]] = collections.OrderedDict()
+    self._program_resources:collections.OrderedDict[int, wr.ReferenceType[RockchipProgram]] = collections.OrderedDict()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
   def _touch_program(self, program:RockchipProgram) -> None:
     self._program_resources.pop(id(program), None)
-    self._program_resources[id(program)] = weakref.ref(program)
+    self._program_resources[id(program)] = wr.ref(program)
     while len(self._program_resources) > self._program_resource_limit:
       _, reference = self._program_resources.popitem(last=False)
       if (old:=reference()) is not None: old._release_resources()

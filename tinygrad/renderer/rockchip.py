@@ -2226,9 +2226,8 @@ class RKContext:
       raise _RKGenericReject
     mask_layout = RKLayout.BOOL_INT16 if yes.layout in (RKLayout.INT16, RKLayout.INT32) else RKLayout.BOOL_MASK
     if selector is None: selector = self._static(u.src[0], mask_layout) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
-    if selector.layout is not mask_layout and not (yes.layout in (RKLayout.FP16, RKLayout.INT_FP16, RKLayout.INT32) and
-                                                    selector.layout in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16)):
-      raise _RKGenericReject
+    allowed_masks = (mask_layout,) if yes.layout is RKLayout.INT16 else (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16)
+    if selector.layout not in allowed_masks: raise _RKGenericReject
     if yes.layout is RKLayout.INT16:
       return self._masked_where(u, dtypes.int16, yes.layout, selector, yes, no, self._constant(UOp.const(1, dtypes.int16)))
     mask, (yes_bytes,no_bytes) = self._coerce_bool(selector, RKLayout.BOOL_INT16), (self._raw(x, cache=False, copy_wide=False) for x in (yes,no))
@@ -2271,8 +2270,7 @@ class RKContext:
           selector = tuple(bool(x) for x in _static_values(self.out_index, node.src[0], self.count, int))
           for child,take in zip(node.src[1:], (selector, tuple(not x for x in selector))):
             route(child, tuple(live and pick for live,pick in zip(active, take)))
-          return
-        routes[node] = [old or live for old,live in zip(routes.get(node, [False]*self.count), active)]
+        else: routes[node] = [old or live for old,live in zip(routes.get(node, [False]*self.count), active)]
       route(u, (True,)*self.count)
       def exact_operand(src:UOp) -> RKValue:
         return self._load(src, _fp16_bits(-65504.0)) if (src.op is Ops.LOAD and dtype is dtypes.half and len(src.src) > 2 and
