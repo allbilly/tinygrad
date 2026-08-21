@@ -7242,3 +7242,77 @@ and [register-command reference](/home/orangepi/opennpu-rk3588-audit-Qqy5uQ/repo
 are reference links only; they provide no line-negative transplant.
 
 No further hardware retry or push was performed.
+
+---
+
+## 2026-08-21 — hardware-verify corrected 2,912-line renderer checkpoint
+
+The prior exact-2,899 attempt is not a valid milestone. Its post-reboot
+serial census was explicitly run with `ROCKCHIP_SUBMIT_RETRIES=0` and stopped
+at a submit timeout in `TestRockchipLossOps.test_cross_entropy_smoothing`
+(`247 passed, 6 skipped, 1 failed`, **254 nodes reached**, **126 subtests**,
+exit 1). A separate retry-4 run then reached
+`TestRockchipReductionOps.test_sum_dtype_arg` but failed numerically:
+Rockchip returned `-2.8164062` versus the FP32 reference `-2.7783928`, with
+absolute error `0.03801346` above the allowed `0.018891964` (`368 passed,
+12 skipped, 1 failed`, **381 nodes reached**, **154 subtests**, exit 1).
+Those runs are recorded in [the no-retry failure log](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-2899-postreboot/first-failure.txt)
+and [the retry-4 failure log](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-2899-retry4/first-failure.txt),
+with node accounting in [the no-retry count record](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-2899-postreboot/count-accounting.txt)
+and [the retry-4 count record](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-2899-retry4/count-accounting.txt).
+
+The corrected source is HEAD `0ee929a187a5562711e246ff4a5fb4eb8b3b7b5a`
+(`WIP rockchip: restore precise scalar reductions`) and measures exactly
+**2,912 executable renderer lines** with runtime **470** by `sz.py`. The
+2,899 count therefore was not a valid completed milestone. This entry records
+the corrected 2,912-line checkpoint; it does not establish any 2.9k-or-lower
+milestone.
+
+The root cause of the `sum_dtype_arg` failure was a duplicate normalized
+`INDEX`/`LOAD` pair. The scalar parser admitted both the source `INDEX` and its
+same-index `LOAD`; the lowerer then saw 270 flattened blocks instead of 135
+unique lanes, rejected the scalar route, and fell back to the generic mapped
+route. That route performed a sequential FP16 fold before the terminal FP32
+conversion, producing the observed `-2.8164062`. The v2 repair requires the
+canonical one-source `LOAD` / two-source `INDEX` / direct `PARAM` structure and
+stably deduplicates normalized `INDEX.key` entries in first topological order.
+It preserves rejection of gated or aliased loads, dynamic/out-of-bounds
+indices, distinct physical index keys, and extent mismatches. The [v2 repair
+report](/home/orangepi/rk-artifacts-exact2900-20260821/fix-sum-dtype/report-v2.md)
+and reproducible [v2 patch](/home/orangepi/rk-artifacts-exact2900-20260821/fix-sum-dtype/fix-v2.patch)
+contain the host-only contract and image evidence.
+
+- Host gates on the corrected HEAD: `test/unit/test_rockchip_uops.py -q
+  -n12` **115 passed**; Ruff passed; `mypy tinygrad/` reported no issues
+  in **216 source files**; `compileall` and `git diff --check` passed; backend
+  collection gathered **445 nodes**. The [v2 corrected source tree report](/home/orangepi/rk-artifacts-exact2900-20260821/fix-sum-dtype/report-v2.md)
+  records the 115-pass, Ruff, mypy, compileall, and diff-check results; the
+  [full-run metadata](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-fixed2912/run-metadata.txt)
+  records the corrected HEAD and 445-node expectation.
+- Focused hardware `TestRockchipReductionOps.test_sum_dtype_arg`: **1 pytest
+  node passed**, exit 0. Its captured pytest log and
+  `retry-markers.txt` contain **zero retry/timeout/reset log markers**; this
+  does not establish that zero internal retry attempts occurred. Metadata
+  records corrected HEAD, renderer 2,912, fresh cache, and explicit
+  `ROCKCHIP_SUBMIT_TIMEOUT_MS=6000` / `ROCKCHIP_SUBMIT_RETRIES=4`; see [the
+  focused pytest log](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-sum-dtype-fix/pytest.log),
+  [retry markers](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-sum-dtype-fix/retry-markers.txt),
+  and [metadata](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-sum-dtype-fix/metadata.txt).
+- The fresh-cache serial command
+  `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP
+  ROCKCHIP_SUBMIT_TIMEOUT_MS=6000 ROCKCHIP_SUBMIT_RETRIES=4` with pytest
+  `-n0` completed **433 passed, 12 skipped, 0 failed** across **445 collected
+  pytest nodes**, with **154 subtests passed**, and pytest exit code **0**.
+  The [full pytest log](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-fixed2912/pytest.log),
+  [count accounting](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-fixed2912/count-accounting.txt),
+  and [run metadata](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-fixed2912/run-metadata.txt)
+  identify the exact current-HEAD run. The dedicated [retry/reset evidence](/home/orangepi/rk-artifacts-exact2900-20260821/hardware-full445-fixed2912/retry-reset-evidence.txt)
+  records **zero retry/timeout/reset log markers in the captured census
+  log**; this is not a claim of zero retry attempts.
+
+No production CPU/GPU/CMAC fallback, runtime/core workaround, or tolerance
+relaxation was added. The corrected scalar image is native DPU EW with no
+host gathers/scatters. The unit regression's NumPy image simulator is
+host-only test evidence, not a production execution path. This draft only
+records the captured gates above; it did not modify the shared checkout or
+run another NPU test.
