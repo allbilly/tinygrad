@@ -7496,3 +7496,79 @@ documentation pass ran no `elementwise.py`, rerun, reset, or additional NPU
 test (the captured health program output itself records `reset_npu ret=0`).
 Commit `444561b3c` is the code milestone; this progress-only documentation
 patch is pending.
+
+---
+
+## 2026-08-22 — exact 2,823 renderer / 465 runtime union-v2 milestone hardware-proven
+
+The current shared code milestone is commit
+`f3a0f590ab6809fccf7ca7dd77bf4544e714fa66` (`WIP rockchip: readable cleanup to
+2.823k`), parent `eec67078bb5faf8f47b1d28e37e51ae0d4342fb5`, tree
+`dcfe3ad7d10b755467100c64fd1771d12a5c061c`. Its renderer/runtime source blobs
+are `f478b7be371b99d9e8b33814bba9a45954591006` and
+`6d959bcea8b181faa67e74dadf20de50e91dcd3d`, with SHA-256
+`86948c9a1302c0a657921413ea9646d5041f688a20e078cdfddb6082be033b74` and
+`7aa9947a65c899132fc0e5fc0ce10b7c4ce4e5817792ca0bc7ab5f9ea5e28b85`.
+`sz.py` reports renderer/runtime **2,823/465**. The exact isolated union
+source candidate is commit `1318b3d1244fddd9a4cd43d75053aa1a2b9c4d52`,
+parent `444561b3c30c37e2201fd512e5040fe9627e3368`, tree
+`9c6e8f0097b112ed4cb39756fcccfdbce0d25404`; its two source blobs are
+byte-identical to shared `f3a`. The union patch SHA-256 is
+`d8dc9733e9651a1778d3ab5c1d0490f4e8894659d1abf9f567c091f46b77c23e`.
+The component savings are WHERE-v2 **-2 renderer**, buffer-binding-v1
+**-4 runtime**, and scheduler-v4 **-1 runtime**, for **-7 combined** from
+base444 (renderer **-2**, runtime **-5**). The tracked shared tree is clean;
+the five pre-existing untracked files listed in the preceding milestone were
+preserved and are not part of this documentation patch.
+
+- The [second independent union-v2 verdict](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4-independent-judge-v2/VERDICT-independent-judge-v2.md)
+  records **VERIFIED WITH CAVEATS**: exact three-component provenance and
+  replay, no test/config weakening, no added CPU/GPU/CMAC/host-numeric/LUT or
+  other fallback route, and equal host semantic payloads. Its independent
+  limits include WHERE **13,578** full cases, **978** adversarial cases,
+  **216** coordinate/rebinding/lifetime cases, equal buffer exhaustive/state/
+  sync probes, and equal scheduler v1/v2/v3/contract/order/oracle/fresh
+  probes plus the 104-case cross oracle. Host gates are Rockchip UOps **115
+  passed**, b79d **1 passed**, null UOps **62 passed/2 skipped/1 xfailed**,
+  null stats **16 passed/11 skipped**, Ruff clean, mypy clean in **216 source
+  files**, compileall clean, and backend collection **445**.
+- The raw broad style monitor remains `NEEDS_CHANGES` with three heuristic
+  findings, while the strict gate is PASS. The [manual style verdict](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4-independent-judge-v2/STYLE-VERDICT.md)
+  classifies the two renderer findings as inherited standalone WHERE span
+  attribution and the low scheduler `_run_ew_ops` finding as a lexical alias
+  false positive: base/scheduler/final whole-function AST metrics are
+  **22/36**, **21/35**, **21/35** BoolOps/joins, with `spatial` **3/8** in
+  all three. This is a manual false-positive-aware **VERIFIED WITH CAVEATS**
+  result, not a raw-monitor-clean PASS; a policy requiring raw broad PASS
+  would reject it. The [provenance/no-cheat evidence](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4-independent-judge-v2/REPORT.md)
+  records exact two-file scope, `git diff --check`, empty fallback findings,
+  and no changed tests.
+- The union manifest admitted only WHERE-v2, buffer-binding-v1, and
+  scheduler-v4; dynamic-load-v2, math-v1, and LUT candidates were refused and
+  are not part of this milestone.
+- Hardware evidence reuses the single recorded post-reboot
+  `simple_add.py` PASS at
+  `/home/orangepi/rk-artifacts-next2790-20260822/health-post-reboot-wpi109`;
+  `health/reused-from.txt` records `invocations_in_this_run=0`, so this
+  documentation does not claim a health rerun. The one authoritative census
+  artifact is
+  `/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4/hardware-union-v2-1318b3d1244f-20260821T225646Z/`.
+  Its fresh dedicated cache and serial command used
+  `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`,
+  `ROCKCHIP_SUBMIT_TIMEOUT_MS=6000`, `ROCKCHIP_SUBMIT_RETRIES=4`, `-n0`, and
+  `-x`; collection and observation were **445**, with **433 passed + 12
+  skipped = 445**, **154 subtests passed**, exit **0**, wrapper duration
+  **1006.297 s**, and pytest duration **944.22 s**. Census stderr is empty.
+  The marker scan emitted no `retry|timeout|resubmit|submit` text; four
+  retries were configured, and marker absence does not prove zero attempts.
+  Execution accounting is aggregate with collection names persisted; no
+  per-node outcome manifest is present. See the [census result](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4/hardware-union-v2-1318b3d1244f-20260821T225646Z/RESULT.txt),
+  [command](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4/hardware-union-v2-1318b3d1244f-20260821T225646Z/census/command.txt),
+  [counts](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4/hardware-union-v2-1318b3d1244f-20260821T225646Z/census/counts.txt),
+  [timings](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4/hardware-union-v2-1318b3d1244f-20260821T225646Z/census/timestamps.txt),
+  and [marker scan](/home/orangepi/rk-artifacts-next2825-20260822/next-union-plan/union-v2-scheduler-v4/hardware-union-v2-1318b3d1244f-20260821T225646Z/census/retry-markers.txt).
+
+No CPU/GPU/CMAC/host production numeric fallback or LUT route was added, and
+no test was weakened. This documentation pass ran no tests, NPU command,
+`elementwise.py`, rerun, reset, or push. Commit `f3a0f590a` is the shared code
+milestone; this progress-only documentation patch is pending.
