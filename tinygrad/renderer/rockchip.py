@@ -163,8 +163,7 @@ def decode_image(blob:bytes) -> RKImage:
     _HEADER.unpack_from(blob)
   if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags or
       (mid_count and not 0 <= gather_after < nop) or (not mid_count and gather_after != 0)): raise ValueError("invalid RKImage header")
-  off = _HEADER.size
-  scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
+  off,scratch=_HEADER.size+nscratch*_SCRATCH.size, tuple(RKScratch(*_SCRATCH.unpack_from(blob,_HEADER.size+i*_SCRATCH.size))for i in range(nscratch))
   gathers:list[RKGather] = []
   for _ in range(ngather):
     dst_index, src_index, count, kind, naxes, itemsize, dst_kind, src_kind, base, fill_bits, dst_stride, dst_addend, after = \
@@ -177,7 +176,7 @@ def decode_image(blob:bytes) -> RKImage:
     else: axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
     gathers.append(RKGather(src_index, dst_index, count, base if kind == 0 else 0, axes, offsets, fill_bits, values, kind == 3,
       dst_stride, dst_addend, RKBufferKind(dst_kind), itemsize, RKBufferKind(src_kind), after))
-  host_addresses:list[RKHostAddress] = []
+  host_addresses, ew_ops = typing_cast(list[RKHostAddress], []), typing_cast(list[RKEWOp], [])
   for _ in range(nhost_gather+nhost_scatter):
     src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \
       fill_bits, host_flags, index_limit, src_addend, index_addend, dst_addend, base, index_scale, lane_stride = _HOST_ADDRESS.unpack_from(blob, off); off += _HOST_ADDRESS.size  # noqa: E501
@@ -187,7 +186,6 @@ def decode_image(blob:bytes) -> RKImage:
     host_addresses.append(RKHostAddress(RKArg(RKBufferKind(src_kind), src_index, src_addend),
       RKArg(RKBufferKind(index_kind), index_index, index_addend), RKArg(RKBufferKind(dst_kind), dst_index, dst_addend),
       count, src_count, dst_count, itemsize, index_itemsize, fill_bits, index_limit, base, index_scale, lane_stride))
-  ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri, count, ew_cfg, da, la, ra = _EWOP.unpack_from(blob, off); off += _EWOP.size
     int16_to_int32 = op_flags & 0x88 == 0x88 and not op_flags & 0x50
@@ -256,8 +254,7 @@ def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=Fal
   if not 0 < count <= limit:
     raise ValueError(f"{'stateful EW' if special else 'EW fp16'} count {count} out of range")
   lanes, is_div = (4 if int32_input or fp32_input else 8), ew_cfg == _EW_CFG[Ops.FDIV]
-  width = (count + lanes-1) // lanes - 1
-  data_format = next(format_ for flag,format_ in zip(
+  width, data_format = (count + lanes-1) // lanes - 1, next(format_ for flag,format_ in zip(
     (fp32_output, fp32_input, native_int16, native_int32, int16_to_int32, int32_output, int16_output, int32_input, True), _DPU_DATA_FORMATS) if flag)
   regs:tuple[tuple[int, int, int], ...] = ((D,R.REG_DPU_S_POINTER,0xe),(D,R.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
     (D,R.REG_DPU_DATA_FORMAT,data_format)) + (((D,R.REG_DPU_DST_SURF_STRIDE,1<<4),) if int16_to_int32 or fp32_output else ()) + (
@@ -712,8 +709,7 @@ def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
     offsets = tuple(block[0] for block in blocks); direct = offsets == tuple(range(len(blocks)))
     gathers = (RKGather(in_param.arg.slot, data_slot, len(blocks), axes=((1, len(blocks), 1),) if direct else (),
                         offsets=() if direct else offsets, dst_stride=stride_lanes),)
-  ops:list[RKEWOp] = []
-  out = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  ops, out = typing_cast(list[RKEWOp], []), RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if negate_inputs:
     ops.extend(_ew_ops(((arena(offset), arena(offset), RKArg(RKBufferKind.SCRATCH, slots[-1.0]), Ops.MUL) for offset in active), rows))
   reduced = _reduce_arena(ops, active, rows, _EW_CFG[reduce_op], arena, out if post_scale == 1.0 else None, fp32_out)
@@ -1428,8 +1424,7 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   """Lower an exact FP16 expression through the requested native integer output ABI."""
   store, out_param, count, _, _ = output
   if count <= 0: return RKImage(RKTarget.RK3588)
-  out_slot = out_param.arg.slot
-  replacement = store.replace(src=(store.src[0].replace(dtype=dtypes.half,
+  out_slot, replacement = out_param.arg.slot, store.replace(src=(store.src[0].replace(dtype=dtypes.half,
     src=(out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half)), *store.src[0].src[1:])), value, *store.src[2:]))
   image = _lower_composed_uops(list(replacement.toposort())) if int32 else \
     _lower_composed_uops(list(UOp(Ops.SINK, src=(replacement,)).toposort()), recipes_ready=True)
@@ -2536,8 +2531,7 @@ def _local_buffer(u:UOp) -> UOp|None:
 def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
   """Execute ordered static local accumulators without recovering a tensor operation."""
   local_cache:dict[UOp, tuple[UOp, ...]] = {}
-  local_loads = _semantic_loads(root, local_cache, True)
-  definitions:dict[UOp, _RKStaticLocalDef] = {}
+  local_loads, definitions = _semantic_loads(root, local_cache, True), typing_cast(dict[UOp, _RKStaticLocalDef], {})
   expanded:dict[tuple[UOp, tuple[tuple[UOp, int], ...]], UOp] = {}
   active:set[tuple[UOp, tuple[tuple[UOp, int], ...]]] = set()
   budget = [_MAX_STATIC_LOCAL_STEPS]
@@ -2649,8 +2643,7 @@ def _lower_multi_scalar_local_reductions(output:RKOutput, uops:list[UOp]) -> RKI
     fake, mapped, groups = child
     if (reduced:=_finish_mapped_add_reduction(mapped, fake_slot, 1, groups, 1.0)) is None: return None
     staged = reduced if staged is None else _append_inplace_image(staged, reduced); sources[buffer] = fake
-    if staged is None: return None
-  if any(_local_buffer(load) is None for load in local_loads): return None
+    if staged is None or any(_local_buffer(load) is None for load in local_loads): return None
   substitutions = {load: sources[typing_cast(UOp, _local_buffer(load))].index(0).load() if load.dtype.scalar() is dtypes.half else
                    sources[typing_cast(UOp, _local_buffer(load))].index(0).load().cast(load.dtype.scalar())  # noqa: E501
                    for load in local_loads}
@@ -2819,8 +2812,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if not ((affine:=typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(output[3]))) is not None and affine[0] == 0 and
             set(affine[1]) == set(_index_ranges(output[3])) and _affine_output_axes(affine, output[2]) is not None) and \
        _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return None
-    reduced = _unroll_static_reduces(output[4]) if any(u.op is Ops.REDUCE for u in uops) else output[4]
-    root = _finite_int_max_neutrals(_unroll_static_local(uops, reduced))
+    root=_finite_int_max_neutrals(_unroll_static_local(uops,_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4]))
     if not recipes_ready and len(storage_uops if storage_uops is not None else root.toposort()) <= 256:
       root = _expand_math_uops(root, accurate_adds=storage_uops is None or storage_product_adds)
     n = root.toposort()
@@ -2876,8 +2868,7 @@ def _unwrap_condition(u:UOp) -> UOp:
 
 def _finite_positive_mask(u:UOp) -> UOp:
   """Map finite binary16 values to `u > 0` without the stateful DPU compare path."""
-  magnitude = u.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
-  for _ in range(2): magnitude = magnitude.alu(Ops.MUL, UOp.const(256.0, dtypes.half))
+  magnitude = u.alu(Ops.MAX, UOp.const(0.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half))
   return UOp(Ops.MAX, magnitude.dtype, src=(magnitude, UOp.const(1.0, dtypes.half)), arg=_NATIVE_MIN)
 
 def _mask_expr(u:UOp) -> UOp|None:
@@ -3110,8 +3101,7 @@ def _dpu_sin(source:UOp) -> UOp:
     for _ in range(3):
       correction = _positive_mask(reduced.alu(Ops.SUB,_half(math.pi))).alu(Ops.SUB,_positive_mask(_half(-math.pi).alu(Ops.SUB,reduced))); reduced, normalization_residual = _precise_add_parts([reduced, *(correction.alu(Ops.MUL, UOp.const(-coefficient, half)) for coefficient in period_split)])  # noqa: E501
       residuals.append(normalization_residual)
-    invalid = terms[0].alu(Ops.MUL, UOp.const(0.0, half))
-    for term in terms[1:]: invalid = invalid.alu(Ops.ADD, term.alu(Ops.MUL, UOp.const(0.0, half)))
+    invalid=functools.reduce(lambda v,t:v.alu(Ops.ADD,t.alu(Ops.MUL,UOp.const(0.0,half))),terms[1:],terms[0].alu(Ops.MUL,UOp.const(0.0,half)))
   else:
     source = source.cast(half); _, _, reduced = _dpu_periodic_reduce(source, 1/(2*math.pi), period_split, math.pi)
     invalid = source.alu(Ops.MUL, UOp.const(0.0, half))
