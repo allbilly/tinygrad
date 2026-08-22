@@ -188,6 +188,9 @@ def test_cmac_patches_all_dma_sites_keeps_rhs_tail_and_swizzles_output() -> None
   names = [event[0] for event in program.dev.events if isinstance(event, tuple)]
   assert names.count("reset") == 1 and names.count("submit") == 1 and len(program.dev.freed) == 2
   command = next(data for size, data in program.dev.freed if size == rkp.CMAC_V1_COMMAND_RESERVATION_BYTES)
+  task = next(data for size, data in program.dev.freed if size == 4096)
+  command_dma = next(event[3] for event in program.dev.events if event[0] == "alloc" and event[1] == rkp.CMAC_V1_COMMAND_RESERVATION_BYTES)
+  assert struct.unpack_from("<8IQ", task) == (*rkp.CMAC_V1_TASK, command_dma)
   patched = struct.unpack_from("<46Q", command)
   assert all((patched[word] >> 16) & 0xFFFFFFFF != 0 for word in (18, 24, 31))
   assert effects.last_logical_output == struct.pack("<4H", 0, 1, 2, 3)

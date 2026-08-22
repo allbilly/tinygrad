@@ -11,7 +11,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import struct
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
 from typing import NoReturn, Protocol, Sequence, cast
 
 from tinygrad.renderer.rockchip import (
@@ -282,9 +282,8 @@ class RockchipPhysicalEffects:
       self._reject("command_image", "native command bytes differ from the generated template")
     if self.native.tail != tail:
       self._reject("command_image", "native command tail differs from the generated contract")
-    task_fields = ("op_index", "enable_mask", "interrupt_mask", "interrupt_clear", "interrupt_status", "regcfg_amount", "regcfg_offset", "reserved")
     submit_fields = ("flags", "timeout_ms", "core_mask", "fence_fd", "task_count")
-    if tuple(getattr(self.native.task, name) for name in task_fields) != task:
+    if tuple(astuple(self.native.task)) != task:
       self._reject("task", "native task differs from generated descriptor")
     if tuple(getattr(self.native.submit, name) for name in submit_fields) != submit:
       self._reject("submit_contract", "native submit differs from generated contract")
@@ -462,15 +461,11 @@ class RockchipPhysicalEffects:
     ctypes.memset(int(command_buffer.va_addr), 0, _allocation_size(command_buffer))
     _write(command_buffer, command_image)
     task = self.native.task
+    task_words = tuple(cast(tuple[int, ...], astuple(task)))
+    if len(task_words) != 8:
+      self._reject("task", "native task wire tuple must contain eight words")
     descriptor = rk.struct_rknpu_task(
-      task.op_index,
-      task.enable_mask,
-      task.interrupt_mask,
-      task.interrupt_clear,
-      task.interrupt_status,
-      task.regcfg_amount,
-      task.regcfg_offset,
-      task.reserved,
+      *task_words,
       _dma(self.program, command_buffer),
     )
     if _TASK_DESCRIPTOR_BYTES != rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES:
