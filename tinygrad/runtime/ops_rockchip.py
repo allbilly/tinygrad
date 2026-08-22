@@ -5,7 +5,7 @@ import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
-  RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+  RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT, _validate_native_image)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -73,6 +73,8 @@ class RockchipProgram(Program['RockchipDevice']):
     if native is None: raise RuntimeError("native dispatch requested for a generic RKImage")
     for asset in native.assets:
       if hashlib.sha256(asset.payload).digest() != asset.digest: raise RuntimeError(f"native asset {asset.asset_id} hash mismatch")
+    try: _validate_native_image(self.image)
+    except ValueError as exc: raise RuntimeError(f"native preflight validation failed: {exc}") from exc
     refs = native.reads + native.writes + native.outputs + tuple(reloc.arg for reloc in native.relocs) + \
       tuple(guard.buffer for guard in native.guards)
     for ref in refs:

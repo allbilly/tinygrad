@@ -9,7 +9,7 @@ from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16
 from tinygrad.helpers import ceildiv, round_up
 from tinygrad.renderer import Renderer
-from tinygrad.runtime.autogen import rockchip as rk
+from tinygrad.runtime.autogen import rockchip as rk, rockchip_physical as rkp
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, python_alu
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
@@ -28,6 +28,22 @@ _NATIVE_REPAIR = struct.Struct("<HBBIII")
 _NATIVE_TASK = struct.Struct("<8I")
 _NATIVE_SUBMIT = struct.Struct("<IIIiI")
 _NATIVE_RESET = struct.Struct("<II")
+
+# The generated catalog owns physical command/table bytes and their hashes.
+_CMAC_BODY_SHA256 = bytes.fromhex(rkp.CMAC_V1_BODY_SHA256)
+_CMAC_TAIL, _CMAC_RELOCS = rkp.CMAC_V1_TAIL, rkp.CMAC_V1_RELOCATIONS
+_CMAC_TASK, _CMAC_SUBMIT, _CMAC_RESET = rkp.CMAC_V1_TASK, rkp.CMAC_V1_SUBMIT, rkp.CMAC_V1_RESET
+_CMAC_SPANS = ((rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_LHS_BYTES, 0),
+               (rkp.CMAC_V1_RHS_BYTES, rkp.CMAC_V1_RHS_BYTES, 0),
+               (rkp.CMAC_V1_OUTPUT_SURFACE_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES, 0))
+_EXP2_COMMAND_SHA256 = bytes.fromhex(rkp.LUT_V1_EXP2_COMMAND_SHA256)
+_EXP2_RELOCS = tuple((*reloc, (rkp.LUT_V1_EXP2_COMMANDS[reloc[0]] >> 16) & 0xffffffff) for reloc in rkp.LUT_V1_EXP2_RELOCATIONS)
+_EXP2_TASK, _EXP2_SUBMIT, _EXP2_RESET = rkp.LUT_V1_EXP2_TASK, rkp.LUT_V1_EXP2_SUBMIT, rkp.LUT_V1_EXP2_RESET
+_EXP2_TABLE_SHA256 = bytes.fromhex(rkp.LUT_V1_EXP2_TABLE_SHA256)
+_EXP2_CONTROLS = rkp.LUT_V1_EXP2_REQUIRED_CONTROLS
+_EXP2_RANGES = ((0, 1026), (1026, 1026))
+_EXP2_REPAIRS = tuple((index + 1, index, index + 1, True) for index in range(7))
+RK_EXP2_REPAIR_METADATA = ("nan", "positive_infinity", "negative_infinity", "underflow", "overflow", "positive_zero", "negative_zero")
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
@@ -195,7 +211,7 @@ def _native_arg(value:Any, name:str="argument") -> None:
   _native_int(value.addend, -(1 << 31), (1 << 31)-1, f"{name} addend")
 
 def _native_args(values:Any, name:str) -> None:
-  if type(values) is not tuple: raise ValueError(f"invalid RKNativeOp {name}")
+  if type(values) is not tuple or len(values) > _RKIMAGE_U16_MAX: raise ValueError(f"invalid RKNativeOp {name}")
   for index,value in enumerate(values): _native_arg(value, f"{name}[{index}]")
 
 def _native_qwords(values:Any, name:str, *, required:bool=False) -> None:
@@ -203,28 +219,90 @@ def _native_qwords(values:Any, name:str, *, required:bool=False) -> None:
     raise ValueError(f"invalid RKNativeOp {name}")
   for value in values: _native_int(value, 0, (1 << 64)-1, name)
 
+def _native_refs_unique(values:tuple[Any, ...], name:str) -> None:
+  if len(set(values)) != len(values): raise ValueError(f"duplicate native {name}")
+
+def _native_arg_zero(value:RKArg, name:str) -> None:
+  _native_arg(value, name)
+  if value.kind is not RKBufferKind.ARG or value.addend != 0: raise ValueError(f"invalid native {name} binding")
+
+def _native_word_fields(word:int) -> tuple[int, int, int]:
+  return word >> 48, word & _RKIMAGE_U16_MAX, (word >> 16) & 0xffffffff
+
+def _native_route_contract(native:RKNativeOp) -> None:
+  refs = native.reads + native.writes
+  if native.kind is RKNativeKind.CMAC:
+    if native.flags != 0: raise ValueError("native CMAC controls mismatch")
+    if len(native.commands) != 46 or hashlib.sha256(struct.pack("<46Q", *native.commands)).digest() != _CMAC_BODY_SHA256 or native.tail != _CMAC_TAIL:
+      raise ValueError("native CMAC command template mismatch")
+    if (len(native.reads), len(native.writes), len(native.outputs), native.assets, native.guards, native.repairs) != (2, 1, 1, (), (), ()):
+      raise ValueError("invalid native CMAC resources")
+    if native.outputs != native.writes: raise ValueError("native CMAC output ownership mismatch")
+    _native_refs_unique(refs, "CMAC references")
+    for index,arg in enumerate(refs): _native_arg_zero(arg, f"CMAC ref[{index}]")
+    expected = tuple((word, target, register, arg, 16, 32)
+      for (word, target, register), arg in zip(_CMAC_RELOCS, native.reads + native.outputs))
+    actual = tuple((item.word_index, item.target, item.register, item.arg, item.shift, item.width) for item in native.relocs)
+    if actual != expected:
+      raise ValueError("native CMAC relocation contract mismatch")
+    if tuple(astuple(native.task)) != _CMAC_TASK or tuple(astuple(native.submit)) != _CMAC_SUBMIT or tuple(astuple(native.reset)) != _CMAC_RESET:
+      raise ValueError("native CMAC lifecycle contract mismatch")
+    return
+  if len(native.commands) != 1064 or hashlib.sha256(struct.pack("<1064Q", *native.commands)).digest() != _EXP2_COMMAND_SHA256 or native.tail:
+    raise ValueError("native EXP2 command template mismatch")
+  if native.flags != _EXP2_CONTROLS: raise ValueError("native EXP2 controls mismatch")
+  if len(native.reads) != 1 or len(native.writes) != 1 or len(native.outputs) != 1 or native.outputs != native.writes:
+    raise ValueError("invalid native EXP2 resources")
+  _native_refs_unique(refs, "EXP2 references")
+  for index,arg in enumerate(refs): _native_arg_zero(arg, f"EXP2 ref[{index}]")
+  expected = tuple((word, target, register, arg, 16, 32)
+    for (word, target, register, _), arg in zip(_EXP2_RELOCS, (native.outputs[0], native.reads[0])))
+  actual = tuple((item.word_index, item.target, item.register, item.arg, item.shift, item.width) for item in native.relocs)
+  if actual != expected:
+    raise ValueError("native EXP2 relocation contract mismatch")
+  for index,target,register,sentinel in _EXP2_RELOCS:
+    if _native_word_fields(native.commands[index]) != (target, register, sentinel): raise ValueError("native EXP2 relocation sentinel mismatch")
+  if _native_word_fields(native.commands[1043])[2] != 0x302 or _native_word_fields(native.commands[1063]) != (0x81, 8, 0x18):
+    raise ValueError("native EXP2 fixed command field mismatch")
+  if tuple(astuple(native.task)) != _EXP2_TASK or tuple(astuple(native.submit)) != _EXP2_SUBMIT or tuple(astuple(native.reset)) != _EXP2_RESET:
+    raise ValueError("native EXP2 lifecycle contract mismatch")
+  if len(native.assets) != 1:
+    raise ValueError("native EXP2 requires one asset")
+  asset = native.assets[0]
+  if (asset.asset_id, asset.size, asset.digest, asset.ranges, asset.flags, sum(count for _,count in asset.ranges)) != \
+     (1, 2052, _EXP2_TABLE_SHA256, _EXP2_RANGES, 0, 2052):
+    raise ValueError("native EXP2 asset contract mismatch")
+  if len(native.guards) != 1 or (native.guards[0].buffer, native.guards[0].offset, native.guards[0].size, native.guards[0].fill) != \
+     (native.outputs[0], 256, 3840, 0xA5):
+    raise ValueError("native EXP2 output guard mismatch")
+  actual_repairs = tuple((int(item.kind), item.source_mask, item.source_value, item.result_bits, item.fallback) for item in native.repairs)
+  if actual_repairs != tuple((1, *repair) for repair in _EXP2_REPAIRS):
+    raise ValueError("native EXP2 repair contract mismatch")
+
 def _validate_native_image(image:RKImage) -> None:
-  if type(image) is not RKImage or image.version != RKIMAGE_NATIVE_VERSION or type(image.target) is not RKTarget or image.native is None:
+  if type(image) is not RKImage or type(image.target) is not RKTarget or image.native is None:
     raise ValueError("invalid native RKImage")
+  _native_int(image.version, RKIMAGE_NATIVE_VERSION, RKIMAGE_NATIVE_VERSION, "image version")
   if any(type(value) is not tuple for value in (image.scratch, image.gathers, image.ew_ops, image.mid_gathers, image.post_gathers,
                                                 image.host_gathers, image.host_scatters)) or image.gathers or image.ew_ops or image.mid_gathers or \
-     image.post_gathers or image.host_gathers or image.host_scatters or image.gather_after != 0 or type(image.constants) is not bytes:
+     image.post_gathers or image.host_gathers or image.host_scatters or image.scratch or type(image.gather_after) is not int or \
+     image.gather_after != 0 or type(image.constants) is not bytes or image.constants:
     raise ValueError("native RKImage cannot contain generic execution stages")
   for index,spec in enumerate(image.scratch):
     if type(spec) is not RKScratch: raise ValueError(f"invalid native scratch[{index}]")
     _native_int(spec.size, 1, (1 << 32)-1, f"scratch[{index}] size")
     _native_int(spec.alignment, 1, (1 << 32)-1, f"scratch[{index}] alignment")
+    if spec.alignment & (spec.alignment - 1): raise ValueError(f"invalid native scratch[{index}] alignment")
   native = image.native
   if type(native) is not RKNativeOp: raise ValueError("invalid native operation")
   _native_enum(native.kind, RKNativeKind, "kind")
   if native.kind is RKNativeKind.LUT and not native.assets: raise ValueError("native LUT requires an embedded asset")
-  _native_int(native.flags, 0, 0, "flags")
+  _native_int(native.flags, 0, _RKIMAGE_U16_MAX, "flags")
   _native_qwords(native.commands, "commands", required=True); _native_qwords(native.tail, "tail")
   _native_args(native.reads, "reads"); _native_args(native.writes, "writes"); _native_args(native.outputs, "outputs")
   for name,values in (("relocations", native.relocs), ("assets", native.assets), ("guards", native.guards), ("repairs", native.repairs)):
-    if type(values) is not tuple: raise ValueError(f"invalid native {name}")
-  for name,values in (("reads", native.reads), ("writes", native.writes), ("outputs", native.outputs)):
-    if len(set(values)) != len(values): raise ValueError(f"duplicate native {name}")
+    if type(values) is not tuple or len(values) > _RKIMAGE_U16_MAX: raise ValueError(f"invalid native {name}")
+  _native_refs_unique(native.reads, "reads"); _native_refs_unique(native.writes, "writes"); _native_refs_unique(native.outputs, "outputs")
   write_set = set(native.writes)
   if any(value not in write_set for value in native.outputs): raise ValueError("native output is not a write")
   reloc_words:set[int] = set(); declared = set(native.reads + native.writes + native.outputs)
@@ -250,7 +328,7 @@ def _validate_native_image(image:RKImage) -> None:
     _native_int(asset.size, 1, (1 << 32)-1, f"asset[{index}] size"); _native_int(asset.flags, 0, (1 << 32)-1, f"asset[{index}] flags")
     if type(asset.payload) is not bytes or len(asset.payload) != asset.size or hashlib.sha256(asset.payload).digest() != asset.digest:
       raise ValueError(f"invalid native asset[{index}] payload")
-    if type(asset.ranges) is not tuple: raise ValueError(f"invalid native asset[{index}] ranges")
+    if type(asset.ranges) is not tuple or len(asset.ranges) > _RKIMAGE_U16_MAX: raise ValueError(f"invalid native asset[{index}] ranges")
     previous = -1
     for interval in asset.ranges:
       if type(interval) is not tuple or len(interval) != 2: raise ValueError(f"invalid native asset[{index}] range")
@@ -274,8 +352,6 @@ def _validate_native_image(image:RKImage) -> None:
   task_names = ("op index", "enable mask", "interrupt mask", "interrupt clear", "interrupt status", "regcfg amount", "regcfg offset", "reserved")
   for name,value in zip(task_names, astuple(native.task)):
     _native_int(value, 0, (1 << 32)-1, f"task {name}")
-  if native.task.op_index != 0 or native.task.regcfg_offset != 0: raise ValueError("native task must describe the first stage")
-  if native.task.regcfg_amount != len(native.commands): raise ValueError("native task amount does not match commands")
   if type(native.submit) is not RKNativeSubmit: raise ValueError("invalid native submit")
   _native_int(native.submit.flags, 0, (1 << 32)-1, "submit flags"); _native_int(native.submit.timeout_ms, 1, (1 << 32)-1, "submit timeout")
   _native_int(native.submit.core_mask, 1, (1 << 32)-1, "submit core mask")
@@ -284,6 +360,7 @@ def _validate_native_image(image:RKImage) -> None:
   if native.submit.task_count != 1: raise ValueError("native operation must submit one task")
   if type(native.reset) is not RKNativeReset: raise ValueError("invalid native reset")
   _native_int(native.reset.flags, 0, (1 << 32)-1, "reset flags"); _native_int(native.reset.value, 0, (1 << 32)-1, "reset value")
+  _native_route_contract(native)
 
 def _native_put_arg(out:bytearray, value:RKArg) -> None:
   out += _NATIVE_ARG.pack(int(value.kind), 0, value.index, value.addend)
@@ -323,7 +400,7 @@ def _decode_native_image(blob:bytes) -> RKImage:
     header = _NATIVE_HEADER.unpack_from(blob)
   except struct.error as exc: raise ValueError("truncated native RKImage header") from exc
   magic,version,target,kind,flags,nscratch,nreads,nwrites,noutputs,nrelocs,nassets,nguards,nrepairs,ncommands,ntail,nconst = header
-  if magic != RKIMAGE_MAGIC or version != RKIMAGE_NATIVE_VERSION or flags: raise ValueError("invalid native RKImage header")
+  if magic != RKIMAGE_MAGIC or version != RKIMAGE_NATIVE_VERSION: raise ValueError("invalid native RKImage header")
   off = _NATIVE_HEADER.size; scratch = []
   for _ in range(nscratch):
     data,off = _native_take(blob, off, _SCRATCH.size); scratch.append(RKScratch(*_SCRATCH.unpack(data)))
@@ -359,7 +436,7 @@ def _decode_native_image(blob:bytes) -> RKImage:
   for _ in range(nrepairs):
     data,off = _native_take(blob, off, _NATIVE_REPAIR.size)
     repair_kind,fallback,reserved,source_mask,source_value,result_bits = _NATIVE_REPAIR.unpack(data)
-    if reserved: raise ValueError("invalid native repair flags")
+    if reserved or fallback not in (0, 1): raise ValueError("invalid native repair flags")
     repairs.append(RKNativeRepair(RKNativeRepairKind(repair_kind), source_mask, source_value, result_bits, bool(fallback)))
   data,off = _native_take(blob, off, ncommands*8); commands = tuple(struct.unpack(f"<{ncommands}Q", data))
   data,off = _native_take(blob, off, ntail*8); tail = tuple(struct.unpack(f"<{ntail}Q", data))
@@ -369,7 +446,7 @@ def _decode_native_image(blob:bytes) -> RKImage:
   constants,off = _native_take(blob, off, nconst)
   if off != len(blob): raise ValueError("invalid native RKImage size")
   native = RKNativeOp(RKNativeKind(kind), commands, tuple(relocs), reads, writes, outputs, tail,
-                      tuple(assets), tuple(guards), tuple(repairs), task, submit, reset)
+                      tuple(assets), tuple(guards), tuple(repairs), task, submit, reset, flags)
   image = RKImage(RKTarget(target), tuple(scratch), constants, RKIMAGE_NATIVE_VERSION, native=native)
   _validate_native_image(image)
   return image
@@ -407,6 +484,7 @@ def encode_image(image:RKImage) -> bytes:
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
+  if type(blob) is not bytes: raise ValueError("RKImage wire value must be bytes")
   if len(blob) >= 6 and blob[:4] == RKIMAGE_MAGIC and struct.unpack_from("<H", blob, 4)[0] == RKIMAGE_NATIVE_VERSION:
     return _decode_native_image(blob)
   magic, version, target, nscratch, ngather, nhost_gather, nhost_scatter, nop, nconst, mid_count, post_count, gather_after, flags = \
