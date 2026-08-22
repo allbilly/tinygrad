@@ -7694,3 +7694,34 @@ or dynamic gather.  Broad reductions, generic WMMA, and the modular/OpenNPU
 paths remain **NO-GO** because packing, CBUF layout, strides, output layout,
 and precision semantics are not proven.  This is a future contract only; no
 CMAC source, test, or device change is part of this milestone.
+
+---
+
+## 2026-08-22 — verified 2.811k renderer / 457 runtime source milestone
+
+Source commit `be8bd962262664ca8a2de88836fe3e80d2a42d6f` (parent
+`a9e1b162cab4b269a3ff3149999b8d1da96480a5`, tree
+`fa2196271c55aa62fd982cd88177c183db877ec2`) applies only the canonical
+two-file union patch (`1a87859a4606e51834b6c0145bb39488eaf02f9862e4cd7a83000ec8ba0d29ed`)
+to base tree `612a59340eab4adf923c6eb170379c4ba989e4de`.  `sz.py` reports
+renderer **2811**, runtime **457**, a **-11** combined-line delta from
+2820/459; no test or runtime/core behavior was changed outside that patch.
+
+The exact post-reboot hardware evidence is
+`/home/orangepi/rk-artifacts-next2825-20260822/union-2811-457-postreboot-hardware-20260822/`:
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health **PASS** (exit 0),
+and the `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` census recorded
+**433 passed + 12 skipped = 445**, **154 subtests**, exit **0**, in **916.87 s**.
+The recorded marker scan observed zero `retry`, `timeout`, or `submit` lines
+(and stderr was empty); this is an observed-marker statement, not a claim
+that configured retry capacity was absent.  No CPU/GPU/host-numeric fallback,
+CMAC shortcut, reset, or `elementwise.py` health run was used.
+
+The hardware-proven LUT donor routes remain separate architectural evidence:
+the typed integration is currently line-positive/default-off and is not merged.
+CMAC archaeology still proves **zero deletion** today; only the narrow future
+K=32, N=4..16 contiguous-FP16 contract is plausible, so no CMAC code is merged.
+The raw-cast/byte-plane unification audit is **REJECTED**: numeric FP16
+truncate/modulo and raw FP16 bitcast have different offset, lane, output-image,
+and resource contracts, making the proposed shared route unsafe; no CAST change
+is included.
