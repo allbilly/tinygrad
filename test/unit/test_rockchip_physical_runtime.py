@@ -336,6 +336,16 @@ def test_dma_snapshot_is_revalidated_before_patch_and_submit() -> None:
   assert "reset" not in names and "submit" not in names
 
 
+def test_native_plan_and_span_snapshot_is_revalidated_before_patch() -> None:
+  program, effects = _setup(_exp2_native())
+  effects._preflight()
+  effects.native = replace(effects.native, spans=())
+  with pytest.raises(PhysicalRuntimeReject, match="span_contract"):
+    effects.execute(preflight=False)
+  assert effects.closed and not effects.ownership_unknown
+  assert all(event[0] not in ("reset", "submit", "asset") for event in program.dev.events)
+
+
 def test_dma_snapshot_revalidation_runs_again_immediately_before_submit() -> None:
   program, effects = _setup(_cmac_native())
   calls = 0

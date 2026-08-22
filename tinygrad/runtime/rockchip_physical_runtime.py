@@ -183,13 +183,16 @@ class RockchipPhysicalEffects:
     if type(candidate) is not RKNativeOp:
       raise PhysicalRuntimeReject("native_schema", "RKImage has no RKNativeOp")
     self.native: RKNativeOp = candidate
+    self._native_identity = self.native
     self.kind = self.native.kind
     self.telemetry = PhysicalRuntimeTelemetry("cmac_v1" if self.kind is RKNativeKind.CMAC else "exp2_lut_v1")
     self._cmd_buf: HCQBuffer | None = None
     self._task_buf: HCQBuffer | None = None
     self._resource_buffers: dict[str, HCQBuffer] = {}
+    self._resource_args: dict[str, RKArg] = {}
     self._dma_by_arg: dict[RKArg, int] = {}
     self._binding_snapshot: tuple[tuple[RKArg, int, int, int, int, int], ...] = ()
+    self._span_snapshot: tuple[RKNativeSpan, ...] = ()
     self._prepared = False
     self._reset = False
     self._in_flight = False
@@ -318,14 +321,18 @@ class RockchipPhysicalEffects:
         self._reject("dma_alias", f"{role} overlaps another native resource")
       seen.append((dma, allocation))
       self._resource_buffers[role] = buffer
+      self._resource_args[role] = arg
       self._dma_by_arg[arg] = dma
     self._binding_snapshot = tuple(
       (arg, id(self.bufs[arg.index]), int(self.bufs[arg.index].va_addr), self.bufs[arg.index].size,
        _allocation_size(self.bufs[arg.index]), self._dma_by_arg[arg]) for arg in refs)
+    self._span_snapshot = self.native.spans
 
   def _revalidate_bindings(self) -> None:
     if not self._binding_snapshot:
       self._reject("dma_binding", "native caller bindings were not snapshotted")
+    if self.native is not self._native_identity or self.native.spans != self._span_snapshot:
+      self._reject("span_contract", "native immutable plan or spans changed after preflight")
     current: list[tuple[RKArg, int, int, int, int, int]] = []
     ranges: list[tuple[int, int]] = []
     for arg, buffer_id, va_addr, requested, allocation, expected_dma in self._binding_snapshot:
@@ -347,6 +354,9 @@ class RockchipPhysicalEffects:
       allocation = next(item[4] for item in current if item[0] == span.buffer)
       if allocation != span.allocation or span.offset + span.size > allocation:
         self._reject("span_contract", "caller allocation no longer covers immutable native span")
+    for role,arg in self._resource_args.items():
+      if self._resource_buffers.get(role) is not self.bufs[arg.index]:
+        self._reject("dma_binding", "caller resource role changed after preflight")
     self._dma_by_arg = {arg: dma for arg,_,_,_,_,dma in current}
 
   def _check_cmac_inputs(self) -> None:
