@@ -27,11 +27,6 @@ def _offset_stage(op:RKEWOp, count:int, offset:int, *, dst_step:int=1, src_step:
   dst, lhs, rhs = (RKArg(arg.kind, arg.index, arg.addend+offset*(dst_step if i == 0 else src_step))
                    for i,arg in enumerate((op.dst, op.lhs, op.rhs)))
   return emit_ew_stage(dst, lhs, rhs, count, op.ew_cfg, **flags)
-def _pcchain_sizes(body_qwords:list[int]) -> tuple[int, int]:
-  """Exact command and descriptor BO sizes for one PC-chain, including prefetch guard."""
-  if not body_qwords or any(not 0 < amount <= _PC_DATA_AMOUNT_MAX for amount in body_qwords): raise ValueError("invalid EW PC-chain body")
-  return sum(_task_command_bytes(amount) for amount in body_qwords)+_CMD_PREFETCH_GUARD, len(body_qwords)*_TASK_DESC_BYTES
-
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
   def _copyin(self, dest:HCQBuffer, src:memoryview):
@@ -122,7 +117,9 @@ class RockchipProgram(Program['RockchipDevice']):
     if self._pcchain_bodies == packed_bodies and self._cmd_buf is not None and self._task_buf is not None:
       self._submit(self._cmd_buf, self._task_buf, n)
       return
-    cmd_size, task_need = _pcchain_sizes([len(body) for body in bodies])
+    sizes = [len(body) for body in bodies]
+    if not sizes or not all(0 < s <= _PC_DATA_AMOUNT_MAX for s in sizes): raise ValueError("invalid EW PC-chain body")
+    cmd_size, task_need = sum(_task_command_bytes(s) for s in sizes)+_CMD_PREFETCH_GUARD, len(sizes)*_TASK_DESC_BYTES
     offsets = [0]
     for body in bodies:
       offsets.append(offsets[-1] + _align_up(len(body) + _PC_TAIL, 2))
@@ -217,8 +214,7 @@ class RockchipProgram(Program['RockchipDevice']):
       cached = self._scratch_ew_bodies.get(ops)
       if cached is None:
         stages = []
-        for op in ops:
-          for start in self._tile(wr.ref(op), _MAX_EW_ELEMS_FP16, addr, scratch=True, patch=True): stages += [start]
+        for op in ops: stages.extend(self._tile(wr.ref(op), _MAX_EW_ELEMS_FP16, addr, scratch=True, patch=True))
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return

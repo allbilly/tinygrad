@@ -1303,8 +1303,7 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
   if candidates > min(_MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS//count) or any(size > _RKIMAGE_U16_MAX for size in (
      pre_blocks*(3*len(axes)+16*alternative_count+2*pre_repeat*dtype.itemsize)+external_count+total_scratch,
      pre_blocks*(len(axes)+8*alternative_count+pre_repeat*dtype.itemsize)+external_count+pre_repeat*dtype.itemsize+total_gathers)): return None
-  combinations:tuple[tuple[int, ...], ...] = ((),)
-  for _,_,extent,_ in axes: combinations = tuple(prefix+(value,) for prefix in combinations for value in range(extent))
+  combinations = tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes)))
   external:tuple[int, tuple[int, ...]]|None = None
   if bool_load is not None and bool_param is not None:
     try: bool_offsets = _gather_offsets(out_index, bool_load.src[0].src[1], None, count)
@@ -1322,7 +1321,6 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
           for offset in offsets) or any(not 0 <= offset < data_count or offset*dtype.itemsize+dtype.itemsize-1 > dtypes.int.max
           for row in plan_offsets for offset in row) or external is not None and any(offset > dtypes.int.max for offset in external[1])): return None
   if total_gate is not None and index_offsets[0] != tuple(range(count)): return None
-  coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(axes)))
   repeat = next((width for width in range(min(8, count), 0, -1) if count%width == 0 and all(all(
     row[start:start+width] == (row[start],)*width for start in range(0, count, width)) for row in (*index_offsets,
     *((external[1],) if external else ())))), 1)
@@ -1333,11 +1331,9 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
   if any(size > _RKIMAGE_U16_MAX for size in (block_count*(3*len(axes)+16*alternative_count+2*repeat*dtype.itemsize)+external_count+total_scratch,
      block_count*(len(axes)+8*alternative_count+repeat*dtype.itemsize)+external_count+repeat*dtype.itemsize+total_gathers)): return None
   builder, blocks = _RKBuilder(), []
-  for start in range(0, candidates, block_rows):
-    stop = min(candidates, start+block_rows)
-    rows, matrix_lanes = stop-start, (stop-start)*vector_lanes
-    axis_masks:list[RKArg] = []
-    for axis,((index_slot, offsets), values) in enumerate(zip(grouped_indices, coordinates)):
+  for start,stop in ((start,min(candidates,start+block_rows)) for start in range(0,candidates,block_rows)):
+    rows, matrix_lanes, axis_masks = stop-start, (stop-start)*vector_lanes, typing_cast(list[RKArg], [])
+    for axis,((index_slot, offsets), values) in enumerate(zip(grouped_indices, zip(*combinations))):
       alternatives = (values, *((tuple(value-axes[axis][2] for value in values),) if axes[axis][3] else ()))
       coordinate_sets = tuple(tuple((value,)*group_count for value in alternative[start:stop]) for alternative in alternatives)
       if (mask:=_native_int16_byte_mask(builder, index_slot, offsets, coordinate_sets, group_count, vector_lanes)) is None: return None
@@ -1370,9 +1366,8 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
     total = _reduce_rows(builder.ops, [replace(bool_values, addend=lane*64) for lane in range(data_count)], 1, _EW_CFG[Ops.ADD], int16=True)
     gather_after, total_vector, coordinate, zero, one = len(builder.ops), *(builder.scratch(count*2) for _ in range(4))
     mid = (RKGather(total.index, total_vector.index, count, offsets=(total.addend//2,)*count, src_kind=RKBufferKind.SCRATCH),)
-    builder.gathers.extend((RKGather(mask_param.arg.slot, coordinate.index, count, values=tuple(range(count)), itemsize=2),
-                            RKGather(mask_param.arg.slot, zero.index, count, values=(0,)*count, itemsize=2),
-                            RKGather(mask_param.arg.slot, one.index, count, values=(1,)*count, itemsize=2)))
+    builder.gathers.append(RKGather(mask_param.arg.slot, coordinate.index, count, values=tuple(range(count))))
+    for dst,constant in ((zero,0),(one,1)): builder.constant(mask_param.arg.slot, count, constant, dst=dst)
     valid, _ = _prefix_valid(builder, total_vector, coordinate, zero, one, count)
     fill_bits = int(fill.arg) & ((1 << (dtype.itemsize*8))-1)
     for byte,value in enumerate(results[0]):
@@ -2203,8 +2198,7 @@ class RKContext:
     specials = [i for i,arm in enumerate(u.src[1:]) if arm.op is Ops.CONST and arm.dtype is dtypes.half and not math.isfinite(float(arm.arg))]
     selector:RKValue|None = None
     if len(specials) == 1:
-      special, finite_index = specials[0], 1-specials[0]
-      finite = self.lower(u.src[1+finite_index])
+      special, finite = specials[0], self.lower(u.src[2-specials[0]])
       if finite.layout is not RKLayout.FP16: raise _RKGenericReject
       selector = self._static(u.src[0], RKLayout.BOOL_MASK) if _is_static_expr(u.src[0]) else self.lower(u.src[0])
       if selector.layout is RKLayout.BOOL_MASK:
@@ -2600,8 +2594,7 @@ def _lower_multi_scalar_local_reductions(output:RKOutput, uops:list[UOp]) -> RKI
   if any(_static_local_descriptor(buffer, definition, dtypes.float, Ops.ADD, 0.0) is None or _semantic_loads(definition.term, local=True)
          for buffer,definition in definitions.items()): return None  # noqa: E501
   next_slot = 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM), default=out.arg.slot); staged:RKImage|None = None; sources:dict[UOp, UOp] = {}
-  for buffer in buffers:
-    fake_slot, next_slot = next_slot, next_slot+1
+  for fake_slot,buffer in enumerate(buffers, next_slot):
     if (child:=_lower_static_local_child(definitions[buffer], fake_slot, recipes_ready=True)) is None: return None
     fake, mapped, groups = child
     if (reduced:=_finish_mapped_add_reduction(mapped, fake_slot, 1, groups, 1.0)) is None: return None
@@ -2672,12 +2665,10 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   scratch, gathers, ops, mid = list(combined.scratch), list(combined.gathers), list(combined.ew_ops), list(combined.mid_gathers)
   scratch.append(RKScratch(_scratch_bytes(total)))
   result = _spaced_reduction(ops, mid, weighted, total, allocate, _EW_CFG[Ops.MAX], int16=True)
-  if slope != 1:
-    scale = allocate(1); gathers.append(RKGather(out_param.arg.slot, scale.index, 1, values=(_int16_bits(slope),)))
-    scaled = allocate(1); ops.append(RKEWOp(scaled, result, scale, 1, _EW_CFG[Ops.MUL], **_INT16_EW)); result = scaled
-  if baseline:
-    offset = allocate(1); gathers.append(RKGather(out_param.arg.slot, offset.index, 1, values=(_int16_bits(baseline),)))
-    translated = allocate(1); ops.append(RKEWOp(translated, result, offset, 1, _EW_CFG[Ops.ADD], **_INT16_EW)); result = translated
+  for value,op in ((v,o) for v,o,n in ((slope,Ops.MUL,1), (baseline,Ops.ADD,0)) if v != n):
+    source, previous, result = allocate(1), result, allocate(1)
+    gathers.append(RKGather(out_param.arg.slot, source.index, 1, values=(_int16_bits(value),)))
+    ops.append(RKEWOp(result, previous, source, 1, _EW_CFG[op], **_INT16_EW))
   zero = allocate(1); gathers.append(RKGather(out_param.arg.slot, zero.index, 1, values=(0,)))
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, zero, 1, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
   image = RKImage(RKTarget.RK3588, tuple(scratch), combined.constants, gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid), gather_after=child.gather_after)  # noqa: E501
