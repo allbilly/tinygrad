@@ -35,7 +35,9 @@ def _exp2_image() -> RKImage:
                           ((0, 1026), (1026, 1026)), payload=rkp.LUT_V1_EXP2_TABLE),),
     guards=(RKNativeGuard(output, 256, 3840, 0xA5),),
     repairs=tuple(RKNativeRepair(RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True) for index in range(7)),
-    task=RKNativeTask(*rkp.LUT_V1_EXP2_TASK), submit=RKNativeSubmit(*rkp.LUT_V1_EXP2_SUBMIT), reset=RKNativeReset(*rkp.LUT_V1_EXP2_RESET),
+    task=RKNativeTask(op_index=4, enable_mask=0x18, interrupt_mask=0x300, interrupt_clear=0x1FFFF,
+                      interrupt_status=0, regcfg_amount=1064, regcfg_offset=0, reserved=0),
+    submit=RKNativeSubmit(*rkp.LUT_V1_EXP2_SUBMIT), reset=RKNativeReset(*rkp.LUT_V1_EXP2_RESET),
     flags=rkp.LUT_V1_EXP2_REQUIRED_CONTROLS)
   return RKImage(RKTarget.RK3588, version=32, native=native)
 
@@ -107,6 +109,28 @@ def test_native_canonical_validator_rejects_aliases_and_exact_type_violations():
   bad_commands = (native.commands[0] ^ 1,) + native.commands[1:]
   with pytest.raises(ValueError, match="command template"):
     encode_image(replace(image, native=replace(native, commands=bad_commands)))
+
+
+def test_native_exp2_task_matches_detached_named_wire_contract():
+  image = _exp2_image()
+  native = image.native
+  assert native is not None
+  expected = RKNativeTask(op_index=4, enable_mask=0x18, interrupt_mask=0x300, interrupt_clear=0x1FFFF,
+                          interrupt_status=0, regcfg_amount=1064, regcfg_offset=0, reserved=0)
+  assert native.task == expected
+  assert rkp.LUT_V1_EXP2_TASK == (4, 0x18, 0x300, 0x1FFFF, 0, 1064, 0, 0)
+  assert decode_image(encode_image(image)) == image
+
+
+def test_native_exp2_rejects_shifted_task_and_controls():
+  image = _exp2_image()
+  native = image.native
+  assert native is not None
+  shifted = RKNativeTask(0, 4, 0x18, 0x300, 0x1FFFF, 0, 1064, 0)
+  with pytest.raises(ValueError, match="lifecycle"):
+    encode_image(replace(image, native=replace(native, task=shifted)))
+  with pytest.raises(ValueError, match="controls"):
+    encode_image(replace(image, native=replace(native, flags=0)))
 
 
 @pytest.mark.parametrize("ranges", (((0, 2052),), ((0, 1025), (1025, 1027))))
