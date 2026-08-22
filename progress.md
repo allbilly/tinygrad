@@ -7694,26 +7694,3 @@ or dynamic gather.  Broad reductions, generic WMMA, and the modular/OpenNPU
 paths remain **NO-GO** because packing, CBUF layout, strides, output layout,
 and precision semantics are not proven.  This is a future contract only; no
 CMAC source, test, or device change is part of this milestone.
-
-### 2026-08-22 — host-only general CMAC matrixizer design
-
-The static donor audit now has a host-only planning artifact at
-`rockchip-cmac-matrixizer.md` and an intentionally unimported prototype at
-`tinygrad/renderer/rockchip_cmac.py`.  It exhaustively matrixizes arbitrary
-static M/N/K/batch axes, emits only integer gather/packing metadata, records
-K-tile scratch/barrier sequencing and FP16-input/FP32-accumulator boundaries,
-and explicitly rejects extrema, integer, boolean, dynamic, malformed, and
-unsupported-precision requests.  It covers six normalized additive/MADD
-families plus static-local ADD.  The frozen 46-word donor command serializer
-matches the existing source-only hash; it does not submit a task or inspect a
-tensor buffer.
-
-The prototype has **173 executable lines** and its seven host tests pass with
-`-n12`; Ruff and mypy pass.  No production renderer/runtime import, codec
-change, CPU/GPU numeric fallback, NPU command, or full 445-case claim is made.
-The production integration budget is capped at **186 executable additions**;
-the six current candidate route bodies total **236** executable lines, with an
-additional approximate **74** matcher/dispatch-only lines conditionally
-removable only after a future full census and image differential.  Thus the
-realistic conditional deletion is **310 lines**, rather than 58–59; no lines
-are deleted by this host-only milestone.
