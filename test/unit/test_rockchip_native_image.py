@@ -171,7 +171,7 @@ class _HostOnlyDevice:
 def test_native_runtime_preflights_then_fails_closed_before_device_effects():
   dev = _HostOnlyDevice()
   program = RockchipProgram(cast(RockchipDevice, dev), TinyELF(encode_image(_cmac_image()), "native", Target(), ()))
-  with pytest.raises(RuntimeError, match="native execution effects are not implemented"):
+  with pytest.raises(RuntimeError, match="buffer_binding"):
     program(*(cast(HCQBuffer, object()) for _ in range(3)))
   assert dev.events == ["touch", "touch"]
 
