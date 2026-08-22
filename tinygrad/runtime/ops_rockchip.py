@@ -72,6 +72,11 @@ class RockchipProgram(Program['RockchipDevice']):
     self.scratch = tuple(self._scratch_arena.offset(offset, spec.size)
       for offset,spec in zip(self._scratch_offsets, self.image.scratch))
 
+  def _preflight_native(self, bufs:tuple[HCQBuffer, ...]) -> RockchipPhysicalEffects:
+    effects = RockchipPhysicalEffects(self, self.image, bufs, self.native)
+    effects._preflight()
+    return effects
+
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False, *, retry:bool=True,
               submit_contract:object|None=None, sync_before_submit:bool=True) -> None:
     if submit_contract is None:
@@ -106,9 +111,9 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _run_native(self, *bufs:HCQBuffer, wait:bool=False) -> float|None:
     start = time.perf_counter()
-    effects = RockchipPhysicalEffects(self, self.image, tuple(bufs), self.native)
+    effects = self._preflight_native(tuple(bufs))
     try:
-      receipt = effects.execute()
+      receipt = effects.execute(preflight=False)
       if type(receipt) is not PhysicalSubmitReceipt or receipt.status != 0 or not receipt.ownership_known:
         raise RuntimeError("RK physical execution did not prove completion")
     except Exception:

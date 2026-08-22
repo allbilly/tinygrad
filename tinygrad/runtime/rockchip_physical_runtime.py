@@ -639,9 +639,10 @@ class RockchipPhysicalEffects:
     self.last_reason = reason
     self.telemetry.reject("ownership_unknown")
 
-  def execute(self) -> PhysicalSubmitReceipt:
+  def execute(self, *, preflight: bool = True) -> PhysicalSubmitReceipt:
     try:
-      self._preflight()
+      if preflight:
+        self._preflight()
       self._prepare()
       self._upload_asset_while_idle()
       self.reset_before()
