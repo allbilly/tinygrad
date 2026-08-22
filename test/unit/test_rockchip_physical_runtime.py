@@ -11,6 +11,7 @@ import pytest
 from tinygrad.device import TinyELF
 from tinygrad.helpers import Target
 import tinygrad.renderer.rockchip as rk
+import tinygrad.runtime.rockchip_physical_runtime as physical_runtime
 from tinygrad.runtime.autogen import rockchip as driver
 from tinygrad.runtime.autogen import rockchip_physical as rkp
 from tinygrad.runtime.rockchip_physical_runtime import (
@@ -35,9 +36,10 @@ class _Meta:
 class _SpyDevice:
   native_reset_live_proven = True
 
-  def __init__(self, *, alias_dma: bool = False, corrupt_guard: bool = False, fail_free: bool = False):
+  def __init__(self, *, alias_dma: bool = False, corrupt_guard: bool = False, fail_free: bool = False,
+               fail_second_alloc: bool = False):
     self.next_dma = 0x00100000
-    self.alias_dma, self.corrupt_guard, self.fail_free = alias_dma, corrupt_guard, fail_free
+    self.alias_dma, self.corrupt_guard, self.fail_free, self.fail_second_alloc = alias_dma, corrupt_guard, fail_free, fail_second_alloc
     self.events: list[object] = []
     self.submit_count = self.task_count = self.timeout_retries = 0
     self.storage: list[ctypes.Array[ctypes.c_char]] = []
@@ -60,6 +62,9 @@ class _SpyDevice:
     return HCQBuffer(ctypes.addressof(storage), size, _Meta(dma, dma, allocation))
 
   def _gpu_alloc(self, size: int, flags: int = 0) -> HCQBuffer:
+    if self.fail_second_alloc and flags == driver.RKNPU_MEM_KERNEL_MAPPING:
+      self.events.append(("alloc_fail", size, flags))
+      raise MemoryError("spy second allocation failure")
     result = self.buffer(size)
     self.events.append(("alloc", size, flags, result.meta.dma_addr))
     return result
@@ -81,8 +86,9 @@ class _SpyDevice:
 
 
 class _SpyProgram:
-  def __init__(self, native: rk.RKNativeOp, *, fail_submit: bool = False, alias_dma: bool = False, corrupt_guard: bool = False):
-    self.dev = _SpyDevice(alias_dma=alias_dma, corrupt_guard=corrupt_guard)
+  def __init__(self, native: rk.RKNativeOp, *, fail_submit: bool = False, alias_dma: bool = False, corrupt_guard: bool = False,
+               fail_second_alloc: bool = False):
+    self.dev = _SpyDevice(alias_dma=alias_dma, corrupt_guard=corrupt_guard, fail_second_alloc=fail_second_alloc)
     self.image = rk.RKImage(rk.RKTarget.RK3588, version=32, native=native)
     self.native, self.fail_submit = native, fail_submit
     self.effects: RockchipPhysicalEffects | None = None
@@ -103,9 +109,11 @@ class _SpyProgram:
       ctypes.memmove(int(output.va_addr), struct.pack("<64H", *range(64)), rkp.CMAC_V1_OUTPUT_VIEW_BYTES)
     else:
       ctypes.memset(int(output.va_addr), 0, rkp.LUT_V1_EXP2_OUTPUT_BYTES)
-      ctypes.memmove(int(output.va_addr) + 32, struct.pack("<H", 0x3C00) * 112, 224)
+      ctypes.memmove(int(output.va_addr) + rkp.LUT_V1_EXP2_PADDING_OFFSET,
+                     struct.pack("<H", rkp.LUT_V1_EXP2_PADDING_FILL) * (rkp.LUT_V1_EXP2_PADDING_BYTES // 2),
+                     rkp.LUT_V1_EXP2_PADDING_BYTES)
       if self.dev.corrupt_guard:
-        ctypes.memset(int(output.va_addr) + 256, 0x5A, 1)
+        ctypes.memset(int(output.va_addr) + rkp.LUT_V1_EXP2_OUTPUT_BYTES, 0x5A, 1)
     return PhysicalSubmitReceipt(0, True, 77)
 
 
@@ -135,7 +143,9 @@ def _exp2_native() -> rk.RKNativeOp:
   relocs = tuple(
     rk.RKNativeRelocation(word, target, register, arg) for (word, target, register), arg in zip(rkp.LUT_V1_EXP2_RELOCATIONS, (output, input_arg))
   )
-  repairs = tuple(rk.RKNativeRepair(rk.RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True) for index in range(7))
+  repairs = tuple(rk.RKNativeRepair(rk.RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True, name,
+                                    input_arg, output, rk.RK_EXP2_PHYSICAL_PROVENANCE, rk.RK_EXP2_REPAIR_DEVICE_STAGE)
+                  for index,name in enumerate(rk.RK_EXP2_REPAIR_METADATA))
   return rk.RKNativeOp(
     rk.RKNativeKind.LUT,
     rkp.LUT_V1_EXP2_COMMANDS,
@@ -144,12 +154,26 @@ def _exp2_native() -> rk.RKNativeOp:
     (output,),
     (output,),
     assets=(asset,),
-    guards=(rk.RKNativeGuard(output, 256, rkp.LUT_V1_EXP2_GUARD_BYTES, 0xA5),),
+    guards=(rk.RKNativeGuard(output, rkp.LUT_V1_EXP2_OUTPUT_BYTES, rkp.LUT_V1_EXP2_GUARD_BYTES, rkp.LUT_V1_EXP2_GUARD_FILL),),
     repairs=repairs,
     task=rk.RKNativeTask(*rkp.LUT_V1_EXP2_TASK),
     submit=rk.RKNativeSubmit(*rkp.LUT_V1_EXP2_SUBMIT),
     reset=rk.RKNativeReset(*rkp.LUT_V1_EXP2_RESET),
     flags=rkp.LUT_V1_EXP2_REQUIRED_CONTROLS,
+    spans=(
+      rk.RKNativeSpan(input_arg, rk.RKNativeSpanKind.INPUT, 0, rkp.LUT_V1_EXP2_INPUT_BYTES,
+                      rkp.LUT_V1_EXP2_INPUT_ALLOCATION_BYTES, provenance=rk.RK_EXP2_PHYSICAL_PROVENANCE),
+      rk.RKNativeSpan(output, rk.RKNativeSpanKind.OUTPUT_LOGICAL, 0, rkp.LUT_V1_EXP2_INPUT_BYTES,
+                      rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, provenance=rk.RK_EXP2_PHYSICAL_PROVENANCE),
+      rk.RKNativeSpan(output, rk.RKNativeSpanKind.OUTPUT_PHYSICAL, 0, rkp.LUT_V1_EXP2_OUTPUT_BYTES,
+                      rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, provenance=rk.RK_EXP2_PHYSICAL_PROVENANCE),
+      rk.RKNativeSpan(output, rk.RKNativeSpanKind.OUTPUT_PADDING, rkp.LUT_V1_EXP2_PADDING_OFFSET,
+                      rkp.LUT_V1_EXP2_PADDING_BYTES, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES,
+                      rkp.LUT_V1_EXP2_PADDING_FILL, 2, rk.RK_EXP2_PHYSICAL_PROVENANCE),
+      rk.RKNativeSpan(output, rk.RKNativeSpanKind.OUTPUT_GUARD, rkp.LUT_V1_EXP2_OUTPUT_BYTES,
+                      rkp.LUT_V1_EXP2_GUARD_BYTES, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES,
+                      rkp.LUT_V1_EXP2_GUARD_FILL, 1, rk.RK_EXP2_PHYSICAL_PROVENANCE),
+    ),
   )
 
 
@@ -232,6 +256,99 @@ def test_exp2_upload_repair_padding_guard_and_cleanup_order() -> None:
   assert names.index("asset") < names.index("reset") < names.index("submit") < names.index("free")
   asset_event = next(event for event in program.dev.events if event[0] == "asset")
   assert asset_event[1] == rkp.LUT_V1_EXP2_TABLE and asset_event[2] == ((0, 1026), (1026, 1026))
+  input_dma = effects._dma_by_arg[effects.native.reads[0]]
+  input_sync = ("sync", input_dma, driver.RKNPU_MEM_SYNC_TO_DEVICE)
+  assert input_sync in program.dev.events and program.dev.events.index(input_sync) < names.index("reset")
+
+
+def test_exp2_readback_has_no_host_numeric_repair_or_input_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
+  program, effects = _setup(_exp2_native())
+  effects._preflight()
+  input_buffer, output_buffer = effects._resource_buffers["input"], effects._resource_buffers["output"]
+  original_read, original_write = physical_runtime._read, physical_runtime._write
+  reads: list[tuple[HCQBuffer, int, int]] = []
+  writes: list[tuple[HCQBuffer, bytes, int]] = []
+
+  def read_spy(buffer: HCQBuffer, size: int, offset: int = 0) -> bytes:
+    if buffer is input_buffer:
+      raise AssertionError("EXP2 runtime inspected input bytes")
+    reads.append((buffer, size, offset))
+    return original_read(buffer, size, offset)
+
+  def write_spy(buffer: HCQBuffer, data: bytes, offset: int = 0) -> None:
+    writes.append((buffer, data, offset))
+    original_write(buffer, data, offset)
+
+  monkeypatch.setattr(physical_runtime, "_read", read_spy)
+  monkeypatch.setattr(physical_runtime, "_write", write_spy)
+  effects.execute(preflight=False)
+  assert reads == [(output_buffer, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, 0)]
+  assert all(buffer is not output_buffer for buffer,_,_ in writes)
+  assert effects.last_output == bytes(rkp.LUT_V1_EXP2_INPUT_BYTES) + \
+    struct.pack("<H", rkp.LUT_V1_EXP2_PADDING_FILL) * (rkp.LUT_V1_EXP2_PADDING_BYTES // 2)
+
+
+def test_exp2_missing_device_repair_provenance_is_zero_effect_reject() -> None:
+  native = _exp2_native()
+  bad_repairs = tuple(replace(rule, name="", provenance="", device_stage="") for rule in native.repairs)
+  program, effects = _setup(replace(native, repairs=bad_repairs))
+  with pytest.raises(PhysicalRuntimeReject, match="span_contract|exp2_repair"):
+    effects.execute()
+  assert effects.closed and program.dev.events == []
+
+
+def test_exp2_asset_flags_are_zero_effect_reject() -> None:
+  native = _exp2_native()
+  program, effects = _setup(replace(native, assets=(replace(native.assets[0], flags=1),)))
+  with pytest.raises(PhysicalRuntimeReject, match="asset"):
+    effects.execute()
+  assert effects.closed and program.dev.events == []
+
+
+def test_second_native_allocation_is_tracked_and_freed_on_failure() -> None:
+  program = _SpyProgram(_cmac_native(), fail_second_alloc=True)
+  bufs = tuple(program.dev.buffer(size) for size in (64, 2048, 256))
+  ctypes.memset(int(bufs[1].va_addr) + 256, 0, 1792)
+  effects = RockchipPhysicalEffects(program, program.image, bufs, program.native)
+  program.effects = effects
+  with pytest.raises(PhysicalRuntimeReject, match="allocator"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert [event[0] for event in program.dev.events if isinstance(event, tuple)] == ["alloc", "alloc_fail", "free"]
+
+
+def test_non_contract_submit_receipt_is_terminal_unknown() -> None:
+  program, effects = _setup(_cmac_native())
+  program._submit_physical = lambda _command, _task, _contract: object()  # type: ignore[method-assign]
+  with pytest.raises(PhysicalOwnershipUnknown, match="non-contract receipt"):
+    effects.execute()
+  assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+
+
+def test_dma_snapshot_is_revalidated_before_patch_and_submit() -> None:
+  program, effects = _setup(_cmac_native())
+  effects._preflight()
+  effects._resource_buffers["lhs"].meta.dma_addr += 0x1000
+  with pytest.raises(PhysicalRuntimeReject, match="dma_binding"):
+    effects.execute(preflight=False)
+  assert effects.closed and not effects.ownership_unknown
+  names = [event[0] for event in program.dev.events if isinstance(event, tuple)]
+  assert "reset" not in names and "submit" not in names
+
+
+def test_dma_snapshot_revalidation_runs_again_immediately_before_submit() -> None:
+  program, effects = _setup(_cmac_native())
+  calls = 0
+  original = effects._revalidate_bindings
+
+  def spy() -> None:
+    nonlocal calls
+    calls += 1
+    original()
+
+  effects._revalidate_bindings = spy  # type: ignore[method-assign]
+  effects.execute()
+  assert calls == 2
 
 
 def test_submit_exception_is_unknown_and_holds_command_and_task() -> None:

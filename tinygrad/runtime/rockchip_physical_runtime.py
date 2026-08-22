@@ -24,9 +24,14 @@ from tinygrad.renderer.rockchip import (
   RKNativeRelocation,
   RKNativeRepair,
   RKNativeRepairKind,
+  RKNativeSpan,
+  RKNativeSpanKind,
   RKNativeReset,
   RKNativeSubmit,
   RKNativeTask,
+  RK_EXP2_PHYSICAL_PROVENANCE,
+  RK_EXP2_REPAIR_DEVICE_STAGE,
+  RK_EXP2_REPAIR_METADATA,
 )
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.autogen import rockchip_physical as rkp
@@ -37,8 +42,6 @@ _PAGE = 4096
 _U32_MAX = (1 << 32) - 1
 _TASK_DESCRIPTOR_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _EXP2_IDLE_UPLOAD_RANGES = ((0, 1026), (1026, 1026))
-_EXP2_REPAIR_RULES = 7
-_EXP2_REPAIR_CONTRACT = tuple((RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True) for index in range(_EXP2_REPAIR_RULES))
 _CMAC_LOGICAL_LANES = 4
 
 # Stable event IDs.  These are a finite vocabulary, not a second telemetry
@@ -170,28 +173,6 @@ def cmac_logical_output(raw_bytes: bytes, logical_lanes: int, swizzle: Sequence[
   return struct.pack(f"<{logical_lanes}H", *(words[indexes[index]] for index in range(logical_lanes)))
 
 
-def _default_exp2_repair(input_bytes: bytes, output_bytes: bytes) -> bytes:
-  """Apply the exact exceptional-value policy using raw binary16 bits only."""
-  if len(input_bytes) != rkp.LUT_V1_EXP2_INPUT_BYTES or len(output_bytes) != rkp.LUT_V1_EXP2_OUTPUT_BYTES:
-    raise ValueError("invalid EXP2 repair image")
-  words = list(struct.unpack("<128H", output_bytes))
-  inputs = struct.unpack("<16H", input_bytes)
-  for index, bits in enumerate(inputs):
-    exponent, fraction = (bits >> 10) & 0x1F, bits & 0x3FF
-    replacement: int | None = None
-    if exponent == 0x1F:
-      replacement = 0x7E00 if fraction else (0x7C00 if not bits >> 15 else 0)
-    elif exponent == 0:
-      replacement = 0x3C00
-    elif bits >> 15 and bits > 0xCE00:
-      replacement = 0
-    elif not bits >> 15 and bits > 0x4BFF:
-      replacement = 0x7C00
-    if replacement is not None:
-      words[index] = replacement
-  return struct.pack("<128H", *words)
-
-
 class RockchipPhysicalEffects:
   """Execute exactly one frozen native operation with no retry or fallback."""
 
@@ -208,6 +189,7 @@ class RockchipPhysicalEffects:
     self._task_buf: HCQBuffer | None = None
     self._resource_buffers: dict[str, HCQBuffer] = {}
     self._dma_by_arg: dict[RKArg, int] = {}
+    self._binding_snapshot: tuple[tuple[RKArg, int, int, int, int, int], ...] = ()
     self._prepared = False
     self._reset = False
     self._in_flight = False
@@ -337,8 +319,45 @@ class RockchipPhysicalEffects:
       seen.append((dma, allocation))
       self._resource_buffers[role] = buffer
       self._dma_by_arg[arg] = dma
+    self._binding_snapshot = tuple(
+      (arg, id(self.bufs[arg.index]), int(self.bufs[arg.index].va_addr), self.bufs[arg.index].size,
+       _allocation_size(self.bufs[arg.index]), self._dma_by_arg[arg]) for arg in refs)
+
+  def _revalidate_bindings(self) -> None:
+    if not self._binding_snapshot:
+      self._reject("dma_binding", "native caller bindings were not snapshotted")
+    current: list[tuple[RKArg, int, int, int, int, int]] = []
+    ranges: list[tuple[int, int]] = []
+    for arg, buffer_id, va_addr, requested, allocation, expected_dma in self._binding_snapshot:
+      if not 0 <= arg.index < len(self.bufs):
+        self._reject("dma_binding", "native argument index changed")
+      buffer = self.bufs[arg.index]
+      if not isinstance(buffer, HCQBuffer) or id(buffer) != buffer_id or int(buffer.va_addr) != va_addr or buffer.size != requested:
+        self._reject("dma_binding", "caller buffer identity or span changed after preflight")
+      actual_allocation, actual_dma = _allocation_size(buffer), _dma(self.program, buffer)
+      if actual_allocation != allocation or actual_dma != expected_dma:
+        self._reject("dma_binding", "caller DMA or allocation span changed after preflight")
+      current.append((arg, id(buffer), int(buffer.va_addr), buffer.size, actual_allocation, actual_dma))
+      ranges.append((actual_dma, actual_allocation))
+    if any(a < c + d and c < a + b for index,(a,b) in enumerate(ranges) for c,d in ranges[index+1:]):
+      self._reject("dma_alias", "caller DMA spans overlap before native patch or submit")
+    for span in self.native.spans:
+      if span.buffer not in self._dma_by_arg:
+        self._reject("span_contract", "native span is not bound to a caller resource")
+      allocation = next(item[4] for item in current if item[0] == span.buffer)
+      if allocation != span.allocation or span.offset + span.size > allocation:
+        self._reject("span_contract", "caller allocation no longer covers immutable native span")
+    self._dma_by_arg = {arg: dma for arg,_,_,_,_,dma in current}
 
   def _check_cmac_inputs(self) -> None:
+    if (
+      rkp.CMAC_V1_OUTPUT_SURFACE_BYTES != 128
+      or rkp.CMAC_V1_OUTPUT_VIEW_BYTES != 256
+      or rkp.CMAC_V1_OUTPUT_STRIDE_BYTES != 128
+      or rkp.CMAC_V1_OUTPUT_SWIZZLE != tuple((channel // 16) * 32 + channel % 16 for channel in range(32))
+      or len(rkp.CMAC_V1_OUTPUT_SWIZZLE) != rkp.CMAC_V1_PHYSICAL_CHANNELS
+    ):
+      self._reject("cmac_geometry", "CMAC output surface or byte swizzle differs from the immutable catalog")
     rhs = _read(self._resource_buffers["rhs"], rkp.CMAC_V1_RHS_BYTES)
     active = _CMAC_LOGICAL_LANES * rkp.CMAC_V1_RHS_KERNEL_STRIDE_BYTES
     if rhs[active:] != bytes(len(rhs) - active):
@@ -363,6 +382,7 @@ class RockchipPhysicalEffects:
       or asset.size != rkp.LUT_V1_EXP2_TABLE_BYTES
       or len(asset.payload) != asset.size
       or asset.digest != bytes.fromhex(rkp.LUT_V1_EXP2_TABLE_SHA256)
+      or asset.flags != 0
     ):
       self._reject("asset", "EXP2 asset bytes or digest differ from the generated table")
     if hashlib.sha256(asset.payload).digest() != asset.digest:
@@ -372,7 +392,8 @@ class RockchipPhysicalEffects:
       for interval in asset.ranges
     ):
       self._reject("asset", "EXP2 asset ranges are not immutable integer pairs")
-    if asset.ranges != _EXP2_IDLE_UPLOAD_RANGES or sum(count for _, count in asset.ranges) != asset.size:
+    if asset.ranges != _EXP2_IDLE_UPLOAD_RANGES or sum(count for _, count in asset.ranges) != asset.size or \
+       any(start < 0 or count <= 0 or start + count > asset.size for start,count in asset.ranges):
       self._reject("asset", "EXP2 asset ranges are not the two canonical banks")
     indexes = (*range(1, 514), *range(515, 1028))
     encoded = struct.pack("<1026H", *((self.native.commands[index] >> 16) & 0xFFFF for index in indexes))
@@ -384,14 +405,32 @@ class RockchipPhysicalEffects:
     if guard.buffer != self.native.outputs[0] or (guard.offset, guard.size, guard.fill) != (
       rkp.LUT_V1_EXP2_OUTPUT_BYTES,
       rkp.LUT_V1_EXP2_GUARD_BYTES,
-      0xA5,
+      rkp.LUT_V1_EXP2_GUARD_FILL,
     ):
       self._reject("output_guard", "EXP2 output guard is not canonical")
-    if len(self.native.repairs) != _EXP2_REPAIR_RULES or any(type(rule) is not RKNativeRepair for rule in self.native.repairs):
-      self._reject("exp2_repair", "EXP2 does not carry seven special-value repair rules")
-    actual_repairs = tuple((rule.kind, rule.source_mask, rule.source_value, rule.result_bits, rule.fallback) for rule in self.native.repairs)
-    if actual_repairs != _EXP2_REPAIR_CONTRACT:
-      self._reject("exp2_repair", "EXP2 repair policy differs from the generated contract")
+    expected_spans = (
+      RKNativeSpan(self.native.reads[0], RKNativeSpanKind.INPUT, 0, rkp.LUT_V1_EXP2_INPUT_BYTES,
+                   rkp.LUT_V1_EXP2_INPUT_ALLOCATION_BYTES, provenance=RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(self.native.outputs[0], RKNativeSpanKind.OUTPUT_LOGICAL, 0, rkp.LUT_V1_EXP2_INPUT_BYTES,
+                   rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, provenance=RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(self.native.outputs[0], RKNativeSpanKind.OUTPUT_PHYSICAL, 0, rkp.LUT_V1_EXP2_OUTPUT_BYTES,
+                   rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, provenance=RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(self.native.outputs[0], RKNativeSpanKind.OUTPUT_PADDING, rkp.LUT_V1_EXP2_PADDING_OFFSET,
+                   rkp.LUT_V1_EXP2_PADDING_BYTES, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES,
+                   rkp.LUT_V1_EXP2_PADDING_FILL, 2, RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(self.native.outputs[0], RKNativeSpanKind.OUTPUT_GUARD, rkp.LUT_V1_EXP2_OUTPUT_BYTES,
+                   rkp.LUT_V1_EXP2_GUARD_BYTES, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES,
+                   rkp.LUT_V1_EXP2_GUARD_FILL, 1, RK_EXP2_PHYSICAL_PROVENANCE),
+    )
+    if type(self.native.spans) is not tuple or self.native.spans != expected_spans:
+      self._reject("span_contract", "EXP2 geometry, padding, guard, or provenance is not immutable")
+    if len(self.native.repairs) != len(RK_EXP2_REPAIR_METADATA) or any(type(rule) is not RKNativeRepair for rule in self.native.repairs):
+      self._reject("exp2_repair", "EXP2 does not carry named device-side repair stages")
+    expected_repairs = tuple(RKNativeRepair(RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True,
+      name, self.native.reads[0], self.native.outputs[0], RK_EXP2_PHYSICAL_PROVENANCE, RK_EXP2_REPAIR_DEVICE_STAGE)
+      for index,name in enumerate(RK_EXP2_REPAIR_METADATA))
+    if self.native.repairs != expected_repairs:
+      self._reject("exp2_repair", "EXP2 repair provenance is not a device-side immutable contract")
 
   def _preflight(self) -> None:
     if type(self.native) is not RKNativeOp:
@@ -420,7 +459,10 @@ class RockchipPhysicalEffects:
     if not callable(allocate):
       self._reject("allocator", "device has no Rockchip allocator")
     try:
-      self._cmd_buf, self._task_buf = allocate(command_size), allocate(task_size, rk.RKNPU_MEM_KERNEL_MAPPING)
+      command_buffer = allocate(command_size)
+      self._cmd_buf = command_buffer
+      task_buffer = allocate(task_size, rk.RKNPU_MEM_KERNEL_MAPPING)
+      self._task_buf = task_buffer
       command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
       if _allocation_size(command_buffer) < command_size or _allocation_size(task_buffer) < task_size:
         self._reject("allocator", "native allocation is smaller than contract")
@@ -453,6 +495,7 @@ class RockchipPhysicalEffects:
 
   def _write_command_and_task(self) -> None:
     command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
+    self._revalidate_bindings()
     patched = self._patch_commands()
     command_image = struct.pack(f"<{len(patched)}Q", *patched) + struct.pack(f"<{len(self.native.tail)}Q", *self.native.tail)
     expected = rkp.CMAC_V1_COMMAND_IMAGE_BYTES if self.kind is RKNativeKind.CMAC else len(rkp.LUT_V1_EXP2_COMMANDS) * 8
@@ -525,13 +568,9 @@ class RockchipPhysicalEffects:
     asset = self.native.assets[0]
     uploader = getattr(self.program.dev, "_upload_native_asset", None)
     try:
-      if callable(uploader):
-        uploader(asset.payload, asset.ranges)
-      else:
-        if self._cmd_buf is None:
-          self._reject("asset", "command buffer is missing for idle table upload")
-        self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
-        self._command_synced = True
+      if not callable(uploader):
+        self._reject("asset", "device has no idle native-asset upload primitive")
+      uploader(asset.payload, asset.ranges)
     except PhysicalRuntimeReject:
       raise
     except Exception as exc:
@@ -546,6 +585,8 @@ class RockchipPhysicalEffects:
     if self.kind is RKNativeKind.CMAC:
       self._sync(self._resource_buffers["lhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
       self._sync(self._resource_buffers["rhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    else:
+      self._sync(self._resource_buffers["input"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if not self._command_synced:
       self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self._sync(self._require_buffer("_task_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
@@ -572,6 +613,7 @@ class RockchipPhysicalEffects:
     submitter = getattr(self.program, "_submit_physical", None)
     if not callable(submitter):
       self._reject("submit", "program has no physical submit primitive")
+    self._revalidate_bindings()
     self._in_flight = True
     self.telemetry.pc_submits += 1
     self._event("submit_one")
@@ -581,11 +623,11 @@ class RockchipPhysicalEffects:
       self._unknown = True
       self.telemetry.reject("submit_unknown")
       raise PhysicalOwnershipUnknown("physical submit crossed driver boundary") from exc
-    receipt = (
-      result
-      if isinstance(result, PhysicalSubmitReceipt)
-      else PhysicalSubmitReceipt(getattr(result, "status", 0), getattr(result, "ownership_known", True), getattr(result, "submit_id", result))
-    )
+    if type(result) is not PhysicalSubmitReceipt:
+      self._unknown = True
+      self.telemetry.reject("submit_unknown")
+      raise PhysicalOwnershipUnknown("physical submit returned a non-contract receipt")
+    receipt = result
     if type(receipt.status) is not int or type(receipt.ownership_known) is not bool or not receipt.ownership_known or receipt.submit_id is None:
       self._unknown = True
       self.telemetry.reject("submit_unknown")
@@ -606,16 +648,12 @@ class RockchipPhysicalEffects:
   def _validate_exp2_output(self) -> None:
     output = self._resource_buffers["output"]
     raw = _read(output, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES)
-    if raw[rkp.LUT_V1_EXP2_OUTPUT_BYTES :] != bytes([0xA5]) * rkp.LUT_V1_EXP2_GUARD_BYTES:
+    if raw[rkp.LUT_V1_EXP2_OUTPUT_BYTES :] != bytes([rkp.LUT_V1_EXP2_GUARD_FILL]) * rkp.LUT_V1_EXP2_GUARD_BYTES:
       self._reject("output_guard", "EXP2 output guard was modified")
-    padding = struct.pack("<H", 0x3C00) * 112
+    padding = struct.pack("<H", rkp.LUT_V1_EXP2_PADDING_FILL) * (rkp.LUT_V1_EXP2_PADDING_BYTES // 2)
     if raw[rkp.LUT_V1_EXP2_INPUT_BYTES : rkp.LUT_V1_EXP2_OUTPUT_BYTES] != padding:
       self._reject("output_padding", "EXP2 physical padding was modified")
-    repaired = _default_exp2_repair(_read(self._resource_buffers["input"], rkp.LUT_V1_EXP2_INPUT_BYTES), raw[: rkp.LUT_V1_EXP2_OUTPUT_BYTES])
-    if repaired[rkp.LUT_V1_EXP2_INPUT_BYTES :] != padding:
-      self._reject("exp2_repair", "EXP2 repair changed physical padding")
-    _write(output, repaired)
-    self.last_output = repaired
+    self.last_output = raw[: rkp.LUT_V1_EXP2_OUTPUT_BYTES]
 
   def barrier_after(self) -> None:
     if not self._in_flight or self._unknown:
