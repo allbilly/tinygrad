@@ -7,8 +7,9 @@ import pytest
 from tinygrad.device import TinyELF
 from tinygrad.helpers import Target
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKImage, RKNativeAsset, RKNativeGuard, RKNativeKind,
-  RKNativeOp, RKNativeRelocation, RKNativeRepair, RKNativeRepairKind, RKNativeReset, RKNativeSubmit, RKNativeTask,
-  RKTarget, RockchipCompiler, decode_image, encode_image)
+  RKNativeOp, RKNativeRelocation, RKNativeRepair, RKNativeRepairKind, RKNativeReset, RKNativeSpan, RKNativeSpanKind,
+  RKNativeSubmit, RKNativeTask, RKTarget, RK_EXP2_PHYSICAL_PROVENANCE, RK_EXP2_REPAIR_DEVICE_STAGE,
+  RK_EXP2_REPAIR_METADATA, RockchipCompiler, decode_image, encode_image)
 from tinygrad.runtime.autogen import rockchip_physical as rkp
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipProgram
 from tinygrad.runtime.support.hcq import HCQBuffer
@@ -33,12 +34,25 @@ def _exp2_image() -> RKImage:
     reads=(input_,), writes=(output,), outputs=(output,),
     assets=(RKNativeAsset(rkp.LUT_V1_EXP2_ASSET_ID, bytes.fromhex(rkp.LUT_V1_EXP2_TABLE_SHA256), rkp.LUT_V1_EXP2_TABLE_BYTES,
                           ((0, 1026), (1026, 1026)), payload=rkp.LUT_V1_EXP2_TABLE),),
-    guards=(RKNativeGuard(output, 256, 3840, 0xA5),),
-    repairs=tuple(RKNativeRepair(RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True) for index in range(7)),
+    guards=(RKNativeGuard(output, rkp.LUT_V1_EXP2_OUTPUT_BYTES, rkp.LUT_V1_EXP2_GUARD_BYTES, rkp.LUT_V1_EXP2_GUARD_FILL),),
+    repairs=tuple(RKNativeRepair(RKNativeRepairKind.SPECIAL_VALUE, index + 1, index, index + 1, True, name,
+                                 input_, output, RK_EXP2_PHYSICAL_PROVENANCE, RK_EXP2_REPAIR_DEVICE_STAGE)
+                   for index,name in enumerate(RK_EXP2_REPAIR_METADATA)),
     task=RKNativeTask(op_index=4, enable_mask=0x18, interrupt_mask=0x300, interrupt_clear=0x1FFFF,
                       interrupt_status=0, regcfg_amount=1064, regcfg_offset=0, reserved=0),
     submit=RKNativeSubmit(*rkp.LUT_V1_EXP2_SUBMIT), reset=RKNativeReset(*rkp.LUT_V1_EXP2_RESET),
-    flags=rkp.LUT_V1_EXP2_REQUIRED_CONTROLS)
+    flags=rkp.LUT_V1_EXP2_REQUIRED_CONTROLS, spans=(
+      RKNativeSpan(input_, RKNativeSpanKind.INPUT, 0, rkp.LUT_V1_EXP2_INPUT_BYTES,
+                   rkp.LUT_V1_EXP2_INPUT_ALLOCATION_BYTES, provenance=RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(output, RKNativeSpanKind.OUTPUT_LOGICAL, 0, rkp.LUT_V1_EXP2_INPUT_BYTES,
+                   rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, provenance=RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(output, RKNativeSpanKind.OUTPUT_PHYSICAL, 0, rkp.LUT_V1_EXP2_OUTPUT_BYTES,
+                   rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, provenance=RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(output, RKNativeSpanKind.OUTPUT_PADDING, rkp.LUT_V1_EXP2_PADDING_OFFSET, rkp.LUT_V1_EXP2_PADDING_BYTES,
+                   rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, rkp.LUT_V1_EXP2_PADDING_FILL, 2, RK_EXP2_PHYSICAL_PROVENANCE),
+      RKNativeSpan(output, RKNativeSpanKind.OUTPUT_GUARD, rkp.LUT_V1_EXP2_OUTPUT_BYTES, rkp.LUT_V1_EXP2_GUARD_BYTES,
+                   rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES, rkp.LUT_V1_EXP2_GUARD_FILL, 1, RK_EXP2_PHYSICAL_PROVENANCE),
+    ))
   return RKImage(RKTarget.RK3588, version=32, native=native)
 
 
