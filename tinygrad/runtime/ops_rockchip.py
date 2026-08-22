@@ -1,5 +1,5 @@
 from __future__ import annotations
-import collections, ctypes, mmap, os, time, weakref as wr
+import collections, ctypes, hashlib, mmap, os, time, weakref as wr
 from dataclasses import replace as copy_dataclass
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
@@ -60,13 +60,32 @@ class RockchipProgram(Program['RockchipDevice']):
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
     dev._touch_program(self)
-    self._ensure_scratch()
+    if self.image.native is None: self._ensure_scratch()
 
   def _ensure_scratch(self) -> None:
     if self._scratch_arena is not None or not self._scratch_size: return
     self._scratch_arena = self.dev._gpu_alloc(self._scratch_size)
     self.scratch = tuple(self._scratch_arena.offset(offset, spec.size)
       for offset,spec in zip(self._scratch_offsets, self.image.scratch))
+
+  def _preflight_native(self, bufs:tuple[HCQBuffer, ...]) -> None:
+    native = self.image.native
+    if native is None: raise RuntimeError("native dispatch requested for a generic RKImage")
+    for asset in native.assets:
+      if hashlib.sha256(asset.payload).digest() != asset.digest: raise RuntimeError(f"native asset {asset.asset_id} hash mismatch")
+    refs = native.reads + native.writes + native.outputs + tuple(reloc.arg for reloc in native.relocs) + \
+      tuple(guard.buffer for guard in native.guards)
+    for ref in refs:
+      if ref.kind is RKBufferKind.ARG and ref.index >= len(bufs): raise RuntimeError(f"RKImage argument slot {ref.index} is not bound")
+      if ref.kind is RKBufferKind.SCRATCH: raise RuntimeError("native scratch allocation is not implemented")
+    for reloc in native.relocs:
+      word = native.commands[reloc.word_index]
+      if ((word >> 48) & 0xffff, word & 0xffff) != (reloc.target, reloc.register): raise RuntimeError("native relocation preflight failed")
+
+  def _run_native(self, *bufs:HCQBuffer, wait:bool=False) -> None:
+    del wait
+    self._preflight_native(bufs)
+    raise RuntimeError("RK native execution effects are not implemented")
 
   def _release_resources(self) -> None:
     self.scratch = ()
@@ -333,6 +352,7 @@ class RockchipProgram(Program['RockchipDevice']):
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
     self.dev._touch_program(self)
+    if self.image.native is not None: return self._run_native(*bufs, wait=wait)
     self._ensure_scratch()
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
       if kind is RKBufferKind.ARG:
