@@ -7572,3 +7572,125 @@ No CPU/GPU/CMAC/host production numeric fallback or LUT route was added, and
 no test was weakened. This documentation pass ran no tests, NPU command,
 `elementwise.py`, rerun, reset, or push. Commit `f3a0f590a` is the shared code
 milestone; this progress-only documentation patch is pending.
+
+---
+
+## 2026-08-22 — verified 2.820k Rockchip source milestone
+
+The shared source checkpoint is commit `515cb6b2cf908e0a14b477dccb58db0f365c7026`,
+parent `c473465726b932f06d420434d7a3340eefd3a7da`, tree
+`24b76c436847edd859e0254c81a03203ad4d0fb3`.  The exact source reconstruction
+is based on `f3a0f590ab6809fccf7ca7dd77bf4544e714fa66`; its combined patch is
+`1f283e12f7abcb2273f2420490f5213d07a711ca7a124b40c5036c46334957ab`.
+The reconstruction record is
+`/home/orangepi/rk-artifacts-next2825-20260822/full445-2820-reconstruction.txt`.
+Only `tinygrad/renderer/rockchip.py` and `tinygrad/runtime/ops_rockchip.py`
+are source files in that patch.  The executable `sz.py` evidence is renderer
+**2820**, runtime **459**, and repository total **28347** (the corresponding
+size record is
+`/home/orangepi/rk-artifacts-next2825-20260822/full445-2820-sz.txt`).  The
+candidate source SHA-256 values are renderer
+`d37bce7a51b95d78768e304a5e40c6c7b51236a0c5b9429d8c0f40fa396c39f4` and
+runtime `870902e3e240689032cb5733165f235398c839422d189ec9e6e57f3813ad8e48`.
+
+Host-only gates recorded by the corrected union-v2 report were Rockchip UOp
+unit pack **115 passed**, focused b79d **1 passed**, PC-chain **32** normalized
+cases (SHA-256
+`6bc08cd68d6e5e2408e6937d501a8e7783cd5d7c40182f0108996e85de54bc47`), submit
+oracle **144** cases with **0 mismatches**, and combined integration **12**
+cases (SHA-256
+`89256b63e1913453773f249105267f2418e82718de36445dc352946de7db16bf`), plus
+Ruff, mypy, compileall, diff-check, and the exact-baseline ugliness check.
+The authoritative host report and manifest are
+`/home/orangepi/rk-artifacts-next2825-20260822/next-union-2820-salvage-rank13-rank14/REPORT-v2.md`
+and
+`/home/orangepi/rk-artifacts-next2825-20260822/next-union-2820-salvage-rank13-rank14/MANIFEST-v2.json`;
+the report supersedes its stale-hash predecessor.
+
+The one fresh serial hardware census is archived at
+`/home/orangepi/rk-artifacts-next2825-20260822/full445-2820-union-v2-20260822T044657Z/`.
+It ran `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` with a fresh cache,
+`-n0 -x`, timeout 6000 ms, and four configured submit retries.  The result was
+**433 passed + 12 skipped = 445**, **154 subtests passed**, exit **0**; pytest
+reported **1006.32 s (0:16:46)** and the wrapper duration was **1062.885 s**.
+The recorded boot ID was `3eb3630c-3147-4a2b-b726-e7e73167eea4`.  The marker
+scan emitted no `retry`, `timeout`, `resubmit`, or `submit` markers; this is an
+absence-of-marker observation, not a claim that zero retry attempts occurred.
+The authoritative counts, timings, command, and marker files are
+`census/summary.txt`, `census/timestamps.txt`, `census/command.txt`, and
+`census/retry-markers.txt` below that directory.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health result was reused
+from the same boot and recorded `PASS`; it was not rerun for this census.
+
+The provenance is one serial census, with no CPU/GPU/host numeric fallback,
+CMAC shortcut, LUT route, weakened test, `elementwise.py` health run, reset,
+or repeated census/duplicate experiment.  The device and source artifacts are
+retained for audit; this progress entry does not change source or test files.
+
+### Hardware LUT evidence, kept separate from the merge
+
+The SiLU donor route is `/home/orangepi/rk3588/experimental/silu.py` (source
+SHA-256 `ea5ddb90571470e19d4d9e74ef927e0fd1bc2e8d340d8424f847dc126c8a1f3f`)
+and its independent evidence is in
+`/home/orangepi/rk-artifacts-next2790-20260822/lut-v24-same-boot-20260822T112300Z/`.
+The independent report is
+`/home/orangepi/rk-artifacts-next2790-20260822/lut-v24-independent-judge-luna-max/REPORT.md`;
+its SHA-256 is
+`711aea7db73cf9103c8002d49553815b22702e565eeb00d86f5573d58f25a30c`.
+It observed a real hardware LUT route with LUT bypass clear, 1026 signed
+int16 table entries (513 per bank; table SHA-256
+`2d75bf85cb5aa6df95b3a5b43ee13932f7a801e3bb80d4b8f2fa89d93445a932`), finite
+lane-varying output, and donor-scaled maximum absolute error **0.0027546**.
+The donor stream and runtime capture hashes were respectively
+`4ecec9dc2ef116cf8ebb46c129ecddc50ec9c4e6141c30287eb1c490f865b696` and
+`530ef5f217ae0ab45b3a840f33b1704dbf528928ec2f9524b0423756f8a4b2e0`.
+The strict ideal raw-fixed-point oracle rejected the readback, so this is
+hardware-proven donor-route evidence with that fixed-point model caveat, not
+proof of Tinygrad integration.
+
+The normalized EXP2 probe is archived at
+`/home/orangepi/rk-artifacts-next2790-20260822/lut-exp2-v1131-hardware-20260822T122537/`.
+Its command stream has SHA-256
+`1b3aa43ac814f8ef570c230904e91483c47f8f341bc8fbd972dc7bdfa20e6c4d`, the LUT
+table has SHA-256
+`ad3ef028711e351f457bb1598b28abc2c21c3de99b21b12dd210e21680760dcc`, and the
+validation record has SHA-256
+`4334de26ef537b6f5f95defdd6110d8521cc81a98d117cfd338c582adb9c68f3`.
+The probe recorded hardware-opened, LUT bypass clear, finite lane-varying
+outputs within Tinygrad tolerance, one reset/submit, and the poisoned guard
+check passing: bytes 256..4095 remained `0xa5` and changed guard bytes were
+zero.  Its fail-closed human-review exit is not a hardware failure.
+
+Neither LUT route is merged: the correct typed integration is line-positive
+(the archival plan adds physical-stage machinery and does not remove the old
+EW approximants).  The corrected future plan is
+`/home/orangepi/rk-artifacts-next2825-20260822/lut-future-merge-v2-2820-459/worktree/FUTURE_LUT_MERGE.md`;
+the corresponding patch is
+`/home/orangepi/rk-artifacts-next2825-20260822/lut-future-merge-v2-2820-459/future-lut-merge-v2.patch`
+(SHA-256 `d42abcb0f5e2ddc607a3a2bfed1724a66f05af557574952c81088acffa7f9e51`).
+It is **ARCHIVAL_WIP_NOT_RUNTIME_INTEGRATED**, explicitly default-off, adds
+997 physical lines (0 deletions; **+156 `sz.py` lines**), and has no
+full-445/default-route/NPU integration proof.  It is pending an independent
+verdict and is not merge-ready.  The v1
+patch at
+`/home/orangepi/rk-artifacts-next2825-20260822/lut-future-merge-2820/future-lut-merge.patch`
+is archival/refuted merge metadata, not a ready patch.
+
+### CMAC/WMMA research disposition
+
+The read-only synthesis and provenance reports are in
+`/home/orangepi/rk-artifacts-cmac-20260822/FINAL_CMAC_SYNTHESIS.md`,
+`CMAC_AUDIT.md`, `cmac-git-archaeology.md`, `cmac-wmma-audit.md`,
+`cmac-architecture-break-even.md`, `reduction-deletion-map.md`, and
+`cmac-dedup-ledger.md`; their recorded hashes are in the synthesis report.
+They inspect the existing `~/npu`, `~/rk3588`, and historical WMMA/CMAC
+branches without repeating hardware or source experiments.  The conclusion
+is **zero proven deletion** today.  A narrow future M1 contract is plausible:
+`REDUCE(ADD, MUL(INDEX(A,k), INDEX(B,n*32+k)), k)` to the CNA → CORE/CMAC/CACC
+→ DPU pipeline, with contiguous FP16 A, pre-packed FP16 B, **K=32**,
+**N=4..16**, FP16 output, one reduction/store, affine zero-based indices, and
+no casts, broadcasts, predicates, epilogues, K/N split, swizzle, multi-output,
+or dynamic gather.  Broad reductions, generic WMMA, and the modular/OpenNPU
+paths remain **NO-GO** because packing, CBUF layout, strides, output layout,
+and precision semantics are not proven.  This is a future contract only; no
+CMAC source, test, or device change is part of this milestone.
