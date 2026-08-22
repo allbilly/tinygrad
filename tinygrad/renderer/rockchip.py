@@ -7,7 +7,7 @@ from enum import IntEnum
 from typing import Any, Callable, Iterable, Mapping, cast, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16
-from tinygrad.helpers import ceildiv, round_up
+from tinygrad.helpers import Target, ceildiv, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_physical as rkp
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, python_alu
@@ -36,6 +36,7 @@ _NATIVE_METADATA_MAGIC, _NATIVE_METADATA_VERSION, _NATIVE_NO_FILL = b"RKMD", 1, 
 _CMAC_BODY_SHA256 = bytes.fromhex(rkp.CMAC_V1_BODY_SHA256)
 _CMAC_TAIL, _CMAC_RELOCS = rkp.CMAC_V1_TAIL, rkp.CMAC_V1_RELOCATIONS
 _CMAC_TASK, _CMAC_SUBMIT, _CMAC_RESET = rkp.CMAC_V1_TASK, rkp.CMAC_V1_SUBMIT, rkp.CMAC_V1_RESET
+_CMAC_RHS_ONE_N4_SHA256 = bytes.fromhex("96a33b81830614e9b95b033117210b3933d7d971323992d35be7d901cb183c00")
 _CMAC_SPANS = ((rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_LHS_BYTES, 0),
                (rkp.CMAC_V1_RHS_BYTES, rkp.CMAC_V1_RHS_BYTES, 0),
                (rkp.CMAC_V1_OUTPUT_SURFACE_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES, 0))
@@ -269,12 +270,18 @@ def _native_metadata_present(native:RKNativeOp) -> bool:
   return bool(native.spans) or any(any(field != "" for field in (repair.name, repair.provenance, repair.device_stage))
                                   for repair in native.repairs)
 
+def _native_asset_ref(value:RKArg, assets:tuple[RKNativeAsset, ...], name:str) -> None:
+  _native_arg(value, name)
+  if value.kind is not RKBufferKind.ASSET or value.addend != 0 or value.index >= len(assets):
+    raise ValueError(f"invalid native {name} binding")
+
 def _native_word_fields(word:int) -> tuple[int, int, int]:
   return word >> 48, word & _RKIMAGE_U16_MAX, (word >> 16) & 0xffffffff
 
 def _native_route_contract(native:RKNativeOp) -> None:
   refs = native.reads + native.writes
   if native.kind is RKNativeKind.CMAC:
+    expected_args:tuple[RKArg, ...]
     if native.flags != 0: raise ValueError("native CMAC controls mismatch")
     if len(native.commands) != 46 or hashlib.sha256(struct.pack("<46Q", *native.commands)).digest() != _CMAC_BODY_SHA256 or native.tail != _CMAC_TAIL:
       raise ValueError("native CMAC command template mismatch")
@@ -3168,13 +3175,19 @@ def _lower_host_scatter(output:RKOutput) -> RKImage|None:
 def _same_condition(a:UOp, b:UOp) -> bool: return a.key == b.key or a.op is b.op is Ops.AND and len(a.src) == len(b.src) == 2 and any(
   all(_same_condition(x, y) for x,y in zip(a.src, order)) for order in (b.src, b.src[::-1]))
 
-def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False) -> RKImage|None:
+def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False,
+                       _try_cmac:bool=True, _cmac_counters:Any=None) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
+  if _try_cmac and not recipes_ready:
+    from tinygrad.renderer.rockchip_cmac_uops import try_cmac
+    if (native:=try_cmac(uops, counters=_cmac_counters)) is not None:
+      return RKImage(RKTarget.RK3588, version=RKIMAGE_NATIVE_VERSION, native=native)
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return None
   accepted = (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool, dtypes.uchar)
   strict_output, local_output, output_stores = _outs(uops)
   if len(output_stores) > 1:
-    lower_store = functools.partial(_lower_uop_program, vectorize_reductions=vectorize_reductions, recipes_ready=recipes_ready)
+    lower_store = functools.partial(_lower_uop_program, vectorize_reductions=vectorize_reductions, recipes_ready=recipes_ready,
+                                    _try_cmac=False, _cmac_counters=_cmac_counters)
     if (combined:=lower_store(list(UOp(Ops.SINK, src=(output_stores[0],)).toposort()))) is None: return None
     for store in output_stores[1:]:
       if (child:=lower_store(list(UOp(Ops.SINK, src=(store,)).toposort()))) is None: return None
@@ -3591,12 +3604,18 @@ class RockchipRenderer(Renderer):
   code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None,
                  Ops.FDIV: lambda: None, Ops.SQRT: lambda: None, Ops.EXP2: lambda: None, Ops.LOG2: lambda: None, Ops.SIN: lambda: None}
   compiler = RockchipCompiler("rockchip")
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.renderer.rockchip_cmac_uops import CMACRouteCounters
+    self.cmac_counters = CMACRouteCounters()
+
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = _lower_uop_program(uops)
+    image = _lower_uop_program(uops, _cmac_counters=self.cmac_counters)
     if image is None:
       sink = graph_rewrite(next(u for u in uops if u.op is Ops.SINK), _pm_exp2_fallback, name="rockchip exp2 fallback")
-      image = _lower_uop_program(list(graph_rewrite(sink, _pm_storage_common, name="rockchip fallback storage").toposort()), recipes_ready=True)
+      image = _lower_uop_program(list(graph_rewrite(sink, _pm_storage_common, name="rockchip fallback storage").toposort()),
+                                  recipes_ready=True, _try_cmac=False, _cmac_counters=self.cmac_counters)
     if image is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))
     return base64.b64encode(encode_image(image)).decode()
 

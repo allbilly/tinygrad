@@ -194,7 +194,8 @@ def replace_input_buffer(ctx:AllocCtx, b:UOp):
   ctx.replacements.append(b)
   if b.op is Ops.BIND: return b.param_like(len(ctx.replacements)-1)
   return UOp.param(len(ctx.replacements)-1, b.dtype, b.shape, b.device,
-                   addrspace=b.addrspace if b.addrspace is not None else AddrSpace.GLOBAL)
+                   addrspace=b.addrspace if b.addrspace is not None else AddrSpace.GLOBAL,
+                   layout_certificate=b.arg.layout_certificate if isinstance(b.arg, ParamArg) else None)
 
 pm_finalize_call = PatternMatcher([
   (UPat(Ops.AFTER, name="x"), finalize_after),

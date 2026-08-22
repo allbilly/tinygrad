@@ -87,7 +87,9 @@ from tinygrad.uop.ops import PatternMatcher, UPat, ParamArg
 from tinygrad.dtype import AddrSpace
 
 def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
-  if (ret:=ctx[0].get(b, None)) is None: ctx[0][b] = ret = UOp.new_buffer(b.device, b.max_numel(), b.dtype)
+  if (ret:=ctx[0].get(b, None)) is None:
+    ctx[0][b] = ret = UOp.new_buffer(b.device, b.max_numel(), b.dtype,
+                                     layout_certificate=b.arg.layout_certificate if isinstance(b.arg, ParamArg) else None)
   return ret
 
 pm_post_sched_cache = PatternMatcher([
