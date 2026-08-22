@@ -53,7 +53,7 @@ RK_EXP2_PHYSICAL_PROVENANCE = f"{RK_EXP2_SEMANTIC_PROVENANCE}:LUT_V1_EXP2_N128:{
 RK_EXP2_REPAIR_DEVICE_STAGE = rkp.LUT_V1_EXP2_REPAIR_DEVICE_STAGE
 
 class RKTarget(IntEnum): RK3588 = 1
-class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
+class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1; ASSET = 2
 class RKLayout(IntEnum): FP16 = 0; INT16 = 1; BOOL_MASK = 2; INT32 = 3; BOOL_INT16 = 4; INT_FP16 = 5
 class RKExecutionClass(IntEnum): NATIVE = 0; HOST_ADDRESS = 1
 class RKNativeKind(IntEnum): CMAC = 1; LUT = 2
@@ -73,7 +73,7 @@ class RKScratch: size: int; alignment: int = 4096
 
 @dataclass(frozen=True)
 class RKNativeRelocation:
-  """A command-word field that the runtime binds to one declared buffer reference."""
+  """A command-word field bound to a declared ARG or immutable ASSET reference."""
   word_index: int; target: int; register: int; arg: RKArg; shift: int = 16; width: int = 32
 
 @dataclass(frozen=True)
@@ -278,14 +278,25 @@ def _native_route_contract(native:RKNativeOp) -> None:
     if native.flags != 0: raise ValueError("native CMAC controls mismatch")
     if len(native.commands) != 46 or hashlib.sha256(struct.pack("<46Q", *native.commands)).digest() != _CMAC_BODY_SHA256 or native.tail != _CMAC_TAIL:
       raise ValueError("native CMAC command template mismatch")
-    if (len(native.reads), len(native.writes), len(native.outputs), native.assets, native.guards, native.repairs,
-        native.spans) != (2, 1, 1, (), (), (), ()):
-      raise ValueError("invalid native CMAC resources")
+    dynamic_rhs = (len(native.reads), len(native.writes), len(native.outputs), native.assets, native.guards, native.repairs,
+                   native.spans) == (2, 1, 1, (), (), (), ())
+    asset_rhs = (len(native.reads), len(native.writes), len(native.outputs), len(native.assets), native.guards,
+                 native.repairs, native.spans) == (1, 1, 1, 1, (), (), ())
+    if not (dynamic_rhs or asset_rhs): raise ValueError("invalid native CMAC resources")
     if native.outputs != native.writes: raise ValueError("native CMAC output ownership mismatch")
     _native_refs_unique(refs, "CMAC references")
     for index,arg in enumerate(refs): _native_arg_zero(arg, f"CMAC ref[{index}]")
+    if asset_rhs:
+      asset = native.assets[0]
+      if (asset.asset_id, asset.size, asset.digest, asset.ranges, asset.flags, asset.payload) != (
+        rkp.CMAC_V1_RHS_ASSET_ID, rkp.CMAC_V1_RHS_ASSET_SIZE, bytes.fromhex(rkp.CMAC_V1_RHS_ASSET_SHA256),
+        rkp.CMAC_V1_RHS_ASSET_RANGES, 0, rkp.CMAC_V1_RHS_ASSET_PAYLOAD):
+        raise ValueError("native CMAC asset contract mismatch")
+      reloc_refs = native.reads + (RKArg(RKBufferKind.ASSET, 0),) + native.outputs
+    else:
+      reloc_refs = native.reads + native.outputs
     expected = tuple((word, target, register, arg, 16, 32)
-      for (word, target, register), arg in zip(_CMAC_RELOCS, native.reads + native.outputs))
+      for (word, target, register), arg in zip(_CMAC_RELOCS, reloc_refs))
     actual = tuple((item.word_index, item.target, item.register, item.arg, item.shift, item.width) for item in native.relocs)
     if actual != expected:
       raise ValueError("native CMAC relocation contract mismatch")
@@ -375,7 +386,10 @@ def _validate_native_image(image:RKImage) -> None:
     _native_int(reloc.register, 0, _RKIMAGE_U16_MAX, f"relocation[{index}] register")
     _native_arg(reloc.arg, f"relocation[{index}] argument")
     _native_int(reloc.shift, 16, 16, f"relocation[{index}] shift"); _native_int(reloc.width, 32, 32, f"relocation[{index}] width")
-    if reloc.word_index in reloc_words or reloc.arg not in declared: raise ValueError("invalid native relocation binding")
+    if reloc.word_index in reloc_words or (reloc.arg.kind is RKBufferKind.ASSET and
+                                           (reloc.arg.addend != 0 or not 0 <= reloc.arg.index < len(native.assets))) or \
+       (reloc.arg.kind is not RKBufferKind.ASSET and reloc.arg not in declared):
+      raise ValueError("invalid native relocation binding")
     word = native.commands[reloc.word_index]
     if (word >> 48) & _RKIMAGE_U16_MAX != reloc.target or word & _RKIMAGE_U16_MAX != reloc.register:
       raise ValueError("native relocation does not match command word")

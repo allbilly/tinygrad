@@ -26,6 +26,20 @@ def _cmac_image() -> RKImage:
   return RKImage(RKTarget.RK3588, version=32, native=native)
 
 
+def _cmac_asset_image() -> RKImage:
+  activation, output = RKArg(RKBufferKind.ARG, 0), RKArg(RKBufferKind.ARG, 1)
+  asset_ref = RKArg(RKBufferKind.ASSET, 0)
+  asset = RKNativeAsset(rkp.CMAC_V1_RHS_ASSET_ID, bytes.fromhex(rkp.CMAC_V1_RHS_ASSET_SHA256), rkp.CMAC_V1_RHS_ASSET_SIZE,
+                        rkp.CMAC_V1_RHS_ASSET_RANGES, payload=rkp.CMAC_V1_RHS_ASSET_PAYLOAD)
+  native = RKNativeOp(
+    RKNativeKind.CMAC, rkp.CMAC_V1_COMMANDS,
+    tuple(RKNativeRelocation(word, target, register, arg) for (word, target, register), arg in zip(rkp.CMAC_V1_RELOCATIONS,
+                                                                                                    (activation, asset_ref, output))),
+    reads=(activation,), writes=(output,), outputs=(output,), tail=rkp.CMAC_V1_TAIL, assets=(asset,),
+    task=RKNativeTask(*rkp.CMAC_V1_TASK), submit=RKNativeSubmit(*rkp.CMAC_V1_SUBMIT), reset=RKNativeReset(*rkp.CMAC_V1_RESET))
+  return RKImage(RKTarget.RK3588, version=32, native=native)
+
+
 def _exp2_image() -> RKImage:
   input_, output = RKArg(RKBufferKind.ARG, 0), RKArg(RKBufferKind.ARG, 1)
   native = RKNativeOp(
@@ -56,7 +70,7 @@ def _exp2_image() -> RKImage:
   return RKImage(RKTarget.RK3588, version=32, native=native)
 
 
-@pytest.mark.parametrize("factory", (_cmac_image, _exp2_image))
+@pytest.mark.parametrize("factory", (_cmac_image, _cmac_asset_image, _exp2_image))
 def test_native_image_is_exact_wire_cache_value(factory):
   image = factory()
   encoded = encode_image(image)

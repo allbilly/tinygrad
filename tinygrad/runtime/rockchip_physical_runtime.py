@@ -43,12 +43,20 @@ _U32_MAX = (1 << 32) - 1
 _TASK_DESCRIPTOR_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _EXP2_IDLE_UPLOAD_RANGES = ((0, 1026), (1026, 1026))
 _CMAC_LOGICAL_LANES = 4
+_CMAC_GUARD_FILL = 0xA5
+# These are runtime-owned allocation guards, not output guards.  In
+# particular, CMAC's [128:256) host view tail is deliberately not a guard.
+_CMAC_GUARD_SPANS = (
+  ("_cmd_buf", rkp.CMAC_V1_COMMAND_IMAGE_BYTES, rkp.CMAC_V1_COMMAND_RESERVATION_BYTES - rkp.CMAC_V1_COMMAND_IMAGE_BYTES),
+  ("_task_buf", rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES, _PAGE - rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES),
+)
 
 # Stable event IDs.  These are a finite vocabulary, not a second telemetry
 # policy or an attempt counter encoded as an event name.
 RK_PHYSICAL_TELEMETRY_IDS = {
   RKNativeKind.CMAC: (
     "cmac_v1.attempt",
+    "cmac_v1.asset_upload_idle",
     "cmac_v1.reset_action_6",
     "cmac_v1.barrier_before",
     "cmac_v1.submit_one",
@@ -173,6 +181,11 @@ def cmac_logical_output(raw_bytes: bytes, logical_lanes: int, swizzle: Sequence[
   return struct.pack(f"<{logical_lanes}H", *(words[indexes[index]] for index in range(logical_lanes)))
 
 
+def _native_fingerprint(native: RKNativeOp) -> bytes:
+  """Hash every immutable command, asset, resource, and lifecycle field."""
+  return hashlib.sha256(repr(astuple(native)).encode("utf-8")).digest()
+
+
 class RockchipPhysicalEffects:
   """Execute exactly one frozen native operation with no retry or fallback."""
 
@@ -188,17 +201,22 @@ class RockchipPhysicalEffects:
     self.telemetry = PhysicalRuntimeTelemetry("cmac_v1" if self.kind is RKNativeKind.CMAC else "exp2_lut_v1")
     self._cmd_buf: HCQBuffer | None = None
     self._task_buf: HCQBuffer | None = None
+    self._asset_buffers: dict[int, HCQBuffer] = {}
     self._resource_buffers: dict[str, HCQBuffer] = {}
     self._resource_args: dict[str, RKArg] = {}
     self._dma_by_arg: dict[RKArg, int] = {}
+    self._asset_snapshot: tuple[tuple[int, int, int, int, int, int], ...] = ()
     self._binding_snapshot: tuple[tuple[RKArg, int, int, int, int, int], ...] = ()
     self._span_snapshot: tuple[RKNativeSpan, ...] = ()
+    self._native_fingerprint: bytes | None = None
     self._prepared = False
     self._reset = False
     self._in_flight = False
     self._unknown = False
     self._closed = False
     self._command_synced = False
+    self._assets_uploaded = False
+    self._cmac_asset_mode = False
     self.last_output: bytes | None = None
     self.last_logical_output: bytes | None = None
     self.last_reason: str | None = None
@@ -277,7 +295,13 @@ class RockchipPhysicalEffects:
 
   def _check_relocations(self) -> None:
     expected = rkp.CMAC_V1_RELOCATIONS if self.kind is RKNativeKind.CMAC else rkp.LUT_V1_EXP2_RELOCATIONS
-    expected_args = self.native.reads + self.native.outputs if self.kind is RKNativeKind.CMAC else self.native.outputs + self.native.reads
+    has_asset_relocation = type(self.native.relocs) is tuple and any(
+      type(item) is RKNativeRelocation and type(item.arg) is RKArg and item.arg.kind is RKBufferKind.ASSET
+      for item in self.native.relocs)
+    if self.kind is RKNativeKind.CMAC and has_asset_relocation:
+      expected_args = self.native.reads + (RKArg(RKBufferKind.ASSET, 0),) + self.native.outputs
+    else:
+      expected_args = self.native.reads + self.native.outputs if self.kind is RKNativeKind.CMAC else self.native.outputs + self.native.reads
     if type(self.native.relocs) is not tuple or len(self.native.relocs) != len(expected):
       self._reject("relocations", "native relocation count is not canonical")
     for item, wanted, arg in zip(self.native.relocs, expected, expected_args):
@@ -294,13 +318,25 @@ class RockchipPhysicalEffects:
     roles: tuple[str, ...]
     sizes: tuple[int, ...]
     if self.kind is RKNativeKind.CMAC:
-      if len(self.native.reads) != 2 or len(self.native.writes) != 1 or self.native.outputs != self.native.writes:
-        self._reject("resource_contract", "CMAC must own two reads and one output")
-      refs, roles, sizes = (
-        self.native.reads + self.native.outputs,
-        ("lhs", "rhs", "output"),
-        (rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_RHS_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES),
-      )
+      if len(self.native.writes) != 1 or self.native.outputs != self.native.writes:
+        self._reject("resource_contract", "CMAC must own one output write")
+      self._cmac_asset_mode = any(item.arg.kind is RKBufferKind.ASSET for item in self.native.relocs)
+      if self._cmac_asset_mode:
+        if len(self.native.reads) != 1:
+          self._reject("resource_contract", "CMAC asset route must own one LHS read")
+        refs, roles, sizes = (
+          self.native.reads + self.native.outputs,
+          ("lhs", "output"),
+          (rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES),
+        )
+      else:
+        if len(self.native.reads) != 2:
+          self._reject("resource_contract", "CMAC must own two reads for a dynamic RHS")
+        refs, roles, sizes = (
+          self.native.reads + self.native.outputs,
+          ("lhs", "rhs", "output"),
+          (rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_RHS_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES),
+        )
     else:
       if len(self.native.reads) != 1 or len(self.native.writes) != 1 or self.native.outputs != self.native.writes:
         self._reject("resource_contract", "EXP2 must own one read and one output")
@@ -359,6 +395,42 @@ class RockchipPhysicalEffects:
         self._reject("dma_binding", "caller resource role changed after preflight")
     self._dma_by_arg = {arg: dma for arg,_,_,_,_,dma in current}
 
+  def _revalidate_assets(self) -> None:
+    current = []
+    for index, buffer_id, va_addr, requested, allocation, expected_dma in self._asset_snapshot:
+      buffer = self._asset_buffers.get(index)
+      if buffer is None or id(buffer) != buffer_id or int(buffer.va_addr) != va_addr or buffer.size != requested or \
+         _allocation_size(buffer) != allocation or _dma(self.program, buffer) != expected_dma:
+        self._reject("asset", "immutable asset DMA span changed after allocation")
+      current.append((index, buffer_id, va_addr, requested, allocation, expected_dma))
+    if tuple(current) != self._asset_snapshot:
+      self._reject("asset", "immutable asset allocation was not snapshotted")
+
+  def _revalidate_native_fingerprint(self) -> None:
+    if self._native_fingerprint is None:
+      self._reject("native_schema", "native fingerprint was not captured during preflight")
+    if self.native is not self._native_identity:
+      if type(self.native) is not RKNativeOp:
+        self._reject("native_schema", "native immutable plan identity changed after preflight")
+      if self.native.spans != self._span_snapshot:
+        self._reject("span_contract", "native immutable spans changed after preflight")
+      self._reject("native_schema", "native immutable plan identity changed after preflight")
+    if _native_fingerprint(self.native) != self._native_fingerprint:
+      self._reject("native_fingerprint", "native command, asset, or lifecycle bytes changed after preflight")
+
+  def _check_cmac_asset(self) -> None:
+    if not self._cmac_asset_mode:
+      return
+    if type(self.native.assets) is not tuple or len(self.native.assets) != 1 or type(self.native.assets[0]) is not RKNativeAsset:
+      self._reject("asset", "CMAC asset route requires one immutable asset")
+    asset = self.native.assets[0]
+    if (asset.asset_id, asset.size, asset.digest, asset.ranges, asset.flags, asset.payload) != (
+      rkp.CMAC_V1_RHS_ASSET_ID, rkp.CMAC_V1_RHS_ASSET_SIZE, bytes.fromhex(rkp.CMAC_V1_RHS_ASSET_SHA256),
+      rkp.CMAC_V1_RHS_ASSET_RANGES, 0, rkp.CMAC_V1_RHS_ASSET_PAYLOAD):
+      self._reject("asset", "CMAC RHS asset bytes, digest, flags, or ranges differ from the generated asset")
+    if hashlib.sha256(asset.payload).digest() != asset.digest:
+      self._reject("asset", "CMAC RHS asset hash mismatch")
+
   def _check_cmac_inputs(self) -> None:
     if (
       rkp.CMAC_V1_OUTPUT_SURFACE_BYTES != 128
@@ -368,19 +440,24 @@ class RockchipPhysicalEffects:
       or len(rkp.CMAC_V1_OUTPUT_SWIZZLE) != rkp.CMAC_V1_PHYSICAL_CHANNELS
     ):
       self._reject("cmac_geometry", "CMAC output surface or byte swizzle differs from the immutable catalog")
-    rhs = _read(self._resource_buffers["rhs"], rkp.CMAC_V1_RHS_BYTES)
-    active = _CMAC_LOGICAL_LANES * rkp.CMAC_V1_RHS_KERNEL_STRIDE_BYTES
-    if rhs[active:] != bytes(len(rhs) - active):
-      self._reject("cmac_rhs", "inactive RHS lanes are not zero-filled")
-    if (
-      type(self.native.guards) is not tuple
-      or type(self.native.repairs) is not tuple
-      or type(self.native.assets) is not tuple
-      or self.native.guards
-      or self.native.repairs
-      or self.native.assets
-    ):
-      self._reject("native_schema", "CMAC carries LUT-only metadata")
+    if self._cmac_asset_mode:
+      self._check_cmac_asset()
+      if type(self.native.guards) is not tuple or type(self.native.repairs) is not tuple or self.native.guards or self.native.repairs:
+        self._reject("native_schema", "CMAC asset route carries unexpected guards or repairs")
+    else:
+      rhs = _read(self._resource_buffers["rhs"], rkp.CMAC_V1_RHS_BYTES)
+      active = _CMAC_LOGICAL_LANES * rkp.CMAC_V1_RHS_KERNEL_STRIDE_BYTES
+      if rhs[active:] != bytes(len(rhs) - active):
+        self._reject("cmac_rhs", "inactive RHS lanes are not zero-filled")
+      if (
+        type(self.native.guards) is not tuple
+        or type(self.native.repairs) is not tuple
+        or type(self.native.assets) is not tuple
+        or self.native.guards
+        or self.native.repairs
+        or self.native.assets
+      ):
+        self._reject("native_schema", "CMAC carries LUT-only metadata")
 
   def _check_exp2_metadata(self) -> None:
     if type(self.native.assets) is not tuple or len(self.native.assets) != 1 or type(self.native.assets[0]) is not RKNativeAsset:
@@ -455,6 +532,7 @@ class RockchipPhysicalEffects:
       self._check_cmac_inputs()
     if self.program.dev.native_reset_live_proven is not True:
       self._reject("reset_gate", "action-6 reset live gate is not proven by device owner")
+    self._native_fingerprint = _native_fingerprint(self.native)
 
   def _require_buffer(self, attr: str) -> HCQBuffer:
     buffer = getattr(self, attr)
@@ -480,6 +558,7 @@ class RockchipPhysicalEffects:
         (_dma(self.program, command_buffer), _allocation_size(command_buffer)),
         (_dma(self.program, task_buffer), _allocation_size(task_buffer)),
       ]
+      ranges += [(_dma(self.program, buffer), _allocation_size(buffer)) for buffer in self._asset_buffers.values()]
       ranges += [(_dma(self.program, buffer), _allocation_size(buffer)) for buffer in self._resource_buffers.values()]
       if any(i < j and a < c + d and c < a + b for i, (a, b) in enumerate(ranges) for j, (c, d) in enumerate(ranges)):
         self._reject("dma_alias", "command/task memory aliases caller resource")
@@ -489,10 +568,59 @@ class RockchipPhysicalEffects:
       self._reject("allocator", "native command/task allocation failed")
       raise AssertionError from exc
 
+  def _ensure_asset_buffers(self) -> None:
+    indexes = tuple(sorted({item.arg.index for item in self.native.relocs if item.arg.kind is RKBufferKind.ASSET}))
+    if not indexes:
+      return
+    allocate = getattr(self.program.dev, "_gpu_alloc", None)
+    if not callable(allocate):
+      self._reject("asset", "device has no immutable asset allocator")
+    if self._asset_buffers:
+      if tuple(sorted(self._asset_buffers)) != indexes or not self._asset_snapshot:
+        self._reject("asset", "immutable asset allocation snapshot is incomplete")
+      self._revalidate_assets()
+      return
+    try:
+      for index in indexes:
+        if index in self._asset_buffers:
+          continue
+        if index < 0 or index >= len(self.native.assets):
+          self._reject("asset", "asset relocation index is out of range")
+        asset = self.native.assets[index]
+        buffer = allocate(asset.size)
+        if not isinstance(buffer, HCQBuffer):
+          self._reject("asset", "immutable asset allocator returned a foreign buffer")
+        self._asset_buffers[index] = buffer
+        allocation = _allocation_size(buffer)
+        if allocation < asset.size:
+          self._reject("asset", "immutable asset allocation is smaller than its payload")
+        dma = _dma(self.program, buffer)
+        caller_ranges = [(_dma(self.program, resource), _allocation_size(resource)) for resource in self._resource_buffers.values()]
+        prior_assets = [(_dma(self.program, resource), _allocation_size(resource))
+                        for asset_index, resource in self._asset_buffers.items() if asset_index != index]
+        if any(dma < old_dma + old_size and old_dma < dma + allocation for old_dma, old_size in (*caller_ranges, *prior_assets)):
+          self._reject("dma_alias", "immutable asset DMA span overlaps a caller or asset resource")
+        ctypes.memset(int(buffer.va_addr), 0, allocation)
+        for start, count in asset.ranges:
+          _write(buffer, asset.payload[start:start + count], start)
+      snapshot = tuple(
+        (index, id(buffer), int(buffer.va_addr), buffer.size, _allocation_size(buffer), _dma(self.program, buffer))
+        for index, buffer in sorted(self._asset_buffers.items()))
+      self._asset_snapshot = snapshot
+    except PhysicalRuntimeReject:
+      raise
+    except Exception as exc:
+      self._reject("asset", "immutable asset allocation or write failed")
+      raise AssertionError from exc
+
   def _patch_commands(self) -> tuple[int, ...]:
     commands = list(self.native.commands)
     for item in self.native.relocs:
-      base = self._dma_by_arg.get(item.arg)
+      if item.arg.kind is RKBufferKind.ASSET:
+        asset_buffer = self._asset_buffers.get(item.arg.index)
+        base = None if asset_buffer is None else _dma(self.program, asset_buffer)
+      else:
+        base = self._dma_by_arg.get(item.arg)
       if base is None:
         self._reject("relocations", "relocation argument was not bound")
       value = base + item.arg.addend
@@ -505,6 +633,8 @@ class RockchipPhysicalEffects:
 
   def _write_command_and_task(self) -> None:
     command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
+    self._revalidate_native_fingerprint()
+    self._revalidate_assets()
     self._revalidate_bindings()
     patched = self._patch_commands()
     command_image = struct.pack(f"<{len(patched)}Q", *patched) + struct.pack(f"<{len(self.native.tail)}Q", *self.native.tail)
@@ -530,11 +660,21 @@ class RockchipPhysicalEffects:
     if self.kind is RKNativeKind.LUT:
       ctypes.memset(int(self._resource_buffers["output"].va_addr) + rkp.LUT_V1_EXP2_OUTPUT_BYTES, 0xA5, rkp.LUT_V1_EXP2_GUARD_BYTES)
 
+  def _prepare_cmac_guards(self) -> None:
+    if self.kind is not RKNativeKind.CMAC:
+      return
+    for attr, offset, size in _CMAC_GUARD_SPANS:
+      buffer = self._require_buffer(attr)
+      ctypes.memset(int(buffer.va_addr) + offset, _CMAC_GUARD_FILL, size)
+
   def _prepare(self) -> None:
     if self._prepared:
       return
+    self._revalidate_native_fingerprint()
+    self._ensure_asset_buffers()
     self._ensure_buffers()
     self._write_command_and_task()
+    self._prepare_cmac_guards()
     self._prepare_output()
     self._prepared = True
     self.telemetry.attempts += 1
@@ -556,23 +696,49 @@ class RockchipPhysicalEffects:
       self.telemetry.reject("cleanup_unknown")
       raise PhysicalOwnershipUnknown("native allocation cleanup primitive is unavailable")
     errors: list[Exception] = []
-    for attr in ("_cmd_buf", "_task_buf"):
-      buffer = getattr(self, attr)
-      if buffer is not None:
-        try:
-          free(buffer)
-        except Exception as exc:
-          errors.append(exc)
+    buffers: list[tuple[str, HCQBuffer]] = [
+      (attr, buffer) for attr in ("_cmd_buf", "_task_buf") if (buffer := getattr(self, attr)) is not None
+    ]
+    buffers.extend((f"asset[{index}]", buffer) for index, buffer in sorted(self._asset_buffers.items()))
+    for name, buffer in buffers:
+      try:
+        free(buffer)
+      except Exception as exc:
+        errors.append(exc)
+      else:
+        if name.startswith("asset["):
+          del self._asset_buffers[int(name[6:-1])]
         else:
-          setattr(self, attr, None)
+          setattr(self, name, None)
     if errors:
       self._unknown = True
       self.last_reason = "cleanup"
       self.telemetry.reject("cleanup_unknown")
       raise PhysicalOwnershipUnknown("native command/task cleanup ownership is unknown") from errors[0]
+    self._asset_snapshot = ()
+    self._assets_uploaded = False
     self._closed = True
 
   def _upload_asset_while_idle(self) -> None:
+    if self._assets_uploaded:
+      return
+    self._revalidate_native_fingerprint()
+    asset_indexes = tuple(sorted({item.arg.index for item in self.native.relocs if item.arg.kind is RKBufferKind.ASSET}))
+    if asset_indexes:
+      try:
+        for index in asset_indexes:
+          self._sync(self._asset_buffers[index], rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      except PhysicalRuntimeReject:
+        raise
+      except KeyError as exc:
+        self._reject("asset", "immutable asset allocation is missing before idle upload")
+        raise AssertionError from exc
+      except Exception as exc:
+        self._reject("asset", f"immutable asset sync failed: {exc}")
+      self.telemetry.asset_bytes += sum(self.native.assets[index].size for index in asset_indexes)
+      self._assets_uploaded = True
+      self._event("asset_upload_idle")
+      return
     if self.kind is not RKNativeKind.LUT:
       return
     asset = self.native.assets[0]
@@ -586,17 +752,23 @@ class RockchipPhysicalEffects:
     except Exception as exc:
       self._reject("asset", f"native idle asset upload failed: {exc}")
     self.telemetry.asset_bytes += len(asset.payload)
+    self._assets_uploaded = True
     self._event("asset_upload_idle")
 
   def reset_before(self) -> None:
     if self._reset or self._in_flight:
       self._reject("lifecycle", "native reset is not first or one-shot")
     self._prepare()
+    self._upload_asset_while_idle()
     if self.kind is RKNativeKind.CMAC:
       self._sync(self._resource_buffers["lhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
-      self._sync(self._resource_buffers["rhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      if not self._cmac_asset_mode:
+        self._sync(self._resource_buffers["rhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
     else:
       self._sync(self._resource_buffers["input"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      # The poison guard is host-initialized and must be handed to the device
+      # before reset/submit just like the EXP2 input and command/task buffers.
+      self._sync(self._resource_buffers["output"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if not self._command_synced:
       self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self._sync(self._require_buffer("_task_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
@@ -623,6 +795,8 @@ class RockchipPhysicalEffects:
     submitter = getattr(self.program, "_submit_physical", None)
     if not callable(submitter):
       self._reject("submit", "program has no physical submit primitive")
+    self._revalidate_native_fingerprint()
+    self._revalidate_assets()
     self._revalidate_bindings()
     self._in_flight = True
     self.telemetry.pc_submits += 1
@@ -655,6 +829,15 @@ class RockchipPhysicalEffects:
     self.last_output = raw
     self.last_logical_output = cmac_logical_output(raw, _CMAC_LOGICAL_LANES, rkp.CMAC_V1_OUTPUT_SWIZZLE)
 
+  def _validate_cmac_guards(self) -> None:
+    if self.kind is not RKNativeKind.CMAC:
+      return
+    expected = bytes([_CMAC_GUARD_FILL])
+    for attr, offset, size in _CMAC_GUARD_SPANS:
+      buffer = self._require_buffer(attr)
+      if _read(buffer, size, offset) != expected * size:
+        self._reject("cmac_guard", f"{attr} guard was modified")
+
   def _validate_exp2_output(self) -> None:
     output = self._resource_buffers["output"]
     raw = _read(output, rkp.LUT_V1_EXP2_OUTPUT_ALLOCATION_BYTES)
@@ -669,8 +852,12 @@ class RockchipPhysicalEffects:
     if not self._in_flight or self._unknown:
       self._reject("lifecycle", "native barrier-after is out of order")
     try:
+      if self.kind is RKNativeKind.CMAC:
+        self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+        self._sync(self._require_buffer("_task_buf"), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       self._sync(self._resource_buffers["output"], rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       if self.kind is RKNativeKind.CMAC:
+        self._validate_cmac_guards()
         self._validate_cmac_output()
       else:
         self._validate_exp2_output()

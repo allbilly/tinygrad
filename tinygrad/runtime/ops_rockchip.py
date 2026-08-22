@@ -78,7 +78,7 @@ class RockchipProgram(Program['RockchipDevice']):
     return effects
 
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False, *, retry:bool=True,
-              submit_contract:object|None=None, sync_before_submit:bool=True) -> None:
+              submit_contract:object|None=None, sync_before_submit:bool=True) -> object:
     if submit_contract is None:
       flags, timeout, core_mask, fence_fd, task_count = rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, _SUBMIT_TIMEOUT_MS, 1, -1, 1
     else:
@@ -87,12 +87,14 @@ class RockchipProgram(Program['RockchipDevice']):
         raise ValueError("invalid Rockchip submit contract")
       flags, timeout, core_mask, fence_fd, task_count = cast(tuple[int, int, int, int, int], values)
     subcores = ((0,n),) if standalone else ((0,n),(n,0),(n,0))
+    submit_result: object | None = None
     for attempt in range(1 if not retry else _SUBMIT_RETRIES+1):
       try:
         if sync_before_submit:
           for buffer in (cmd,task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl, flags=flags, timeout=timeout, task_start=0, task_number=n, task_counter=0, priority=0,
-          task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=core_mask, fence_fd=fence_fd,
+        submit_result = rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl, flags=flags, timeout=timeout, task_start=0, task_number=n,
+          task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
+          core_mask=core_mask, fence_fd=fence_fd,
           subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
         break
       except TimeoutError:
@@ -103,11 +105,22 @@ class RockchipProgram(Program['RockchipDevice']):
     self.submit_count += 1
     self.dev.submit_count += 1
     self.dev.task_count += n
+    return submit_result
 
   def _submit_physical(self, cmd:HCQBuffer, task:HCQBuffer, contract:object) -> PhysicalSubmitReceipt:
     """Submit one physical task with no timeout retry or reset retry."""
-    self._submit(cmd, task, 1, standalone=True, retry=False, submit_contract=contract, sync_before_submit=False)
-    return PhysicalSubmitReceipt(0, True, self.submit_count)
+    result = self._submit(cmd, task, 1, standalone=True, retry=False, submit_contract=contract, sync_before_submit=False)
+    if type(result) is not rk.struct_rknpu_submit:
+      raise RuntimeError("RKNPU submit wrapper returned a foreign payload")
+    expected = tuple(getattr(contract, name) for name in ("flags", "timeout_ms", "task_count", "core_mask", "fence_fd"))
+    actual = (result.flags, result.timeout, result.task_number, result.core_mask, result.fence_fd)
+    if actual != (expected[0], expected[1], expected[2], expected[3], expected[4]):
+      raise RuntimeError("RKNPU submit wrapper returned a mismatched receipt")
+    # The current struct has no returned job ID.  This contract also does not
+    # request RKNPU_JOB_FENCE_OUT, so fence_fd is only the -1 input fence.
+    # Preserve that fact instead of fabricating submit_count as an identity;
+    # the effects layer will halt with terminal unknown ownership.
+    return PhysicalSubmitReceipt(0, False, None)
 
   def _run_native(self, *bufs:HCQBuffer, wait:bool=False) -> float|None:
     start = time.perf_counter()

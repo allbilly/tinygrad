@@ -35,6 +35,16 @@ CMAC_V1_RHS_SHAPE = (2, 1, 16, 32)
 CMAC_V1_RHS_STRIDES_BYTES = (1024, 1024, 64, 2)
 CMAC_V1_RHS_KERNEL_STRIDE_BYTES = 64
 CMAC_V1_RHS_GROUP_STRIDE_BYTES = 1024
+# Immutable dense N=4 sum RHS: rows 0..3 are FP16 one, all remaining
+# physical lanes are zero.  The runtime treats this as an ASSET relocation,
+# never as a dynamically packed caller buffer.
+CMAC_V1_RHS_ASSET_ID = 2
+CMAC_V1_RHS_ASSET_SIZE = CMAC_V1_RHS_BYTES
+CMAC_V1_RHS_ASSET_RANGES = ((0, CMAC_V1_RHS_ASSET_SIZE),)
+CMAC_V1_RHS_ASSET_SHA256 = "96a33b81830614e9b95b033117210b3933d7d971323992d35be7d901cb183c00"
+CMAC_V1_RHS_ASSET_PAYLOAD = b"".join(
+  struct.pack("<H", 0x3C00 if group == 0 and row < 4 else 0x0000)
+  for group in range(2) for row in range(16) for _ in range(32))
 CMAC_V1_OUTPUT_SURFACE_BYTES = 128  # raw 32-channel FP16 surface, one row
 CMAC_V1_OUTPUT_VIEW_BYTES = 256  # donor's minimum host readback mapping
 CMAC_V1_OUTPUT_STRIDE_BYTES = 128
@@ -70,5 +80,6 @@ _T = "eNoFwQdYVIcBAGAqFt8e9+7e7T3gFhxwwDHuGAcce+8he8kQEBHZGoJGQxzUGRWRGHGQoESraQ
 LUT_V1_EXP2_COMMANDS = struct.unpack("<1064Q", zlib.decompress(base64.b64decode(_Q)))
 LUT_V1_EXP2_TABLE = zlib.decompress(base64.b64decode(_T))
 assert len(CMAC_V1_COMMANDS) == CMAC_V1_BODY_QWORDS and hashlib.sha256(struct.pack("<46Q", *CMAC_V1_COMMANDS)).hexdigest() == CMAC_V1_BODY_SHA256
+assert len(CMAC_V1_RHS_ASSET_PAYLOAD) == CMAC_V1_RHS_ASSET_SIZE and hashlib.sha256(CMAC_V1_RHS_ASSET_PAYLOAD).hexdigest() == CMAC_V1_RHS_ASSET_SHA256
 assert len(LUT_V1_EXP2_COMMANDS) == 1064 and hashlib.sha256(struct.pack("<1064Q", *LUT_V1_EXP2_COMMANDS)).hexdigest() == LUT_V1_EXP2_COMMAND_SHA256
 assert len(LUT_V1_EXP2_TABLE) == LUT_V1_EXP2_TABLE_BYTES and hashlib.sha256(LUT_V1_EXP2_TABLE).hexdigest() == LUT_V1_EXP2_TABLE_SHA256

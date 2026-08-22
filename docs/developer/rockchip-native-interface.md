@@ -21,7 +21,7 @@ metadata. It must not return addresses, host numeric work, a mutable catalog,
 or a second planner/segmenter.
 
 Each relocation names a command word and its `(target, register)` pair and is
-bound to one declared `RKArg`. Each asset carries its exact payload, SHA-256,
+bound to one declared ARG or immutable ASSET `RKArg`. Each asset carries its exact payload, SHA-256,
 size, and upload ranges. Guards and repairs describe checks or exceptional
 value policy; they do not execute those checks. `RKNativeTask`,
 `RKNativeReset`, and `RKNativeSubmit` are the complete lifecycle controls.
@@ -29,11 +29,11 @@ value policy; they do not execute those checks. `RKNativeTask`,
 ## Runtime seam
 
 `RockchipProgram` decodes and validates the complete image before allocating
-scratch or touching an NPU buffer. Native dispatch currently performs a
-host-only preflight (asset hashes, argument ownership, and relocation fields)
-and then raises `RuntimeError("RK native execution effects are not implemented")`.
-That deliberate fail-closed seam is the only place for the future
-`physical_runtime_effects` implementation to attach.
+scratch or touching an NPU buffer. Native dispatch preflights the immutable
+record, binds caller buffers, allocates any declared CMAC ASSET buffer, and
+executes the direct effects lifecycle. The action-6 live-proof gate remains
+explicit: without it, native execution rejects before allocation or device
+effects and ordinary EW execution keeps its existing path.
 
 The eventual effect order is: validate again immediately before effects,
 upload embedded assets while the DPU is idle, reset, barrier-before, submit
