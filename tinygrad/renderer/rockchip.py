@@ -2425,13 +2425,11 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   def rewrite(u:UOp) -> UOp:
     if u in cache: return cache[u]
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
-      mapped = rewrite(physical_recipe(_dpu_sin(u.src[0].src[0]), (u.src[0].src[0],))) if u.src[0].op is Ops.SIN else \
-        _canonical_half_storage(u.src[0])
-      return cache.setdefault(u, mapped)
+      return cache.setdefault(u, rewrite(physical_recipe(_dpu_sin(u.src[0].src[0]), (u.src[0].src[0],)))
+                              if u.src[0].op is Ops.SIN else _canonical_half_storage(u.src[0]))
     if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
       try:
-        mapped = _accurate_add_recipe(u)
-        return cache.setdefault(u, mapped)
+        return cache.setdefault(u, _accurate_add_recipe(u))
       except _RKGenericReject: pass
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
     if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
@@ -2543,8 +2541,7 @@ def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
     active.remove(key)
     if len(accumulator.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
     return expanded.setdefault(key, accumulator)
-  substitutions = {load:expand_load(load, {}) for load in local_loads}
-  return root.substitute(substitutions, walk=True)
+  return root.substitute({load:expand_load(load, {}) for load in local_loads}, walk=True)
 
 @dataclass(frozen=True)
 class _RKStaticLocalDef:

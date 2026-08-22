@@ -99,17 +99,14 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
-    def submit() -> None:
-      self.dev._sync_buffer(cmd, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-      self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-      rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
-        task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
-        regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
-        subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
     for attempt in range(_SUBMIT_RETRIES+1):
       try:
-        submit()
+        for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
+          task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
+          regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
+          subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
         break
       except TimeoutError:
         self.dev.timeout_retries += 1
@@ -126,13 +123,10 @@ class RockchipProgram(Program['RockchipDevice']):
       self._submit(self._cmd_buf, self._task_buf, n)
       return
     cmd_size, task_need = _pcchain_sizes([len(body) for body in bodies])
-    offsets:list[int] = []
-    words = 0
+    offsets = [0]
     for body in bodies:
-      offsets.append(words)
-      words += _align_up(len(body) + _PC_TAIL, 2)
-    need = words * 8
-    assert cmd_size == need+_CMD_PREFETCH_GUARD
+      offsets.append(offsets[-1] + _align_up(len(body) + _PC_TAIL, 2))
+    assert cmd_size == offsets[-1]*8+_CMD_PREFETCH_GUARD
     cmd = self._ensure_buffer("_cmd_buf", cmd_size, _CMD_BUF_MIN)
     task = self._ensure_buffer("_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
     ctypes.memset(int(cmd.va_addr), 0, cmd_size)
@@ -142,7 +136,7 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(cmd.va_addr) + base*8, (ctypes.c_uint64 * len(body))(*body), len(body)*8)
       # REGISTER_AMOUNTS=0 terminates the chain. Keep its speculative base-address fetch inside the mapped
       # zero-filled guard page: RK3588 can otherwise race completion with an IOMMU read from address zero.
-      next_addr = (base_dma + (offsets[i+1] if i+1 < n else words)*8) & 0xfffffff0
+      next_addr = (base_dma + (offsets[i+1] if i+1 < n else offsets[-1])*8) & 0xfffffff0
       next_amount = len(bodies[i+1]) if i+1 < n else 0
       tail = (_pc(rk.TARGET_PC_REG, rk.REG_PC_BASE_ADDRESS, next_addr),
               _pc(rk.TARGET_PC_REG, rk.REG_PC_REGISTER_AMOUNTS, next_amount),
