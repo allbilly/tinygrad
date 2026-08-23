@@ -1170,22 +1170,6 @@ def _has_runtime_address(root:UOp) -> bool:
              if load.op is Ops.LOAD and load.src and load.src[0].op is Ops.INDEX
              for node in (*load.src[0].src[1].toposort(), *(load.src[2].toposort() if len(load.src) > 2 else ())))
 
-def _runtime_load_address(index:UOp, out_index:UOp, count:int, loads:tuple[UOp, ...]) -> tuple[tuple[UOp, UOp, int, int, int, int, int], bool]|None:
-  """Resolve an affine or table-addressed runtime index without reading it on the renderer."""
-  infos = tuple(info for node in index.toposort() if (info:=_runtime_index(node)) is not None)
-  if len(infos) == 1 and (lane_offset:=_runtime_lane_offset(infos[0], out_index, count)) is not None:
-    load, param, _, itemsize = infos[0]
-    try: zero, one = (_static_values(out_index, index.substitute({load:load.const_like(value)}), count, int) for value in (0, 1))
-    except RuntimeError: pass
-    else:
-      lane_stride = zero[1]-zero[0] if count > 1 else 0
-      if len({a-b for a,b in zip(one, zero)}) == 1 and zero == tuple(zero[0]+lane*lane_stride for lane in range(count)):
-        return (load, param, itemsize, lane_offset, zero[0], one[0]-zero[0], lane_stride), True
-  if len(runtime_loads:={info[0].key:info for node in loads if (info:=_runtime_index(node)) is not None}) != 1: return None
-  runtime_load, index_param, _, index_itemsize = runtime_info = next(iter(runtime_loads.values()))
-  if (lane_offset:=_runtime_lane_offset(runtime_info, out_index, count)) is None: return None
-  return (runtime_load, index_param, index_itemsize, lane_offset, 0, 0, 0), False
-
 def _fp32_expr_to_half(u:UOp) -> UOp:
   """Represent a float ADD/MUL expression with a three-half expansion at its FP16 storage boundary."""
   if u.dtype.scalar() is dtypes.half: return u
@@ -1349,91 +1333,82 @@ class RKContext:
       else: raise _RKGenericReject
     else: raise _RKGenericReject
 
-  def _load_default(self, u:UOp, dtype:DType, layout:RKLayout, gate:UOp|None, default:UOp, runtime:bool) -> RKValue:
-    if dtype not in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint) or gate is None or runtime: raise _RKGenericReject
-    schedule, fallback = (len(self.ew_ops), len(self.mid_gathers), len(self.host_gathers)), self.lower(default)
-    if fallback.layout is not layout or fallback.count != self.count or schedule != (len(self.ew_ops), len(self.mid_gathers), len(self.host_gathers)):
-      raise _RKGenericReject
-    if (typed_plan:=_typed_load_plan(u, dtype, self.out_index, self.count, fill_bits=0)) is None: raise _RKGenericReject
-    value = self._scratch(dtype, layout, self.count*dtype.itemsize)
-    self.gathers.extend((
-      RKGather(fallback.arg.index, value.arg.index, self.count, base=fallback.arg.addend//dtype.itemsize,
-               axes=((1, self.count, 1),), src_kind=fallback.arg.kind, itemsize=dtype.itemsize),
-      replace(typed_plan.gather, dst_index=value.arg.index, partial=True, itemsize=dtype.itemsize)))
-    return value
-
-  def _load_runtime(self, param:UOp, index:UOp, gate:UOp|None, index_loads:tuple[UOp, ...], gate_loads:tuple[UOp, ...],
-                    dtype:DType, layout:RKLayout, fill_bits:int) -> RKValue:
-    if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1": raise _RKGenericReject
-    if (runtime_info:=_runtime_load_address(index, self.out_index, self.count, (*index_loads, *gate_loads))) is None: raise _RKGenericReject
-    (runtime_load, index_param, index_itemsize, index_offset, base, index_scale, lane_stride), affine = runtime_info
-    index_limit = _bounded_index_gate(gate, runtime_load) if gate is not None else int(param.src[0].arg)
-    if index_limit is None: raise _RKGenericReject
-    if gate is not None and {node.key for node in gate.toposort() if node.op is Ops.LOAD} != {runtime_load.key}: raise _RKGenericReject
-    source, source_count = RKArg(RKBufferKind.ARG, param.arg.slot), int(param.src[0].arg)
-    if not affine:
-      if gate is None or index_limit <= 0 or self.count*index_limit > _MAX_STATIC_RANGE_ENVS: raise _RKGenericReject
-      try:
-        candidates = tuple(_static_values(
-          self.out_index, index.substitute({runtime_load:runtime_load.const_like(candidate)}), self.count, int)
-          for candidate in range(index_limit))
-      except RuntimeError: raise _RKGenericReject from None
-      offsets = tuple(candidates[candidate][lane] for lane in range(self.count) for candidate in range(index_limit))
-      plan = RKGather(param.arg.slot, 0, len(offsets), offsets=offsets, itemsize=dtype.itemsize)
-      _validate_gather_bounds(plan, source_count)
-      source, source_count = self._slot(self.materialized_slots, plan, dtype, layout, len(offsets)*dtype.itemsize).arg, len(offsets)
-      base, index_scale, lane_stride = 0, 1, index_limit
-    value = self._scratch(dtype, layout, self.count*dtype.itemsize)
-    self.host_gathers.append(RKHostAddress(source, RKArg(RKBufferKind.ARG, index_param.arg.slot, index_offset*index_itemsize), value.arg,
-      self.count, source_count, self.count, dtype.itemsize, index_itemsize, fill_bits, index_limit, base, index_scale, lane_stride))
-    return value
-
-  def _load_float(self, plan:RKTypedLoadPlan) -> RKValue:
-    groups = tuple(range(0, self.count, _EW_ELEMS_32BIT))
-    raw = self._slot(self.materialized_slots, replace(plan.gather, itemsize=4), dtypes.float, RKLayout.FP16, len(groups)*16,
-                     ("fp32_raw", _gather_cache_key((replace(plan.gather, itemsize=4),))))
-    aligned, zero = self._scratch(dtypes.half, RKLayout.FP16, len(groups)*16), self._scratch(dtypes.float, RKLayout.FP16, 16)
-    self.gathers.append(RKGather(0, zero.arg.index, _EW_ELEMS_32BIT, values=(0,)*_EW_ELEMS_32BIT, itemsize=4))
-    for group,start in enumerate(groups):
-      self.ew_ops.append(RKEWOp(replace(aligned.arg, addend=group*16), replace(raw.arg, addend=group*16), zero.arg,
-        min(_EW_ELEMS_32BIT, self.count-start), _EW_CFG[Ops.ADD]|_EW_STAGE_FP32_IN, stateful=True))
-    compact = self._scratch(dtypes.half, RKLayout.FP16, self.count*2)
-    self.mid_gathers.append(RKGather(aligned.arg.index, compact.arg.index, self.count,
-      offsets=tuple((lane//_EW_ELEMS_32BIT)*8+lane%_EW_ELEMS_32BIT for lane in range(self.count)),
-      src_kind=RKBufferKind.SCRATCH, after=len(self.ew_ops)))
-    return RKValue(compact.arg, dtypes.float, self.count, RKLayout.FP16)
-
-  def _load_native(self, u:UOp, dtype:DType, layout:RKLayout, gate:UOp|None, default:UOp|None,
-                   plan:RKTypedLoadPlan) -> RKValue:
-    if dtype is dtypes.bool:
-      return self._slot(self.materialized_slots,
-        replace(plan.gather, base=0, axes=(), offsets=plan.offsets,
-                fill_bits=int(bool(default.arg)) if default is not None else 0, dst_stride=2, itemsize=1),
-        dtype, RKLayout.BOOL_INT16, self.count*2)
-    if gate is None and u.src[0].src[1].key == self.out_index.key and int(plan.param.src[0].arg) == self.count:
-      return RKValue(RKArg(RKBufferKind.ARG, plan.param.arg.slot), dtype, self.count, layout)
-    return self._slot(self.materialized_slots, replace(plan.gather, itemsize=dtype.itemsize), dtype, layout, self.count*dtype.itemsize)
-
   def _load(self, u:UOp, fill_override:int|None=None) -> RKValue:
     dtype = u.dtype.scalar()
     if dtype not in (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool) or not u.src or u.src[0].op is not Ops.INDEX or \
        (param:=_root_param(u.src[0])) is None or param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST:
       raise _RKGenericReject
     index, gate = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None; default = u.src[1] if len(u.src) > 1 else None
-    index_loads, gate_loads = _semantic_loads(index), () if gate is None else _semantic_loads(gate)
-    runtime_address = bool(index_loads or gate_loads)
+    address_loads = _semantic_loads(index)+(() if gate is None else _semantic_loads(gate))
     layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16 if dtype is dtypes.int16 else RKLayout.INT32
     if default is not None and default.op is not Ops.CONST:
-      return self._load_default(u, dtype, layout, gate, default, runtime_address)
-    if dtype in (dtypes.float, dtypes.bool) and runtime_address: raise _RKGenericReject
+      if dtype not in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint) or gate is None or address_loads: raise _RKGenericReject
+      schedule, fallback = (len(self.ew_ops), len(self.mid_gathers), len(self.host_gathers)), self.lower(default)
+      if fallback.layout is not layout or fallback.count != self.count or schedule != (len(self.ew_ops), len(self.mid_gathers), len(self.host_gathers)): raise _RKGenericReject  # noqa: E501
+      if (typed_plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=0)) is None: raise _RKGenericReject
+      value = self._scratch(dtype,layout,self.count*dtype.itemsize)
+      self.gathers.extend((RKGather(fallback.arg.index,value.arg.index,self.count,base=fallback.arg.addend//dtype.itemsize,
+        axes=((1,self.count,1),),src_kind=fallback.arg.kind,itemsize=dtype.itemsize),
+        replace(typed_plan.gather,dst_index=value.arg.index,partial=True,itemsize=dtype.itemsize)))
+      return value
+    if dtype in (dtypes.float, dtypes.bool) and address_loads: raise _RKGenericReject
     fill_bits = struct.unpack("<I", struct.pack("<f", float(0 if default is None else default.arg)))[0] if dtype is dtypes.float else \
       fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
       _int16_bits(0 if default is None else default.arg) if dtype is dtypes.int16 else int(0 if default is None else default.arg) & 0xffffffff
-    if runtime_address:
-      return self._load_runtime(param, index, gate, index_loads, gate_loads, dtype, layout, fill_bits)
+    if address_loads:
+      if os.getenv("ROCKCHIP_HOST_GATHER","1") != "1": raise _RKGenericReject
+      # Resolve an affine or table-addressed runtime index without reading it on the renderer.
+      infos = tuple(info for node in index.toposort() if (info:=_runtime_index(node)) is not None); affine = False; index_offset:int|None = None
+      if len(infos) == 1 and (lane_offset:=_runtime_lane_offset(infos[0],self.out_index,self.count)) is not None:
+        load,runtime_param,_,index_itemsize = infos[0]
+        try: zero_indices,one_indices = (_static_values(self.out_index,index.substitute({load:load.const_like(value)}),self.count,int) for value in (0,1))  # noqa: E501
+        except RuntimeError: pass
+        else:
+          lane_stride = zero_indices[1]-zero_indices[0] if self.count > 1 else 0
+          if len({a-b for a,b in zip(one_indices,zero_indices)}) == 1 and zero_indices == tuple(zero_indices[0]+lane*lane_stride for lane in range(self.count)):  # noqa: E501
+            runtime_load,index_param,index_offset,base,index_scale,affine = load,runtime_param,lane_offset,zero_indices[0],one_indices[0]-zero_indices[0],True  # noqa: E501
+      if not affine:
+        runtime_loads = {info[0].key:info for node in address_loads if (info:=_runtime_index(node)) is not None}
+        if len(runtime_loads) != 1: raise _RKGenericReject
+        runtime_load,index_param,_,index_itemsize = table_info = next(iter(runtime_loads.values())); base = index_scale = lane_stride = 0; index_offset = _runtime_lane_offset(table_info,self.out_index,self.count)  # noqa: E501
+      if index_offset is None: raise _RKGenericReject
+      index_limit = _bounded_index_gate(gate,runtime_load) if gate is not None else int(param.src[0].arg)
+      if index_limit is None or gate is not None and {node.key for node in gate.toposort() if node.op is Ops.LOAD} != {runtime_load.key}: raise _RKGenericReject  # noqa: E501
+      source,source_count = RKArg(RKBufferKind.ARG,param.arg.slot),int(param.src[0].arg)
+      if not affine:
+        if gate is None or index_limit <= 0 or self.count*index_limit > _MAX_STATIC_RANGE_ENVS: raise _RKGenericReject
+        try: candidates = tuple(_static_values(self.out_index,index.substitute({runtime_load:runtime_load.const_like(candidate)}),self.count,int)
+                                for candidate in range(index_limit))
+        except RuntimeError: raise _RKGenericReject from None
+        offsets = tuple(candidates[candidate][lane] for lane in range(self.count) for candidate in range(index_limit))
+        plan = RKGather(param.arg.slot,0,len(offsets),offsets=offsets,itemsize=dtype.itemsize); _validate_gather_bounds(plan,source_count)
+        source,source_count = self._slot(self.materialized_slots,plan,dtype,layout,len(offsets)*dtype.itemsize).arg,len(offsets)
+        base,index_scale,lane_stride = 0,1,index_limit
+      value = self._scratch(dtype,layout,self.count*dtype.itemsize)
+      self.host_gathers.append(RKHostAddress(source,RKArg(RKBufferKind.ARG,index_param.arg.slot,index_offset*index_itemsize),value.arg,
+        self.count,source_count,self.count,dtype.itemsize,index_itemsize,fill_bits,index_limit,base,index_scale,lane_stride))
+      return value
     if (typed_plan:=_typed_load_plan(u, dtype, self.out_index, self.count, fill_bits=fill_bits,
                                      require_offsets=dtype is dtypes.bool)) is None: raise _RKGenericReject
-    return self._load_float(typed_plan) if dtype is dtypes.float else self._load_native(u, dtype, layout, gate, default, typed_plan)
+    if dtype is dtypes.float:
+      groups = tuple(range(0,self.count,_EW_ELEMS_32BIT))
+      raw = self._slot(self.materialized_slots,replace(typed_plan.gather,itemsize=4),dtypes.float,RKLayout.FP16,len(groups)*16,
+        ("fp32_raw",_gather_cache_key((replace(typed_plan.gather,itemsize=4),))))
+      aligned,zero = self._scratch(dtypes.half,RKLayout.FP16,len(groups)*16),self._scratch(dtypes.float,RKLayout.FP16,16)
+      self.gathers.append(RKGather(0,zero.arg.index,_EW_ELEMS_32BIT,values=(0,)*_EW_ELEMS_32BIT,itemsize=4))
+      for group,start in enumerate(groups): self.ew_ops.append(RKEWOp(replace(aligned.arg,addend=group*16),replace(raw.arg,addend=group*16),
+        zero.arg,min(_EW_ELEMS_32BIT,self.count-start),_EW_CFG[Ops.ADD]|_EW_STAGE_FP32_IN,stateful=True))
+      compact = self._scratch(dtypes.half,RKLayout.FP16,self.count*2)
+      self.mid_gathers.append(RKGather(aligned.arg.index,compact.arg.index,self.count,
+        offsets=tuple((lane//_EW_ELEMS_32BIT)*8+lane%_EW_ELEMS_32BIT for lane in range(self.count)),
+        src_kind=RKBufferKind.SCRATCH,after=len(self.ew_ops)))
+      return RKValue(compact.arg,dtypes.float,self.count,RKLayout.FP16)
+    if dtype is dtypes.bool:
+      return self._slot(self.materialized_slots,replace(typed_plan.gather,base=0,axes=(),offsets=typed_plan.offsets,
+        fill_bits=int(bool(default.arg)) if default is not None else 0,dst_stride=2,itemsize=1),dtype,RKLayout.BOOL_INT16,self.count*2)
+    if gate is None and u.src[0].src[1].key == self.out_index.key and int(typed_plan.param.src[0].arg) == self.count:
+      return RKValue(RKArg(RKBufferKind.ARG,typed_plan.param.arg.slot),dtype,self.count,layout)
+    return self._slot(self.materialized_slots,replace(typed_plan.gather,itemsize=dtype.itemsize),dtype,layout,self.count*dtype.itemsize)
 
   def _emit(self, dst:RKValue, lhs:RKValue, rhs:RKValue, cfg:int, *, compare:bool=False) -> RKValue:
     integer16, integer32 = dst.layout in (RKLayout.INT16, RKLayout.BOOL_INT16), dst.layout is RKLayout.INT32

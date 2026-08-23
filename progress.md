@@ -8253,3 +8253,38 @@ collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
 health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
+## 2026-08-24 — unify typed load ownership at 2,458 lines
+
+This isolated milestone follows `1c8101a01`.  Its predeclared renderer budget
+was **+63/-83 executable lines, net -20**.  The observed token-aware diff is
+**+62/-82, net -20** because one preserved affine-address line aligned on
+each side of the direct-owner rewrite.  Authoritative `sz.py` size moves
+renderer **2478 -> 2458** and repository total **28010 -> 27990** (**-20**);
+runtime remains **464**.
+
+`RKContext._load` was the sole owner of five forwarding layers.  It now owns
+nonconstant LOAD defaults and their partial gathers, affine/table runtime
+address proof and host-address materialization, FP32 raw-load conversion, and
+native BOOL/direct typed loads.  `_runtime_load_address`, `_load_default`,
+`_load_runtime`, `_load_float`, and `_load_native` are deleted.  The runtime
+address contract docstring remains beside its replacement logic as a comment.
+No generic IR, new arithmetic, admission change, wire/runtime path, CPU/GPU
+numeric fallback, test change, or CMAC behavior change was introduced.
+
+A committed-parent/candidate lowering oracle observed **242 outcomes / 226
+RKImages** across the complete Rockchip UOp module.  Every admission result
+and every encoded image is byte-identical; the ordered record SHA-256 remains
+`2f05709ca821f92667ada10d28698473d5516782e7b2a114c249e75f3c4aee95`.
+Six actual production `Tensor.schedule_linear -> to_program` kernels covering
+half ADD, FP32-to-half load conversion, INT32 ADD, BOOL NOT, BOOL WHERE, and a
+dynamic indexed host gather are also byte-identical, with aggregate SHA-256
+`50b38e142fdb904ab47ed258933172a132de9ed3d9fb19f0d5c89b72ca38f89c`.
+
+Host verification reports **128 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full census command was run
+because the board remains untrusted; fresh-boot acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
