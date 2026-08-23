@@ -8159,3 +8159,60 @@ admission, wire field, runtime submit behavior, CPU/GPU numeric fallback, or
 test tolerance changed.  No device, health, reset, reboot, or hardware census
 command was run; fresh-boot CMAC acceptance and its pre/post `simple_add.py`
 bracket remain pending.
+
+## 2026-08-24 — direct CMAC weight packing broadens reductions at 2,493 lines
+
+This isolated milestone follows `3873e3e38`.  Its predeclared renderer budget
+was **+24/-31 executable lines, net -7**.  The observed executable diff is
+**+27/-34, net -7**: the multiple-constant semantic guard and final type
+narrowing shifted three lines onto each side of the replacement without
+changing the promised net reduction.  Authoritative `sz.py` size moves the
+renderer **2500 -> 2493** and repository total **28032 -> 28025** (**-7**);
+runtime remains **464**.
+
+`_lower_cmac_reduction` now owns the former `_cmac_scaled_root` scale peeling
+and parses one-source contraction terms with distinct compile-time weights.
+FP16-exact finite weights are packed directly into the immutable CMAC B
+surface through `RKGather.values`; pure sum and mean images therefore use
+three scratch buffers and no constant scratch slot.  This deletes
+`_cmac_scaled_root` and the uniform-weight constant materialization while
+adding no generic IR, wire field, runtime path, or CPU/GPU numeric fallback.
+
+Admission remains deliberately exact.  A one-source term may carry one
+finite coefficient only when its value round-trips through FP16.  Multiple
+constant factors, a per-term coefficient combined with an outer scale,
+non-FP16-exact or nonfinite weights, and scaled two-dynamic-input dots all
+retain the existing elementwise fallback.  This prevents reassociation such
+as `(x*3)*(1/3)` from silently changing FP16 semantics.  Existing unscaled
+dot and matmul contractions are unchanged.
+
+The actual production `Tensor.schedule_linear -> to_program` path now lowers
+`(source * arange(1, 6)).sum()` to one native `(1,1,5)` CMAC with packed
+weights `1..5`, no EW stages, no host-address path, and no constants.  The
+committed parent used 141 EW stages for that optimized graph; under
+`NOOPT=1`, parent and candidate both retain the same 11-stage fallback.  A
+64-case production sum/mean sweep reports **26 byte-identical programs** and
+**38 packing-only changes**, with **zero new, lost, or other differences**.
+All 38 changed cases materialize byte-identical CMAC A/B surfaces and output
+maps; their aggregate physical-oracle SHA-256 is
+`830861145bb6c1637d1908cad512e8a9e9cb58f746ad3a3b805b0edaf2cb544c`.
+
+An instrumented committed-parent/candidate oracle observed **99 CMAC matcher
+attempts** across the complete Rockchip UOp module: **88 byte-identical**, **9
+packing-equivalent**, **2 intended new weighted admissions**, and **zero lost
+or other outcomes**.  The new admissions are the direct weighted fixture and
+the production weighted Tensor graph.  The unchanged `3x5 @ 5x4` CMAC image
+remains SHA-256
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`;
+the new direct-packed FP32 sum and weighted-sum images are respectively
+`e3341d80e5b30aaf087a847a3da9ab1ec6288a563304b9693491624bde2a2788`
+and `ed9102ae6d693c8b2f978efc0652ec114594fad8bd312669748cb75e855d088a`.
+
+Host verification reports **128 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full census command was run
+because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.

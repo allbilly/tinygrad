@@ -21,6 +21,10 @@ def _program(dtype, value, count:int=4):
   out, axis = UOp.param(0, dtype, (count,)), UOp.range(count, 0)
   return list(out.index(axis).store(value(axis)).end(axis).sink().toposort())
 
+def _cmac_weights(image:RKImage) -> tuple[int, ...]:
+  assert image.cmac is not None and image.cmac.n == 1 and image.gathers[1].values
+  return tuple(image.gathers[1].values[(lane//32)*16*32+lane%32] for lane in range(image.cmac.k))
+
 def _slot_program(slot:int) -> list[UOp]:
   out, axis = UOp.param(slot, dtypes.half, (1,)), UOp.range(1, 0)
   return list(out.index(axis).store(UOp.const(0.0, dtypes.half)).end(axis).sink().toposort())
@@ -423,12 +427,24 @@ def test_native_ew_configs_keep_their_exact_register_values():
     0x108004c0,0x108102c0,0x108502c0,0x108602c0,0x108702c0,0x108802c0)
 
 
-def test_cmac_scale_normalization_keeps_nested_casts_and_rejects_nonfinite_products():
-  root = UOp.const(3.0,dtypes.float)
-  scaled = ((root*0.5).cast(dtypes.float)*0.25).cast(dtypes.float)
-  assert (normalized:=rockchip_renderer._cmac_scaled_root(scaled)) is not None
-  assert normalized[0].key == root.key and normalized[1] == 0.125
-  assert rockchip_renderer._cmac_scaled_root(root*float("inf")) is None
+def test_cmac_packs_fp16_exact_per_term_weights_and_rejects_invalid_weights():
+  def lower(weights:tuple[float, ...], nested:bool=False) -> RKImage|None:
+    out, source = UOp.param(0,dtypes.half,(1,)), UOp.param(1,dtypes.half,(len(weights),))
+    terms = [source.index(i).load().cast(dtypes.float)*UOp.const(weight,dtypes.float) for i,weight in enumerate(weights)]
+    if nested: terms[0] = terms[0]*UOp.const(2.0,dtypes.float)
+    value = terms[0]
+    for term in terms[1:]: value = value+term
+    return _lower_uop_program(list(out.index(0).store(value.cast(dtypes.half)).sink().toposort()))
+  weights = (0.5,-0.25,2.0,0.125)
+  image = lower(weights)
+  assert image is not None and image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,4)
+  assert not image.constants and len(image.scratch) == 3
+  assert _cmac_weights(image) == tuple(rockchip_renderer._fp16_bits(weight) for weight in weights)
+  for invalid in (0.1,float("inf")):
+    fallback = lower((invalid,*weights[1:]))
+    assert fallback is not None and fallback.cmac is None and fallback.ew_ops
+  nested = lower(weights, nested=True)
+  assert nested is not None and nested.cmac is None and nested.ew_ops
 
 
 def test_generic_fp16_uops_lower_in_dependency_order():
@@ -885,7 +901,8 @@ def test_scalar_half_to_float_sum_routes_production_cmac():
     program = to_program(ast, RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
   assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k,image.cmac.out_fp16) == (1,1,values.size,False)
-  assert image.constants == struct.pack("<e", 1.0) and len(image.gathers) == 2 and len(image.post_gathers) == 1
+  assert not image.constants and len(image.scratch) == 3 and len(image.gathers) == 2 and len(image.post_gathers) == 1
+  assert _cmac_weights(image) == (rockchip_renderer._fp16_bits(1.0),)*values.size
   assert image.gathers[0].offsets[:values.size] == tuple(range(values.size))
   assert all(offset == -1 for offset in image.gathers[0].offsets[values.size:])
   assert image.post_gathers[0].itemsize == 4 and image.post_gathers[0].offsets == (0,)
@@ -930,8 +947,22 @@ def test_tensor_mean_routes_scaled_production_cmac_weights():
   images = [decode_image(u.arg) for u in program.src if u.op is Ops.BINARY]
   image = next(image for image in images if image.cmac is not None)
   assert (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,8)
-  assert image.constants == struct.pack("<e",0.125) and image.cmac.out_fp16 and not image.ew_ops
+  assert not image.constants and len(image.scratch) == 3 and _cmac_weights(image) == (rockchip_renderer._fp16_bits(0.125),)*8
+  assert image.cmac.out_fp16 and not image.ew_ops
   assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+
+
+def test_arange_weighted_tensor_sum_routes_production_cmac():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",5,dtypes.half,num=1006))
+    ast = (source*Tensor.arange(1,6).cast(dtypes.half)).sum().schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,5)
+  assert image.gathers[0].offsets[:5] == tuple(range(5))
+  assert _cmac_weights(image) == tuple(rockchip_renderer._fp16_bits(value) for value in range(1,6))
+  assert not image.constants and not image.ew_ops and image.execution_class is RKExecutionClass.NATIVE
 
 
 def test_static_dot_reduce_owns_accurate_physical_recipe():
@@ -1045,7 +1076,9 @@ def test_scaled_pure_sum_routes_cmac_weights_but_scaled_dot_stays_generic():
     value = value*0.125
     image = _lower_uop_program(_program(dtypes.half,lambda _i:value.cast(dtypes.half),count=1))
     assert image is not None
-    if terms is sums: assert image.cmac is not None and image.constants == struct.pack("<e",0.125) and not image.ew_ops
+    if terms is sums:
+      assert image.cmac is not None and not image.constants and _cmac_weights(image) == (rockchip_renderer._fp16_bits(0.125),)*8
+      assert not image.ew_ops
     else: assert image.cmac is None and image.ew_ops
 
 
@@ -1058,7 +1091,9 @@ def test_nested_scaled_direct_reduce_routes_cmac_but_scaled_dot_stays_generic():
     reduced = UOp(Ops.REDUCE,dtypes.float,src=(value,axis),arg=(Ops.ADD,))*0.5*0.25
     image = _lower_uop_program(list(out.index(row).store(reduced.cast(dtypes.half)).end(row,axis).sink().toposort()))
     assert image is not None
-    if not dot: assert image.cmac is not None and image.constants == struct.pack("<e",0.125) and not image.ew_ops
+    if not dot:
+      assert image.cmac is not None and not image.constants and _cmac_weights(image) == (rockchip_renderer._fp16_bits(0.125),)*4
+      assert not image.ew_ops
     else: assert image.cmac is None and image.ew_ops
 
 

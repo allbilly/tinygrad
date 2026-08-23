@@ -627,40 +627,36 @@ def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> I
     if node.op is op and (dtype is None or node.dtype.scalar() is dtype) and (not plain or node.arg is None): stack.extend(reversed(node.src))
     else: yield node
 
-def _cmac_scaled_root(root:UOp) -> tuple[UOp, float]|None:
-  scale = 1.0
-  while (pair:=_const_operand(root:=_strip_cast(root), Ops.MUL)) is not None: root,scale = pair[0],scale*float(pair[1].arg)
-  return (root,scale) if math.isfinite(scale) else None
-
 def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
-  """Factor a real sum/dot/matmul into one fixed CMAC stage and raw physical gathers."""
+  """Factor a real weighted sum/dot/matmul into one fixed CMAC stage and raw physical gathers."""
   _,out,rows,out_index,root = output
   if rows <= 0 or out.dtype.scalar() not in (dtypes.half,dtypes.float): return None
-  graph = root.toposort(); local_loads = _semantic_loads(root, local=True) if any(u.op is Ops.BUFFER for u in graph) else (); local_add = bool(local_loads) and all(load.dtype.scalar() is dtypes.float for load in local_loads); add_reduce = any(u.op is Ops.REDUCE and (u.arg is Ops.ADD or isinstance(u.arg, tuple) and u.arg and u.arg[0] is Ops.ADD) for u in graph)  # noqa: E501
+  graph = root.toposort(); local_loads = _semantic_loads(root, local=True) if any(u.op is Ops.BUFFER for u in graph) else (); local_add = bool(local_loads) and all(load.dtype.scalar() is dtypes.float for load in local_loads); additive = local_add or any(u.op is Ops.REDUCE and (u.arg is Ops.ADD or isinstance(u.arg, tuple) and u.arg and u.arg[0] is Ops.ADD) for u in graph)  # noqa: E501
   try: root = _unroll_static_reduces(_unroll_static_local(uops, root) if local_loads else root, precise=False)
   except (_RKGenericReject, RuntimeError, ValueError): return None
-  if (scaled:=_cmac_scaled_root(root)) is None: return None
-  root,scale = scaled
-  if root.op is Ops.ADD: terms = tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD))
-  elif add_reduce or local_add: terms = (_strip_cast(root),)
-  else: return None
+  scale = 1.0
+  while (pair:=_const_operand(root:=_strip_cast(root), Ops.MUL)) is not None: root,scale = pair[0],scale*float(pair[1].arg)
+  if not math.isfinite(scale): return None
+  terms = tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD)) if root.op is Ops.ADD else \
+    (_strip_cast(root),) if additive else ()
   terms = tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)); groups = len(terms)
-  if local_loads and not local_add or groups < (1 if add_reduce or local_add else 4): return None
+  if local_loads and not local_add or groups < (1 if additive else 4) or groups > _MAX_GENERIC_UNROLL: return None
   try: envs = _iter_range_env(_index_ranges(out_index))
   except RuntimeError: return None
   if len(envs) != rows or tuple(int(_eval_expr(out_index, env, {})) for env in envs) != tuple(range(rows)): return None
-  if not 0 < groups <= _MAX_GENERIC_UNROLL: return None
-  parsed:list[tuple[tuple[UOp,UOp], ...]] = []
+  parsed:list[tuple[tuple[UOp,UOp], ...]] = []; weights:list[float] = []
   for term in terms:
-    value = _strip_cast(term); nodes = value.src if value.op is Ops.MUL and value.arg is None else (value,)
-    operands:list[tuple[UOp,UOp]] = []
-    for node in nodes:
+    factors = tuple(_iter_binary(_strip_cast(term), Ops.MUL, plain=True)); operands:list[tuple[UOp,UOp]] = []; weight,weighted = scale,False
+    for node in factors:
       load = _strip_cast(node)
+      if load.op is Ops.CONST and (weighted or scale != 1.0): return None
+      if load.op is Ops.CONST: weight,weighted = float(load.arg),True; continue
       if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 1 or load.src[0].op is not Ops.INDEX or \
          (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST: return None
       operands.append((param,load.src[0].src[1]))
-    if len(operands) not in (1,2): return None
-    parsed.append(tuple(operands))
+    if len(operands) not in (1,2) or not math.isfinite(weight) or \
+       len(operands) == 1 and float_to_fp16(weight) != weight or len(operands) == 2 and weight != 1.0: return None
+    parsed.append(tuple(operands)); weights.append(weight)
   slots = tuple(x[0].arg.slot for x in parsed[0])
   for i,parsed_operands in enumerate(parsed):
     if len(slots) == 2 and tuple(x[0].arg.slot for x in parsed_operands) == slots[::-1]: parsed[i] = parsed_operands[::-1]
@@ -693,30 +689,26 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   ai,ao,_ = _cmac_layout(m,n,groups)
   if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1 or \
      m*ai+ao*ai+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
-  constant = right is None
-  if not constant and scale != 1.0: return None
-  if constant and float_to_fp16(scale) != scale: return None
-  constants = struct.pack("<e",scale) if constant else b""
-  shift = int(constant)
-  a_slot,b_slot,c_slot = shift,shift+1,shift+2; a_base = bases[left] if diagonal else bases[left][::n]; a_delta = deltas[left]
+  a_slot,b_slot,c_slot = 0,1,2; a_base = bases[left] if diagonal else bases[left][::n]; a_delta = deltas[left]
   a_offsets = tuple(base+a_delta[k] if k < groups else -1 for base in a_base for k in range(ai))
-  if right is None: b_offsets = tuple(0 if ob*16+ni < n and ib*32+ki < groups else -1
-    for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))
+  if right is None:
+    b_values = tuple(_fp16_bits(weights[ib*32+ki]) if ob*16+ni < n and ib*32+ki < groups else 0
+      for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32)); b_offsets = typing_cast(tuple[int, ...], ())
   else:
     b_base,b_delta = bases[right][:n],deltas[right]
     b_offsets = tuple(b_base[ob*16+ni]+b_delta[ib*32+ki] if ob*16+ni < n and ib*32+ki < groups else -1
-      for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))
-  scratch = ((RKScratch(64),) if constant else ())+(RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4))
+      for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32)); b_values = ()
+  scratch = (RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4))
   gathers = (RKGather(params[left].arg.slot,a_slot,len(a_offsets),offsets=a_offsets),
-    RKGather(0 if constant else params[typing_cast(int,right)].arg.slot,b_slot,len(b_offsets),offsets=b_offsets,
-             src_kind=RKBufferKind.SCRATCH if constant else RKBufferKind.ARG))
+    RKGather(out.arg.slot if right is None else params[right].arg.slot,b_slot,len(b_values or b_offsets),
+             offsets=b_offsets,values=b_values))
   fp16 = out.dtype.scalar() is dtypes.half
   positions = ((i,i) if diagonal else divmod(i,n) for i in range(rows))
   output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for row,col in positions)
   post = (RKGather(c_slot,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
                    src_kind=RKBufferKind.SCRATCH),)
   cmac = RKCMAC(RKArg(RKBufferKind.SCRATCH,c_slot),RKArg(RKBufferKind.SCRATCH,a_slot),RKArg(RKBufferKind.SCRATCH,b_slot),m,n,groups,fp16)
-  return RKImage(RKTarget.RK3588,scratch,constants,gathers=gathers,post_gathers=post,cmac=cmac)
+  return RKImage(RKTarget.RK3588,scratch,gathers=gathers,post_gathers=post,cmac=cmac)
 
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64; return vector_bytes, vector_bytes//2, rows*vector_bytes//2
