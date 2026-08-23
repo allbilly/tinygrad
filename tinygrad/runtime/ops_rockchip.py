@@ -72,6 +72,11 @@ class RockchipProgram(Program['RockchipDevice']):
     self.scratch = tuple(self._scratch_arena.offset(offset, spec.size)
       for offset,spec in zip(self._scratch_offsets, self.image.scratch))
 
+  def _ensure_ordinary_initialized(self) -> None:
+    if getattr(self.dev, "_ordinary_initialized", False): return
+    self.dev.reset_npu()
+    self.dev._ordinary_initialized = True
+
   def _preflight_native(self, bufs:tuple[HCQBuffer, ...]) -> RockchipPhysicalEffects:
     effects = RockchipPhysicalEffects(self, self.image, bufs, self.native)
     effects._preflight()
@@ -381,6 +386,7 @@ class RockchipProgram(Program['RockchipDevice']):
     del global_size, local_size, vals, kwargs
     self.dev._touch_program(self)
     if self.image.native is not None: return self._run_native(*bufs, wait=wait)
+    self._ensure_ordinary_initialized()
     self._ensure_scratch()
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
       if kind is RKBufferKind.ARG:
@@ -487,7 +493,7 @@ class RockchipDevice(Compiled):
     self.submit_count = self.task_count = self.timeout_retries = 0
     self._native_int16 = False
     self.native_reset_live_proven = False
-    self.reset_npu()
+    self._ordinary_initialized = False
     self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
     self._program_resources:collections.OrderedDict[int, wr.ReferenceType[RockchipProgram]] = collections.OrderedDict()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)

@@ -11,6 +11,7 @@ from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKImage, RKNativeAs
   RKNativeSubmit, RKNativeTask, RKTarget, RK_EXP2_PHYSICAL_PROVENANCE, RK_EXP2_REPAIR_DEVICE_STAGE,
   RK_EXP2_REPAIR_METADATA, RockchipCompiler, decode_image, encode_image)
 from tinygrad.runtime.autogen import rockchip_physical as rkp
+import tinygrad.runtime.ops_rockchip as rockchip_runtime
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipProgram
 from tinygrad.runtime.support.hcq import HCQBuffer
 
@@ -194,6 +195,51 @@ class _HostOnlyDevice:
       self.events.append(name)
       raise AssertionError(f"unexpected native device effect: {name}")
     return unexpected
+
+
+def test_rockchip_device_constructor_has_no_hidden_action6(monkeypatch: pytest.MonkeyPatch):
+  reset_calls: list[object] = []
+
+  class FakeFileIO:
+    def __init__(self, *_args, **_kwargs): pass
+
+  monkeypatch.setattr(rockchip_runtime, "FileIOInterface", FakeFileIO)
+  monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_ACTION",
+                      lambda *args, **kwargs: reset_calls.append((args, kwargs)))
+  dev = RockchipDevice("ROCKCHIP")
+  assert reset_calls == [] and dev._ordinary_initialized is False
+
+
+def test_ordinary_program_initialization_is_explicit_and_one_shot():
+  class OrdinaryDevice:
+    _ordinary_initialized = False
+    resets = 0
+
+    def reset_npu(self): self.resets += 1
+    def _forget_program(self, _program): pass
+
+  program = object.__new__(RockchipProgram)
+  program.dev = OrdinaryDevice()
+  program._ensure_ordinary_initialized()
+  program._ensure_ordinary_initialized()
+  assert program.dev.resets == 1 and program.dev._ordinary_initialized is True
+
+
+def test_ordinary_v31_program_path_initializes_once():
+  class OrdinaryDevice:
+    _ordinary_initialized = False
+    resets = 0
+
+    def _touch_program(self, _program): pass
+    def _forget_program(self, _program): pass
+    def _sync_buffers(self, _buffers, _flags): pass
+    def reset_npu(self): self.resets += 1
+
+  dev = OrdinaryDevice()
+  program = RockchipProgram(dev, TinyELF(encode_image(RKImage(RKTarget.RK3588, version=31)), "ordinary", Target(), ()))
+  assert program(wait=True) is not None
+  assert program(wait=True) is not None
+  assert dev.resets == 1
 
 
 def test_native_runtime_preflights_then_fails_closed_before_device_effects():

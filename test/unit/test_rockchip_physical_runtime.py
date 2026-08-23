@@ -248,6 +248,15 @@ def test_cmac_patches_all_dma_sites_keeps_rhs_tail_and_swizzles_output() -> None
   assert effects.last_logical_output == struct.pack("<4H", 0, 1, 2, 3)
 
 
+def test_native_cmac_owns_exactly_one_reset_without_retry() -> None:
+  program, effects = _setup(_cmac_native(), fail_submit=True)
+  with pytest.raises(PhysicalOwnershipUnknown, match="driver boundary"):
+    effects.execute()
+  names = [event[0] for event in program.dev.events if isinstance(event, tuple)]
+  assert names.count("reset") == 1 and names.count("submit") == 1
+  assert program.dev.timeout_retries == 0 and effects.telemetry.pc_submits == 1
+
+
 def test_cmac_asset_upload_patches_q24_and_cleans_asset_buffer() -> None:
   program, effects = _setup(_cmac_asset_native())
   receipt = effects.execute()
