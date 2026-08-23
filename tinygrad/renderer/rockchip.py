@@ -453,20 +453,6 @@ def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, 
     envs = [{**env, r: i} for env in envs for i in range(bound)]
   return envs
 
-def _cmac_loop(output:RKOutput) -> tuple[UOp,UOp,int,float]|None:
-  """Extract one additive local loop and its candidate output scale."""
-  store,_,_,_,post = output; root = post; nodes,out_ranges = list(post.toposort()),_index_ranges(store.src[0].src[1])
-  axes = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
-  if len(axes) != 1 or axes[0].src[0].op is not Ops.CONST or (groups:=int(axes[0].src[0].arg)) <= 0: return None
-  axis = axes[0]; updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and axis in u.toposort()]
-  if len(updates) != 1 or root.op is Ops.MAX and ((pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or _fp16_bits(float(pair[1].arg)) != 0): return None  # noqa: E501
-  if root.op is Ops.MAX: root = typing_cast(tuple[UOp,UOp],pair)[0]
-  if (scaled:=_cmac_scaled_root(root)) is None: return None
-  root,scale = scaled
-  update = _strip_cast(updates[0].src[1]); acc = next((x for x in update.src if _local_load(x) is not None),None) if update.op is Ops.ADD else None
-  if _local_load(root) is None or acc is None: return None
-  return _strip_cast(update.src[1 if update.src[0] is acc else 0]),axis,groups,scale
-
 @functools.lru_cache(maxsize=8)
 def _static_vector_env(out_index:UOp, count:int, *expressions:UOp, reject:str="static_index") -> tuple[dict[UOp, np.ndarray], np.ndarray]:
   ranges = tuple(_index_ranges(out_index)); envs = _iter_range_env(list(ranges))
@@ -667,21 +653,20 @@ def _cmac_scaled_root(root:UOp) -> tuple[UOp, float]|None:
   while (pair:=_const_operand(root:=_strip_cast(root), Ops.MUL)) is not None: root,scale = pair[0],scale*float(pair[1].arg)
   return (root,scale) if math.isfinite(scale) else None
 
-def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
+def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Factor a real sum/dot/matmul into one fixed CMAC stage and raw physical gathers."""
   _,out,rows,out_index,root = output
   if rows <= 0 or out.dtype.scalar() not in (dtypes.half,dtypes.float): return None
-  axis:UOp|None = None; terms:tuple[UOp, ...]; scale = 1.0
-  if (loop:=_cmac_loop(output)) is not None:
-    term,axis,groups,scale = loop; terms = (term,)
-  else:
-    if (scaled:=_cmac_scaled_root(root)) is None: return None
-    root,scale = scaled
-    if root.op is Ops.REDUCE and root.arg in ((Ops.ADD,),Ops.ADD) and len(root.src) == 2 and root.src[1].op is Ops.RANGE and \
-       root.src[1].src[0].op is Ops.CONST:
-      terms, axis, groups = (_strip_cast(root.src[0]),), root.src[1], int(root.src[1].src[0].arg)
-    elif root.op is Ops.ADD and len(terms:=tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD))) >= 4: groups = len(terms)
-    else: return None
+  graph = root.toposort(); local_loads = _semantic_loads(root, local=True) if any(u.op is Ops.BUFFER for u in graph) else (); local_add = bool(local_loads) and all(load.dtype.scalar() is dtypes.float for load in local_loads); add_reduce = any(u.op is Ops.REDUCE and (u.arg is Ops.ADD or isinstance(u.arg, tuple) and u.arg and u.arg[0] is Ops.ADD) for u in graph)  # noqa: E501
+  try: root = _unroll_static_reduces(_unroll_static_local(uops, root) if local_loads else root, precise=False)
+  except (_RKGenericReject, RuntimeError, ValueError): return None
+  if (scaled:=_cmac_scaled_root(root)) is None: return None
+  root,scale = scaled
+  if root.op is Ops.ADD: terms = tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD))
+  elif add_reduce or local_add: terms = (_strip_cast(root),)
+  else: return None
+  terms = tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)); groups = len(terms)
+  if local_loads and not local_add or groups < (1 if add_reduce or local_add else 4): return None
   try: envs = _iter_range_env(_index_ranges(out_index))
   except RuntimeError: return None
   if len(envs) != rows or tuple(int(_eval_expr(out_index, env, {})) for env in envs) != tuple(range(rows)): return None
@@ -705,15 +690,10 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
   try:
     for side in range(len(slots)):
       expressions = tuple(item[side][1] for item in parsed)
-      if axis is not None:
-        if (affine:=_linear_index(expressions[0])) is None: return None
-        bases.append(tuple(int(_eval_expr(expressions[0], {**env,axis:0}, {})) for env in envs))
-        deltas.append(tuple(k*affine[1].get(axis,0) for k in range(groups)))
-      else:
-        affine = _linear_index(expressions[0]); others = tuple(_linear_index(expr) for expr in expressions[1:])
-        if affine is None or any(item is None or item[1] != affine[1] for item in others): return None
-        bases.append(tuple(int(_eval_expr(expressions[0], env, {})) for env in envs))
-        deltas.append((0,)+tuple(item[0]-affine[0] for item in others if item is not None))
+      affine = _linear_index(expressions[0]); others = tuple(_linear_index(expr) for expr in expressions[1:])
+      if affine is None or any(item is None or item[1] != affine[1] for item in others): return None
+      bases.append(tuple(int(_eval_expr(expressions[0], env, {})) for env in envs))
+      deltas.append((0,)+tuple(item[0]-affine[0] for item in others if item is not None))
   except (RuntimeError,ValueError): return None
   params = tuple(parsed[0][side][0] for side in range(len(slots)))
   if any(min(base)+min(delta) < 0 or max(base)+max(delta) >= int(param.src[0].arg)
@@ -2221,8 +2201,8 @@ def _finite_int_max_neutrals(root:UOp) -> UOp:
       stack.extend((src, active, False) for src in reversed(u.src))
   return cache[(root, False)]
 
-def _unroll_static_reduces(root:UOp) -> UOp:
-  """Interpret static REDUCE/RANGE structure into ordinary semantic UOps."""
+def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
+  """Interpret static REDUCE/RANGE structure into ordinary semantic UOps; CMAC leaves product terms factorable."""
   cache:dict[UOp, UOp] = {}
   for u in root.toposort():
     mapped = u.replace(src=tuple(cache[src] for src in u.src))
@@ -2234,7 +2214,7 @@ def _unroll_static_reduces(root:UOp) -> UOp:
       terms = [mapped.src[0].substitute({r:r.const_like(env[r]) for r in ranges}, walk=True) for env in envs]
       nonzero = [term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)] \
         if reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.half else []
-      if nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero): mapped = _precise_mul_sum(nonzero)
+      if precise and nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero): mapped = _precise_mul_sum(nonzero)  # noqa: E501
       else:
         while len(terms) > 1:
           terms = [UOp(reduce_op, u.dtype, src=(terms[i], terms[i+1])) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
@@ -2443,7 +2423,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       if (combined:=_append_inplace_image(combined, child)) is None: return None
     return combined
   strict_output, local_output = (_admit(output, accepted) for output in (strict_output, local_output))
-  if (cmac:=_try(local_output, (dtypes.half,dtypes.float), _lower_cmac_reduction, v=vectorize_reductions)) is not None: return cmac
+  if (cmac:=_try(local_output, (dtypes.half,dtypes.float), _lower_cmac_reduction, uops, v=vectorize_reductions)) is not None: return cmac
   if (scatter:=_try(strict_output, (dtypes.half, dtypes.int16), _lower_host_scatter)) is not None: return scatter
   for dtype, lower in ((dtypes.int, _lower_raw_fp16_bitcast), (dtypes.uchar, _lower_fp16_uint8_cast)):
     if (output:=_admit(strict_output, dtype)) is not None and (image:=lower(output)) is not None: return image

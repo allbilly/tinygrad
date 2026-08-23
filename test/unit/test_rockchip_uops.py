@@ -847,6 +847,34 @@ def test_static_reduce_uops_are_structurally_executed():
     if op is Ops.ADD: assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (2,1,3)
     else: assert image.cmac is None and len(image.gathers) == 3 and len(image.ew_ops) == 2
 
+def test_multi_axis_reduce_and_fp32_local_add_share_cmac_unrolling():
+  out, source = UOp.param(0,dtypes.half,(2,)), UOp.param(1,dtypes.half,(12,))
+  row,outer,inner = UOp.range(2,0),UOp.range(2,1,AxisType.REDUCE),UOp.range(3,2,AxisType.REDUCE)
+  term = source.index(row*6+outer*3+inner).load()
+  reduced = UOp(Ops.REDUCE,dtypes.float,src=(term.cast(dtypes.float),outer,inner),arg=(Ops.ADD,0))
+  direct = _lower_uop_program(list(out.index(row).store(reduced.cast(dtypes.half)).end(row,outer,inner).sink().toposort()))
+  local = UOp.placeholder((1,),dtypes.float,0,addrspace=AddrSpace.REG)
+  initialize = local.index(0).store(0.0)
+  pointer = local.after(initialize,outer,inner).index(0)
+  update = pointer.store(pointer.load()+term.cast(dtypes.float))
+  result = local.after(update.end(outer,inner)).index(0).load().cast(dtypes.half)
+  loop = _lower_uop_program(list(UOp.sink(initialize,update,out.index(row).store(result)).toposort()))
+  for image in (direct,loop):
+    assert image is not None and image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (2,1,6)
+    assert not image.ew_ops and decode_image(encode_image(image)) == image
+    assert image.gathers[0].offsets[:6] == tuple(range(6)) and image.gathers[0].offsets[32:38] == tuple(range(6,12))
+  assert encode_image(direct) == encode_image(loop)
+
+def test_noopt_multi_axis_tensor_sum_routes_production_cmac():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=1):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",24,dtypes.half,num=1005).reshape((2,3,4)))
+    ast = source.sum((0,2)).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (3,1,8)
+  assert not image.ew_ops and image.execution_class is RKExecutionClass.NATIVE
+
 def test_scalar_half_to_float_sum_routes_production_cmac():
   values = np.random.RandomState(0).uniform(-2, 2, size=(45, 3)).astype(np.float16).reshape(-1)
   with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):

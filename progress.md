@@ -7977,3 +7977,48 @@ FP32-sum and `3x5 @ 5x4` CMAC images remain byte-identical at SHA-256
 and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
 No device, health, reset, reboot, or census command was run; the proven
 fresh-boot hardware bracket remains pending.
+
+## 2026-08-24 — shared static unrolling broadens CMAC coverage
+
+This isolated milestone follows `0e7f6fe56`.  Its predeclared renderer budget
+was at most **+18 additions**, at least **-30 deletions**, and net at most
+**-12 executable source lines**.  The observed raw production diff is
+**+19/-39, net -20**; one insertion/deletion pair is the retained docstring
+update, leaving the executable source budget at **+18/-38**.  Authoritative
+`sz.py` size moves renderer **2565 -> 2547** and repository total **28097 ->
+28079** (**-18**); runtime remains **464**.
+
+The existing bounded `_unroll_static_local` and `_unroll_static_reduces`
+interpreters now expose structural ADD terms to `_lower_cmac_reduction` before
+factorization.  CMAC requests `precise=False` only for this speculative parse;
+an unsupported graph falls through and the generic EW path reruns the normal
+precise reduction recipe.  This makes the bespoke one-axis `_cmac_loop` and
+the separate axis-specific base/delta branch obsolete and removes them.  No
+new reduction IR, runtime phase, codec field, command register, submit path,
+or CPU/GPU numeric fallback was added.
+
+The production `to_program` sweep covered **208** sum/mean schedules across
+rank, axis, and `NOOPT` variants.  It found **14** intended new admissions:
+multi-axis `NOOPT=1` sums and FP16-exact means now replace 5--22 EW stages with
+one fixed CMAC.  For example, `(2,3,4).sum((0,2))` moves from nine EW stages to
+CMAC `(M,N,K) = (3,1,8)`.  The other **194** schedules remain byte-identical.
+A two-axis structural fixture proves both direct REDUCE and linked FP32 local
+ADD forms produce the same `(2,1,6)` image and exact Cartesian source packing.
+FP16 stateful locals, MAX/MUL reductions, activations, scaled dots, bias,
+padding, dynamic addressing, and oversized graphs continue to use honest EW
+fallback.
+
+A separate parent-versus-candidate oracle kept all images byte-identical for
+12 representative production programs (sum, mean, axis sum, dot, scaled-dot
+fallback, ReLU fallback, matmul, einsum, plain/biased/padded convolution, and
+avg-pool) and for the former one-axis direct/local CMAC fixtures.  Canonical
+FP32-sum and `3x5 @ 5x4` hashes remain
+`8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9` and
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+
+Host verification reports **127 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, or hardware census command was run; fresh-boot CMAC
+acceptance and its pre/post `simple_add.py` bracket remain pending.
