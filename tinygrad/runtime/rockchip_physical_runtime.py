@@ -51,7 +51,7 @@ _CMAC_GUARD_SPANS = (
   ("_cmd_buf", rkp.CMAC_V1_COMMAND_IMAGE_BYTES, rkp.CMAC_V1_COMMAND_RESERVATION_BYTES - rkp.CMAC_V1_COMMAND_IMAGE_BYTES),
   ("_task_buf", rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES, _PAGE - rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES),
 )
-_BufferSnapshot = tuple[int, int, int, int, int, int, int, int, int, int]
+_BufferSnapshot = tuple[int, int, int, int, int, int, int, int, int, int, int]
 
 # Stable event IDs.  These are a finite vocabulary, not a second telemetry
 # policy or an attempt counter encoded as an event name.
@@ -140,35 +140,40 @@ class PhysicalRuntimeTelemetry:
 
 
 def _read(buffer: HCQBuffer, size: int, offset: int = 0) -> bytes:
-  allocation = getattr(getattr(buffer, "meta", None), "size", getattr(buffer, "size", None))
+  base = buffer.base
+  allocation = getattr(getattr(base, "meta", None), "size", getattr(base, "size", None))
   if type(allocation) is not int or offset < 0 or size < 0 or offset + size > allocation:
     raise PhysicalRuntimeReject("readback", "read exceeds the declared allocation")
   return ctypes.string_at(int(buffer.va_addr) + offset, size)
 
 
 def _write(buffer: HCQBuffer, data: bytes, offset: int = 0) -> None:
-  allocation = getattr(getattr(buffer, "meta", None), "size", getattr(buffer, "size", None))
+  base = buffer.base
+  allocation = getattr(getattr(base, "meta", None), "size", getattr(base, "size", None))
   if type(allocation) is not int or offset < 0 or offset + len(data) > allocation:
     raise PhysicalRuntimeReject("write", "write exceeds the declared allocation")
   ctypes.memmove(int(buffer.va_addr) + offset, data, len(data))
 
 
 def _allocation_size(buffer: HCQBuffer) -> int:
-  value = getattr(getattr(buffer, "meta", None), "size", getattr(buffer, "size", None))
+  base = buffer.base
+  value = getattr(getattr(base, "meta", None), "size", getattr(base, "size", None))
   if type(value) is not int or value <= 0:
     raise PhysicalRuntimeReject("dma", "buffer allocation size is invalid")
   return value
 
 
 def _obj_addr(buffer: HCQBuffer) -> int:
-  value = getattr(getattr(buffer, "meta", None), "obj_addr", None)
+  base = buffer.base
+  value = getattr(getattr(base, "meta", None), "obj_addr", None)
   if type(value) is not int or value < 0:
     raise PhysicalRuntimeReject("dma", "buffer object address is invalid")
   return value
 
 
 def _handle(buffer: HCQBuffer) -> int:
-  value = getattr(getattr(buffer, "meta", None), "handle", None)
+  base = buffer.base
+  value = getattr(getattr(base, "meta", None), "handle", None)
   if type(value) is not int or not 0 <= value <= _U32_MAX:
     raise PhysicalRuntimeReject("dma", "buffer GEM handle is invalid")
   return value
@@ -178,7 +183,14 @@ def _dma(program: object, buffer: HCQBuffer) -> int:
   resolver = getattr(program, "_dma", None)
   if not callable(resolver):
     raise PhysicalRuntimeReject("dma", "program has no DMA resolver")
-  value = resolver(buffer)
+  base = buffer.base
+  try:
+    base_dma, buffer_va, base_va = resolver(base), buffer.va_addr, base.va_addr
+  except Exception as exc:
+    raise PhysicalRuntimeReject("dma", "buffer DMA metadata is invalid") from exc
+  if type(base_dma) is not int or type(buffer_va) is not int or type(base_va) is not int:
+    raise PhysicalRuntimeReject("dma", "buffer DMA metadata is invalid")
+  value = base_dma + buffer_va - base_va
   if type(value) is not int or not 0 < value <= _U32_MAX or value & (_PAGE - 1):
     raise PhysicalRuntimeReject("dma", f"DMA address {value!r} is not an aligned uint32")
   if value + _allocation_size(buffer) > 1 << 32:
@@ -194,6 +206,8 @@ def _base_metadata(buffer: HCQBuffer) -> tuple[HCQBuffer, int, int]:
     raise PhysicalRuntimeReject("dma", "buffer base metadata is invalid") from exc
   if not isinstance(base, HCQBuffer) or type(base_va) is not int or type(base_size) is not int or base_va < 0 or base_size <= 0:
     raise PhysicalRuntimeReject("dma", "buffer base metadata is invalid")
+  if buffer.meta is not base.meta:
+    raise PhysicalRuntimeReject("dma", "buffer view metadata is not identical to base metadata")
   allocation_size = _allocation_size(buffer)
   if base_size > allocation_size:
     raise PhysicalRuntimeReject("dma", "buffer base logical size exceeds allocation")
@@ -213,7 +227,7 @@ def _buffer_snapshot(program: object, buffer: HCQBuffer) -> _BufferSnapshot:
   if buffer_va < base_va or buffer_end > base_end:
     raise PhysicalRuntimeReject("dma", "buffer view range lies outside base")
   return (id(buffer), id(base), base_va, base_size, buffer_va, buffer_size, _allocation_size(buffer),
-          _dma(program, buffer), _obj_addr(buffer), _handle(buffer))
+          _dma(program, buffer), _obj_addr(buffer), _handle(buffer), id(base.meta))
 
 
 def _owned_buffer_snapshot(program: object, buffer: object, logical_size: int, role: str) -> _BufferSnapshot:
@@ -410,6 +424,7 @@ class RockchipPhysicalEffects:
       buffer = self.bufs[arg.index]
       if not isinstance(buffer, HCQBuffer):
         self._reject("buffer_binding", f"{role} is not an HCQBuffer")
+      _base_metadata(buffer)
       if buffer.size < required or _allocation_size(buffer) < required:
         self._reject("resource_bounds", f"{role} allocation is smaller than {required} bytes")
       dma, allocation = _dma(self.program, buffer), _allocation_size(buffer)

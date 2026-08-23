@@ -100,7 +100,8 @@ class _SpyProgram:
     self.submit_contracts: list[object] = []
 
   def _dma(self, buffer: HCQBuffer) -> int:
-    return int(buffer.meta.dma_addr) + int(buffer.va_addr) - int(buffer.base.va_addr)
+    base = buffer.base
+    return int(base.meta.dma_addr) + int(buffer.va_addr) - int(base.va_addr)
 
   def _submit_physical(self, command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
     del command, task
@@ -519,6 +520,79 @@ def test_malformed_initial_view_is_zero_effect_reject(mutation: str) -> None:
     effects.execute()
   assert effects.closed and not effects.ownership_unknown
   assert program.dev.events == [] and program.dev.freed == []
+
+
+def _forge_view_meta(view: HCQBuffer, field: str) -> None:
+  assert view.meta is view.base.meta
+  meta = view.meta
+  if field == "larger_alloc":
+    view.meta = replace(meta, size=meta.size + 4096)
+  elif field == "dma":
+    view.meta = replace(meta, dma_addr=meta.dma_addr + 0x1000)
+  elif field == "obj":
+    view.meta = replace(meta, obj_addr=meta.obj_addr + 1)
+  elif field == "equal_meta":
+    view.meta = replace(meta)
+  else:
+    view.meta = replace(meta, handle=meta.handle + 1)
+
+
+@pytest.mark.parametrize("field", ("larger_alloc", "dma", "obj", "handle", "equal_meta"))
+def test_distinct_view_metadata_is_zero_effect_reject(field: str) -> None:
+  program, effects = _setup(_cmac_native())
+  view = _cmac_output_view(effects)
+  _forge_view_meta(view, field)
+  with pytest.raises(PhysicalRuntimeReject, match="identical"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert program.dev.events == [] and program.dev.freed == []
+
+
+@pytest.mark.parametrize("field", ("larger_alloc", "dma", "obj", "handle"))
+def test_distinct_view_metadata_after_submit_is_terminal_unknown(field: str) -> None:
+  program, effects = _setup(_cmac_native())
+  view = _cmac_output_view(effects)
+  original_submit = program._submit_physical
+
+  def tampering_submit(command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
+    receipt = original_submit(command, task, contract)
+    _forge_view_meta(view, field)
+    return receipt
+
+  program._submit_physical = tampering_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalOwnershipUnknown, match="readback"):
+    effects.execute()
+  assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+  assert not any(event[0] == "sync" and event[2] == driver.RKNPU_MEM_SYNC_FROM_DEVICE
+                 for event in program.dev.events if isinstance(event, tuple))
+
+
+def test_equal_distinct_view_metadata_after_submit_is_terminal_unknown() -> None:
+  program, effects = _setup(_cmac_native())
+  view = _cmac_output_view(effects)
+  original_submit = program._submit_physical
+
+  def tampering_submit(command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
+    receipt = original_submit(command, task, contract)
+    _forge_view_meta(view, "equal_meta")
+    return receipt
+
+  program._submit_physical = tampering_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalOwnershipUnknown, match="readback"):
+    effects.execute()
+  assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+
+
+def test_shared_meta_endpoint_view_remains_a_valid_caller_binding() -> None:
+  program, effects = _setup(_cmac_native())
+  output = effects.bufs[2]
+  view = output.offset(0, output.size)
+  effects.bufs = effects.bufs[:2] + (view,)
+  assert view.meta is view.base.meta
+  assert view.va_addr + view.size == view.base.va_addr + view.base.size
+  assert effects.execute() == PhysicalSubmitReceipt(0, True, 77)
+  assert effects.closed and not effects.ownership_unknown
+  assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 1
 
 
 def _tamper_output_base(buffer: HCQBuffer, mutation: str) -> None:
