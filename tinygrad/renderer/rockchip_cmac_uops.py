@@ -16,6 +16,8 @@ from tinygrad.uop.ops import AxisType, Ops, ParamArg, UOp
 CMAC_UOP_SEMANTIC_PROVENANCE = "rk-cmac-semantic-v5:764c833fdcb22455f344812ab375867c0d8518fe"
 CMAC_RHS_ONE_N4_ASSET_ID = 2
 CMAC_RHS_ONE_N4_ASSET_SHA256 = "96a33b81830614e9b95b033117210b3933d7d971323992d35be7d901cb183c00"
+# The physical RHS is [group=2, batch=1, row=16, K=32] FP16: four rows of
+# group zero contain one, while every inactive row/lane is zero-filled.
 CMAC_RHS_ONE_N4_PAYLOAD = b"\x00\x3c" * 128 + b"\0" * 1792
 CMAC_RHS_ONE_N4_ASSET = RKNativeAsset(CMAC_RHS_ONE_N4_ASSET_ID, bytes.fromhex(CMAC_RHS_ONE_N4_ASSET_SHA256), 2048,
   ((0, 2048),), payload=CMAC_RHS_ONE_N4_PAYLOAD)
@@ -134,6 +136,7 @@ class CMACUOpMatch:
   def body_hash(self) -> str: return CMAC_V1_BODY_SHA256
   @property
   def command_guard_bytes(self) -> int: return CMAC_V1_PC_GUARD_BYTES
+  # (surface offset, host view bytes, row stride bytes, command guard bytes).
   @property
   def output_span_provenance(self) -> tuple[int, int, int, int]: return (128, CMAC_V1_OUTPUT_VIEW_BYTES, 128, CMAC_V1_PC_GUARD_BYTES)
 
@@ -272,6 +275,7 @@ def _match_linear_sum(nodes: tuple[UOp, ...]) -> CMACUOpMatch | CMACFallback:
 
 def _native(lhs_slot: int, out_slot: int) -> RKNativeOp:
   lhs, asset, out = RKArg(RKBufferKind.ARG, lhs_slot), RKArg(RKBufferKind.ASSET, 0), RKArg(RKBufferKind.ARG, out_slot)
+  # The three command fields bind lhs, immutable RHS asset, and output in that order.
   relocs = tuple(RKNativeRelocation(word, target, register, arg) for (word, target, register), arg in zip(CMAC_V1_RELOCATIONS, (lhs, asset, out)))
   native = RKNativeOp(RKNativeKind.CMAC, tuple(CMAC_V1_COMMANDS), relocs, reads=(lhs,), writes=(out,), outputs=(out,), tail=tuple(CMAC_V1_TAIL),
     assets=(CMAC_RHS_ONE_N4_ASSET,), task=RKNativeTask(*CMAC_V1_TASK), submit=RKNativeSubmit(*CMAC_V1_SUBMIT), reset=RKNativeReset(*CMAC_V1_RESET))

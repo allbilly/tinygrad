@@ -27,14 +27,12 @@ _NATIVE_TASK = struct.Struct("<8I")
 _NATIVE_SUBMIT = struct.Struct("<IIIiI")
 _NATIVE_RESET = struct.Struct("<II")
 
-# The generated catalog owns physical command/table bytes and their hashes.
+# The generated catalog owns the physical command image, relocation fields,
+# and lifecycle tuples.  Renderer validation only admits those exact bytes;
+# addresses are supplied later by the physical runtime.
 _CMAC_BODY_SHA256 = bytes.fromhex(rkp.CMAC_V1_BODY_SHA256)
 _CMAC_TAIL, _CMAC_RELOCS = rkp.CMAC_V1_TAIL, rkp.CMAC_V1_RELOCATIONS
 _CMAC_TASK, _CMAC_SUBMIT, _CMAC_RESET = rkp.CMAC_V1_TASK, rkp.CMAC_V1_SUBMIT, rkp.CMAC_V1_RESET
-_CMAC_RHS_ONE_N4_SHA256 = bytes.fromhex("96a33b81830614e9b95b033117210b3933d7d971323992d35be7d901cb183c00")
-_CMAC_SPANS = ((rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_LHS_BYTES, 0),
-               (rkp.CMAC_V1_RHS_BYTES, rkp.CMAC_V1_RHS_BYTES, 0),
-               (rkp.CMAC_V1_OUTPUT_SURFACE_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES, 0))
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1; ASSET = 2
 class RKLayout(IntEnum): FP16 = 0; INT16 = 1; BOOL_MASK = 2; INT32 = 3; BOOL_INT16 = 4; INT_FP16 = 5
@@ -63,20 +61,23 @@ class RKNativeAsset:
 
 @dataclass(frozen=True)
 class RKNativeTask:
+  """The eight-word task descriptor consumed by the one-task CMAC submit."""
   op_index: int; enable_mask: int; interrupt_mask: int; interrupt_clear: int
   interrupt_status: int; regcfg_amount: int; regcfg_offset: int; reserved: int = 0
 
 @dataclass(frozen=True)
 class RKNativeSubmit:
+  """The generated PC/block/ping-pong submit controls for one task."""
   flags: int = 5; timeout_ms: int = 6000; core_mask: int = 1; fence_fd: int = -1; task_count: int = 1
 
 @dataclass(frozen=True)
 class RKNativeReset:
+  """The generated action-6 reset tuple; the device must prove it is live."""
   flags: int = 6; value: int = 0
 
 @dataclass(frozen=True)
 class RKNativeOp:
-  """The single-stage, wire-first physical operation carried by an RKImage."""
+  """One frozen CMAC stage: declared buffers/assets plus its exact wire lifecycle."""
   kind: RKNativeKind; commands: tuple[int, ...]; relocs: tuple[RKNativeRelocation, ...]
   reads: tuple[RKArg, ...] = (); writes: tuple[RKArg, ...] = (); outputs: tuple[RKArg, ...] = ()
   tail: tuple[int, ...] = (); assets: tuple[RKNativeAsset, ...] = (); task: RKNativeTask = RKNativeTask(0, 0, 0, 0, 0, 0, 0)
@@ -203,18 +204,8 @@ def _native_arg_zero(value:RKArg, name:str) -> None:
   _native_arg(value, name)
   if value.kind is not RKBufferKind.ARG or value.addend != 0: raise ValueError(f"invalid native {name} binding")
 
-def _native_text(value:Any, name:str, *, required:bool=False) -> bytes:
-  if type(value) is not str or (required and not value): raise ValueError(f"invalid native {name}")
-  encoded = value.encode("utf-8")
-  if len(encoded) > _RKIMAGE_U16_MAX: raise ValueError(f"native {name} is too long")
-  return encoded
-
-def _native_asset_ref(value:RKArg, assets:tuple[RKNativeAsset, ...], name:str) -> None:
-  _native_arg(value, name)
-  if value.kind is not RKBufferKind.ASSET or value.addend != 0 or value.index >= len(assets):
-    raise ValueError(f"invalid native {name} binding")
-
 def _native_route_contract(native:RKNativeOp) -> None:
+  """Validate the active CMAC resource, relocation, and lifecycle contract."""
   refs = native.reads + native.writes
   if native.kind is RKNativeKind.CMAC:
     if native.flags != 0: raise ValueError("native CMAC controls mismatch")

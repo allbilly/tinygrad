@@ -26,15 +26,18 @@ CMAC_V1_COMMAND_IMAGE_BYTES = CMAC_V1_COMMAND_IMAGE_QWORDS * 8
 CMAC_V1_COMMAND_RESERVATION_BYTES = CMAC_V1_COMMAND_IMAGE_BYTES + 4096
 CMAC_V1_TASK_DESCRIPTOR_BYTES = 40
 CMAC_V1_COMMAND_IMAGE = CMAC_V1_COMMANDS + CMAC_V1_TAIL
-CMAC_V1_SUBMIT = (0x5, 6000, 1, -1, 1)
-CMAC_V1_RESET_ACTION = 6
-CMAC_V1_RESET = (CMAC_V1_RESET_ACTION, 0)
+CMAC_V1_SUBMIT = (0x5, 6000, 1, -1, 1)  # PC|BLOCK|PINGPONG, timeout, core, fence, task count
+CMAC_V1_RESET_ACTION = 6  # immutable production reset action; live effect confirmation remains required
+CMAC_V1_RESET = (CMAC_V1_RESET_ACTION, 0)  # struct rknpu_action { flags=6, value=0 }
 CMAC_V1_LHS_BYTES = 64
-CMAC_V1_RHS_BYTES = 2048
+CMAC_V1_RHS_BYTES = 2048  # [2,1,16,32] FP16 payload; 0x800 is not 4096.
 CMAC_V1_RHS_SHAPE = (2, 1, 16, 32)
 CMAC_V1_RHS_STRIDES_BYTES = (1024, 1024, 64, 2)
 CMAC_V1_RHS_KERNEL_STRIDE_BYTES = 64
 CMAC_V1_RHS_GROUP_STRIDE_BYTES = 1024
+# Immutable dense N=4 sum RHS: rows 0..3 are FP16 one, all remaining
+# physical lanes are zero.  The runtime treats this as an ASSET relocation,
+# never as a dynamically packed caller buffer.
 CMAC_V1_RHS_ASSET_ID = 2
 CMAC_V1_RHS_ASSET_SIZE = CMAC_V1_RHS_BYTES
 CMAC_V1_RHS_ASSET_RANGES = ((0, CMAC_V1_RHS_ASSET_SIZE),)
@@ -42,13 +45,18 @@ CMAC_V1_RHS_ASSET_SHA256 = "96a33b81830614e9b95b033117210b3933d7d971323992d35be7
 CMAC_V1_RHS_ASSET_PAYLOAD = b"".join(
   struct.pack("<H", 0x3C00 if group == 0 and row < 4 else 0x0000)
   for group in range(2) for row in range(16) for _ in range(32))
-CMAC_V1_OUTPUT_SURFACE_BYTES = 128
-CMAC_V1_OUTPUT_VIEW_BYTES = 256
+CMAC_V1_OUTPUT_SURFACE_BYTES = 128  # raw 32-channel FP16 surface, one row
+CMAC_V1_OUTPUT_VIEW_BYTES = 256  # donor's minimum host readback mapping
 CMAC_V1_OUTPUT_STRIDE_BYTES = 128
 CMAC_V1_OUTPUT_ROW_STRIDE_ELEMS = 64
 CMAC_V1_PHYSICAL_CHANNELS = 32
 CMAC_V1_PC_GUARD_BYTES = 4096
+# Logical channel c is read from FP16 word (c // 16) * 32 + (c % 16) in
+# the raw 64-word window of the donor's 128-word host view; the adapter
+# returns only the admitted lanes.
 CMAC_V1_OUTPUT_SWIZZLE = tuple((channel // 16) * 32 + channel % 16 for channel in range(32))
+# Compatibility alias: physical relocation spans carry the raw DMA surface,
+# while the larger host readback view remains an adapter-level requirement.
 CMAC_V1_OUTPUT_BYTES = CMAC_V1_OUTPUT_SURFACE_BYTES
 
 assert len(CMAC_V1_COMMANDS) == CMAC_V1_BODY_QWORDS and hashlib.sha256(struct.pack("<46Q", *CMAC_V1_COMMANDS)).hexdigest() == CMAC_V1_BODY_SHA256

@@ -321,6 +321,7 @@ class RockchipPhysicalEffects:
       self._reject("dma_binding", "native resource reference is not a bound zero-addend ARG")
 
   def _expected_contract(self) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return the generated command, task, submit, and action-6 reset bytes."""
     return rkp.CMAC_V1_COMMANDS, rkp.CMAC_V1_TAIL, rkp.CMAC_V1_TASK, rkp.CMAC_V1_SUBMIT, rkp.CMAC_V1_RESET
 
   def _check_command_contract(self) -> None:
@@ -373,6 +374,8 @@ class RockchipPhysicalEffects:
         self._reject("resource_contract", "CMAC must own one output write")
       self._cmac_asset_mode = any(item.arg.kind is RKBufferKind.ASSET for item in self.native.relocs)
       if self._cmac_asset_mode:
+        # Asset mode binds only the 32-value LHS and an immutable dense RHS;
+        # the third relocation is patched to the owned output surface.
         if len(self.native.reads) != 1:
           self._reject("resource_contract", "CMAC asset route must own one LHS read")
         refs, roles, sizes = (
@@ -381,6 +384,8 @@ class RockchipPhysicalEffects:
           (rkp.CMAC_V1_LHS_BYTES, rkp.CMAC_V1_OUTPUT_VIEW_BYTES),
         )
       else:
+        # Dynamic mode owns a caller RHS and admits it only after its inactive
+        # physical lanes have been proven zero-filled during preflight.
         if len(self.native.reads) != 2:
           self._reject("resource_contract", "CMAC must own two reads for a dynamic RHS")
         refs, roles, sizes = (
@@ -466,6 +471,8 @@ class RockchipPhysicalEffects:
   def _check_cmac_asset(self) -> None:
     if not self._cmac_asset_mode:
       return
+    # The payload layout is part of the route: four FP16-one rows in group 0
+    # followed by zero lanes, uploaded once while the device is idle.
     if type(self.native.assets) is not tuple or len(self.native.assets) != 1 or type(self.native.assets[0]) is not RKNativeAsset:
       self._reject("asset", "CMAC asset route requires one immutable asset")
     asset = self.native.assets[0]
@@ -477,6 +484,8 @@ class RockchipPhysicalEffects:
       self._reject("asset", "CMAC RHS asset hash mismatch")
 
   def _check_cmac_inputs(self) -> None:
+    # The NPU writes a 32-channel raw surface; the host reads the donor's
+    # larger view and applies the generated channel-to-word swizzle later.
     if (
       rkp.CMAC_V1_OUTPUT_SURFACE_BYTES != 128
       or rkp.CMAC_V1_OUTPUT_VIEW_BYTES != 256
@@ -609,6 +618,8 @@ class RockchipPhysicalEffects:
     return tuple(commands)
 
   def _write_command_and_task(self) -> None:
+    # Relocations are the only dynamic command fields.  The task descriptor
+    # points at this patched image and is submitted exactly once.
     command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
     self._revalidate_native_fingerprint()
     self._revalidate_owned_buffers()
@@ -720,6 +731,8 @@ class RockchipPhysicalEffects:
     self._closed = True
 
   def _upload_asset_while_idle(self) -> None:
+    # Embedded assets must reach the device before reset; no asset upload is
+    # legal after the driver has crossed into the in-flight state.
     if self._assets_uploaded:
       return
     self._revalidate_native_fingerprint()
@@ -738,7 +751,9 @@ class RockchipPhysicalEffects:
       self._assets_uploaded = True
       self._event("asset_upload_idle")
       return
+
   def reset_before(self) -> None:
+    """Prepare, sync host-owned bytes, then issue the one-shot action-6 reset."""
     if self._reset or self._in_flight:
       self._reject("lifecycle", "native reset is not first or one-shot")
     self._prepare()
@@ -761,11 +776,13 @@ class RockchipPhysicalEffects:
     self._event("reset_action_6")
 
   def barrier_before(self) -> None:
+    """Mark the post-reset submission boundary without issuing another reset."""
     if not self._reset or self._in_flight:
       self._reject("lifecycle", "native barrier-before is out of order")
     self._event("barrier_before")
 
   def submit_physical(self) -> PhysicalSubmitReceipt:
+    """Submit the generated one-task record and retain ownership on uncertainty."""
     if not self._reset or self._in_flight:
       self._reject("lifecycle", "native submit is out of order")
     submitter = getattr(self.program, "_submit_physical", None)
@@ -802,6 +819,7 @@ class RockchipPhysicalEffects:
     return receipt
 
   def _validate_cmac_output(self) -> None:
+    """Keep the raw host view and derive logical lanes through the catalog swizzle."""
     raw = _read(self._resource_buffers["output"], rkp.CMAC_V1_OUTPUT_VIEW_BYTES)
     self.last_output = raw
     self.last_logical_output = cmac_logical_output(raw, _CMAC_LOGICAL_LANES, rkp.CMAC_V1_OUTPUT_SWIZZLE)
@@ -814,6 +832,7 @@ class RockchipPhysicalEffects:
         self._reject("cmac_guard", f"{attr} guard was modified")
 
   def barrier_after(self) -> None:
+    """Prove post-submit ownership, read back output, verify guards, and then free."""
     if not self._in_flight or self._unknown:
       self._reject("lifecycle", "native barrier-after is out of order")
     try:
