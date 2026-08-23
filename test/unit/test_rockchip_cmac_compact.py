@@ -13,7 +13,7 @@ from tinygrad.renderer.rockchip_cmac_uops import (CMACConstantAssetCertificate, 
   trusted_constant_sum)
 from tinygrad.runtime.autogen.rockchip_physical import (CMAC_V1_BODY_QWORDS, CMAC_V1_BODY_SHA256, CMAC_V1_COMMANDS,
   CMAC_V1_OUTPUT_VIEW_BYTES, CMAC_V1_PC_GUARD_BYTES, CMAC_V1_RELOCATIONS, CMAC_V1_RESET, CMAC_V1_SUBMIT, CMAC_V1_TAIL, CMAC_V1_TASK)
-from tinygrad.uop.ops import AxisType, Ops
+from tinygrad.uop.ops import AxisType, Ops, UOp
 
 
 def _ast(*, trusted: bool = True):
@@ -102,6 +102,15 @@ def test_output_surface_wrappers_are_rejected(wrapper):
   ast = _ast()
   output = next(node for node in ast.toposort() if node.op is Ops.PARAM and node.arg.slot == 0)
   malformed = ast.substitute({output: getattr(output, wrapper)(dtypes.int16)}, walk=True)
+  assert isinstance(_match(malformed), CMACFallback)
+
+
+@pytest.mark.parametrize("load_dtype", (dtypes.int16, dtypes.float, dtypes.bool))
+def test_reduction_load_dtype_mutation_is_rejected(load_dtype):
+  ast = _ast()
+  source = next(node for node in ast.toposort() if node.op is Ops.CAST and node.dtype.scalar() is dtypes.float)
+  load = UOp(Ops.LOAD, dtype=load_dtype, src=(source.src[0],))
+  malformed = ast.substitute({source: source.replace(src=(load,))}, walk=True)
   assert isinstance(_match(malformed), CMACFallback)
 
 

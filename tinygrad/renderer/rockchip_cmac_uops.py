@@ -203,7 +203,7 @@ def _sum_source(value: UOp, axis: UOp) -> tuple[int, int, DType, UOp] | CMACFall
   source = reduce.src[0]
   if source.op is not Ops.CAST or source.dtype.scalar() is not dtypes.float or len(source.src) != 1:
     return _reject(CMACReject.DTYPE, "CMAC sum needs FP32 input cast")
-  load = source.src[0]
+  if (load := source.src[0]).op is Ops.LOAD and load.dtype.scalar() is not dtypes.half: return _reject(CMACReject.DTYPE, "CMAC sum LOAD must be FP16")
   index = load.src[0] if load.op is Ops.LOAD and len(load.src) == 1 else load
   if index.op is not Ops.INDEX or len(index.src) != 2:
     return _reject(CMACReject.ARGUMENT, "CMAC sum needs one direct lhs index")
