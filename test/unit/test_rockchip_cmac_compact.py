@@ -7,7 +7,7 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import to_program, to_program_cache
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Target
-from tinygrad.renderer.rockchip import (RKBufferKind, RKNativeKind, RockchipRenderer, decode_image, encode_image)
+from tinygrad.renderer.rockchip import (RKBufferKind, RKIMAGE_NATIVE_VERSION, RKNativeKind, RockchipRenderer, decode_image, encode_image)
 from tinygrad.renderer.rockchip_cmac_uops import (CMACConstantAssetCertificate, CMACFallback, CMACReject, CMACRouteCounters, CMACUOpMatch,
   CMAC_RHS_ONE_N4_ASSET, CMAC_RHS_ONE_N4_ASSET_SHA256, CMAC_RHS_ONE_N4_PAYLOAD, is_cmac_physical_image, match_cmac_uops,
   trusted_constant_sum)
@@ -22,7 +22,7 @@ def _ast(*, trusted: bool = True):
     view = trusted_constant_sum(lhs)
   else:
     output = Tensor.empty((1, 1), dtype=dtypes.half, device="CPU")
-    output.assign(lhs.sum(axis=1))
+    output.assign(lhs.max(axis=1))
     view = output
   return view.schedule_linear().src[0].src[0]
 
@@ -61,6 +61,20 @@ def test_real_tensor_reduction_to_program_uses_asset_q24_and_exact_donor():
   assert renderer.cmac_counters == CMACRouteCounters(attempted=1, admitted=1, native=1)
 
 
+def test_ordinary_tensor_sum_auto_mints_asset_without_helper():
+  to_program_cache.clear()
+  lhs = Tensor.empty((1, 32), dtype=dtypes.half, device="CPU")
+  value = lhs.sum(axis=1)
+  output = Tensor.empty(value.shape, dtype=dtypes.half, device="CPU")
+  output.assign(value)
+  renderer = RockchipRenderer(Target.parse("ROCKCHIP"))
+  program = to_program(output.schedule_linear().src[0].src[0], renderer)
+  blob = next(u for u in program.src if u.op is Ops.BINARY).arg
+  image = decode_image(blob)
+  assert image.version == RKIMAGE_NATIVE_VERSION and image.native is not None and image.native.kind is RKNativeKind.CMAC
+  assert image.native.relocs[1].arg.kind is RKBufferKind.ASSET and renderer.cmac_counters.native == 1
+
+
 def test_direct_sum_match_exposes_semantic_oracle_and_raw_view():
   result = _match(_ast())
   assert isinstance(result, CMACUOpMatch) and result.n == 4
@@ -70,7 +84,7 @@ def test_direct_sum_match_exposes_semantic_oracle_and_raw_view():
   assert result.native.relocs[1].arg.kind is RKBufferKind.ASSET
 
 
-def test_ordinary_uninjected_sum_falls_back_before_to_program():
+def test_unproven_non_sum_falls_back_before_to_program():
   result = _match(_ast(trusted=False))
   assert isinstance(result, CMACFallback) and result.reason is CMACReject.BOUNDS
 
@@ -81,6 +95,14 @@ def test_public_certificate_constructor_is_untrusted():
   forged = output.replace(arg=replace(output.arg, layout_certificate=CMACConstantAssetCertificate()))
   result = _match(ast.substitute({output: forged}, walk=True))
   assert isinstance(result, CMACFallback) and result.reason is CMACReject.LAYOUT
+
+
+@pytest.mark.parametrize("wrapper", ("cast", "bitcast"))
+def test_output_surface_wrappers_are_rejected(wrapper):
+  ast = _ast()
+  output = next(node for node in ast.toposort() if node.op is Ops.PARAM and node.arg.slot == 0)
+  malformed = ast.substitute({output: getattr(output, wrapper)(dtypes.int16)}, walk=True)
+  assert isinstance(_match(malformed), CMACFallback)
 
 
 @pytest.mark.parametrize("field,value", (
@@ -147,7 +169,7 @@ def test_fallback_bytes_match_forced_existing_ew(monkeypatch):
   assert renderer.cmac_counters.native == 0 and renderer.cmac_counters.fallback == 1
 
 
-def test_untrusted_sum_fallback_bytes_match_existing_ew(monkeypatch):
+def test_unproven_non_sum_fallback_bytes_match_existing_ew(monkeypatch):
   ast = _ast(trusted=False)
   renderer = RockchipRenderer(Target.parse("ROCKCHIP"))
   routed = renderer.render(list(ast.toposort()))
@@ -155,5 +177,5 @@ def test_untrusted_sum_fallback_bytes_match_existing_ew(monkeypatch):
   forced = RockchipRenderer(Target.parse("ROCKCHIP")).render(list(ast.toposort()))
   assert routed == forced
   blob = base64.b64decode(routed)
-  assert decode_image(blob).version == 31 and hashlib.sha256(blob).hexdigest() == "cbe1806b7b392ad22919db73c25cb1ccfb9eec9623a079ea9923a499f1af5dfc"
+  assert decode_image(blob).version == 31 and hashlib.sha256(blob).hexdigest() == "80de05347d1b8ce67f067212d34334ffda673441bd3197a3a554f01dccbe3fbe"
   assert renderer.cmac_counters == CMACRouteCounters(attempted=1, fallback=1, reasons={CMACReject.BOUNDS: 1})

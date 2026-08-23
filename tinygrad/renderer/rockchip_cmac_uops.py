@@ -65,6 +65,24 @@ def trusted_constant_sum(lhs: Any, *, n: int = 4) -> Any:
   return physical[:, :1]
 
 
+def _is_exact_sum_uop(node: UOp) -> bool:
+  if node.op is Ops.RESHAPE and node.shape == (1, 1) and len(node.src) == 2: node = node.src[0]
+  if node.op is not Ops.CAST or node.dtype.scalar() is not dtypes.half or len(node.src) != 1: return False
+  reduce = node.src[0]
+  if reduce.op is not Ops.REDUCE or reduce.dtype.scalar() is not dtypes.float or type(reduce.arg) is not tuple or \
+     len(reduce.arg) != 2 or reduce.arg[0] is not Ops.ADD or type(reduce.arg[1]) is not int or reduce.arg[1] != 1 or \
+     len(reduce.src) != 1: return False
+  permute = reduce.src[0]
+  if permute.op is not Ops.PERMUTE or permute.shape != (32, 1) or type(permute.arg) is not tuple or len(permute.arg) != 2 or \
+     type(permute.arg[0]) is not int or type(permute.arg[1]) is not int or permute.arg != (1, 0) or len(permute.src) != 1: return False
+  source = permute.src[0]
+  if source.op is not Ops.CAST or source.dtype.scalar() is not dtypes.float or len(source.src) != 1: return False
+  reshape = source.src[0]
+  if reshape.op is not Ops.RESHAPE or reshape.shape != (1, 32) or len(reshape.src) != 2: return False
+  lhs = reshape.src[0]
+  return lhs.op in (Ops.BUFFER, Ops.PARAM) and lhs.dtype.scalar() is dtypes.half and lhs.max_numel() == 32
+
+
 class CMACReject(Enum):
   ARGUMENT = auto()
   ASSET = auto()
@@ -140,12 +158,6 @@ def _param(node: UOp) -> tuple[int, int, DType, UOp] | None:
   return None if count is None else (int(node.arg.slot), count, node.dtype.scalar(), node)
 
 
-def _base_param(node: UOp) -> tuple[int, int, DType, UOp] | None:
-  if node.op in (Ops.PARAM, Ops.BUFFER): return _param(node)
-  if node.op in (Ops.CAST, Ops.BITCAST) and len(node.src) == 1: return _base_param(node.src[0])
-  return None
-
-
 def _exact_int_tuple(value: Any, size: int) -> bool:
   return type(value) is tuple and len(value) == size and all(type(item) is int for item in value)
 
@@ -172,7 +184,7 @@ def _store(nodes: tuple[UOp, ...]) -> tuple[UOp, tuple[int, int, DType, UOp]] | 
   store = stores[0]
   if len(store.src) != 2 or store.src[0].op is not Ops.INDEX or len(store.src[0].src) != 2:
     return _reject(CMACReject.ARGUMENT, "CMAC sum output must be a direct indexed store")
-  output = _base_param(store.src[0].src[0])
+  output = _param(store.src[0].src[0])
   if output is None or output[2] is not dtypes.half: return _reject(CMACReject.DTYPE, "CMAC sum output must be FP16")
   if output[1] != 128: return _reject(CMACReject.BOUNDS, "CMAC sum output must be a fresh 128-element surface")
   if _const_int(store.src[0].src[1]) != 0: return _reject(CMACReject.MAP, "CMAC sum output must use zero-offset lane 0")
@@ -221,7 +233,7 @@ def _match_constant_sum(nodes: tuple[UOp, ...]) -> CMACUOpMatch | CMACFallback:
   result = _sum_source(store.src[1], ranges[0])
   if isinstance(result, CMACFallback): return result
   params = tuple(node for node in nodes if node.op in (Ops.PARAM, Ops.BUFFER))
-  if len(params) != 2 or any(_base_param(node) is None for node in params):
+  if len(params) != 2 or any(_param(node) is None for node in params):
     return _reject(CMACReject.ARGUMENT, "CMAC sum may have only lhs and output parameters")
   if result[0] == output[0]: return _reject(CMACReject.ARGUMENT, "CMAC sum surfaces must not alias")
   if sum(node.op is Ops.LOAD for node in nodes) > 1: return _reject(CMACReject.ARGUMENT, "CMAC sum has multiple lhs loads")
@@ -246,7 +258,8 @@ def _match_linear_sum(nodes: tuple[UOp, ...]) -> CMACUOpMatch | CMACFallback:
     if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.float or len(term.src) != 1 or term.src[0].op is not Ops.LOAD:
       return _reject(CMACReject.FAMILY, "CMAC linear sum terms need FP32 casts of lhs loads")
     load = term.src[0]
-    if len(load.src) != 1 or load.src[0].op is not Ops.INDEX or len(load.src[0].src) != 2 or _const_int(load.src[0].src[1]) != k:
+    if load.dtype.scalar() is not dtypes.half or len(load.src) != 1 or load.src[0].op is not Ops.INDEX or \
+       len(load.src[0].src) != 2 or _const_int(load.src[0].src[1]) != k:
       return _reject(CMACReject.MAP, "CMAC linear sum lhs indices must be K=0..31")
     current = _param(load.src[0].src[0])
     if current is None or current[1] != 32 or current[2] is not dtypes.half: return _reject(CMACReject.DTYPE, "CMAC linear sum lhs must be FP16 K=32")
@@ -270,7 +283,8 @@ def match_cmac_uops(uops: Iterable[UOp], *, counters: CMACRouteCounters | None =
   if counters is not None: counters.attempted += 1
   try:
     nodes = _nodes(uops)
-    result = _match_constant_sum(nodes) if any(node.op is Ops.REDUCE for node in nodes) else _match_linear_sum(nodes)
+    result = _reject(CMACReject.DTYPE, "INDEX dtype") if any(node.op is Ops.INDEX and node.dtype is not dtypes.half for node in nodes) else (
+      _match_constant_sum(nodes) if any(node.op is Ops.REDUCE for node in nodes) else _match_linear_sum(nodes))
   except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
     result = _reject(CMACReject.ARGUMENT, f"unrecognized UOp form: {exc}")
   if isinstance(result, CMACFallback):

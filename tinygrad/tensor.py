@@ -429,6 +429,12 @@ class Tensor(RandMixin):
     if self.dtype in dtypes.weaks: self.uop = self.uop.clone()
     is_disk = isinstance(self.device, str) and self.device.startswith(("DISK", "TINYFS"))
     if not isinstance(x, Tensor): x = Tensor(x, device="CPU" if is_disk else self.device, dtype=self.dtype)
+    if isinstance(x, Tensor) and self.uop.base.op is Ops.BUFFER and self.uop.base.max_numel() == 1 and self.shape in ((1,), (1, 1)) and \
+       self.dtype.scalar() is dtypes.half and x.dtype.scalar() is dtypes.half and self.device == x.device and not self.uop.base.is_realized:
+      from tinygrad.renderer.rockchip_cmac_uops import _attach_asset_certificate, _is_exact_sum_uop
+      if _is_exact_sum_uop(x.uop):
+        physical = _attach_asset_certificate(Tensor.empty((1, 128), dtype=dtypes.half, device=self.device))
+        self.uop = physical[:, :1].reshape(self.shape).uop
     if self.uop is x.uop: return self  # a self assign is a NOOP
     # broadcast x (shape only, dtype must match)
     x = x._broadcast_to(self.shape)
