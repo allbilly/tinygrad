@@ -225,10 +225,8 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
   return tuple(commands)
 
 # Admission and exact-carrier bounds.
-(_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_MAPPED_DOT_SCRATCH_BYTES, _MAX_GENERIC_UNROLL, _MIN_GENERIC_PRODUCT_RESIDUAL_TERMS,
- _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_LOCAL_STEPS, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS,
- _EW_ELEMS_32BIT, _FP16_EXACT_INTEGER) = (
-   0x1001, 0x2001, 64000, 352 << 20, 1 << 14, 64, 1 << 20, 4096, 1 << 20, 1 << 18, 1 << 22, 8*dtypes.half.itemsize//dtypes.float.itemsize, 1 << 11)
+(_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_LOCAL_STEPS, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _EW_ELEMS_32BIT, _FP16_EXACT_INTEGER) = (  # noqa: E501
+  0x1001, 0x2001, 64000, 1 << 14, 1 << 20, 4096, 1 << 20, 1 << 18, 1 << 22, 8*dtypes.half.itemsize//dtypes.float.itemsize, 1 << 11)
 # Native EW register fields.
 (_EW_DATA_MODE_FP16, _EW_EDATA_SIZE_FP16, _EW_ALU_MIN, _EW_ALU_ADD, _EW_ALU_FDIV, _EW_ALU_SUB, _EW_ALU_ABS, _EW_ALU_NEG,
  _EW_ALU_FLOOR, _EW_ALU_CEIL, _EW_RELUX_EN, _EW_RELU_BYPASS, _EW_OP_CVT_BYPASS, _EW_LUT_BYPASS, _EW_OP_SRC_DMA, _EW_OP_TYPE_MUL) = (
@@ -417,8 +415,6 @@ def _eval_expr(u:UOp, env:Mapping[UOp, int|float|bool|np.ndarray], cache:dict[UO
   elif u.op is Ops.WHERE and not vector:
     return cache.setdefault(u, _static_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype))
   else: return cache.setdefault(u, _static_alu(u.op, u.dtype, tuple(_eval_expr(src, env, cache, vector) for src in u.src), vector))
-
-def _eval_int(u:UOp, env:dict[UOp, int], cache=None) -> int: return int(_eval_expr(u, env, cache if cache is not None else {}))
 
 def _is_static_expr(u:UOp) -> bool: return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
 
@@ -645,16 +641,6 @@ def _ew_ops(stages:Iterable[tuple[RKArg, RKArg, RKArg, Ops|int]], count:int,
                       stateful=stateful, **flags)
                for i,(dst,lhs,rhs,cfg) in enumerate(stages))
 
-def _reduction_store(store:UOp, out:UOp, index:UOp, lanes:int, value:UOp) -> UOp:
-  return store.replace(src=(store.src[0].replace(src=(out.replace(src=(out.src[0].const_like(lanes),)), index)), value, *store.src[2:]))
-
-def _reduction_input(u:UOp, load_dtype:DType|None=None, out_slot:int|None=None, param_dtypes:tuple[DType, ...]|None=None) -> tuple[UOp, UOp]|None:
-  index = u.src[0] if u.op is Ops.LOAD and len(u.src) == 1 and u.src[0].op is Ops.INDEX else u if u.op is Ops.INDEX and len(u.src) == 2 else None
-  if index is None or len(index.src) != 2 or (param:=index.src[0]).op is not Ops.PARAM: return None
-  return (index, param) if (load_dtype is None or u.dtype.scalar() is load_dtype) and \
-    (param_dtypes is None or param.dtype.scalar() in param_dtypes) and param.src and param.src[0].op is Ops.CONST and \
-    (out_slot is None or param.arg.slot != out_slot) else None
-
 def _reduction_post_parts(value:UOp, output_dtype:DType, *, strict:bool=False) -> tuple[float, UOp|None, UOp|None]|None:
   local_refs = [u for u in value.toposort() if _local_load(u) is not None]
   if strict and (value.op is Ops.SQRT and len(value.src) == 1 or
@@ -668,10 +654,6 @@ def _reduction_post_parts(value:UOp, output_dtype:DType, *, strict:bool=False) -
   if strict or not local_refs: return None
   return 1.0, value, next((u for u in local_refs if u.dtype.scalar() is output_dtype.scalar()), local_refs[-1])
 
-def _reduction_arena(rows:int, groups:int, slot:int) -> tuple[int, int, Callable[[int], RKArg], list[int]]:
-  stride = round_up(rows*2, 64)
-  return stride, stride//2, lambda offset=0: RKArg(RKBufferKind.SCRATCH, slot, offset), [i*stride for i in range(groups)]
-
 def _spaced_reduction(ops:list[RKEWOp], mid:list[RKGather], source:RKArg, count:int, allocate:Callable[[int], RKArg], cfg:int,
                       *, int16:bool=False) -> RKArg:
   stride = round_up(2, 64); spaced = allocate(count*stride//2)
@@ -682,9 +664,6 @@ def _lower_composed_uops(uops:list[UOp], *, recipes_ready:bool=False) -> RKImage
   image = _lower_uop_program(uops, vectorize_reductions=False, recipes_ready=recipes_ready)
   if image is None: raise RuntimeError("RKPLAN_REJECT:composed_uops")
   return image
-
-def _lower_mapped_uops(store:UOp) -> RKImage|None:
-  return _lower_uop_program(list(UOp(Ops.SINK, src=(store,)).toposort()), vectorize_reductions=False, recipes_ready=True)
 
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append an in-place EW image, scheduling its input materialization after the first image completes."""
@@ -699,10 +678,6 @@ def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   return RKImage(RKTarget.RK3588, scratch, first.constants+second.constants,
                  gathers=first.gathers, ew_ops=first.ew_ops+second_ops, mid_gathers=first.mid_gathers+second_mid,
                  gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers))
-
-def _lower_post_image(store:UOp, out_index:UOp, root:UOp, substitutions:dict[UOp, UOp]) -> RKImage|None:
-  rs = {axis:axis.replace(src=(axis.src[0],)) for axis in _index_ranges(out_index) if len(axis.src) > 1}
-  return _lower_mapped_uops(store.replace(src=(store.src[0].substitute(rs),root.substitute(substitutions).substitute(rs),*store.src[2:])))
 
 def _flat_static_ranges(ranges:Iterable[UOp], dtype:DType=dtypes.int) -> tuple[UOp, int]:
   flat, groups = UOp.const(0, dtype), 1
@@ -863,36 +838,6 @@ def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:
       reduced.append(lhs)
     active = reduced + (active[-1:] if len(active) & 1 else [])
   return out if out is not None else arena(active[0])
-
-def _compensated_add(ops:list[RKEWOp], active:list[int], count:int, arena:Callable[[int], RKArg],
-                     temporary:Callable[[int], RKArg], out:RKArg, op_barriers:bool=False) -> RKArg:
-  """Reduce aligned FP16 vectors with TwoSum residuals retained in consumed arena lanes."""
-  errors:list[int] = []
-  while len(active) > 1:
-    reduced:list[int] = []
-    for lhs,rhs in zip(active[::2], active[1::2]):
-      total, delta = temporary(0), temporary(1)
-      ops.extend(_ew_ops(((total, arena(lhs), arena(rhs), Ops.ADD), (delta, total, arena(lhs), Ops.SUB),
-        (arena(rhs), arena(rhs), delta, Ops.SUB), (delta, total, delta, Ops.SUB),
-        (arena(lhs), arena(lhs), delta, Ops.SUB), (arena(rhs), arena(lhs), arena(rhs), Ops.ADD),
-        (arena(lhs), total, total, Ops.MAX)), count, op_barriers, op_barriers))
-      reduced.append(lhs); errors.append(rhs)
-    active = reduced + (active[-1:] if len(active)&1 else [])
-  residual = _reduce_arena(ops, errors, count, _EW_CFG[Ops.ADD], arena, op_barriers=op_barriers)
-  ops.append(RKEWOp(out, arena(active[0]), residual, count, _EW_CFG[Ops.ADD], submit_barrier=op_barriers, stateful=op_barriers))
-  return out
-
-def _kahan_add(ops:list[RKEWOp], active:list[int], count:int, arena:Callable[[int], RKArg],
-               temporary:Callable[[int], RKArg], out:RKArg, op_barriers:bool=False) -> RKArg:
-  """Accumulate physical lanes literally with Kahan correction for mixed-sign FP16 sums."""
-  if not active: raise ValueError("empty Kahan reduction")
-  total, correction, adjusted, updated = (temporary(i) for i in range(4))
-  ops.extend(_ew_ops(itertools.chain(
-    ((total, arena(active[0]), arena(active[0]), Ops.MAX), (correction, arena(active[0]), arena(active[0]), Ops.SUB)),
-    *(((adjusted, arena(offset), correction, Ops.SUB), (updated, total, adjusted, Ops.ADD),
-       (correction, updated, total, Ops.SUB), (correction, correction, adjusted, Ops.SUB),
-       (total, updated, updated, Ops.MAX)) for offset in active[1:]), ((out, total, total, Ops.MAX),)), count, op_barriers, op_barriers))
-  return out
 
 def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""

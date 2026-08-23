@@ -310,7 +310,7 @@ def test_static_vector_values_match_scalar_typed_evaluation():
     expected = [None]*20
     for env in rockchip_renderer._iter_range_env([outer, inner]):
       cache = {}
-      expected[rockchip_renderer._eval_int(out_index, env, cache)] = encode(rockchip_renderer._eval_expr(expr, env, cache))
+      expected[int(rockchip_renderer._eval_expr(out_index, env, cache))] = encode(rockchip_renderer._eval_expr(expr, env, cache))
     assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
 
 

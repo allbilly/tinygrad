@@ -7809,3 +7809,26 @@ therefore remains pending a fresh-boot pre-health gate, the actual serial
 445-case NPU census through production `to_program`, and post-health on the
 same boot.  This milestone records a line-negative candidate and host proof,
 not hardware correctness or merge readiness.
+
+## 2026-08-23 — post-CMAC dead reduction cleanup
+
+This isolated milestone follows `ff99ce6b0` and removes code made unreachable
+by the compact CMAC replacement.  The predeclared and observed executable
+budget is exactly **+2/-47, net -45**.  Renderer size moves **2655 -> 2610**
+and repository total **28195 -> 28150**; runtime remains **472**.
+
+The deleted private functions are `_eval_int`, `_reduction_store`,
+`_reduction_input`, `_reduction_arena`, `_lower_mapped_uops`,
+`_lower_post_image`, `_compensated_add`, and `_kahan_add`.  The unused
+`_MAX_MAPPED_DOT_SCRATCH_BYTES` and
+`_MIN_GENERIC_PRODUCT_RESIDUAL_TERMS` bounds are also removed.  No production
+replacement was added: repository-wide symbol search found no caller for the
+reduction helpers, and `_eval_int`'s sole unit-test use now calls `_eval_expr`
+directly.  Generic native EW fallback and the production CMAC route are
+unchanged.
+
+Host verification reports **118 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 files**, Ruff
+success, clean diff checks, and exactly **445 tests collected** in the required
+Rockchip environment.  No device command or hardware claim is part of this
+dead-code milestone; the fresh-boot CMAC acceptance gate above remains pending.
