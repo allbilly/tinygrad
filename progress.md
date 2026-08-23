@@ -8254,6 +8254,48 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — remove obsolete raw bitcast specialization at 2,381 lines
+
+This isolated milestone follows `64bd2256e`.  Its predeclared and observed
+renderer budget is exactly **+1/-18 executable lines, net -17**.  Authoritative
+`sz.py` size moves renderer **2398 -> 2381** and repository total **27930 ->
+27913**; runtime remains **464**.
+
+The deleted `_lower_raw_fp16_bitcast` attempted to recover an emitted INT32
+kernel that paired adjacent FP16 representation lanes.  Current production
+`Tensor.bitcast` owns that operation as a zero-kernel movement, as required by
+the existing hardware census test's zero-submit contract.  Raw FP16 sign and
+payload arithmetic that does emit UOps already lowers through
+`_lower_uop_program` and `RKContext._raw`.  The old two-specializer dispatch
+loop is therefore replaced by a direct call to the still-live
+`_lower_fp16_uint8_cast`; no replacement helper, IR, runtime path, wire field,
+CPU/GPU numeric fallback, or test deletion is added.
+
+A return-profile over the original complete Rockchip UOp suite called the raw
+bitcast specializer **93** times and observed **zero** non-`None` admissions.
+The actual production `Tensor.schedule_linear` probe for a `2x3x4` FP16 tensor
+bitcast to INT32 observes zero scheduled kernels.  Its new regression sits
+beside the existing emitted-UOp raw-sign/payload test, which continues through
+the generic typed physical path.
+
+An immutable committed-parent/candidate lowering oracle records every nested
+`_lower_uop_program` return across the original suite: both sides produce
+exactly **264 outcomes / 248 RKImages**, byte-identical at aggregate SHA-256
+`2c4e7c19af00c2c24da2f170a6a688385a2d79b75fd124f163371e810ac13c45`.
+The promoted renderer and test SHA-256 values
+`45016665e16546a7a8575bee01702b19ea9366f22fbc4a4e6d4a4c35cf0e0173`
+and `9105fda4fb013ff8b2d573aec57c8f71a38c5f01633c68f070941a14a35f911e`
+exactly match the fully tested isolated prototype.
+
+Host verification reports **136 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full census command was run
+because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — nested weights and broad linear grids share CMAC planning at 2,398 lines
 
 This isolated milestone follows `1590f3038`.  Its predeclared and observed

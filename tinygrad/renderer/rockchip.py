@@ -725,24 +725,6 @@ def _int16_byte_bits(ops:list[RKEWOp], alloc:Callable[[], RKArg], const:dict[int
   result[0] = remainder
   return typing_cast(tuple[RKArg, ...], tuple(result))
 
-def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
-  """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
-  _, out_param, count, out_index, value = output
-  if count <= 0 or value.op is not Ops.BITCAST or value.dtype.scalar() is not dtypes.int or len(value.src) != 1: return None
-  if (packed:=value.src[0]).op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: return None
-  lanes:dict[int, RKTypedLoadPlan] = {}
-  for term in packed.src:
-    if (term.op is not Ops.SHL or len(term.src) != 2 or term.src[1].op is not Ops.CONST or (shift:=int(term.src[1].arg)) not in (0, 16)): return None
-    bitcast = _typed_cast_source(term.src[0], dtypes.uint, dtypes.ushort)
-    if bitcast is None or bitcast.op is not Ops.BITCAST or len(bitcast.src) != 1: return None
-    if len((load:=bitcast.src[0]).src) != 1 or \
-       (parsed:=_typed_load_plan(load, dtypes.half, out_index, count, require_offsets=True)) is None: return None
-    lanes[shift] = parsed
-  if len(lanes)<2 or lanes[0].param.arg != lanes[16].param.arg or any(a&1 or b!=a+1 for a,b in zip(*(lanes[i].offsets for i in (0,16)))): return None
-  gather = replace(_raw_gather(RKArg(RKBufferKind.ARG, lanes[0].param.arg.slot), out_param.arg.slot, count, itemsize=4,
-                               src_kind=RKBufferKind.ARG), axes=(), offsets=tuple(offset//2 for offset in lanes[0].offsets))
-  return RKImage(RKTarget.RK3588, gathers=(gather,))
-
 def _ordered_byte_less(ops:list[RKEWOp], allocate:Callable[[], RKArg], zero:RKArg, one:RKArg,
                        lhs_components:Iterable[RKArg], rhs_components:Iterable[RKArg], lanes:int) -> RKArg:
   less, equal = zero, one
@@ -2274,8 +2256,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   strict_output, local_output = (_admit(output, accepted) for output in (strict_output, local_output))
   if (cmac:=_try(local_output, (dtypes.half,dtypes.float), _lower_cmac_reduction, uops, v=vectorize_reductions)) is not None: return cmac
   if (scatter:=_try(strict_output, (dtypes.half, dtypes.int16), _lower_host_scatter)) is not None: return scatter
-  for dtype, lower in ((dtypes.int, _lower_raw_fp16_bitcast), (dtypes.uchar, _lower_fp16_uint8_cast)):
-    if (output:=_admit(strict_output, dtype)) is not None and (image:=lower(output)) is not None: return image
+  if (image:=_try(strict_output, dtypes.uchar, _lower_fp16_uint8_cast)) is not None: return image
   if (bool_output:=_admit(strict_output, dtypes.bool)) is not None and \
      (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_half_image(bool_output, nonzero, True, bool_output=True)
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):

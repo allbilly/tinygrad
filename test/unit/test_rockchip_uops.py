@@ -530,6 +530,12 @@ def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
   assert decode_image(encode_image(image)) == image
 
 
+def test_production_fp16_pair_bitcast_remains_zero_kernel_movement():
+  with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP", 24, dtypes.half, num=1001)).reshape(2,3,4)
+    assert not source.bitcast(dtypes.int).schedule_linear().src
+
+
 def test_zero_count_raw_fp16_bitcast_uses_empty_generic_image():
   lhs, rhs = UOp.param(1, dtypes.half, (0,)), UOp.param(2, dtypes.half, (0,))
   def packed(i):
