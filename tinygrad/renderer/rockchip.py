@@ -637,29 +637,22 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     (_strip_cast(root),) if additive else ()
   terms = tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)); groups = len(terms)
   if local_loads and not local_add or groups < (1 if additive else 4) or groups > _MAX_GENERIC_UNROLL: return None
-  try: envs = _iter_range_env(_index_ranges(out_index))
-  except RuntimeError: return None
-  if len(envs) != rows or tuple(int(_eval_expr(out_index, env, {})) for env in envs) != tuple(range(rows)): return None
-  CMACSource = tuple[int, tuple[int, ...]]
   # Charge each term before materializing its output offsets, so rejection never builds beyond the selector-cell cap.
-  parsed:list[tuple[tuple[CMACSource, ...], float]] = []; cells = 0
+  parsed:list[tuple[tuple[RKTypedLoadPlan, ...], float]] = []; cells = 0
   for term in terms:
     factors = tuple(map(_strip_cast, _iter_binary(_strip_cast(term), Ops.MUL, plain=True)))
     constants, loads = tuple(node for node in factors if node.op is Ops.CONST), tuple(node for node in factors if node.op is not Ops.CONST)
-    if len(constants) > 1 or constants and scale != 1.0 or len(loads) not in (1,2) or any(load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 1 or load.src[0].op is not Ops.INDEX for load in loads): return None  # noqa: E501
-    params = tuple(_root_param(load.src[0]) for load in loads)
-    if any(param is None or param.dtype.scalar() is not dtypes.half or not param.src or param.src[0].op is not Ops.CONST for param in params): return None  # noqa: E501
+    if len(constants) > 1 or constants and scale != 1.0 or len(loads) not in (1,2) or any(len(load.src) > 1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0 or math.copysign(1.0,float(load.src[1].arg)) < 0.0) for load in loads): return None  # noqa: E501
     weight = scale*(float(constants[0].arg) if constants else 1.0)
     if not math.isfinite(weight) or len(loads) == 1 and float_to_fp16(weight) != weight or len(loads) == 2 and weight != 1.0 or rows*len(loads) > _MAX_DYNAMIC_SELECTOR_CELLS-cells: return None  # noqa: E501
-    try: sources = tuple((typing_cast(UOp,param).arg.slot, tuple(int(_eval_expr(load.src[0].src[1],env,{})) for env in envs)) for load,param in zip(loads,params))  # noqa: E501
-    except (RuntimeError,ValueError): return None
-    if any(min(values) < 0 or max(values) >= int(typing_cast(UOp,param).src[0].arg) for param,(_,values) in zip(params,sources)): return None
-    parsed.append((sources,weight)); cells += rows*len(loads)
+    plans = typing_cast(tuple[RKTypedLoadPlan, ...], tuple(_typed_load_plan(load,dtypes.half,out_index,rows,require_offsets=True) for load in loads))  # noqa: E501
+    if any(plan is None for plan in plans): return None
+    parsed.append((plans,weight)); cells += rows*len(loads)
   # A is row-stable and B is column-stable; explicit offset tables allow source-stride differences and broadcasts.
-  def align(m:int, n:int) -> tuple[tuple[CMACSource|None,CMACSource|None,float], ...]:
-    aligned:list[tuple[CMACSource|None,CMACSource|None,float]] = []
+  def align(m:int, n:int) -> tuple[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float], ...]:
+    aligned:list[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float]] = []
     for operands,weight in parsed:
-      row,col = zip(*((all(values[i*n+j] == values[i*n] for i in range(m) for j in range(n)),all(values[i*n+j] == values[j] for i in range(m) for j in range(n))) for _,values in operands))  # noqa: E501
+      row,col = zip(*((all(plan.offsets[i*n+j] == plan.offsets[i*n] for i in range(m) for j in range(n)),all(plan.offsets[i*n+j] == plan.offsets[j] for i in range(m) for j in range(n))) for plan in operands))  # noqa: E501
       order = ((0,None) if row[0] else (None,0) if col[0] else None) if len(operands) == 1 else (0,1) if row[0] and col[1] else (1,0) if row[1] and col[0] else None  # noqa: E501
       if order is None: return ()
       aligned.append((None if order[0] is None else operands[order[0]],None if order[1] is None else operands[order[1]],weight))
@@ -673,8 +666,8 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
       m = n = rows; diagonal = True; normalized = tuple((operands[0],operands[1] if len(operands) == 2 else None,weight) for operands,weight in parsed)  # noqa: E501
   ai,ao,_ = _cmac_layout(m,n,groups)
   if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1: return None
-  a_cells = tuple(((source[0],source[1][row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
-  b_cells = tuple(((source[0],source[1][ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
+  a_cells = tuple(((source.param.arg.slot,source.offsets[row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
+  b_cells = tuple(((source.param.arg.slot,source.offsets[ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
   def gather_surface(dst:int, cells:tuple[tuple[int|None,int], ...]) -> tuple[RKGather, ...]:
     sources = tuple(dict.fromkeys(source for source,_ in cells if source is not None)); values = tuple(value if source is None else 0 for source,value in cells); seeded = not sources or any(values)  # noqa: E501
     return ((RKGather(out.arg.slot,dst,len(cells),values=values),) if seeded else ()) + tuple(RKGather(source,dst,len(cells),offsets=tuple(value if owner == source else -1 for owner,value in cells),partial=seeded or bool(i)) for i,source in enumerate(sources))  # noqa: E501

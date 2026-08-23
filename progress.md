@@ -8254,6 +8254,63 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — zero-gated padded contractions share CMAC typed loads at 2,412 lines
+
+This isolated milestone follows `5f281daad`.  Its predeclared and observed
+renderer budget is exactly **+10/-17 executable lines, net -7**.
+Authoritative `sz.py` size moves renderer **2419 -> 2412** and repository
+total **27951 -> 27944**; runtime remains **464**.
+
+`_lower_cmac_reduction` now reuses `_typed_load_plan(...,
+require_offsets=True)` for source typing, output-lane enumeration, gate
+evaluation, argument ownership, and bounds validation.  This replaces its
+private range environment, output-index evaluator, `CMACSource` record, LOAD
+parser, offset evaluator, and manual source-bound check.  The selector-cell
+cap is still charged before any offset table is materialized.  No generic IR,
+wire field, runtime phase, retry/reset behavior, CPU/GPU numeric fallback, or
+CMAC-to-EW sequence is added.
+
+The shared plan admits only direct HALF loads or gated HALF loads whose
+compile-time default is exact positive `+0.0`; `-0.0`, nonzero defaults,
+unsupported gates, malformed loads, and out-of-bounds live lanes fail closed
+to the existing EW path.  Zero-gated padding can therefore populate the
+existing raw CMAC surfaces without a second address interpreter.
+
+The actual production `Tensor.schedule_linear -> to_program` path for a
+`(1,4,9,9)` input and `(4,4,3,3)` weights with padding one changes from
+**2,213 EW stages / 72 gathers / 134,168 encoded bytes** to one native CMAC
+`(M,N,K) = (4,81,36)` with **zero EW stages / two gathers / 39,893 encoded
+bytes**.  The parent and candidate image SHA-256 values are respectively
+`1a365110d969580267c10a5c7001684731de699eee956608009c15001c90c979`
+and `1de6b9773377abed515eff87d7034cfd703877b73f03255fb4eb6a9ae40213f2`.
+A physical packing oracle materializes both scratch surfaces and verifies
+their FP32 matrix product exactly equals a direct padded convolution.
+
+Host-only production classification also admits stride-two padding as
+`(4,25,36)`, dilation-two padding as `(4,81,36)`, and asymmetric padding as
+`(4,72,36)`, each with two gathers and no EW stages.  A **200-case** exact
+small-integer packing/mathematical oracle covers those four families; its
+ordered surface SHA-256 is
+`d47cdcf88170866341df65d498d5f52a15983529990505284ec37f95faf4129d`.
+Batched padded convolution remains an honest EW fallback.
+
+A committed-parent/candidate oracle observed all **251 pre-existing lowering
+outcomes**.  Every admission result and encoded image is byte-identical on
+both sides at aggregate SHA-256
+`c6b39952ebda64090a6a758db55ee039b0d0434b9715a1ff7caa1240e50ccae4`.
+The new production regression separately checks raw packing arithmetic,
+codec round-trip, native execution class, and `-0.0`/nonzero-default
+rejection.
+
+Host verification reports **133 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full hardware census command was
+run because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — short FP32 contractions use compact CMAC records at 2,419 lines
 
 This isolated milestone follows `7eeee5d97`.  Its predeclared and observed

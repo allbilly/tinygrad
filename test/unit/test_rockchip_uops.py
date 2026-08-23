@@ -1,4 +1,4 @@
-import ctypes, hashlib, itertools, math, struct
+import ctypes, functools, hashlib, itertools, math, struct
 import numpy as np
 from collections.abc import Callable
 from dataclasses import replace
@@ -936,6 +936,40 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
   np.testing.assert_array_equal(packed_rhs[:4,:5], rhs_values.T)
   np.testing.assert_array_equal(packed_lhs[:,:5].astype(np.float32)@packed_rhs[:4,:5].T.astype(np.float32),
                                 lhs_values.reshape(3,5).astype(np.float32)@rhs_values.astype(np.float32))
+
+
+def test_zero_gated_padded_convolution_routes_production_cmac():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",324,dtypes.half,num=1012)).reshape(1,4,9,9)
+    weight = Tensor(UOp.new_buffer("ROCKCHIP",144,dtypes.half,num=1013)).reshape(4,4,3,3)
+    ast = source.conv2d(weight,padding=1).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (4,81,36)
+  assert not image.ew_ops and len(image.gathers) == 2 and any(offset < 0 for gather in image.gathers for offset in gather.offsets)
+  source_values = (np.arange(324)%5-2).astype(np.float16).reshape(1,4,9,9)
+  weight_values = (np.arange(144)%5-2).astype(np.float16).reshape(4,4,3,3)
+  sources = {1:source_values.view(np.uint16).reshape(-1),2:weight_values.view(np.uint16).reshape(-1)}
+  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  for gather in image.gathers:
+    destination,offsets = scratch[gather.dst_index],np.asarray(gather.offsets)
+    valid = offsets >= 0
+    if not gather.partial: destination[:gather.count] = gather.fill_bits
+    destination[:gather.count][valid] = sources[gather.src_index][offsets[valid]]
+  packed_weight = scratch[image.cmac.lhs.index].view(np.float16).reshape(4,96)
+  packed_source = scratch[image.cmac.rhs.index].view(np.float16).reshape(6,3,16,32).transpose(0,2,1,3).reshape(96,96)
+  expected = np.asarray([[sum(float(weight_values[oc,ic,ky,kx])*float(source_values[0,ic,y+ky-1,x+kx-1])
+    for ic in range(4) for ky in range(3) for kx in range(3) if 0 <= y+ky-1 < 9 and 0 <= x+kx-1 < 9)
+    for y in range(9) for x in range(9)] for oc in range(4)],dtype=np.float32)
+  np.testing.assert_array_equal(packed_weight[:,:36].astype(np.float32)@packed_source[:81,:36].T.astype(np.float32),expected)
+  assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
+  out,lhs,rhs = UOp.param(0,dtypes.half,(1,)),UOp.param(1,dtypes.half,(4,)),UOp.param(2,dtypes.half,(4,))
+  for fill in (-0.0,1.0):
+    terms = [lhs.index(UOp.const(-1,dtypes.int)).load(UOp.const(fill,dtypes.half),UOp.const(False,dtypes.bool))*rhs.index(i).load()
+             for i in range(4)]
+    fallback = _lower_uop_program(list(out.index(0).store(functools.reduce(lambda total,term:total+term,terms[1:],terms[0])).sink().toposort()))
+    assert fallback is not None and fallback.cmac is None and fallback.ew_ops
 
 
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
