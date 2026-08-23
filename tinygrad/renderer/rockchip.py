@@ -281,7 +281,6 @@ def _native_word_fields(word:int) -> tuple[int, int, int]:
 def _native_route_contract(native:RKNativeOp) -> None:
   refs = native.reads + native.writes
   if native.kind is RKNativeKind.CMAC:
-    expected_args:tuple[RKArg, ...]
     if native.flags != 0: raise ValueError("native CMAC controls mismatch")
     if len(native.commands) != 46 or hashlib.sha256(struct.pack("<46Q", *native.commands)).digest() != _CMAC_BODY_SHA256 or native.tail != _CMAC_TAIL:
       raise ValueError("native CMAC command template mismatch")
