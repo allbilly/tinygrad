@@ -5,7 +5,7 @@ import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
-  RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+  emit_cmac_stage, RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -92,9 +92,10 @@ class RockchipProgram(Program['RockchipDevice']):
       return new
     return buf
 
-  def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
+  def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False, retry:bool=True) -> None:
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
-    for attempt in range(_SUBMIT_RETRIES+1):
+    retries = _SUBMIT_RETRIES if retry else 0
+    for attempt in range(retries+1):
       try:
         for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
         rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
@@ -105,7 +106,7 @@ class RockchipProgram(Program['RockchipDevice']):
         break
       except TimeoutError:
         self.dev.timeout_retries += 1
-        if attempt == _SUBMIT_RETRIES: raise
+        if attempt == retries: raise
         self.dev.reset_npu()
     self.submit_count += 1
     self.dev.submit_count += 1
@@ -155,6 +156,21 @@ class RockchipProgram(Program['RockchipDevice']):
     desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(commands), 0, self._dma(cmd))
     ctypes.memmove(int(task.va_addr), ctypes.addressof(desc), _TASK_DESC_BYTES)
     self._submit(cmd, task, 1, standalone=True)
+
+  def _run_cmac(self, address) -> None:
+    """Run one fixed CMAC body with its proven terminal tail and no timeout replay."""
+    if (op:=self.image.cmac) is None: return
+    body = patch_stage(emit_cmac_stage(op), address)
+    commands = body+(_pc(0x0001,0), _pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),
+      _pc(rk.TARGET_VERSION,0), _pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd))
+    cmd = self._ensure_buffer("_standalone_cmd_buf", len(commands)*8+_CMD_PREFETCH_GUARD, _CMD_BUF_MIN)
+    task = self._ensure_buffer("_standalone_task_buf", _TASK_DESC_BYTES, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
+    ctypes.memset(int(cmd.va_addr),0,len(commands)*8+_CMD_PREFETCH_GUARD)
+    ctypes.memmove(int(cmd.va_addr),(ctypes.c_uint64*len(commands))(*commands),len(commands)*8)
+    desc = rk.struct_rknpu_task(0,0,0xd,0x300,0x1ffff,0,len(body),0,self._dma(cmd))
+    ctypes.memmove(int(task.va_addr),ctypes.addressof(desc),_TASK_DESC_BYTES)
+    self.dev.reset_npu()
+    self._submit(cmd,task,1,standalone=True,retry=False)
 
   def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
     """Convert aligned four-lane atoms on DPU; host movement preserves raw lane representations."""
@@ -423,6 +439,7 @@ class RockchipProgram(Program['RockchipDevice']):
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
     if self.image.ew_ops: self.dev._native_int16 = native_int16
+    if self.image.cmac is not None: self._run_cmac(address)
     if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if self.image.host_scatters:
       touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \

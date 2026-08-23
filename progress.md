@@ -7748,3 +7748,64 @@ performed.  The production/test tree therefore remains the pre-CMAC
 `910d3f9e5ff41957d8c3be3bf4cad7be6486ef8f` state.  CMAC commits, bundles,
 reports, and LUT patches remain outside this source tree for provenance only;
 no CPU/GPU numeric fallback or repair is admitted.
+
+## 2026-08-23 — compact broad-CMAC line-cut candidate (hardware pending)
+
+This isolated candidate starts from recovery parent `74093caf8` and is not a
+shared-tree acceptance or a reversal of the timeout evidence above.  It
+replaces the duplicated EW sum/dot specializers with one production
+`to_program` CMAC route while retaining generic native EW fallback for
+unsupported math, activations, extrema, predicates, dynamic addressing, and
+mixed reductions.  Packing and output extraction use existing raw-lane
+gathers; there is no CPU/GPU numeric reduction or matmul fallback.
+
+The predeclared executable budget was at most **+206 additions**, at least
+**-301 deletions**, and net at most **-95**.  Tokenized executable-line diff
+against the parent is **+169/-319, net -150**: renderer **+150/-315** and
+runtime **+19/-4**.  `sz.py` moves renderer **2820 -> 2655**, runtime
+**457 -> 472**, and repository total **28345 -> 28195**.  The replacement
+surface is `RKCMAC`, `_cmac_layout`, `_validate_cmac`, `emit_cmac_stage`,
+`_lower_cmac_reduction`, and `RockchipProgram._run_cmac`.  It makes these nine
+old functions obsolete and removes them:
+
+- `_product_residual_ops`
+- `_lower_dot_loop_reduction`
+- `_lower_scalar_loop_reduction`
+- `_finish_mapped_add_reduction`
+- `_append_mapped_product_residual`
+- `_lower_mapped_add_loop_reduction`
+- `_lower_vectorized_unrolled_add_reduction`
+- `_lower_vectorized_mul_add_reduction`
+- `_lower_multi_scalar_local_reductions`
+
+The matcher covers direct and loop `ADD` reductions, unrolled pure sums and
+dots, dense matmul/matvec factorization, non-affine static K permutations,
+paired batched dots through diagonal extraction, and FP16 or FP32 storage.
+It emits one 45-qword CNA/CORE/DPU body with three relocations and a separately
+owned four-qword PC tail.  It fails closed on invalid scratch extents, more
+than one row above the donor's 384-channel CBUF boundary, excessive packing,
+or unsupported semantics.  A CMAC timeout is never replayed.
+
+Host evidence for this candidate:
+
+- the emitted 45-qword body matched `/home/orangepi/rk3588/examples/gemm.py`
+  exactly for `(M,N,K,out) = (1,4,32,fp16)`, `(3,4,5,fp16)`,
+  `(8,16,32,fp16)`, `(1,128,128,fp32)`, and `(256,256,256,fp16)`;
+- the production `to_program` path selects CMAC for a real `3x5 @ 5x4`
+  Tensor matmul and a scalar half-to-FP32 Tensor sum;
+- `python -m pytest test/unit/test_rockchip_uops.py -q -n12` reports
+  **118 passed**;
+- `python -m mypy tinygrad/` reports no issues in **216 files**;
+- `python -m ruff check .` passes;
+- the required Rockchip environment collects exactly **445 tests** without
+  opening the device.
+
+A private attempt to replay all collected cases through host compilation was
+terminated when generic `logcumsumexp` expansion became pathological; it is
+inconclusive and is not counted as a pass.  No hardware ioctl, census, or
+`simple_add.py` health command was run because the board still requires a
+fresh proven boot after the rejected CMAC poisoned-state evidence.  Acceptance
+therefore remains pending a fresh-boot pre-health gate, the actual serial
+445-case NPU census through production `to_program`, and post-health on the
+same boot.  This milestone records a line-negative candidate and host proof,
+not hardware correctness or merge readiness.
