@@ -8022,3 +8022,45 @@ repository-wide Ruff success, clean diff checks, and exactly **445 tests
 collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
 health, reset, reboot, or hardware census command was run; fresh-boot CMAC
 acceptance and its pre/post `simple_add.py` bracket remain pending.
+
+## 2026-08-24 — remove one-caller scalar-local plumbing
+
+This isolated milestone follows `995748f23`.  Its predeclared renderer budget
+was at most **+19 additions**, at least **-36 deletions**, and net at most
+**-17 executable source lines**.  The observed raw renderer diff is
+**+16/-37, net -21**.  Authoritative `sz.py` size moves renderer **2547 ->
+2530** and repository total **28079 -> 28062** (**-17**); runtime remains
+**464**.
+
+The fixed scalar-local extrema path no longer routes its sole call through
+generic `_flat_static_ranges`, `_static_local_descriptor`, and
+`_lower_static_local_child` wrappers.  Their exact constant-loop validation,
+row-major flattening, child `to_program` lowering, host-address rejection, and
+scratch materialization now remain visibly at the call site.  The sole
+`_lower_composed_uops` caller likewise invokes `_lower_uop_program` directly
+and preserves the same `RKPLAN_REJECT:composed_uops` failure.  No new IR,
+admission rule, runtime path, wire field, CPU/GPU fallback, or test deletion
+was introduced.
+
+The first candidate also removed `_output_store`, but two admission-limit
+tests intentionally use that helper as a direct production parser probe.  The
+full corpus exposed the mistake; the helper and its production caller were
+restored rather than changing those tests.  A whole-repository symbol audit
+then confirmed that each of the four removed helpers had exactly one caller
+and no test or runtime consumer.
+
+A committed-parent/candidate lowering oracle observed **242 outcomes / 226
+RKImages** across all Rockchip UOp tests.  Every admission result and encoded
+image is byte-identical; both sides have aggregate SHA-256
+`c62655755cab3cb37a04484aafc05aaf6e8a174b41d20bdf88bed9b5926d5a8b`.
+Seven actual production `Tensor.schedule_linear -> to_program` programs
+(argmax, bool cast, uint8 cast, sum, mean, multi-axis sum, and matmul) are also
+byte-identical, with aggregate record SHA-256
+`36bde9d0ded5569f6ac34882fe7a723b1994bcf34d613816f6db6a2f1a46def8`.
+
+Host verification reports **127 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, or hardware census command was run; fresh-boot CMAC
+acceptance and its pre/post `simple_add.py` bracket remain pending.

@@ -615,11 +615,6 @@ def _spaced_reduction(ops:list[RKEWOp], mid:list[RKGather], source:RKArg, count:
   mid.append(RKGather(source.index, spaced.index, count, axes=((1, count, 1),), dst_stride=stride//2, src_kind=RKBufferKind.SCRATCH, after=len(ops)))
   return _reduce_rows(ops, [replace(spaced, addend=lane*stride) for lane in range(count)], 1, cfg, int16=int16)
 
-def _lower_composed_uops(uops:list[UOp], *, recipes_ready:bool=False) -> RKImage:
-  image = _lower_uop_program(uops, vectorize_reductions=False, recipes_ready=recipes_ready)
-  if image is None: raise RuntimeError("RKPLAN_REJECT:composed_uops")
-  return image
-
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append an in-place EW image, scheduling its input materialization after the first image completes."""
   if first.post_gathers or not second.ew_ops or second.host_gathers or second.host_scatters: return None
@@ -633,13 +628,6 @@ def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   return RKImage(RKTarget.RK3588, scratch, first.constants+second.constants,
                  gathers=first.gathers, ew_ops=first.ew_ops+second_ops, mid_gathers=first.mid_gathers+second_mid,
                  gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers))
-
-def _flat_static_ranges(ranges:Iterable[UOp], dtype:DType=dtypes.int) -> tuple[UOp, int]:
-  flat, groups = UOp.const(0, dtype), 1
-  for axis in reversed(tuple(ranges)):
-    flat = flat.alu(Ops.ADD, axis.alu(Ops.MUL, axis.const_like(groups)))
-    groups *= int(axis.src[0].arg)
-  return flat, groups
 
 def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> Iterable[UOp]:
   stack = [root]
@@ -1143,8 +1131,9 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   if count <= 0: return RKImage(RKTarget.RK3588)
   out_slot, replacement = out_param.arg.slot, store.replace(src=(store.src[0].replace(dtype=dtypes.half,
     src=(out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half)), *store.src[0].src[1:])), value, *store.src[2:]))
-  image = _lower_composed_uops(list(replacement.toposort())) if int32 else \
-    _lower_composed_uops(list(UOp(Ops.SINK, src=(replacement,)).toposort()), recipes_ready=True)
+  image = _lower_uop_program(list(replacement.toposort()), vectorize_reductions=False) if int32 else \
+    _lower_uop_program(list(UOp(Ops.SINK, src=(replacement,)).toposort()), vectorize_reductions=False, recipes_ready=True)
+  if image is None: raise RuntimeError("RKPLAN_REJECT:composed_uops")
   terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
   if terminal != [len(image.ew_ops)-1] or image.mid_gathers or image.post_gathers:
     raise RuntimeError("RKPLAN_REJECT:predicate_terminal" if int32 else "RKPLAN_REJECT:uint8_terminal")
@@ -2282,13 +2271,6 @@ def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
 class _RKStaticLocalDef:
   initial:UOp; update_op:Ops; term:UOp; loops:tuple[UOp, ...]
 
-def _static_local_descriptor(buffer:UOp, definition:_RKStaticLocalDef, dtype:DType, op:Ops, initial:float,
-                             *, minimum:int=1, maximum:int|None=None) -> tuple[int, ...]|None:
-  if buffer.dtype.scalar() is not dtype or definition.update_op is not op or definition.initial.op is not Ops.CONST or \
-     float(definition.initial.arg) != initial or not definition.loops: return None
-  extents = tuple(int(loop.src[0].arg) for loop in definition.loops if loop.src[0].op is Ops.CONST)
-  return extents if len(extents) == len(definition.loops) and all(minimum <= extent and (maximum is None or extent <= maximum) for extent in extents) else None  # noqa: E501
-
 def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticLocalDef]:
   """Parse scalar local accumulators without assigning tensor-operation meaning to their loops."""
   definitions:dict[UOp, _RKStaticLocalDef] = {}
@@ -2313,17 +2295,6 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
     definitions[buffer] = _RKStaticLocalDef(initializers[0], *updates[0])
   return definitions
 
-def _lower_static_local_child(definition:_RKStaticLocalDef, slot:int, dtype:DType=dtypes.half, *, end:bool=False,
-                              recipes_ready:bool=False, materialize:int|None=None) -> tuple[UOp, RKImage, int]|None:
-  flat, groups = _flat_static_ranges(definition.loops)
-  if groups > _MAX_STATIC_RANGE_ENVS: return None
-  fake = UOp.param(slot, dtype, (groups,))
-  store = fake.index(flat).store(definition.term).end(*definition.loops) if end else fake.index(flat).store(definition.term)  # noqa: E501
-  child = _lower_uop_program(list(store.sink().toposort()), vectorize_reductions=False, recipes_ready=recipes_ready)  # noqa: E501
-  if child is None or materialize is not None and (child.host_gathers or child.host_scatters): return None
-  if materialize is not None: target = RKArg(RKBufferKind.SCRATCH, len(child.scratch)); child = replace(_alias_image_args(child, {slot:target}), scratch=child.scratch+(RKScratch(_scratch_bytes(materialize)),))  # noqa: E501
-  return fake, child, groups
-
 def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Vectorize two dependent scalar local MAX accumulators without assigning meaning to their tensor source."""
   _, out_param, count, _, root = output
@@ -2331,9 +2302,10 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   try: definitions = _static_local_defs(uops, {buffer for u in uops if u.op is Ops.BUFFER and (buffer:=_local_buffer(u)) is not None})
   except _RKGenericReject: return None
   limit = min(32767, _MAX_EW_ELEMS_FP16)
-  descriptors = {dtype:(buffer, definition, extents) for dtype,initial in ((dtypes.half,-math.inf),(dtypes.int,dtypes.int.min))
-                 for buffer,definition in definitions.items() if buffer.dtype.scalar() is dtype and
-                 (extents:=_static_local_descriptor(buffer, definition, dtype, Ops.MAX, initial, maximum=limit)) is not None}
+  descriptors = {dtype:(buffer, definition, tuple(int(loop.src[0].arg) for loop in definition.loops))
+    for dtype,initial in ((dtypes.half,-math.inf),(dtypes.int,dtypes.int.min)) for buffer,definition in definitions.items()
+    if buffer.dtype.scalar() is dtype and definition.update_op is Ops.MAX and definition.initial.op is Ops.CONST and
+    float(definition.initial.arg) == initial and definition.loops and all(loop.src[0].op is Ops.CONST and 1 <= int(loop.src[0].arg) <= limit for loop in definition.loops)}  # noqa: E501
   if (len(definitions) != 2 or set(descriptors) != {dtypes.half, dtypes.int} or
       descriptors[dtypes.half][2] != descriptors[dtypes.int][2]): return None
   (value_buffer,value_def,extents), (index_buffer,index_def,_) = descriptors[dtypes.half], descriptors[dtypes.int]
@@ -2358,8 +2330,15 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   if (slope:=output_delta//coordinate_delta)*coordinate_delta != output_delta: return None
   baseline = mapped_outputs[0]-slope*coordinates[0]
   if any(result != baseline+slope*value for value,result in zip(coordinates, mapped_outputs)) or not all(-32768 <= value <= 32767 for value in (*mapped_outputs, slope, baseline)): return None  # noqa: E501
-  if (child_data:=_lower_static_local_child(value_def, 1+max((u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None), default=out_param.arg.slot), end=True, materialize=total)) is None: return None  # noqa: E501
-  fake_param, child, _ = child_data; scratch = list(child.scratch); values = RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
+  flat = UOp.const(0, dtypes.int)
+  for index,axis in reversed(tuple(enumerate(value_def.loops))):
+    flat = flat.alu(Ops.ADD, axis.alu(Ops.MUL, axis.const_like(math.prod(extents[index+1:]))))
+  fake_param = UOp.param(1+max((u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None), default=out_param.arg.slot), dtypes.half, (total,))  # noqa: E501
+  child_store = fake_param.index(flat).store(value_def.term).end(*value_def.loops)
+  child = _lower_uop_program(list(child_store.sink().toposort()), vectorize_reductions=False)
+  if child is None or child.host_gathers or child.host_scatters: return None
+  target = RKArg(RKBufferKind.SCRATCH, len(child.scratch)); child = replace(_alias_image_args(child, {fake_param.arg.slot:target}), scratch=child.scratch+(RKScratch(_scratch_bytes(total)),))  # noqa: E501
+  scratch = list(child.scratch); values = RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
   def allocate(lanes:int=total) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
   ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers); mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)  # noqa: E501
   best = _spaced_reduction(ops, mid, values, total, allocate, _EW_CFG[Ops.MAX])
