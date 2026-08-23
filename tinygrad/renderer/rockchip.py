@@ -1,43 +1,30 @@
 from __future__ import annotations
 # ruff: noqa: E702
-import base64, functools, hashlib, heapq, itertools, math, os, struct
+import base64, functools, heapq, itertools, math, os, struct
 import numpy as np
 from dataclasses import astuple, dataclass, replace
 from enum import IntEnum
 from typing import Any, Callable, Iterable, Mapping, cast, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16
-from tinygrad.helpers import Target, ceildiv, round_up
+from tinygrad.helpers import ceildiv, round_up
 from tinygrad.renderer import Renderer
-from tinygrad.runtime.autogen import rockchip as rk, rockchip_physical as rkp
+from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, python_alu
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RKIMAGE_NATIVE_VERSION = b"RKIM", 31, 32
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 31
 _HEADER = struct.Struct("<4sHHHHHHIIIIII")  # magic/version/target, scratch/gather/host counts, ops/constants, phase split, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIii"), struct.Struct("<IIi")
 _HOST_ADDRESS, _EWOP = struct.Struct("<BBBBBHHHIIIIIIiiiiii"), struct.Struct("<BBHIIIIIIiii")
 _ITEM_FORMAT, _RKIMAGE_U16_MAX = {1:"B", 2:"H", 4:"I"}, (1 << 16) - 1
-_NATIVE_HEADER = struct.Struct("<4sHHHHHHHHHHHHIII")
-_NATIVE_ARG = struct.Struct("<BBHi")
-_NATIVE_RELOC = struct.Struct("<HHHBBHHi")
-_NATIVE_ASSET = struct.Struct("<I32sIIH")
-_NATIVE_TASK = struct.Struct("<8I")
-_NATIVE_SUBMIT = struct.Struct("<IIIiI")
-_NATIVE_RESET = struct.Struct("<II")
 
-# The generated catalog owns the physical command image, relocation fields,
-# and lifecycle tuples.  Renderer validation only admits those exact bytes;
-# addresses are supplied later by the physical runtime.
-_CMAC_BODY_SHA256 = bytes.fromhex(rkp.CMAC_V1_BODY_SHA256)
-_CMAC_TAIL, _CMAC_RELOCS = rkp.CMAC_V1_TAIL, rkp.CMAC_V1_RELOCATIONS
-_CMAC_TASK, _CMAC_SUBMIT, _CMAC_RESET = rkp.CMAC_V1_TASK, rkp.CMAC_V1_SUBMIT, rkp.CMAC_V1_RESET
 class RKTarget(IntEnum): RK3588 = 1
-class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1; ASSET = 2
+class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 class RKLayout(IntEnum): FP16 = 0; INT16 = 1; BOOL_MASK = 2; INT32 = 3; BOOL_INT16 = 4; INT_FP16 = 5
 class RKExecutionClass(IntEnum): NATIVE = 0; HOST_ADDRESS = 1
-class RKNativeKind(IntEnum): CMAC = 1
+
 @dataclass(frozen=True)
 class RKArg: kind: RKBufferKind; index: int; addend: int = 0
 
@@ -48,40 +35,6 @@ class RKValue:
 
 @dataclass(frozen=True)
 class RKScratch: size: int; alignment: int = 4096
-
-@dataclass(frozen=True)
-class RKNativeRelocation:
-  """A command-word field bound to a declared ARG or immutable ASSET reference."""
-  word_index: int; target: int; register: int; arg: RKArg; shift: int = 16; width: int = 32
-
-@dataclass(frozen=True)
-class RKNativeAsset:
-  """An immutable descriptor for bytes supplied by the physical runtime."""
-  asset_id: int; digest: bytes; size: int; ranges: tuple[tuple[int, int], ...] = (); flags: int = 0; payload: bytes = b""
-
-@dataclass(frozen=True)
-class RKNativeTask:
-  """The eight-word task descriptor consumed by the one-task CMAC submit."""
-  op_index: int; enable_mask: int; interrupt_mask: int; interrupt_clear: int
-  interrupt_status: int; regcfg_amount: int; regcfg_offset: int; reserved: int = 0
-
-@dataclass(frozen=True)
-class RKNativeSubmit:
-  """The generated PC/block/ping-pong submit controls for one task."""
-  flags: int = 5; timeout_ms: int = 6000; core_mask: int = 1; fence_fd: int = -1; task_count: int = 1
-
-@dataclass(frozen=True)
-class RKNativeReset:
-  """The generated action-6 reset tuple; the device must prove it is live."""
-  flags: int = 6; value: int = 0
-
-@dataclass(frozen=True)
-class RKNativeOp:
-  """One frozen CMAC stage: declared buffers/assets plus its exact wire lifecycle."""
-  kind: RKNativeKind; commands: tuple[int, ...]; relocs: tuple[RKNativeRelocation, ...]
-  reads: tuple[RKArg, ...] = (); writes: tuple[RKArg, ...] = (); outputs: tuple[RKArg, ...] = ()
-  tail: tuple[int, ...] = (); assets: tuple[RKNativeAsset, ...] = (); task: RKNativeTask = RKNativeTask(0, 0, 0, 0, 0, 0, 0)
-  submit: RKNativeSubmit = RKNativeSubmit(); reset: RKNativeReset = RKNativeReset(); flags: int = 0
 
 @dataclass(frozen=True)
 class RKGather:
@@ -116,11 +69,9 @@ class RKImage:
   gathers: tuple[RKGather, ...] = (); ew_ops: tuple[RKEWOp, ...] = ()
   mid_gathers: tuple[RKGather, ...] = (); gather_after: int = 0; post_gathers: tuple[RKGather, ...] = ()
   host_gathers: tuple[RKHostAddress, ...] = (); host_scatters: tuple[RKHostAddress, ...] = ()
-  native: RKNativeOp|None = None
 
   @property
-  def execution_class(self) -> RKExecutionClass:
-    return RKExecutionClass.HOST_ADDRESS if self.host_gathers or self.host_scatters else RKExecutionClass.NATIVE
+  def execution_class(self) -> RKExecutionClass: return RKExecutionClass(bool(self.host_gathers or self.host_scatters))
 
 def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg], *, map_value_src:bool=True) -> RKImage:
   def gather(v:RKGather) -> RKGather:
@@ -176,213 +127,7 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
 @dataclass(frozen=True)
 class RKStage: commands: tuple[int, ...]; relocs: tuple[tuple[int, RKArg], ...]
 
-def _native_int(value:Any, low:int, high:int, name:str) -> None:
-  if type(value) is not int or not low <= value <= high: raise ValueError(f"invalid RKNativeOp {name}")
-
-def _native_enum(value:Any, enum:type[IntEnum], name:str) -> None:
-  if type(value) is not enum: raise ValueError(f"invalid RKNativeOp {name}")
-
-def _native_arg(value:Any, name:str="argument") -> None:
-  if type(value) is not RKArg: raise ValueError(f"invalid RKNativeOp {name}")
-  _native_enum(value.kind, RKBufferKind, f"{name} kind")
-  _native_int(value.index, 0, _RKIMAGE_U16_MAX, f"{name} index")
-  _native_int(value.addend, -(1 << 31), (1 << 31)-1, f"{name} addend")
-
-def _native_args(values:Any, name:str) -> None:
-  if type(values) is not tuple or len(values) > _RKIMAGE_U16_MAX: raise ValueError(f"invalid RKNativeOp {name}")
-  for index,value in enumerate(values): _native_arg(value, f"{name}[{index}]")
-
-def _native_qwords(values:Any, name:str, *, required:bool=False) -> None:
-  if type(values) is not tuple or (required and not values) or len(values) > _RKIMAGE_U16_MAX:
-    raise ValueError(f"invalid RKNativeOp {name}")
-  for value in values: _native_int(value, 0, (1 << 64)-1, name)
-
-def _native_refs_unique(values:tuple[Any, ...], name:str) -> None:
-  if len(set(values)) != len(values): raise ValueError(f"duplicate native {name}")
-
-def _native_arg_zero(value:RKArg, name:str) -> None:
-  _native_arg(value, name)
-  if value.kind is not RKBufferKind.ARG or value.addend != 0: raise ValueError(f"invalid native {name} binding")
-
-def _native_route_contract(native:RKNativeOp) -> None:
-  """Validate the active CMAC resource, relocation, and lifecycle contract."""
-  refs = native.reads + native.writes
-  if native.kind is RKNativeKind.CMAC:
-    if native.flags != 0: raise ValueError("native CMAC controls mismatch")
-    if len(native.commands) != 46 or hashlib.sha256(struct.pack("<46Q", *native.commands)).digest() != _CMAC_BODY_SHA256 or native.tail != _CMAC_TAIL:
-      raise ValueError("native CMAC command template mismatch")
-    dynamic_rhs = (len(native.reads), len(native.writes), len(native.outputs), len(native.assets)) == (2, 1, 1, 0)
-    asset_rhs = (len(native.reads), len(native.writes), len(native.outputs), len(native.assets)) == (1, 1, 1, 1)
-    if not (dynamic_rhs or asset_rhs): raise ValueError("invalid native CMAC resources")
-    if native.outputs != native.writes: raise ValueError("native CMAC output ownership mismatch")
-    _native_refs_unique(refs, "CMAC references")
-    for index,arg in enumerate(refs): _native_arg_zero(arg, f"CMAC ref[{index}]")
-    if asset_rhs:
-      asset = native.assets[0]
-      if (asset.asset_id, asset.size, asset.digest, asset.ranges, asset.flags, asset.payload) != (
-        rkp.CMAC_V1_RHS_ASSET_ID, rkp.CMAC_V1_RHS_ASSET_SIZE, bytes.fromhex(rkp.CMAC_V1_RHS_ASSET_SHA256),
-        rkp.CMAC_V1_RHS_ASSET_RANGES, 0, rkp.CMAC_V1_RHS_ASSET_PAYLOAD):
-        raise ValueError("native CMAC asset contract mismatch")
-      reloc_refs = native.reads + (RKArg(RKBufferKind.ASSET, 0),) + native.outputs
-    else:
-      reloc_refs = native.reads + native.outputs
-    expected = tuple((word, target, register, arg, 16, 32)
-      for (word, target, register), arg in zip(_CMAC_RELOCS, reloc_refs))
-    actual = tuple((item.word_index, item.target, item.register, item.arg, item.shift, item.width) for item in native.relocs)
-    if actual != expected:
-      raise ValueError("native CMAC relocation contract mismatch")
-    if tuple(astuple(native.task)) != _CMAC_TASK or tuple(astuple(native.submit)) != _CMAC_SUBMIT or tuple(astuple(native.reset)) != _CMAC_RESET:
-      raise ValueError("native CMAC lifecycle contract mismatch")
-    return
-def _validate_native_image(image:RKImage) -> None:
-  if type(image) is not RKImage or type(image.target) is not RKTarget or image.native is None:
-    raise ValueError("invalid native RKImage")
-  _native_int(image.version, RKIMAGE_NATIVE_VERSION, RKIMAGE_NATIVE_VERSION, "image version")
-  if any(type(value) is not tuple for value in (image.scratch, image.gathers, image.ew_ops, image.mid_gathers, image.post_gathers,
-                                                image.host_gathers, image.host_scatters)) or image.gathers or image.ew_ops or image.mid_gathers or \
-     image.post_gathers or image.host_gathers or image.host_scatters or image.scratch or type(image.gather_after) is not int or \
-     image.gather_after != 0 or type(image.constants) is not bytes or image.constants:
-    raise ValueError("native RKImage cannot contain generic execution stages")
-  for index,spec in enumerate(image.scratch):
-    if type(spec) is not RKScratch: raise ValueError(f"invalid native scratch[{index}]")
-    _native_int(spec.size, 1, (1 << 32)-1, f"scratch[{index}] size")
-    _native_int(spec.alignment, 1, (1 << 32)-1, f"scratch[{index}] alignment")
-    if spec.alignment & (spec.alignment - 1): raise ValueError(f"invalid native scratch[{index}] alignment")
-  native = image.native
-  if type(native) is not RKNativeOp: raise ValueError("invalid native operation")
-  _native_enum(native.kind, RKNativeKind, "kind")
-  _native_int(native.flags, 0, _RKIMAGE_U16_MAX, "flags")
-  _native_qwords(native.commands, "commands", required=True); _native_qwords(native.tail, "tail")
-  _native_args(native.reads, "reads"); _native_args(native.writes, "writes"); _native_args(native.outputs, "outputs")
-  for name,values in (("relocations", native.relocs), ("assets", native.assets)):
-    if type(values) is not tuple or len(values) > _RKIMAGE_U16_MAX: raise ValueError(f"invalid native {name}")
-  _native_refs_unique(native.reads, "reads"); _native_refs_unique(native.writes, "writes"); _native_refs_unique(native.outputs, "outputs")
-  write_set = set(native.writes)
-  if any(value not in write_set for value in native.outputs): raise ValueError("native output is not a write")
-  reloc_words:set[int] = set(); declared = set(native.reads + native.writes + native.outputs)
-  for index,reloc in enumerate(native.relocs):
-    if type(reloc) is not RKNativeRelocation: raise ValueError(f"invalid native relocation[{index}]")
-    _native_int(reloc.word_index, 0, len(native.commands)-1, f"relocation[{index}] word")
-    _native_int(reloc.target, 0, _RKIMAGE_U16_MAX, f"relocation[{index}] target")
-    _native_int(reloc.register, 0, _RKIMAGE_U16_MAX, f"relocation[{index}] register")
-    _native_arg(reloc.arg, f"relocation[{index}] argument")
-    _native_int(reloc.shift, 16, 16, f"relocation[{index}] shift"); _native_int(reloc.width, 32, 32, f"relocation[{index}] width")
-    if reloc.word_index in reloc_words or (reloc.arg.kind is RKBufferKind.ASSET and
-                                           (reloc.arg.addend != 0 or not 0 <= reloc.arg.index < len(native.assets))) or \
-       (reloc.arg.kind is not RKBufferKind.ASSET and reloc.arg not in declared):
-      raise ValueError("invalid native relocation binding")
-    word = native.commands[reloc.word_index]
-    if (word >> 48) & _RKIMAGE_U16_MAX != reloc.target or word & _RKIMAGE_U16_MAX != reloc.register:
-      raise ValueError("native relocation does not match command word")
-    reloc_words.add(reloc.word_index)
-  asset_ids:set[int] = set()
-  for index,asset in enumerate(native.assets):
-    if type(asset) is not RKNativeAsset: raise ValueError(f"invalid native asset[{index}]")
-    _native_int(asset.asset_id, 0, (1 << 32)-1, f"asset[{index}] id")
-    if asset.asset_id in asset_ids: raise ValueError("duplicate native asset id")
-    asset_ids.add(asset.asset_id)
-    if type(asset.digest) is not bytes or len(asset.digest) != 32: raise ValueError(f"invalid native asset[{index}] digest")
-    _native_int(asset.size, 1, (1 << 32)-1, f"asset[{index}] size"); _native_int(asset.flags, 0, (1 << 32)-1, f"asset[{index}] flags")
-    if type(asset.payload) is not bytes or len(asset.payload) != asset.size or hashlib.sha256(asset.payload).digest() != asset.digest:
-      raise ValueError(f"invalid native asset[{index}] payload")
-    if type(asset.ranges) is not tuple or len(asset.ranges) > _RKIMAGE_U16_MAX: raise ValueError(f"invalid native asset[{index}] ranges")
-    previous = -1
-    for interval in asset.ranges:
-      if type(interval) is not tuple or len(interval) != 2: raise ValueError(f"invalid native asset[{index}] range")
-      start,count = interval
-      _native_int(start, 0, asset.size, f"asset[{index}] range start"); _native_int(count, 1, asset.size, f"asset[{index}] range size")
-      if start < previous or start + count > asset.size: raise ValueError(f"invalid native asset[{index}] range ordering")
-      previous = start + count
-  if type(native.task) is not RKNativeTask: raise ValueError("invalid native task")
-  task_names = ("op index", "enable mask", "interrupt mask", "interrupt clear", "interrupt status", "regcfg amount", "regcfg offset", "reserved")
-  for name,value in zip(task_names, astuple(native.task)):
-    _native_int(value, 0, (1 << 32)-1, f"task {name}")
-  if type(native.submit) is not RKNativeSubmit: raise ValueError("invalid native submit")
-  _native_int(native.submit.flags, 0, (1 << 32)-1, "submit flags"); _native_int(native.submit.timeout_ms, 1, (1 << 32)-1, "submit timeout")
-  _native_int(native.submit.core_mask, 1, (1 << 32)-1, "submit core mask")
-  _native_int(native.submit.fence_fd, -(1 << 31), (1 << 31)-1, "submit fence")
-  _native_int(native.submit.task_count, 1, (1 << 32)-1, "submit task count")
-  if native.submit.task_count != 1: raise ValueError("native operation must submit one task")
-  if type(native.reset) is not RKNativeReset: raise ValueError("invalid native reset")
-  _native_int(native.reset.flags, 0, (1 << 32)-1, "reset flags"); _native_int(native.reset.value, 0, (1 << 32)-1, "reset value")
-  _native_route_contract(native)
-
-def _native_put_arg(out:bytearray, value:RKArg) -> None:
-  out += _NATIVE_ARG.pack(int(value.kind), 0, value.index, value.addend)
-
-def _native_take(blob:bytes, offset:int, size:int) -> tuple[bytes, int]:
-  if size < 0 or offset < 0 or offset + size > len(blob): raise ValueError("truncated native RKImage")
-  return blob[offset:offset+size], offset+size
-
-def _encode_native_image(image:RKImage) -> bytes:
-  _validate_native_image(image); native = cast(RKNativeOp, image.native)
-  out = bytearray(_NATIVE_HEADER.pack(RKIMAGE_MAGIC, RKIMAGE_NATIVE_VERSION, int(image.target), int(native.kind), native.flags,
-    len(image.scratch), len(native.reads), len(native.writes), len(native.outputs), len(native.relocs), len(native.assets),
-    0, 0, len(native.commands), len(native.tail), len(image.constants)))
-  for spec in image.scratch: out += _SCRATCH.pack(spec.size, spec.alignment)
-  for refs in (native.reads, native.writes, native.outputs):
-    for value in refs: _native_put_arg(out, value)
-  for reloc in native.relocs:
-    out += _NATIVE_RELOC.pack(reloc.word_index, reloc.target, reloc.register, int(reloc.arg.kind), reloc.shift, reloc.width,
-                              reloc.arg.index, reloc.arg.addend)
-  for asset in native.assets:
-    out += _NATIVE_ASSET.pack(asset.asset_id, asset.digest, asset.size, asset.flags, len(asset.ranges))
-    for start,count in asset.ranges: out += struct.pack("<II", start, count)
-    out += asset.payload
-  out += struct.pack(f"<{len(native.commands)}Q", *native.commands)
-  if native.tail: out += struct.pack(f"<{len(native.tail)}Q", *native.tail)
-  out += _NATIVE_TASK.pack(*astuple(native.task))
-  out += _NATIVE_SUBMIT.pack(*astuple(native.submit))
-  out += _NATIVE_RESET.pack(*astuple(native.reset))
-  return bytes(out) + image.constants
-
-def _decode_native_image(blob:bytes) -> RKImage:
-  try:
-    header = _NATIVE_HEADER.unpack_from(blob)
-  except struct.error as exc: raise ValueError("truncated native RKImage header") from exc
-  magic,version,target,kind,flags,nscratch,nreads,nwrites,noutputs,nrelocs,nassets,nguards,nrepairs,ncommands,ntail,nconst = header
-  if magic != RKIMAGE_MAGIC or version != RKIMAGE_NATIVE_VERSION: raise ValueError("invalid native RKImage header")
-  if nguards or nrepairs: raise ValueError("native CMAC metadata is unsupported")
-  off = _NATIVE_HEADER.size; scratch = []
-  for _ in range(nscratch):
-    data,off = _native_take(blob, off, _SCRATCH.size); scratch.append(RKScratch(*_SCRATCH.unpack(data)))
-  def take_args(count:int) -> tuple[RKArg, ...]:
-    nonlocal off
-    values = []
-    for _ in range(count):
-      data,off = _native_take(blob, off, _NATIVE_ARG.size); value_kind, reserved,index,addend = _NATIVE_ARG.unpack(data)
-      if reserved: raise ValueError("invalid native argument flags")
-      values.append(RKArg(RKBufferKind(value_kind), index, addend))
-    return tuple(values)
-  reads,writes,outputs = take_args(nreads),take_args(nwrites),take_args(noutputs)
-  relocs = []
-  for _ in range(nrelocs):
-    data,off = _native_take(blob, off, _NATIVE_RELOC.size)
-    word,target_,register,source_kind,shift,width,index,addend = _NATIVE_RELOC.unpack(data)
-    relocs.append(RKNativeRelocation(word, target_, register, RKArg(RKBufferKind(source_kind), index, addend), shift, width))
-  assets = []
-  for _ in range(nassets):
-    data,off = _native_take(blob, off, _NATIVE_ASSET.size); asset_id,digest,size,asset_flags,nranges = _NATIVE_ASSET.unpack(data)
-    ranges = []
-    for _ in range(nranges):
-      data,off = _native_take(blob, off, 8); ranges.append(struct.unpack("<II", data))
-    payload,off = _native_take(blob, off, size)
-    assets.append(RKNativeAsset(asset_id, digest, size, tuple(ranges), asset_flags, payload))
-  data,off = _native_take(blob, off, ncommands*8); commands = tuple(struct.unpack(f"<{ncommands}Q", data))
-  data,off = _native_take(blob, off, ntail*8); tail = tuple(struct.unpack(f"<{ntail}Q", data))
-  data,off = _native_take(blob, off, _NATIVE_TASK.size); task = RKNativeTask(*_NATIVE_TASK.unpack(data))
-  data,off = _native_take(blob, off, _NATIVE_SUBMIT.size); submit = RKNativeSubmit(*_NATIVE_SUBMIT.unpack(data))
-  data,off = _native_take(blob, off, _NATIVE_RESET.size); reset = RKNativeReset(*_NATIVE_RESET.unpack(data))
-  constants,off = _native_take(blob, off, nconst)
-  if off != len(blob): raise ValueError("invalid native RKImage size")
-  native = RKNativeOp(RKNativeKind(kind), commands, tuple(relocs), reads, writes, outputs, tail,
-                      tuple(assets), task, submit, reset, flags)
-  image = RKImage(RKTarget(target), tuple(scratch), constants, RKIMAGE_NATIVE_VERSION, native=native)
-  _validate_native_image(image)
-  return image
-
 def encode_image(image:RKImage) -> bytes:
-  if image.native is not None or image.version == RKIMAGE_NATIVE_VERSION: return _encode_native_image(image)
   gathers = image.gathers + image.mid_gathers + image.post_gathers
   if image.mid_gathers and any(not 0 <= (g.after if g.after >= 0 else image.gather_after) <= len(image.ew_ops) for g in image.mid_gathers):
     raise ValueError("invalid mid-gather split")
@@ -414,9 +159,6 @@ def encode_image(image:RKImage) -> bytes:
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
-  if type(blob) is not bytes: raise ValueError("RKImage wire value must be bytes")
-  if len(blob) >= 6 and blob[:4] == RKIMAGE_MAGIC and struct.unpack_from("<H", blob, 4)[0] == RKIMAGE_NATIVE_VERSION:
-    return _decode_native_image(blob)
   magic, version, target, nscratch, ngather, nhost_gather, nhost_scatter, nop, nconst, mid_count, post_count, gather_after, flags = \
     _HEADER.unpack_from(blob)
   if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags or
@@ -2960,19 +2702,13 @@ def _lower_host_scatter(output:RKOutput) -> RKImage|None:
 def _same_condition(a:UOp, b:UOp) -> bool: return a.key == b.key or a.op is b.op is Ops.AND and len(a.src) == len(b.src) == 2 and any(
   all(_same_condition(x, y) for x,y in zip(a.src, order)) for order in (b.src, b.src[::-1]))
 
-def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False,
-                       _try_cmac:bool=True, _cmac_counters:Any=None) -> RKImage|None:
+def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
-  if _try_cmac and not recipes_ready:
-    from tinygrad.renderer.rockchip_cmac_uops import try_cmac
-    if (native:=try_cmac(uops, counters=_cmac_counters)) is not None:
-      return RKImage(RKTarget.RK3588, version=RKIMAGE_NATIVE_VERSION, native=native)
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return None
   accepted = (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool, dtypes.uchar)
   strict_output, local_output, output_stores = _outs(uops)
   if len(output_stores) > 1:
-    lower_store = functools.partial(_lower_uop_program, vectorize_reductions=vectorize_reductions, recipes_ready=recipes_ready,
-                                    _try_cmac=False, _cmac_counters=_cmac_counters)
+    lower_store = functools.partial(_lower_uop_program, vectorize_reductions=vectorize_reductions, recipes_ready=recipes_ready)
     if (combined:=lower_store(list(UOp(Ops.SINK, src=(output_stores[0],)).toposort()))) is None: return None
     for store in output_stores[1:]:
       if (child:=lower_store(list(UOp(Ops.SINK, src=(store,)).toposort()))) is None: return None
@@ -3389,18 +3125,12 @@ class RockchipRenderer(Renderer):
   code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None,
                  Ops.FDIV: lambda: None, Ops.SQRT: lambda: None, Ops.EXP2: lambda: None, Ops.LOG2: lambda: None, Ops.SIN: lambda: None}
   compiler = RockchipCompiler("rockchip")
-  def __init__(self, target:Target):
-    super().__init__(target)
-    from tinygrad.renderer.rockchip_cmac_uops import CMACRouteCounters
-    self.cmac_counters = CMACRouteCounters()
-
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = _lower_uop_program(uops, _cmac_counters=self.cmac_counters)
+    image = _lower_uop_program(uops)
     if image is None:
       sink = graph_rewrite(next(u for u in uops if u.op is Ops.SINK), _pm_exp2_fallback, name="rockchip exp2 fallback")
-      image = _lower_uop_program(list(graph_rewrite(sink, _pm_storage_common, name="rockchip fallback storage").toposort()),
-                                  recipes_ready=True, _try_cmac=False, _cmac_counters=self.cmac_counters)
+      image = _lower_uop_program(list(graph_rewrite(sink, _pm_storage_common, name="rockchip fallback storage").toposort()), recipes_ready=True)
     if image is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))
     return base64.b64encode(encode_image(image)).decode()
 

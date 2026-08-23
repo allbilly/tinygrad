@@ -382,10 +382,7 @@ def bufferize_to_store(ctx:itertools.count, x:UOp, idx:UOp, allow_locals=True):
 
   # NOTE: the local BUFFER needs to be disambiguated here
   if x.arg.addrspace == AddrSpace.GLOBAL:
-    buf = UOp(Ops.BUFFER, src=(shape_to_shape_arg((size,)),), arg=ParamArg(next(ctx), dtype, device=x.arg.device,
-                                                                            addrspace=AddrSpace.GLOBAL,
-                                                                            layout_certificate=x.arg.layout_certificate
-                                                                            if isinstance(x.arg, ParamArg) else None))
+    buf = UOp(Ops.BUFFER, src=(shape_to_shape_arg((size,)),), arg=ParamArg(next(ctx), dtype, device=x.arg.device, addrspace=AddrSpace.GLOBAL))
     do_store = buf.index(idx).store(x.src[0].cast(dtype)).end(*rngs)
     return buf.after(do_store).cast(x.dtype)
 
@@ -449,8 +446,7 @@ class LocalAddBufferContext:
 
 def debuf(ctx:LocalAddBufferContext, buf:UOp):
   param = UOp(Ops.PARAM, src=(UOp.const(prod(buf.max_shape)),),
-              arg=ParamArg(ctx.dg, buf.dtype, addrspace=buf.addrspace, device=buf.device,
-                           layout_certificate=buf.arg.layout_certificate if isinstance(buf.arg, ParamArg) else None))
+              arg=ParamArg(ctx.dg, buf.dtype, addrspace=buf.addrspace, device=buf.device))
   ret = param.reshape(buf.max_shape)
   # if the buffer has symbolic shape, shrink the max-sized view to the actual shape
   if buf.max_shape != buf.shape: ret = ret.shrink(tuple((0, s) for s in buf.shape))
@@ -546,8 +542,7 @@ def convert_copy_to_store(ctx, copy:UOp, existing_buf:UOp|None=None):
     # if there's already a buffer, we just use it
     return existing_buf.flatten().store(input_src)
   # create the output buffer
-  buf = UOp(Ops.BUFFER, src=(shape_to_shape_arg(input_src.max_shape),), arg=ParamArg(
-    next(ctx), copy.dtype, device=copy.device, layout_certificate=copy.arg.layout_certificate if isinstance(copy.arg, ParamArg) else None))
+  buf = UOp(Ops.BUFFER, src=(shape_to_shape_arg(input_src.max_shape),), arg=ParamArg(next(ctx), copy.dtype, device=copy.device))
   # reshape back to input
   return buf.after(buf.store(input_src)).reshape(copy.shape)
 

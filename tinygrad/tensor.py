@@ -194,8 +194,7 @@ def replace_input_buffer(ctx:AllocCtx, b:UOp):
   ctx.replacements.append(b)
   if b.op is Ops.BIND: return b.param_like(len(ctx.replacements)-1)
   return UOp.param(len(ctx.replacements)-1, b.dtype, b.shape, b.device,
-                   addrspace=b.addrspace if b.addrspace is not None else AddrSpace.GLOBAL,
-                   layout_certificate=b.arg.layout_certificate if isinstance(b.arg, ParamArg) else None)
+                   addrspace=b.addrspace if b.addrspace is not None else AddrSpace.GLOBAL)
 
 pm_finalize_call = PatternMatcher([
   (UPat(Ops.AFTER, name="x"), finalize_after),
@@ -429,12 +428,6 @@ class Tensor(RandMixin):
     if self.dtype in dtypes.weaks: self.uop = self.uop.clone()
     is_disk = isinstance(self.device, str) and self.device.startswith(("DISK", "TINYFS"))
     if not isinstance(x, Tensor): x = Tensor(x, device="CPU" if is_disk else self.device, dtype=self.dtype)
-    if isinstance(x, Tensor) and self.uop.base.op is Ops.BUFFER and self.uop.base.max_numel() == 1 and self.shape in ((1,), (1, 1)) and \
-       self.dtype.scalar() is dtypes.half and x.dtype.scalar() is dtypes.half and self.device == x.device and not self.uop.base.is_realized:
-      from tinygrad.renderer.rockchip_cmac_uops import _attach_asset_certificate, _is_exact_sum_uop
-      if _is_exact_sum_uop(x.uop):
-        physical = _attach_asset_certificate(Tensor.empty((1, 128), dtype=dtypes.half, device=self.device))
-        self.uop = physical[:, :1].reshape(self.shape).uop
     if self.uop is x.uop: return self  # a self assign is a NOOP
     # broadcast x (shape only, dtype must match)
     x = x._broadcast_to(self.shape)

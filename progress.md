@@ -7726,48 +7726,25 @@ truncate/modulo and raw FP16 bitcast have different offset, lane, output-image,
 and resource contracts, making the proposed shared route unsafe; no CAST change
 is included.
 
-## 2026-08-23 — CMAC compact asset/native runtime milestone
+## 2026-08-23 — CMAC experiment rejected after repeated post-health timeouts
 
-The production candidate was `/home/orangepi/rk-cmac-lut-20260822/compact-cmac-host-candidate-v6-final-luna-max/worktree`
-at candidate HEAD
-`5716c02386a04a770d730126ad7547deb52dda87`.  Its corrected board runner was
-`/home/orangepi/rk-cmac-lut-20260822/compact-cmac-host-candidate-v6-final-luna-max/CMAC_ONCE_RUNNER_RUNTIME_V11_LUNA_MAX.py`
-from runner HEAD
-`b6f424466878e722497ab957518c927e3903c69f`.  The candidate and runner were
-clean at those pinned heads.  The shared integration retains the candidate's
-production and host-test bytes; only the six external
-`PHYSICAL_RUNTIME_EFFECTS*_REPORT.md` audit artifacts were intentionally kept
-out of this repository.
+The compact CMAC experiment is **REJECTED for integration**.  Multiple clean,
+one-shot board gates produced the expected CMAC output (`lane 0 = 0x5000`) and
+accepted the single blocking submit, but the required ordinary EW post-health
+then timed out.  This repeated across the compact path, the sync-order A/B,
+the v6-order lifecycle, and flags-1 variants; their external reports remain
+archived under
+`/home/orangepi/rk-cmac-lut-20260822/cmac-board-gate-luna-max/`.
 
-The corrected one-submit board proof is recorded in
-`/home/orangepi/rk-cmac-lut-20260822/cmac-board-gate-luna-max/BOARD_GATE_V6_CORRECTED_SUCCESS_REPORT.md`.
-The runner was invoked exactly once after a PASS pre-health check with
-`--runtime-v11 --action6-once --no-retry --submit-flags 5`, and returned exit
-0 with empty stderr.  Its JSON receipt proves `action6_count=1`,
-`submit_count=1`, `submit_flags=5`, `retry_count=0`, `asset_upload_count=1`,
-`command_guard_ok=true`, `task_guard_ok=true`, validation order
-`descriptor, output`, and exact CMAC lane-0 output `0x5000`
-(`output_lane0_bits=20480`).  No CPU/GPU/host numeric repair or fallback was
-used; no recovery reset, second CMAC attempt, or reboot was performed.
-
-The all-445 census log is
-`/home/orangepi/rk-cmac-lut-20260822/cmac-full-census-luna-max/rockchip-445.log`.
-Its exact command was:
-
-```text
-cd /home/orangepi/rk-cmac-lut-20260822/compact-cmac-host-candidate-v6-final-luna-max/worktree && FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP /home/orangepi/tinygrad/.venv/bin/python -m pytest test/backend/test_rockchip.py -q -x -n0
-```
-
-It exited 0 with **433 passed, 12 skipped, 154 subtests passed** in
-**868.96 s (0:14:28)**.  The authoritative post-health command was run once
-after the passing CMAC gate:
-`cd /home/orangepi/tinygrad && .venv/bin/python ~/rk3588/examples/simple_add.py`.
-It exited 0 with `ADD NPU=[8 8 8 8 8 8 8 8] expected=[8 8 8 8 8 8 8 8] PASS`;
-`elementwise.py` was not run.
-
-Using `sz.py` (comments/docstrings, generated autogen, and tests excluded),
-the shared baseline was **28,345** executable lines and the integrated
-candidate is **30,026**, an exact **+1,681** line delta.  CMAC/LUT
-functionality remains a priority: the compact CMAC route is now integrated
-and hardware-proven, while the typed LUT functionality is still pending and
-is not merged in this milestone.
+The fresh-boot b62 gate is recorded in
+`STRICT_GATE_B62FB25A_FAILURE_POSTHEALTH_AFTER_REBOOT_20260823.md`: boot ID
+`8ec6177f-8f44-490c-8d66-f02a4be34ed7`, candidate
+`b62fb25a6632f55cc2b35dcb0b7265a4b0a07bee`, pre-health **PASS**, exactly one
+CMAC action-6/flags-5 submit with zero retries and lane `0x5000`, followed by
+`simple_add.py` submit `TimeoutError: [Errno 110] Connection timed out`.
+The preceding pre-health failure is retained in
+`STRICT_GATE_B62FB25A_FAILURE_PREHEALTH_20260823.md`; no retry or recovery was
+performed.  The production/test tree therefore remains the pre-CMAC
+`910d3f9e5ff41957d8c3be3bf4cad7be6486ef8f` state.  CMAC commits, bundles,
+reports, and LUT patches remain outside this source tree for provenance only;
+no CPU/GPU numeric fallback or repair is admitted.

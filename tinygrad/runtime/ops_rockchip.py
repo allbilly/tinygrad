@@ -4,12 +4,10 @@ from dataclasses import replace as copy_dataclass
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
-from typing import cast
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
   RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
-from tinygrad.runtime.rockchip_physical_runtime import PhysicalSubmitReceipt, RockchipPhysicalEffects
 
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
@@ -46,8 +44,6 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
-    self.native = self.image.native
-    self._physical_holds:list[RockchipPhysicalEffects] = []
     self._scratch_offsets:list[int] = []
     self._scratch_size = 0
     for spec in self.image.scratch:
@@ -64,80 +60,13 @@ class RockchipProgram(Program['RockchipDevice']):
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
     dev._touch_program(self)
-    if self.image.native is None: self._ensure_scratch()
+    self._ensure_scratch()
 
   def _ensure_scratch(self) -> None:
     if self._scratch_arena is not None or not self._scratch_size: return
     self._scratch_arena = self.dev._gpu_alloc(self._scratch_size)
     self.scratch = tuple(self._scratch_arena.offset(offset, spec.size)
       for offset,spec in zip(self._scratch_offsets, self.image.scratch))
-
-  def _ensure_ordinary_initialized(self) -> None:
-    if getattr(self.dev, "_ordinary_initialized", False): return
-    self.dev.reset_npu()
-    self.dev._ordinary_initialized = True
-
-  def _preflight_native(self, bufs:tuple[HCQBuffer, ...]) -> RockchipPhysicalEffects:
-    effects = RockchipPhysicalEffects(self, self.image, bufs, self.native)
-    effects._preflight()
-    return effects
-
-  def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False, *, retry:bool=True,
-              submit_contract:object|None=None, sync_before_submit:bool=True) -> object:
-    if submit_contract is None:
-      flags, timeout, core_mask, fence_fd, task_count = rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, _SUBMIT_TIMEOUT_MS, 1, -1, 1
-    else:
-      values = tuple(getattr(submit_contract, name, None) for name in ("flags", "timeout_ms", "core_mask", "fence_fd", "task_count"))
-      if any(type(value) is not int for value in values) or values[-1] != n:
-        raise ValueError("invalid Rockchip submit contract")
-      flags, timeout, core_mask, fence_fd, task_count = cast(tuple[int, int, int, int, int], values)
-    subcores = ((0,n),) if standalone else ((0,n),(n,0),(n,0))
-    submit_result: object | None = None
-    for attempt in range(1 if not retry else _SUBMIT_RETRIES+1):
-      try:
-        if sync_before_submit:
-          for buffer in (cmd,task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-        submit_result = rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl, flags=flags, timeout=timeout, task_start=0, task_number=n,
-          task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
-          core_mask=core_mask, fence_fd=fence_fd,
-          subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
-        break
-      except TimeoutError:
-        if not retry: raise
-        self.dev.timeout_retries += 1
-        if attempt == _SUBMIT_RETRIES: raise
-        self.dev.reset_npu()
-    self.submit_count += 1
-    self.dev.submit_count += 1
-    self.dev.task_count += n
-    return submit_result
-
-  def _submit_physical(self, cmd:HCQBuffer, task:HCQBuffer, contract:object) -> PhysicalSubmitReceipt:
-    """Submit one blocking physical task; ioctl return is the completion receipt."""
-    result = self._submit(cmd, task, 1, standalone=True, retry=False, submit_contract=contract, sync_before_submit=False)
-    if type(result) is not rk.struct_rknpu_submit:
-      raise RuntimeError("RKNPU submit wrapper returned a foreign payload")
-    expected = tuple(getattr(contract, name) for name in ("flags", "timeout_ms", "task_count", "core_mask", "fence_fd"))
-    actual = (result.flags, result.timeout, result.task_number, result.core_mask, result.fence_fd)
-    if actual != (expected[0], expected[1], expected[2], expected[3], expected[4]):
-      raise RuntimeError("RKNPU submit wrapper returned a mismatched receipt")
-    if expected[0] != (rk.RKNPU_JOB_PC | rk.RKNPU_JOB_PINGPONG) or expected[4] != -1:
-      raise RuntimeError("RKNPU physical submit is not the proven blocking contract")
-    # flags=5 has NONBLOCK clear, so the ioctl returns only after the driver's
-    # completion wait.  The ABI has no public job ID or output fence here.
-    return PhysicalSubmitReceipt(0, True, None)
-
-  def _run_native(self, *bufs:HCQBuffer, wait:bool=False) -> float|None:
-    start = time.perf_counter()
-    effects = self._preflight_native(tuple(bufs))
-    try:
-      receipt = effects.execute(preflight=False)
-      if type(receipt) is not PhysicalSubmitReceipt or receipt.status != 0 or not receipt.ownership_known:
-        raise RuntimeError("RK physical execution did not prove completion")
-    except Exception:
-      if effects.ownership_unknown: self._physical_holds.append(effects)
-      raise
-    return time.perf_counter()-start if wait else None
 
   def _release_resources(self) -> None:
     self.scratch = ()
@@ -162,6 +91,25 @@ class RockchipProgram(Program['RockchipDevice']):
       if buf is not None: self.dev._gpu_free(buf)
       return new
     return buf
+
+  def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
+    subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
+    for attempt in range(_SUBMIT_RETRIES+1):
+      try:
+        for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
+          task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
+          regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
+          subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
+        break
+      except TimeoutError:
+        self.dev.timeout_retries += 1
+        if attempt == _SUBMIT_RETRIES: raise
+        self.dev.reset_npu()
+    self.submit_count += 1
+    self.dev.submit_count += 1
+    self.dev.task_count += n
 
   def _submit_pcchain(self, bodies:list[tuple[int, ...]]) -> None:
     """Submit contiguous FP16 EW tasks as one blocking PC chain."""
@@ -385,8 +333,6 @@ class RockchipProgram(Program['RockchipDevice']):
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
     self.dev._touch_program(self)
-    if self.image.native is not None: return self._run_native(*bufs, wait=wait)
-    self._ensure_ordinary_initialized()
     self._ensure_scratch()
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
       if kind is RKBufferKind.ARG:
@@ -492,8 +438,7 @@ class RockchipDevice(Compiled):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count = self.task_count = self.timeout_retries = 0
     self._native_int16 = False
-    self.native_reset_live_proven = False
-    self._ordinary_initialized = False
+    self.reset_npu()
     self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
     self._program_resources:collections.OrderedDict[int, wr.ReferenceType[RockchipProgram]] = collections.OrderedDict()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
