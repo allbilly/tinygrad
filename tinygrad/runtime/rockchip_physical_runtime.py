@@ -40,6 +40,7 @@ from tinygrad.runtime.support.hcq import HCQBuffer
 
 _PAGE = 4096
 _U32_MAX = (1 << 32) - 1
+_U64_MAX = (1 << 64) - 1
 _TASK_DESCRIPTOR_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _EXP2_IDLE_UPLOAD_RANGES = ((0, 1026), (1026, 1026))
 _CMAC_LOGICAL_LANES = 4
@@ -193,6 +194,11 @@ def _base_metadata(buffer: HCQBuffer) -> tuple[HCQBuffer, int, int]:
     raise PhysicalRuntimeReject("dma", "buffer base metadata is invalid") from exc
   if not isinstance(base, HCQBuffer) or type(base_va) is not int or type(base_size) is not int or base_va < 0 or base_size <= 0:
     raise PhysicalRuntimeReject("dma", "buffer base metadata is invalid")
+  allocation_size = _allocation_size(buffer)
+  if base_size > allocation_size:
+    raise PhysicalRuntimeReject("dma", "buffer base logical size exceeds allocation")
+  if base_va > _U64_MAX or base_size > _U64_MAX - base_va:
+    raise PhysicalRuntimeReject("dma", "buffer base range overflows address space")
   return base, base_va, base_size
 
 
@@ -201,6 +207,11 @@ def _buffer_snapshot(program: object, buffer: HCQBuffer) -> _BufferSnapshot:
   buffer_va, buffer_size = buffer.va_addr, buffer.size
   if type(buffer_va) is not int or type(buffer_size) is not int or buffer_va < 0 or buffer_size < 0:
     raise PhysicalRuntimeReject("dma", "buffer metadata is invalid")
+  if buffer_va > _U64_MAX or buffer_size > _U64_MAX - buffer_va:
+    raise PhysicalRuntimeReject("dma", "buffer view range overflows address space")
+  base_end, buffer_end = base_va + base_size, buffer_va + buffer_size
+  if buffer_va < base_va or buffer_end > base_end:
+    raise PhysicalRuntimeReject("dma", "buffer view range lies outside base")
   return (id(buffer), id(base), base_va, base_size, buffer_va, buffer_size, _allocation_size(buffer),
           _dma(program, buffer), _obj_addr(buffer), _handle(buffer))
 
@@ -422,7 +433,11 @@ class RockchipPhysicalEffects:
       if not 0 <= arg.index < len(self.bufs):
         self._reject("dma_binding", "native argument index changed")
       buffer = self.bufs[arg.index]
-      if not isinstance(buffer, HCQBuffer) or _buffer_snapshot(self.program, buffer) != expected:
+      try:
+        current_snapshot = _buffer_snapshot(self.program, buffer) if isinstance(buffer, HCQBuffer) else None
+      except PhysicalRuntimeReject:
+        current_snapshot = None
+      if current_snapshot != expected:
         self._reject("dma_binding", "caller buffer identity or span changed after preflight")
       current.append((arg, expected))
       ranges.append((expected[7], expected[6]))

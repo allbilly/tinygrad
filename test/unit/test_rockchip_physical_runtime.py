@@ -465,9 +465,9 @@ def test_native_task_and_asset_allocations_require_exact_logical_size() -> None:
     return buffer
 
   program.dev._gpu_alloc = allocate  # type: ignore[method-assign]
-  with pytest.raises(PhysicalRuntimeReject, match="task logical size"):
+  with pytest.raises(PhysicalOwnershipUnknown, match="refusing free"):
     effects.execute()
-  assert effects.closed and not effects.ownership_unknown
+  assert not effects.closed and effects.ownership_unknown and program.dev.freed == []
 
   program, effects = _setup(_cmac_asset_native())
   original = program.dev._gpu_alloc
@@ -489,6 +489,36 @@ def _cmac_output_view(effects: RockchipPhysicalEffects) -> HCQBuffer:
   view = output.offset(0, rkp.CMAC_V1_OUTPUT_VIEW_BYTES)
   effects.bufs = effects.bufs[:2] + (view,)
   return view
+
+
+def _malform_cmac_view(view: HCQBuffer, mutation: str) -> None:
+  base = view.base
+  if mutation == "undersized_base":
+    base.size = view.size - 1
+  elif mutation == "base_over_allocation":
+    base.size = base.meta.size + 1
+  elif mutation == "before_base":
+    view.va_addr = base.va_addr - 0x1000
+  elif mutation == "after_base":
+    base.size = 0x1000
+    view.va_addr = base.va_addr + base.size
+  elif mutation == "outside_base":
+    base.size = 0x1000
+    view.size = 0x2000
+  else:
+    base.va_addr = (1 << 64) - 0x100
+    view.va_addr = base.va_addr
+
+
+@pytest.mark.parametrize("mutation", ("undersized_base", "base_over_allocation", "before_base", "after_base", "outside_base", "overflow"))
+def test_malformed_initial_view_is_zero_effect_reject(mutation: str) -> None:
+  program, effects = _setup(_cmac_native())
+  view = _cmac_output_view(effects)
+  _malform_cmac_view(view, mutation)
+  with pytest.raises(PhysicalRuntimeReject, match=r"base|range|overflow|metadata"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert program.dev.events == [] and program.dev.freed == []
 
 
 def _tamper_output_base(buffer: HCQBuffer, mutation: str) -> None:
