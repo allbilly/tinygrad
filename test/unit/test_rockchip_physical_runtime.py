@@ -100,7 +100,7 @@ class _SpyProgram:
     self.submit_contracts: list[object] = []
 
   def _dma(self, buffer: HCQBuffer) -> int:
-    return int(buffer.meta.dma_addr)
+    return int(buffer.meta.dma_addr) + int(buffer.va_addr) - int(buffer.base.va_addr)
 
   def _submit_physical(self, command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
     del command, task
@@ -434,6 +434,26 @@ def test_native_command_allocation_requires_exact_hcq_type() -> None:
   assert all(event[0] != "reset" for event in program.dev.events if isinstance(event, tuple))
 
 
+@pytest.mark.parametrize("role", ("command", "task", "asset"))
+def test_native_owned_hcq_view_is_rejected_before_effects(role: str) -> None:
+  native = _cmac_asset_native() if role == "asset" else _cmac_native()
+  program, effects = _setup(native)
+  original = program.dev._gpu_alloc
+
+  def allocate(size: int, flags: int = 0) -> HCQBuffer:
+    buffer = original(size, flags)
+    target = (role == "command" and flags == 0 and size == rkp.CMAC_V1_COMMAND_RESERVATION_BYTES) or \
+      (role == "task" and flags == driver.RKNPU_MEM_KERNEL_MAPPING) or \
+      (role == "asset" and flags == 0 and size == rkp.CMAC_V1_RHS_ASSET_SIZE)
+    return buffer.offset(0, buffer.size) if target else buffer
+
+  program.dev._gpu_alloc = allocate  # type: ignore[method-assign]
+  with pytest.raises(PhysicalRuntimeReject, match="HCQBuffer view"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert all(event[0] != "reset" for event in program.dev.events if isinstance(event, tuple))
+
+
 def test_native_task_and_asset_allocations_require_exact_logical_size() -> None:
   program, effects = _setup(_cmac_native())
   original = program.dev._gpu_alloc
@@ -462,6 +482,54 @@ def test_native_task_and_asset_allocations_require_exact_logical_size() -> None:
   with pytest.raises(PhysicalRuntimeReject, match=r"asset\[0\] logical size"):
     effects.execute()
   assert effects.closed and not effects.ownership_unknown
+
+
+def _cmac_output_view(effects: RockchipPhysicalEffects) -> HCQBuffer:
+  output = effects.bufs[2]
+  view = output.offset(0, rkp.CMAC_V1_OUTPUT_VIEW_BYTES)
+  effects.bufs = effects.bufs[:2] + (view,)
+  return view
+
+
+def _tamper_output_base(buffer: HCQBuffer, mutation: str) -> None:
+  if mutation == "base_size":
+    buffer.base.size += 1
+  else:
+    buffer.base.va_addr += 0x1000
+    buffer.meta.dma_addr += 0x1000
+
+
+@pytest.mark.parametrize("phase", ("before_submit", "after_submit"))
+@pytest.mark.parametrize("mutation", ("base_size", "base_va_dma"))
+def test_caller_view_base_mutation_is_revalidated(phase: str, mutation: str) -> None:
+  program, effects = _setup(_cmac_native())
+  output = _cmac_output_view(effects)
+  if phase == "before_submit":
+    original_barrier_before = effects.barrier_before
+
+    def tamper_before_submit() -> None:
+      original_barrier_before()
+      _tamper_output_base(output, mutation)
+
+    effects.barrier_before = tamper_before_submit  # type: ignore[method-assign]
+    with pytest.raises(PhysicalRuntimeReject, match="dma_binding"):
+      effects.execute()
+    assert effects.closed and not effects.ownership_unknown and program.dev.freed
+    assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 0
+  else:
+    original_submit = program._submit_physical
+
+    def tampering_submit(command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
+      receipt = original_submit(command, task, contract)
+      _tamper_output_base(output, mutation)
+      return receipt
+
+    program._submit_physical = tampering_submit  # type: ignore[method-assign]
+    with pytest.raises(PhysicalOwnershipUnknown, match="readback"):
+      effects.execute()
+    assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+    assert not any(event[0] == "sync" and event[2] == driver.RKNPU_MEM_SYNC_FROM_DEVICE
+                   for event in program.dev.events if isinstance(event, tuple))
 
 
 def test_non_contract_submit_receipt_is_terminal_unknown() -> None:

@@ -50,7 +50,7 @@ _CMAC_GUARD_SPANS = (
   ("_cmd_buf", rkp.CMAC_V1_COMMAND_IMAGE_BYTES, rkp.CMAC_V1_COMMAND_RESERVATION_BYTES - rkp.CMAC_V1_COMMAND_IMAGE_BYTES),
   ("_task_buf", rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES, _PAGE - rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES),
 )
-_BufferSnapshot = tuple[int, int, int, int, int, int, int, int]
+_BufferSnapshot = tuple[int, int, int, int, int, int, int, int, int, int]
 
 # Stable event IDs.  These are a finite vocabulary, not a second telemetry
 # policy or an attempt counter encoded as an event name.
@@ -185,14 +185,31 @@ def _dma(program: object, buffer: HCQBuffer) -> int:
   return value
 
 
+def _base_metadata(buffer: HCQBuffer) -> tuple[HCQBuffer, int, int]:
+  try:
+    base = buffer.base
+    base_va, base_size = base.va_addr, base.size
+  except Exception as exc:
+    raise PhysicalRuntimeReject("dma", "buffer base metadata is invalid") from exc
+  if not isinstance(base, HCQBuffer) or type(base_va) is not int or type(base_size) is not int or base_va < 0 or base_size <= 0:
+    raise PhysicalRuntimeReject("dma", "buffer base metadata is invalid")
+  return base, base_va, base_size
+
+
 def _buffer_snapshot(program: object, buffer: HCQBuffer) -> _BufferSnapshot:
-  return (id(buffer), id(buffer.base), int(buffer.va_addr), buffer.size, _allocation_size(buffer),
+  base, base_va, base_size = _base_metadata(buffer)
+  buffer_va, buffer_size = buffer.va_addr, buffer.size
+  if type(buffer_va) is not int or type(buffer_size) is not int or buffer_va < 0 or buffer_size < 0:
+    raise PhysicalRuntimeReject("dma", "buffer metadata is invalid")
+  return (id(buffer), id(base), base_va, base_size, buffer_va, buffer_size, _allocation_size(buffer),
           _dma(program, buffer), _obj_addr(buffer), _handle(buffer))
 
 
 def _owned_buffer_snapshot(program: object, buffer: object, logical_size: int, role: str) -> _BufferSnapshot:
   if type(buffer) is not HCQBuffer:
     raise PhysicalRuntimeReject("allocator", f"native {role} allocation is not an exact HCQBuffer")
+  if buffer.base is not buffer:
+    raise PhysicalRuntimeReject("allocator", f"native {role} allocation is an HCQBuffer view")
   if type(buffer.size) is not int or buffer.size != logical_size:
     raise PhysicalRuntimeReject("allocator", f"native {role} logical size is not {logical_size}")
   if _allocation_size(buffer) < logical_size:
@@ -408,19 +425,19 @@ class RockchipPhysicalEffects:
       if not isinstance(buffer, HCQBuffer) or _buffer_snapshot(self.program, buffer) != expected:
         self._reject("dma_binding", "caller buffer identity or span changed after preflight")
       current.append((arg, expected))
-      ranges.append((expected[5], expected[4]))
+      ranges.append((expected[7], expected[6]))
     if any(a < c + d and c < a + b for index,(a,b) in enumerate(ranges) for c,d in ranges[index+1:]):
       self._reject("dma_alias", "caller DMA spans overlap before native patch or submit")
     for span in self.native.spans:
       if span.buffer not in self._dma_by_arg:
         self._reject("span_contract", "native span is not bound to a caller resource")
-      allocation = next(item[1][4] for item in current if item[0] == span.buffer)
+      allocation = next(item[1][6] for item in current if item[0] == span.buffer)
       if allocation != span.allocation or span.offset + span.size > allocation:
         self._reject("span_contract", "caller allocation no longer covers immutable native span")
     for role,arg in self._resource_args.items():
       if self._resource_buffers.get(role) is not self.bufs[arg.index]:
         self._reject("dma_binding", "caller resource role changed after preflight")
-    self._dma_by_arg = {arg: snapshot[5] for arg, snapshot in current}
+    self._dma_by_arg = {arg: snapshot[7] for arg, snapshot in current}
 
   def _revalidate_assets(self) -> None:
     current = []
@@ -636,7 +653,7 @@ class RockchipPhysicalEffects:
           self._asset_snapshot[index] = _buffer_snapshot(self.program, buffer)
         snapshot = _owned_buffer_snapshot(self.program, buffer, asset.size, f"asset[{index}]")
         self._asset_snapshot[index] = snapshot
-        allocation, dma = snapshot[4], snapshot[5]
+        allocation, dma = snapshot[6], snapshot[7]
         caller_ranges = [(_dma(self.program, resource), _allocation_size(resource)) for resource in self._resource_buffers.values()]
         prior_assets = [(_dma(self.program, resource), _allocation_size(resource))
                         for asset_index, resource in self._asset_buffers.items() if asset_index != index]
