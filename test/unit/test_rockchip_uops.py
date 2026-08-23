@@ -428,10 +428,10 @@ def test_native_ew_configs_keep_their_exact_register_values():
 
 
 def test_cmac_packs_fp16_exact_per_term_weights_and_rejects_invalid_weights():
-  def lower(weights:tuple[float, ...], nested:bool=False) -> RKImage|None:
+  def lower(weights:tuple[float, ...], nested:tuple[float, ...]=()) -> RKImage|None:
     out, source = UOp.param(0,dtypes.half,(1,)), UOp.param(1,dtypes.half,(len(weights),))
     terms = [source.index(i).load().cast(dtypes.float)*UOp.const(weight,dtypes.float) for i,weight in enumerate(weights)]
-    if nested: terms[0] = terms[0]*UOp.const(2.0,dtypes.float)
+    for factor in nested: terms[0] = terms[0]*UOp.const(factor,dtypes.float)
     value = terms[0]
     for term in terms[1:]: value = value+term
     return _lower_uop_program(list(out.index(0).store(value.cast(dtypes.half)).sink().toposort()))
@@ -443,8 +443,17 @@ def test_cmac_packs_fp16_exact_per_term_weights_and_rejects_invalid_weights():
   for invalid in (0.1,float("inf")):
     fallback = lower((invalid,*weights[1:]))
     assert fallback is not None and fallback.cmac is None and fallback.ew_ops
-  nested = lower(weights, nested=True)
-  assert nested is not None and nested.cmac is None and nested.ew_ops
+  nested = lower(weights, (2.0,))
+  assert nested is not None and nested.cmac is not None and _cmac_weights(nested) == (
+    rockchip_renderer._fp16_bits(1.0), *tuple(rockchip_renderer._fp16_bits(weight) for weight in weights[1:]))
+  for unsafe in (lower((10.0,*weights[1:]), (0.1,)), lower(weights, (2.0,1.0))):
+    assert unsafe is not None and unsafe.cmac is None and unsafe.ew_ops
+  half_out, half_source = UOp.param(0,dtypes.half,(1,)), UOp.param(1,dtypes.half,(4,))
+  half_terms = [half_source.index(i).load() for i in range(4)]
+  half_terms[0] = half_terms[0]*UOp.const(-53248.0,dtypes.half)*UOp.const(-0.03955078125,dtypes.half)
+  half_value = functools.reduce(lambda total,term:total+term,half_terms[1:],half_terms[0])
+  half_nested = _lower_uop_program(list(half_out.index(0).store(half_value).sink().toposort()))
+  assert half_nested is not None and half_nested.cmac is None and half_nested.ew_ops
 
 
 def test_generic_fp16_uops_lower_in_dependency_order():
@@ -1034,6 +1043,38 @@ def test_fp32_contraction_biases_route_one_production_cmac_surface():
     np.testing.assert_array_equal(packed_lhs[:,:4].astype(np.float32)@packed_rhs[:2,:4].T.astype(np.float32),
                                   lhs_values.astype(np.float32)@rhs_values.astype(np.float32)+bias_values.astype(np.float32))
     assert image.execution_class is RKExecutionClass.NATIVE and decode_image(encode_image(image)) == image
+
+
+def test_literal_fp32_bias_and_large_broadcast_share_cmac_candidate_planner():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",64,dtypes.half,num=1026)).reshape(64,1).expand(64,64)
+    ast = (source.cast(dtypes.float)+3.0).cast(dtypes.half).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (128,32,2)
+  assert not image.ew_ops and len(image.gathers) == 3 and sum(bool(gather.values) for gather in image.gathers) == 2
+  source_values = np.arange(64,dtype=np.float16)
+  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  for gather in image.gathers:
+    destination = scratch[gather.dst_index]
+    if gather.values: destination[:gather.count] = gather.values
+    else:
+      offsets = np.asarray(gather.offsets)
+      valid = offsets >= 0
+      if not gather.partial: destination[:gather.count] = gather.fill_bits
+      destination[:gather.count][valid] = source_values.view(np.uint16)[offsets[valid]]
+  ai,ao,_ = rockchip_renderer._cmac_layout(image.cmac.n,image.cmac.k)
+  lhs = scratch[image.cmac.lhs.index].view(np.float16).reshape(image.cmac.m,ai)
+  rhs = scratch[image.cmac.rhs.index].view(np.float16).reshape(ao//16,ai//32,16,32).transpose(0,2,1,3).reshape(ao,ai)
+  result = (lhs.astype(np.float32)@rhs.astype(np.float32).T).astype(np.float16)
+  physical = np.zeros(image.cmac.m*ao*2,dtype=np.float16)
+  for row in range(image.cmac.m):
+    for col in range(image.cmac.n): physical[row*ao*2+col//16*32+col%16] = result[row,col]
+  got = physical[np.asarray(image.post_gathers[0].offsets)]
+  expected = (source_values[:,None]+np.float16(3)).repeat(64,axis=1).reshape(-1)
+  np.testing.assert_array_equal(got,expected)
+  assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
 
 
 def test_tensor_mean_routes_scaled_production_cmac_weights():

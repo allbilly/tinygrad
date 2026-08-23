@@ -8254,6 +8254,66 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — nested weights and broad linear grids share CMAC planning at 2,398 lines
+
+This isolated milestone follows `1590f3038`.  Its predeclared and observed
+renderer budget is exactly **+9/-15 executable lines, net -6**.  Authoritative
+`sz.py` size moves renderer **2404 -> 2398** and repository total **27936 ->
+27930**; runtime remains **464**.
+
+`_lower_cmac_reduction` now folds at most two finite FP16-exact constant
+factors inside one FP32 linear term, replacing the former one-constant-only
+rejection.  A term with no dynamic load is normalized as `1 * bias`, so one
+literal additive constant shares the existing packed CMAC surfaces.  The
+common M/N candidate search also replaces the all-linear `M=rows,N=1` special
+path.  It explicitly prefers that old layout whenever it remains legal, but
+may use another proved affine factorization when the old M or scratch bound
+rejects.  No new helper, generic IR, image field, runtime phase, CMAC-to-EW
+sequence, or CPU/GPU numeric fallback is added.
+
+Admission remains conservative at observable rounding boundaries.  Nested
+constants are limited to FP32 terms, each constant must round-trip through
+FP16, an outer scale cannot also be distributed into a weighted term, and
+scaled two-dynamic-input products remain generic.  More than two constants,
+non-FP16-exact or nonfinite factors, and every nested HALF multiply retain the
+EW fallback.  The HALF regression uses the concrete counterexample
+`(-9.8109245e-05 * -53248) * -0.03955078125`, whose sequential result is
+`-0.20654296875` rather than the folded `-0.2066650390625`.
+
+The actual production `Tensor.schedule_linear -> to_program` path for a
+`64x64` broadcast FP32 load plus literal bias `3`, stored as HALF, moves from
+one EW stage to one native CMAC `(M,N,K) = (128,32,2)` with zero EW stages,
+three gathers, and SHA-256
+`48d3aeeae296d06ca6332be1ce5126d842b99960f617b666048c766771cb983a`.
+Its encoding grows from 143 to 43,238 bytes, so this is a coverage and
+source-deletion result rather than a serialized-size improvement.  A raw
+surface oracle reconstructs all **4,096** outputs and exactly matches the
+broadcast-plus-bias values.  A nested weighted sum moves from **113 EW stages
+/ 4,948 bytes** to CMAC `(1,1,4)` / 2,377 bytes with SHA-256
+`1557a5417de2b17922c4cfa065fda0a84187cfb720d23a55c31af2b1f9a72fff`.
+
+An exhaustive-input generated oracle checked **512** deterministic valid
+FP16 constant pairs against all **65,536** FP16 input bit patterns: all
+**33,554,432** nested-FP32 results equal their folded CMAC weights, with
+ordered result SHA-256
+`e278d15eb7662c6e5bd1ced26c4e1f1d79f63bb36c610ff87fa2505dc903a322`.
+An immutable committed-parent/candidate oracle observed **258** lowering
+outcomes: **256 are byte-identical**, and exactly the nested-weight fixture
+and broad literal-bias production graph are new CMAC admissions.  The
+unchanged-record SHA-256 is
+`87840d840a977f80564bb87d0b030d77d95b3156b2da886f9e1652bcb67d89c0`.
+The existing production `3x5 @ 5x4` image remains byte-identical at
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+
+Host verification reports **135 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full census command was run
+because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — output-axis packing moves batched contractions to CMAC at 2,404 lines
 
 This isolated milestone follows `3ff32b7cb`.  Its final predeclared and
