@@ -7865,3 +7865,32 @@ collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
 health, census, reboot, or reset command was run: CMAC hardware acceptance is
 still pending a proven fresh boot, pre-health, the serial production 445-case
 census, and post-health on that same boot.
+
+## 2026-08-24 — proven renderer bookkeeping cleanup reapplied
+
+This isolated milestone follows `f2d6e56cf` and reapplies only the
+still-relevant renderer subset of the historically hardware-proven
+`be8bd9622` cleanup.  Current-state inspection found that its runtime changes
+were already present, so the corrected pre-edit budget was exactly
+**+11/-19, net -8** in the renderer alone.  The observed result matches that
+budget: renderer size moves **2596 -> 2588**, repository total **28136 ->
+28128**, and runtime remains **472**.
+
+The manual dynamic-selector Cartesian-product and coordinate transpose are
+replaced by `itertools.product` and `zip`; repeated zero/one mask gathers use
+the existing `_RKBuilder.constant`; the two equivalent extrema affine
+adjustments share one loop; and nonfinite `WHERE` arm selection no longer
+keeps a redundant index temporary.  No matcher, execution class, numeric
+fallback, tolerance, or runtime submit behavior changes.
+
+Host verification reports **120 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, including raw execution checks for
+multi-axis, external-gate, repeated-channel, 1001-candidate, and exact
+total-fill dynamic selectors.  Mypy passes all **216 files**, repository-wide
+Ruff passes, diff checks are clean, and the required Rockchip environment
+collects exactly **445 tests**.  Production FP32-sum and `3x5 @ 5x4` CMAC
+images remain byte-identical at SHA-256
+`8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9`
+and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+No device command was run; the fresh-boot CMAC hardware bracket remains
+pending.
