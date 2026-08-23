@@ -1995,9 +1995,6 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   composite_math = _fold_inverse_hyperbolic(root) if bounded_recipes else None
   if composite_math is None and bounded_recipes: composite_math = _fold_atan(root)
   cache:dict[UOp, UOp] = {}
-  exact_static_selection = root.op is Ops.WHERE and _is_static_expr(root.src[0]) and not any(
-    node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and not math.isfinite(float(node.arg))
-    for node in root.toposort())
   def physical_recipe(recipe:UOp, opaque:tuple[UOp, ...]=()) -> UOp:
     placeholders = {source:UOp.param(-index-1, source.dtype, ()) for index,source in enumerate(opaque)}
     return _tag_precise_adds(recipe.substitute(placeholders)).substitute({placeholder:source for source,placeholder in placeholders.items()})
@@ -2013,9 +2010,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
       except _RKGenericReject: pass
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
     if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
-    if exact_static_selection and mapped.op is Ops.MUL and (minimum:=_fold_minimum(mapped)) is not None:
-      mapped = minimum.replace(arg=_NATIVE_RAW_MIN)
-    elif mapped.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
+    if mapped.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
       if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
       if (recipe:=_DPU_MATH[mapped.op](mapped.src[0])) is None: raise _RKGenericReject
       mapped = rewrite(physical_recipe(recipe, (mapped.src[0],)))
@@ -2415,20 +2410,6 @@ def _fold_relu_cap(x:UOp) -> UOp|None:
     return UOp(Ops.MAX, positive.dtype, src=(positive, UOp.const(cap, dtypes.half)), arg=_NATIVE_MIN)
   return None
 
-def _fold_abs(x:UOp) -> UOp|None:
-  """Recognize tinygrad's signed-zero-aware ABS graph and select native DPU EW ABS."""
-  for value, sign in (x.src, x.src[::-1]):
-    if sign.op is not Ops.WHERE: continue
-    nonzero, signed, zero = sign.src
-    if (nonzero.op is not Ops.CMPNE or nonzero.src[0].key != value.key or nonzero.src[1].op is not Ops.CONST or
-        float(nonzero.src[1].arg) != 0.0 or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or signed.op is not Ops.WHERE): continue
-    negative, minus_one, plus_one = signed.src
-    if (negative.op is Ops.CMPLT and negative.src[0].key == value.key and negative.src[1].op is Ops.CONST and
-        float(negative.src[1].arg) == 0.0 and minus_one.op is Ops.CONST and float(minus_one.arg) == -1.0 and
-        plus_one.op is Ops.CONST and float(plus_one.arg) == 1.0):
-      return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
-  return None
-
 def _fold_where_abs(x:UOp) -> UOp|None:
   """Recognize `WHERE(x < 0, -x, x)` before an unselected infinity can contaminate a mask blend."""
   if x.op is not Ops.WHERE or len(x.src) != 3 or x.dtype.scalar() is not dtypes.half: return None
@@ -2450,14 +2431,6 @@ def _fold_trunc(x:UOp) -> UOp:
   negative = zero.alu(Ops.SUB, zero.alu(Ops.SUB, source).alu(Ops.MAX, zero))
   return _native_same(source.alu(Ops.MAX, zero), _NATIVE_FLOOR).alu(Ops.ADD, _native_same(negative, _NATIVE_CEIL))
 
-def _fold_minimum(x:UOp) -> UOp|None:
-  """Recognize -max(-x,-y); native ALU-MIN mishandles infinities, so lowering expands it through SUB and MAX."""
-  outer = _const_operand(x, Ops.MUL, -1.0)
-  if outer is None or outer[0].op is not Ops.MAX: return None
-  operands = [_const_operand(u, Ops.MUL, -1.0) for u in outer[0].src]
-  if len(operands) != 2 or any(u is None for u in operands): return None
-  return _native_min(*(u[0] for u in operands if u is not None))
-
 def _replace_infinite_multiply(x:UOp) -> UOp|None:
   """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
   for value, factor in (x.src, x.src[::-1]):
@@ -2476,8 +2449,7 @@ _pm_storage_common = PatternMatcher([(UPat((Ops.WHERE, Ops.ADD, Ops.MUL), dtypes
   UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg) if x.op is Ops.WHERE else
   x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
   *[(UPat(op, dtypes.half, name="x"), callback) for op,callback in (
-    (Ops.ADD, _fold_relu_cap), (Ops.MUL, _fold_minimum), (Ops.MUL, _fold_abs),
-    (Ops.MUL, _replace_infinite_multiply), (Ops.FDIV, _preserve_infinite_division_sign))],
+    (Ops.ADD, _fold_relu_cap), (Ops.MUL, _replace_infinite_multiply), (Ops.FDIV, _preserve_infinite_division_sign))],
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),])

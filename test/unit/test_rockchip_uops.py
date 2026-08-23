@@ -509,6 +509,21 @@ def test_generic_where_owns_ternary_arity():
   assert image.ew_ops[-1].dst.kind is RKBufferKind.ARG and image.ew_ops[-1].dst.index == 0
 
 
+def test_production_abs_and_minimum_keep_generic_typed_images():
+  with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
+    x = Tensor(UOp.new_buffer("ROCKCHIP",24,dtypes.half,num=12001)).reshape(2,3,4)
+    y = Tensor(UOp.new_buffer("ROCKCHIP",24,dtypes.half,num=12002)).reshape(2,3,4)
+    records = []
+    for output in (x.abs(), x.minimum(y)):
+      to_program_cache.clear()
+      program = to_program(output.schedule_linear().src[0].src[0], RockchipRenderer(Target(device="ROCKCHIP")))
+      blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
+      image = decode_image(blob)
+      records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(image.ew_ops), len(image.mid_gathers)))
+  assert records == [("3f3c1465a2e4970839a8a15675d53f56e2f58afa793b36d08ac556b3f8c85533",5954,123,16),
+                     ("7230b73ee7b39133536d38615b32f316fd80ad49aaee468de3678845baab446e",234,4,0)]
+
+
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
   fallback, selected = UOp.param(1, dtypes.half, (6,)), UOp.param(2, dtypes.half, (6,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:

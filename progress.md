@@ -8254,6 +8254,56 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — retire obsolete expanded ABS/MINIMUM folds at 2,357 lines
+
+This isolated milestone follows `eab77f7d0`.  The initially declared renderer
+budget was **+2/-23 executable lines, net -21**.  Ruff then exposed that the
+three-line `exact_static_selection` proof had no owner after `_fold_minimum`
+was removed; the revised and observed budget is exactly **+2/-26, net -24**.
+Authoritative `sz.py` size moves renderer **2381 -> 2357** and repository total
+**27913 -> 27889**; runtime remains **464**.
+
+`_fold_abs` and `_fold_minimum` recognized historical expanded MUL graphs.
+Current production Tensor ABS and MINIMUM schedules already lower through
+`RKContext._where`, `_raw_where`, and ordinary `_alu` stages, so both callbacks,
+their storage-matcher entries, the guarded `_expand_math_uops` call, and its
+now-dead static-selection proof are deleted.  The active `_fold_where_abs` and
+`_fold_ordered_where` routes remain unchanged.  No new helper, IR, runtime
+path, wire field, CPU/GPU numeric fallback, or test deletion is introduced.
+
+A source-filename return profile across all **136** parent UOp tests invoked
+each deleted matcher callback **451** times and observed zero non-`None`
+returns.  The same run confirms the neighboring live callbacks are not dead:
+`_fold_ordered_where` returns five replacements in 2,222 calls and
+`_fold_where_abs` returns four in 1,219 calls.  A compile-only execution of the
+actual census `test_minimum`, `test_abs`, and `test_abs_exact` methods builds
+**15** Rockchip production images without touching the device; parent and
+candidate images are byte-identical at aggregate SHA-256
+`01b199e2a22f937d10a0f261c063d50cfdfbf5a0522b71906e4f8095b5797573`.
+
+The new production regression pins the generic typed images directly.  ABS is
+5,954 bytes / 123 EW stages / 16 mid-gathers at SHA-256
+`3f3c1465a2e4970839a8a15675d53f56e2f58afa793b36d08ac556b3f8c85533`;
+MINIMUM is 234 bytes / four EW stages at SHA-256
+`7230b73ee7b39133536d38615b32f316fd80ad49aaee468de3678845baab446e`.
+An immutable committed-parent/candidate oracle over the original full UOp
+suite also preserves all **264 lowering outcomes / 248 RKImages** byte-for-byte
+at aggregate SHA-256
+`2c4e7c19af00c2c24da2f170a6a688385a2d79b75fd124f163371e810ac13c45`.
+The promoted renderer and test SHA-256 values are
+`d6f8301693ab480087294974e86339f3cfa9d252ffa054cad2a1ae92f525393e`
+and `6ebd4277db4b36f2189160bef39a4be11bd434366aef26fbb01397b3a0217f97`,
+exactly matching the fully tested isolated prototype.
+
+Host verification reports **137 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full census command was run
+because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — remove obsolete raw bitcast specialization at 2,381 lines
 
 This isolated milestone follows `64bd2256e`.  Its predeclared and observed
