@@ -314,6 +314,21 @@ def test_static_vector_values_match_scalar_typed_evaluation():
     assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
 
 
+def test_index_range_analysis_keeps_first_seen_order_and_hides_range_dependencies():
+  first,second = UOp.range(3,20),UOp.range(4,21)
+  root = UOp(Ops.ADD,dtypes.int,src=(UOp(Ops.ADD,dtypes.int,src=(second,first)),UOp(Ops.MUL,dtypes.int,src=(second,first))))
+  assert rockchip_renderer._index_ranges(root) == [second,first]
+  dependent = UOp(Ops.RANGE,dtypes.int,src=(UOp.const(2,dtypes.int),first),arg=(22,AxisType.REDUCE))
+  assert rockchip_renderer._index_ranges(dependent) == [dependent]
+
+
+def test_exact_integer_range_analysis_covers_supported_carriers_only():
+  lane = UOp.range(4,23)
+  expressions = (lane,(lane-2)*3,UOp(Ops.WHERE,dtypes.int,src=(lane<2,lane,UOp.const(-5,dtypes.int))),
+                 UOp(Ops.XOR,dtypes.int,src=(lane,UOp.const(-1,dtypes.int))),UOp.const(True,dtypes.bool).cast(dtypes.int),lane<<1)
+  assert tuple(map(rockchip_renderer._exact_int_range,expressions)) == ((0,3),(-6,3),(-5,3),(-4,-1),(1,1),None)
+
+
 def test_rkvalue_is_the_typed_physical_abi():
   value = RKValue(RKArg(RKBufferKind.ARG, 0), dtypes.half, 1, RKLayout.FP16)
   assert value.dtype is dtypes.half and value.count == 1 and value.layout is RKLayout.FP16

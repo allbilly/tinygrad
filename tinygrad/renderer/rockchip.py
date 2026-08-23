@@ -418,14 +418,7 @@ def _is_static_expr(u:UOp) -> bool: return u.op in _STATIC_OPS and all(_is_stati
 
 def _index_ranges(index:UOp) -> list[UOp]:
   """Ranges used as index values, excluding AFTER/END ordering dependencies attached to a RANGE."""
-  ranges:list[UOp] = []
-  def walk(u:UOp) -> None:
-    if u.op in (Ops.RANGE, Ops.SPECIAL):
-      if u not in ranges: ranges.append(u)
-      return
-    for src in u.src: walk(src)
-  walk(index)
-  return ranges
+  return [index] if index.op in (Ops.RANGE, Ops.SPECIAL) else list(dict.fromkeys(r for src in index.src for r in _index_ranges(src)))
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
 def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
@@ -1203,23 +1196,20 @@ def _fp16_nonzero_mask(root:UOp) -> UOp|None:
   if (load:=_nonzero_load(root)) is None: return None
   return _positive_mask(UOp(Ops.MAX, dtypes.half, src=(load, load), arg=_NATIVE_ABS))
 
-def _exact_int_range(root:UOp, cache:dict[UOp, tuple[int, int]|None]|None=None) -> tuple[int, int]|None:
+@functools.lru_cache(maxsize=4096)
+def _exact_int_range(root:UOp) -> tuple[int, int]|None:
   """Conservatively bound an integer UOp before choosing its exact physical scratch layout."""
-  if cache is None: cache = {}
-  if root in cache: return cache[root]
-  dtype = root.dtype.scalar()
-  valid = dtype in (dtypes.int, dtypes.weakint) and (root.op is Ops.CONST or
+  dtype = root.dtype.scalar(); valid = dtype in (dtypes.int, dtypes.weakint) and (root.op is Ops.CONST or
     root.op is Ops.RANGE and len(root.src) == 1 and root.src[0].op is Ops.CONST or
     root.op is Ops.CAST and len(root.src) == 1 and root.src[0].dtype.scalar() is dtypes.bool or
-    root.op is Ops.WHERE and len(root.src) == 3 and all(_exact_int_range(src, cache) is not None for src in root.src[1:]) or
+    root.op is Ops.WHERE and len(root.src) == 3 and all(_exact_int_range(src) is not None for src in root.src[1:]) or
     root.op is Ops.XOR and len(root.src) == 2 and any(marker.op is Ops.CONST and marker.arg == -1 and
-      _exact_int_range(source, cache) is not None for marker,source in (root.src, root.src[::-1])) or
-    root.op is Ops.CMOD and len(root.src) == 2 and (right:=_exact_int_range(root.src[1], cache)) is not None and right[0] == right[1] != 0 or
+      _exact_int_range(source) is not None for marker,source in (root.src, root.src[::-1])) or
+    root.op is Ops.CMOD and len(root.src) == 2 and (right:=_exact_int_range(root.src[1])) is not None and right[0] == right[1] != 0 or
     root.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX) and len(root.src) == 2 and
-      all(_exact_int_range(src, cache) is not None for src in root.src))
+      all(_exact_int_range(src) is not None for src in root.src))
   bounds = (int(root.vmin), int(root.vmax))
-  if not valid or not dtype.min <= bounds[0] <= bounds[1] <= dtype.max: return cache.setdefault(root, None)
-  return cache.setdefault(root, (0, max(0, bounds[1])) if root.op is Ops.RANGE else bounds)
+  return ((0,max(0,bounds[1])) if root.op is Ops.RANGE else bounds) if valid and dtype.min <= bounds[0] <= bounds[1] <= dtype.max else None
 
 def _int_fp16_expr(u:UOp) -> UOp:
   """Represent an integer UOp whose values are exactly carried in FP16 lanes as a half-valued recipe."""
@@ -1355,8 +1345,7 @@ class RKContext:
     self.post_gathers:list[RKGather] = []
     self.ew_ops:list[RKEWOp] = []
     self.mask_program, nodes = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort()), self.root.toposort()
-    self.int_ranges:dict[UOp, tuple[int, int]|None] = {}
-    int_range = _exact_int_range(self.root, self.int_ranges) if self.root.dtype.scalar() is dtypes.int else None
+    int_range = _exact_int_range(self.root) if self.root.dtype.scalar() is dtypes.int else None
     packed_bool_load = any(node.op is Ops.LOAD and node.dtype.scalar() is dtypes.bool and _root_param(node.src[0]) is not None for node in nodes)
     embedded_half_int = any(node.op is Ops.CAST and node.dtype.scalar() is dtypes.int and len(node.src) == 1 and
                             node.src[0].dtype.scalar() in (dtypes.half, dtypes.bool) for node in nodes)
@@ -1583,7 +1572,7 @@ class RKContext:
     if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
       return self.lower(recipe)
     dtype = u.dtype.scalar()
-    int_range = _exact_int_range(u, self.int_ranges) if dtype is dtypes.int else None
+    int_range = _exact_int_range(u) if dtype is dtypes.int else None
     bounded = self.int_layout is RKLayout.INT32 or self.int_layout is RKLayout.INT_FP16 and int_range is not None and \
       -2048 <= int_range[0] <= int_range[1] <= 2048 or self.int_layout is RKLayout.INT16 and int_range is not None and \
       -32768 <= int_range[0] <= int_range[1] <= 32767
@@ -1797,7 +1786,7 @@ class RKContext:
     if u.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_less(u)
     if all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
       sources = tuple(UOp.const(int(src.arg), dtypes.int) if src.dtype.scalar() is dtypes.weakint else src for src in u.src)
-      bounds = tuple(_exact_int_range(src, self.int_ranges) for src in sources)
+      bounds = tuple(_exact_int_range(src) for src in sources)
       if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(bound is not None and
         -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds):
         value = self.lower(UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg))
@@ -2083,7 +2072,7 @@ class RKContext:
         value = RKValue(self.out, dtype, self.count, value.layout)
     elif u.op is Ops.CAST and len(u.src) == 1:
       source_dtype = u.src[0].dtype.scalar()
-      int_range = _exact_int_range(u.src[0], self.int_ranges) if source_dtype is dtypes.int else None
+      int_range = _exact_int_range(u.src[0]) if source_dtype is dtypes.int else None
       source = self._load(u.src[0]) if dtype is dtypes.half and source_dtype is dtypes.float and u.src[0].op is Ops.LOAD else \
         self.lower(_fp32_expr_to_half(u.src[0])) if dtype is dtypes.half and source_dtype is dtypes.float else \
         self.lower(_int_fp16_expr(u.src[0])) if dtype is dtypes.half and source_dtype is dtypes.int and int_range is not None and \

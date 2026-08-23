@@ -7950,3 +7950,30 @@ environment collects exactly **445 tests**.  Production FP32-sum and
 and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
 No device, health, reset, reboot, or census command was run; the proven
 fresh-boot hardware bracket remains pending.
+
+## 2026-08-24 — immutable UOp analysis cleanup
+
+This isolated milestone follows `23ab9311b`.  Its predeclared and observed
+renderer budget is exactly **+13/-24, net -11** executable lines.  Renderer
+size moves **2576 -> 2565**, repository total **28108 -> 28097**, and runtime
+remains **464**.
+
+`_index_ranges` replaces its mutable nested walker with the same first-seen
+recursive range deduplication.  `_exact_int_range` now uses bounded memoization
+on immutable UOps, making the per-`RKContext` `int_ranges` dictionary and its
+threaded cache arguments obsolete.  A direct parent-versus-candidate oracle
+matches all **18 range graphs** and **3002 generated integer graphs**, including
+shared terms, casts, WHERE, complement, modulo, valid bounds, rejected ops, and
+exception identity.  No admission, range bound, traversal order, image, wire
+value, fallback, or runtime behavior changes.
+
+Host verification reports **125 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, including first-seen range order,
+RANGE-dependency exclusion, and exact integer-carrier bounds.  Mypy passes all
+**216 files**, repository-wide Ruff passes, diff checks are clean, and the
+required Rockchip environment collects exactly **445 tests**.  Production
+FP32-sum and `3x5 @ 5x4` CMAC images remain byte-identical at SHA-256
+`8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9`
+and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+No device, health, reset, reboot, or census command was run; the proven
+fresh-boot hardware bracket remains pending.
