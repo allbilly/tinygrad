@@ -972,6 +972,37 @@ def test_zero_gated_padded_convolution_routes_production_cmac():
     assert fallback is not None and fallback.cmac is None and fallback.ew_ops
 
 
+def test_batched_zero_gated_convolution_reorders_one_production_cmac():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",648,dtypes.half,num=1014)).reshape(2,4,9,9)
+    weight = Tensor(UOp.new_buffer("ROCKCHIP",144,dtypes.half,num=1015)).reshape(4,4,3,3)
+    ast = source.conv2d(weight,padding=1).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (4,162,36)
+  assert not image.ew_ops and len(image.gathers) == 2
+  source_values = (np.arange(648)%5-2).astype(np.float16).reshape(2,4,9,9)
+  weight_values = (np.arange(144)%5-2).astype(np.float16).reshape(4,4,3,3)
+  sources = {1:source_values.view(np.uint16).reshape(-1),2:weight_values.view(np.uint16).reshape(-1)}
+  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  for gather in image.gathers:
+    destination,offsets = scratch[gather.dst_index],np.asarray(gather.offsets)
+    valid = offsets >= 0
+    if not gather.partial: destination[:gather.count] = gather.fill_bits
+    destination[:gather.count][valid] = sources[gather.src_index][offsets[valid]]
+  packed_weight = scratch[image.cmac.lhs.index].view(np.float16).reshape(4,192)
+  packed_source = scratch[image.cmac.rhs.index].view(np.float16).reshape(12,6,16,32).transpose(0,2,1,3).reshape(192,192)
+  expected = np.asarray([[[[sum(float(weight_values[oc,ic,ky,kx])*float(source_values[batch,ic,y+ky-1,x+kx-1])
+    for ic in range(4) for ky in range(3) for kx in range(3) if 0 <= y+ky-1 < 9 and 0 <= x+kx-1 < 9)
+    for x in range(9)] for y in range(9)] for oc in range(4)] for batch in range(2)],dtype=np.float32)
+  np.testing.assert_array_equal(packed_weight[:,:36].astype(np.float32)@packed_source[:162,:36].T.astype(np.float32),
+                                expected.transpose(1,0,2,3).reshape(4,162))
+  assert image.post_gathers[0].offsets == tuple(oc*384+(batch*81+lane)//16*32+(batch*81+lane)%16
+    for batch in range(2) for oc in range(4) for lane in range(81))
+  assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
+
+
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     lhs = Tensor(UOp.new_buffer("ROCKCHIP",6,dtypes.half,num=1007)).reshape(2,3)

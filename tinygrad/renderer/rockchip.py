@@ -250,23 +250,18 @@ def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
 def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
 
-def _cmac_layout(m:int, n:int, k:int) -> tuple[int, int, int]:
-  aligned_k, align_out = max(32, round_up(k, 32)), max(32, round_up(n, 32)); align_in = max(aligned_k, align_out)
-  return align_in, align_out, align_in if align_in != aligned_k else k
+def _cmac_layout(n:int, k:int) -> tuple[int, int, int]: aligned_k,align_out=max(32,round_up(k,32)),max(32,round_up(n,32)); align_in=max(aligned_k,align_out); return align_in,align_out,align_in if align_in != aligned_k else k  # noqa: E501
 
 def _validate_cmac(op:RKCMAC, scratch:tuple[RKScratch, ...]|None=None) -> None:
-  ai,ao,_ = _cmac_layout(op.m,op.n,op.k)
-  if not 0 < op.m <= 0x7ff or ai > 0xffff or ao > 0x3fff or op.m*ai*2 > 10*32768 or ai > 12*32 and op.m != 1:
-    raise ValueError("CMAC shape out of range")
+  ai,ao,_ = _cmac_layout(op.n,op.k)
+  if not 0 < op.m <= 0x7ff or ai > 0xffff or ao > 0x3fff or op.m*ai*2 > 10*32768 or ai > 12*32 and op.m != 1: raise ValueError("CMAC shape out of range")  # noqa: E501
   args,needs,alignments = (op.lhs,op.rhs,op.dst),(op.m*ai*2,ao*ai*2,op.m*ao*4),(2,2,2 if op.out_fp16 else 4)
-  if any(arg.kind is not RKBufferKind.SCRATCH or arg.addend < 0 or arg.addend%alignment for arg,alignment in zip(args,alignments)):
-    raise ValueError("CMAC requires aligned scratch buffers")
-  if scratch is not None and any(not 0 <= arg.index < len(scratch) or arg.addend+need > scratch[arg.index].size for arg,need in zip(args,needs)):
-    raise ValueError("CMAC exceeds scratch buffer")
+  if any(arg.kind is not RKBufferKind.SCRATCH or arg.addend < 0 or arg.addend%alignment for arg,alignment in zip(args,alignments)): raise ValueError("CMAC requires aligned scratch buffers")  # noqa: E501
+  if scratch is not None and any(not 0 <= arg.index < len(scratch) or arg.addend+need > scratch[arg.index].size for arg,need in zip(args,needs)): raise ValueError("CMAC exceeds scratch buffer")  # noqa: E501
 
 def emit_cmac_stage(op:RKCMAC) -> RKStage:
   """Emit the proven 45-qword GEMM body; the four-qword PC tail stays runtime-owned."""
-  C,O,D,ai,ao,ek = 0x201,0x801,_DPU,*_cmac_layout(op.m, op.n, op.k)
+  C,O,D,ai,ao,ek = 0x201,0x801,_DPU,*_cmac_layout(op.n, op.k)
   _validate_cmac(op)
   row_bytes = ai*2; grains = max(80, (ceildiv(2*32768, row_bytes)+1)&~1); banks = min(11, max(1, ceildiv(op.m*row_bytes, 32768)))
   line_stride, notch, (precision,size_e) = 4*min(ceildiv(ek,32),13), 8*min(ao//32,13)-1, (2,1) if op.out_fp16 else (5,3)
@@ -450,14 +445,14 @@ def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, 
   return envs
 
 @functools.lru_cache(maxsize=8)
-def _static_vector_env(out_index:UOp, count:int, *expressions:UOp, reject:str="static_index") -> tuple[dict[UOp, np.ndarray], np.ndarray]:
+def _static_vector_env(out_index:UOp, *expressions:UOp, reject:str="static_index") -> tuple[dict[UOp, np.ndarray], np.ndarray]:
   ranges = tuple(_index_ranges(out_index)); envs = _iter_range_env(list(ranges))
   vector_env = {r:np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
   if any(r not in ranges for expression in expressions for r in _index_ranges(expression)): raise RuntimeError(f"RKPLAN_REJECT:{reject}")
   return vector_env, np.broadcast_to(_eval_expr(out_index, vector_env, {}, True), len(envs)).astype(np.int64)
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
-  vector_env, dst_lanes = _static_vector_env(out_index, count, expr)
+  vector_env, dst_lanes = _static_vector_env(out_index, expr)
   expr_lanes = np.broadcast_to(_eval_expr(expr, vector_env, {}, True), len(dst_lanes))
   if encode is _fp16_bits:
     fp_values = np.asarray(expr_lanes, dtype=np.float64)
@@ -491,7 +486,7 @@ def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, i
   return lhs[0]+sign*rhs[0], {key:coefficient for key,coefficient in terms.items() if coefficient}
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
-  vector_env, dst = _static_vector_env(out_index, count, load_index, *((gate,) if gate is not None else ()), reject="gather_index")
+  vector_env, dst = _static_vector_env(out_index, load_index, *((gate,) if gate is not None else ()), reject="gather_index")
   cache:dict[UOp, int|float|bool|np.ndarray] = {}; src = np.broadcast_to(_eval_expr(load_index, vector_env, cache, True), len(dst)).astype(np.int64)
   values = src if gate is None else np.where(active:=np.broadcast_to(_eval_expr(gate, vector_env, cache, True), len(dst)), src, -1)
   if np.any((src < 0) & (gate is None or active)): raise RuntimeError("RKPLAN_REJECT:gather_index")
@@ -520,8 +515,7 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
 
 def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
   deltas = tuple((limit-1)*stride for _,limit,stride in plan.axes) if not plan.offsets else ()
-  low, high = (min(plan.offsets, default=0), max(plan.offsets, default=-1)) if plan.offsets else \
-    (plan.base+sum(min(delta, 0) for delta in deltas), plan.base+sum(max(delta, 0) for delta in deltas))
+  low,high=(min(plan.offsets,default=0),max(plan.offsets,default=-1)) if plan.offsets else (plan.base+sum(min(delta,0) for delta in deltas),plan.base+sum(max(delta,0) for delta in deltas))  # noqa: E501
   if low < (0 if not plan.offsets else -1) or high >= source_count: raise RuntimeError("RKPLAN_REJECT:gather_index")
 
 @dataclass(frozen=True)
@@ -531,17 +525,13 @@ class RKTypedLoadPlan:
   gather: RKGather
   offsets: tuple[int, ...]
 
-def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, strip_cast:bool=False,
-                     require_default:bool=False, fill_bits:int|None=None, require_offsets:bool=False) -> RKTypedLoadPlan|None:
-  if (load:=_strip_cast(load) if strip_cast else load).op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or \
-     load.src[0].op is not Ops.INDEX: return None
-  if (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST or \
-     require_default and len(load.src) > 1 and load.src[1].op is not Ops.CONST: return None
+def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None, require_offsets:bool=False) -> RKTypedLoadPlan|None:  # noqa: E501
+  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX: return None
+  if (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST: return None  # noqa: E501
   gate = load.src[2] if len(load.src) > 2 else None
   fill_bits = fill_bits if fill_bits is not None else _fp16_bits(load.src[1].arg if len(load.src) > 1 else 0) if dtype is dtypes.half else 0
   try:
-    _validate_gather_bounds(gather:=_gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, count, fill_bits), int(param.src[0].arg))
-    offsets = _gather_offsets(out_index, load.src[0].src[1], gate, count) if require_offsets else ()
+    _validate_gather_bounds(gather:=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits),int(param.src[0].arg)); offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count) if require_offsets else ()  # noqa: E501
   except RuntimeError: return None
   return RKTypedLoadPlan(param, gather, offsets)
 
@@ -649,22 +639,24 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     if any(plan is None for plan in plans): return None
     parsed.append((plans,weight)); cells += rows*len(loads)
   # A is row-stable and B is column-stable; explicit offset tables allow source-stride differences and broadcasts.
-  def align(m:int, n:int) -> tuple[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float], ...]:
+  def align(m:int, n:int, lanes:tuple[int, ...]=()) -> tuple[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float], ...]:
     aligned:list[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float]] = []
     for operands,weight in parsed:
+      if lanes: operands = tuple(replace(plan,offsets=tuple(plan.offsets[lane] for lane in lanes)) for plan in operands)
       row,col = zip(*((all(plan.offsets[i*n+j] == plan.offsets[i*n] for i in range(m) for j in range(n)),all(plan.offsets[i*n+j] == plan.offsets[j] for i in range(m) for j in range(n))) for plan in operands))  # noqa: E501
       order = ((0,None) if row[0] else (None,0) if col[0] else None) if len(operands) == 1 else (0,1) if row[0] and col[1] else (1,0) if row[1] and col[0] else None  # noqa: E501
       if order is None: return ()
       aligned.append((None if order[0] is None else operands[order[0]],None if order[1] is None else operands[order[1]],weight))
     return tuple(aligned)
-  if not any(len(operands) == 2 for operands,_ in parsed): m,n,diagonal,normalized = rows,1,False,align(rows,1)
+  if not any(len(operands) == 2 for operands,_ in parsed): m,n,diagonal,outputs,normalized = rows,1,False,typing_cast(tuple[int, ...],()),align(rows,1)  # noqa: E501
   else:
-    candidates = [(m*ai+ao*ai+2*m*ao,-n,m,n,normalized) for n in range(1,rows+1) if rows%n == 0 for m in (rows//n,)
-      for ai,ao,_ in (_cmac_layout(m,n,groups),) if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and (normalized:=align(m,n))]  # noqa: E501
-    if candidates: _,_,m,n,normalized = min(candidates, key=lambda item:item[:2]); diagonal = False
+    candidates = [(bool(lanes),m*ai+ao*ai+2*m*ao,-n,m,n,outputs,normalized) for affine in (_linear_index(out_index),) for m,n,lanes,outputs in itertools.chain(((rows//n,n,(),()) for n in range(1,rows+1) if rows%n == 0),  # noqa: E501
+      ((limit,rows//limit,tuple(high*stride*limit+row*stride+low for row in range(limit) for high in range(rows//stride//limit) for low in range(stride)),tuple((i//stride%limit)*(rows//limit)+i//(stride*limit)*stride+i%stride for i in range(rows))) for _,stride,limit in ((_affine_output_axes(typing_cast(tuple[int, dict[UOp, int]], affine),rows) if affine is not None else None) or ())))  # noqa: E501
+      for ai,ao,_ in (_cmac_layout(n,groups),) if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and (normalized:=align(m,n,lanes))]  # noqa: E501
+    if candidates: _,_,_,m,n,outputs,normalized = min(candidates, key=lambda item:item[:3]); diagonal = False
     else:
-      m = n = rows; diagonal = True; normalized = tuple((operands[0],operands[1] if len(operands) == 2 else None,weight) for operands,weight in parsed)  # noqa: E501
-  ai,ao,_ = _cmac_layout(m,n,groups)
+      m = n = rows; diagonal = True; outputs = (); normalized = tuple((operands[0],operands[1] if len(operands) == 2 else None,weight) for operands,weight in parsed)  # noqa: E501
+  ai,ao,_ = _cmac_layout(n,groups)
   if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1: return None
   a_cells = tuple(((source.param.arg.slot,source.offsets[row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
   b_cells = tuple(((source.param.arg.slot,source.offsets[ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
@@ -675,7 +667,7 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   if sum(gather.count for gather in gathers)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
   fp16 = out.dtype.scalar() is dtypes.half
   output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col)
-    for i in range(rows) for row,col in ((i,i) if diagonal else divmod(i,n),))
+    for i in (outputs or range(rows)) for row,col in ((i,i) if diagonal else divmod(i,n),))
   return RKImage(RKTarget.RK3588,(RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4)),gathers=gathers,
     post_gathers=(RKGather(2,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
                            src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),m,n,groups,fp16))

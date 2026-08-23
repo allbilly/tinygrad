@@ -8254,6 +8254,64 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — output-axis packing moves batched contractions to CMAC at 2,404 lines
+
+This isolated milestone follows `3ff32b7cb`.  Its final predeclared and
+observed renderer budget is exactly **+24/-32 executable lines, net -8**.
+Authoritative `sz.py` size moves renderer **2412 -> 2404** and repository
+total **27944 -> 27936**; runtime remains **464**.
+
+`_lower_cmac_reduction.align` now accepts a physical lane order derived from
+the existing `_affine_output_axes` proof.  When ordinary flattened-row
+factoring fails, each proved output axis is considered as CMAC M while the
+remaining axes form N.  Source offset plans are reordered only for packing,
+and the inverse permutation is retained in the terminal post-gather so the
+observable output remains in its original order.  Ordinary layouts have
+explicit priority over reordered candidates, preserving all existing CMAC
+images.  This adds no generic IR, semantic operation, runtime/wire path,
+CMAC-to-EW sequence, or CPU/GPU numeric fallback.
+
+The same closure removes stale genericity exposed by the new shared owner:
+`_cmac_layout` no longer accepts its unused M argument,
+`_static_vector_env` no longer accepts its unused count, and
+`_typed_load_plan` drops the never-enabled `strip_cast` and
+`require_default` branches.  Their shape/gather validation is retained in
+the same functions with the same exceptions and bounds.
+
+The actual production `Tensor.schedule_linear -> to_program` path for a
+batch-2 `(2,4,9,9)` input and `(4,4,3,3)` weights with padding one changes
+from **2,213 EW stages / 72 gathers / 175,688 encoded bytes** to one native
+CMAC `(M,N,K) = (4,162,36)` with **zero EW stages / two gathers / 153,317
+encoded bytes**.  The parent and candidate image SHA-256 values are
+respectively
+`6c1e9b38883f7f859ce9a194628bc272426cdcb5a55d8c7a723294c6f99a06a7`
+and `caf362db3d071b2298166ce62e7686abd975927636cfd82c9d27faf9db95ab5a`.
+The production regression materializes both packed surfaces, checks their
+FP32 matrix product against direct padded convolution, verifies the inverse
+NCHW post-gather map, and round-trips the native image codec.
+
+A broader host-only oracle covers padding-one batches two, three, and four,
+batch-three stride two, batch-two dilation two, and batch-two asymmetric
+padding.  Their respective CMAC shapes are `(4,162,36)`, `(4,243,36)`,
+`(4,324,36)`, `(4,75,36)`, `(4,162,36)`, and `(4,200,36)`, each with two
+gathers and no EW stage.  All **150** deterministic small-integer physical
+packing/mathematical cases pass; the ordered oracle SHA-256 is
+`f25af3658dd7c97e2cb5e1d6a1f51395910d60e05b56f433d4021fc3e69abebc`.
+
+A committed-parent/candidate oracle observed all **254 pre-existing lowering
+outcomes**.  Every admission result and encoded image is byte-identical on
+both sides at aggregate SHA-256
+`c59e3fd1ddcbb592c0c28f390215a53c729ccaf89a6eb5fa09c09eb9d6e9b4ba`.
+
+Host verification reports **134 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full hardware census command was
+run because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — zero-gated padded contractions share CMAC typed loads at 2,412 lines
 
 This isolated milestone follows `5f281daad`.  Its predeclared and observed
