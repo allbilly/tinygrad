@@ -271,7 +271,6 @@ class RockchipPhysicalEffects:
     self._in_flight = False
     self._unknown = False
     self._closed = False
-    self._command_synced = False
     self._assets_uploaded = False
     self._cmac_asset_mode = False
     self.last_output: bytes | None = None
@@ -545,9 +544,8 @@ class RockchipPhysicalEffects:
         self._reject("dma_alias", "command/task memory aliases caller resource")
     except PhysicalRuntimeReject:
       raise
-    except Exception as exc:
+    except Exception:
       self._reject("allocator", "native command/task allocation failed")
-      raise AssertionError from exc
 
   def _ensure_asset_buffers(self) -> None:
     indexes = tuple(sorted({item.arg.index for item in self.native.relocs if item.arg.kind is RKBufferKind.ASSET}))
@@ -589,9 +587,8 @@ class RockchipPhysicalEffects:
       }
     except PhysicalRuntimeReject:
       raise
-    except Exception as exc:
+    except Exception:
       self._reject("asset", "immutable asset allocation or write failed")
-      raise AssertionError from exc
 
   def _patch_commands(self) -> tuple[int, ...]:
     commands = list(self.native.commands)
@@ -687,19 +684,15 @@ class RockchipPhysicalEffects:
           self._refuse_cleanup(f"native asset[{index}] metadata changed; refusing free")
     except PhysicalOwnershipUnknown:
       raise
-    except Exception as exc:
+    except Exception:
       self._refuse_cleanup("native allocation metadata could not be verified before free")
-      raise AssertionError from exc
 
   def _cleanup(self) -> None:
     if self._unknown or self._closed:
       return
     free = getattr(self.program.dev, "_gpu_free", None)
     if not callable(free):
-      self._unknown = True
-      self.last_reason = "cleanup"
-      self.telemetry.reject("cleanup_unknown")
-      raise PhysicalOwnershipUnknown("native allocation cleanup primitive is unavailable")
+      self._refuse_cleanup("native allocation cleanup primitive is unavailable")
     self._validate_cleanup_snapshots()
     errors: list[Exception] = []
     buffers: list[tuple[str, HCQBuffer]] = [
@@ -737,9 +730,8 @@ class RockchipPhysicalEffects:
           self._sync(self._asset_buffers[index], rk.RKNPU_MEM_SYNC_TO_DEVICE)
       except PhysicalRuntimeReject:
         raise
-      except KeyError as exc:
+      except KeyError:
         self._reject("asset", "immutable asset allocation is missing before idle upload")
-        raise AssertionError from exc
       except Exception as exc:
         self._reject("asset", f"immutable asset sync failed: {exc}")
       self.telemetry.asset_bytes += sum(self.native.assets[index].size for index in asset_indexes)
@@ -754,8 +746,7 @@ class RockchipPhysicalEffects:
     self._sync(self._resource_buffers["lhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if not self._cmac_asset_mode:
       self._sync(self._resource_buffers["rhs"], rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    if not self._command_synced:
-      self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self._sync(self._require_buffer("_task_buf"), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     reset = getattr(self.program.dev, "reset_npu", None)
     if not callable(reset):
@@ -854,8 +845,6 @@ class RockchipPhysicalEffects:
     try:
       if preflight:
         self._preflight()
-      self._prepare()
-      self._upload_asset_while_idle()
       self.reset_before()
       self.barrier_before()
       receipt = self.submit_physical()
