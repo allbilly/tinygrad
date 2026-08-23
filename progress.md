@@ -8107,3 +8107,55 @@ repository-wide Ruff success, clean diff checks, and exactly **445 tests
 collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
 health, reset, reboot, or hardware census command was run; fresh-boot CMAC
 acceptance and its pre/post `simple_add.py` bracket remain pending.
+
+## 2026-08-24 — specialize post-CMAC residual reductions at 2,500 lines
+
+This isolated milestone follows `35018d59d`.  Its predeclared executable
+split was **+15/-31, net -16**; the observed renderer diff is **+14/-30,
+net -16** because the fixed batch-emitter replacement consumed one fewer
+added and deleted executable line than estimated.  The net budget and target
+remain exact: renderer size moves **2516 -> 2500**, repository total **28048
+-> 28032**, and runtime remains **464**.
+
+CMAC's existing ADD-reduction coverage had left `_reduce_arena` with one
+owner and unused direct-output, FP32-output, INT32, callable-barrier, and
+per-operation barrier controls.  `_reduce_rows` now owns its exact balanced
+pairing and first dependent floating-stage barrier directly, while INT16
+users retain the same flag-free ordering.  `_ew_ops` is again only the fixed
+batch emitter its remaining six callers use.  The two scalar-extrema sites
+own their fixed 64-byte-spaced MAX reductions directly, making
+`_reduce_arena` and `_spaced_reduction` obsolete.
+
+The final integer MAX reuses the original 256-byte spaced arena after its
+floating maximum has been copied out, reducing that fixture from **27 to 26
+scratch slots**.  An initial draft incorrectly tried to reuse the 64-byte
+`best_values` buffer; a direct extent oracle caught the undersized four-row
+destination before promotion.  The candidate was corrected to the dead
+256-byte arena, and the unit test now asserts decoded gather/EW scratch
+extents so that error cannot recur.
+
+A committed-parent/candidate lowering oracle observed **242 outcomes / 226
+RKImages** across all Rockchip UOp tests.  Exactly one image differs: the
+intended scalar-extrema scratch reuse above, with the same five gathers, 73
+EW stages, and seven mid-gathers.  The other **225 images are byte-identical**;
+the combined parent/candidate record SHA-256 is
+`773dfee70fa610ff6bb373132817110ca96e3c76f3be06cba98757fb07cefee4`.
+A test-only raw physical executor checked **1,005** finite FP16 extrema cases,
+including ties, negative values, and signed zero; parent and candidate both
+return the same first-argmax result in every case.
+
+Seven actual production `Tensor.schedule_linear -> to_program` programs
+(argmax, bool cast, uint8 cast, sum, mean, multi-axis sum, and matmul) remain
+byte-identical.  Their candidate aggregate SHA-256 is
+`fa32f111b839151233799fdec4697b66f09fc3e06da0d495a19926f4039cda68`;
+the `3x5 @ 5x4` CMAC image remains
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+
+Host verification reports **127 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No CMAC
+admission, wire field, runtime submit behavior, CPU/GPU numeric fallback, or
+test tolerance changed.  No device, health, reset, reboot, or hardware census
+command was run; fresh-boot CMAC acceptance and its pre/post `simple_add.py`
+bracket remain pending.

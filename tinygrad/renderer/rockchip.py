@@ -602,18 +602,9 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
   high, middle = _precise_sum_parts(terms); return _tag_precise_adds(high.alu(Ops.ADD, middle))
 
-def _ew_ops(stages:Iterable[tuple[RKArg, RKArg, RKArg, Ops|int]], count:int,
-            submit_barrier:bool|Callable[[int], bool]=False, stateful:bool=False, **flags) -> tuple[RKEWOp, ...]:
+def _ew_ops(stages:Iterable[tuple[RKArg, RKArg, RKArg, Ops|int]], count:int, **flags) -> tuple[RKEWOp, ...]:
   return tuple(RKEWOp(dst, lhs, rhs, count, cfg if not isinstance(cfg, Ops) else _EW_CFG[cfg],
-                      submit_barrier=submit_barrier(i) if callable(submit_barrier) else submit_barrier,
-                      stateful=stateful, **flags)
-               for i,(dst,lhs,rhs,cfg) in enumerate(stages))
-
-def _spaced_reduction(ops:list[RKEWOp], mid:list[RKGather], source:RKArg, count:int, allocate:Callable[[int], RKArg], cfg:int,
-                      *, int16:bool=False) -> RKArg:
-  stride = round_up(2, 64); spaced = allocate(count*stride//2)
-  mid.append(RKGather(source.index, spaced.index, count, axes=((1, count, 1),), dst_stride=stride//2, src_kind=RKBufferKind.SCRATCH, after=len(ops)))
-  return _reduce_rows(ops, [replace(spaced, addend=lane*stride) for lane in range(count)], 1, cfg, int16=int16)
+                      **flags) for dst,lhs,rhs,cfg in stages)
 
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append an in-place EW image, scheduling its input materialization after the first image completes."""
@@ -746,31 +737,18 @@ class _RKBuilder:
     return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in self.sizes), constants,
                    gathers=tuple(self.gathers), ew_ops=tuple(self.ops), **kwargs)
 
-def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False, int32:bool=False) -> RKArg:
+def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
-  return _reduce_arena(ops, list(range(len(active))), count, cfg, active.__getitem__, int16=int16, int32=int32, first_barrier=not (int16 or int32))
+  first = not int16
+  while len(active) > 1:
+    for lhs,rhs in zip(active[::2], active[1::2]):
+      ops.append(RKEWOp(lhs, lhs, rhs, count, cfg, submit_barrier=first, stateful=first, int16_input=int16, int16_output=int16)); first = False  # noqa: E501
+    active = active[::2]
+  return active[0]
 
 def _masked_rows(builder:_RKBuilder, value:RKArg, mask:RKArg, rows:int, lanes:int, count:int) -> RKArg:
   selected = builder.i16(value, mask, rows*lanes, _EW_CFG[Ops.MUL])
   return _reduce_rows(builder.ops, [replace(selected, addend=row*lanes*2) for row in range(rows)], count, _EW_CFG[Ops.ADD], int16=True)
-
-def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:Callable[[int], RKArg],
-                  out:RKArg|None=None, fp32_out:bool=False, int16:bool=False, op_barriers:bool=False,
-                  int32:bool=False, first_barrier:bool=False) -> RKArg:
-  """Append a balanced in-place arena reduction and optionally write its final stage directly to output."""
-  if int16 and int32: raise ValueError("conflicting integer reduction precision")
-  row_first = True
-  while len(active) > 1:
-    reduced = []
-    for i in range(0, len(active)-1, 2):
-      lhs, rhs, final = active[i], active[i+1], len(active) == 2 and out is not None
-      ops.extend(_ew_ops(((out if final and out else arena(lhs), arena(lhs), arena(rhs), cfg | (fp32_out and final and _EW_STAGE_FP32_OUT)),), count,
-        first_barrier and row_first or op_barriers and bool(ops), first_barrier and row_first or op_barriers,
-        int16_input=int16, int16_output=int16, int32_input=int32, int32_output=int32))
-      row_first = False
-      reduced.append(lhs)
-    active = reduced + (active[-1:] if len(active) & 1 else [])
-  return out if out is not None else arena(active[0])
 
 def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
   """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
@@ -2321,7 +2299,9 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
   scratch = list(child.scratch); values = RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
   def allocate(lanes:int=total) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
   ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers); mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)  # noqa: E501
-  best = _spaced_reduction(ops, mid, values, total, allocate, _EW_CFG[Ops.MAX])
+  spaced = allocate(total*32)
+  mid.append(RKGather(values.index, spaced.index, total, axes=((1,total,1),), dst_stride=32, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
+  best = _reduce_rows(ops, [replace(spaced, addend=lane*64) for lane in range(total)], 1, _EW_CFG[Ops.MAX])
   best_values = allocate(); mid.append(RKGather(best.index, best_values.index, total, offsets=(best.addend//2,)*total, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
   fake_out, fake_values, fake_best, fake_coordinates = range(fake_param.arg.slot, fake_param.arg.slot+4)
   lane = UOp.range(total, max((u.arg[0] for u in (*value_def.loops, *index_def.loops) if isinstance(u.arg, tuple)), default=-1)+1)
@@ -2340,7 +2320,8 @@ def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> R
                                           fake_coordinates:retained(coordinate_arg), fake_out:weighted})
   scratch, gathers, ops, mid = list(combined.scratch), list(combined.gathers), list(combined.ew_ops), list(combined.mid_gathers)
   scratch.append(RKScratch(_scratch_bytes(total)))
-  result = _spaced_reduction(ops, mid, weighted, total, allocate, _EW_CFG[Ops.MAX], int16=True)
+  mid.append(RKGather(weighted.index, retained(spaced).index, total, axes=((1,total,1),), dst_stride=32, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
+  result = _reduce_rows(ops, [replace(retained(spaced), addend=lane*64) for lane in range(total)], 1, _EW_CFG[Ops.MAX], int16=True)
   for value,op in ((v,o) for v,o,n in ((slope,Ops.MUL,1), (baseline,Ops.ADD,0)) if v != n):
     source, previous, result = allocate(1), result, allocate(1)
     gathers.append(RKGather(out_param.arg.slot, source.index, 1, values=(_int16_bits(value),)))

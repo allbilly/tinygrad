@@ -1242,6 +1242,7 @@ def test_dependent_scalar_local_extrema_is_vectorized_from_uop_structure():
   image = _lower_uop_program(list(UOp.sink(value_init, value_update, index_init, index_update, output).toposort()))
   assert image is not None and len(image.ew_ops) < 100 and len(image.mid_gathers) == 7
   assert image.constants == struct.pack("<6h", 0, 1, 123, 124, 127, 128) and decode_image(encode_image(image)) == image
+  assert _assert_decoded_image_bounds(image) == image
   assert any(gather.dst_stride == 32 for gather in image.mid_gathers)
 
 
