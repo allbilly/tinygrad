@@ -8254,6 +8254,52 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — explicit EW tiling ownership makes CMAC room at 454 runtime lines
+
+This isolated milestone follows `54cbbdf13`.  Its predeclared and observed
+runtime budget is exactly **+9/-17 executable lines, net -8**.  Authoritative
+`sz.py` size moves runtime **462 -> 454** and repository total **27886 ->
+27878**; the CMAC-focused renderer remains **2356**.
+
+`RockchipProgram._tile` now owns only the common count/offset loop and always
+returns address-patched command bodies.  Its four production callers directly
+own their scratch INT16, INT16-to-INT32, same-precision INT16/INT32, and live
+stage flags.  This deletes the weak-reference dereferences, five opaque mode
+arguments (`bits`, `live`, `convert`, `scratch`, and `patch`), internal flag
+matrix, caller-side patch loops, and temporary conversion-stage list.  The
+remaining `weakref` import is retained for the program-resource cache.  No
+renderer, image format, CMAC admission, command recipe, numeric path,
+CPU/GPU fallback, tolerance, or existing assertion changed.
+
+A committed-parent/candidate runtime oracle exercises seven physical routes:
+scratch INT16, INT16-to-INT32, native INT16, native INT32, plain live,
+stateful live, and INT16-output live.  Every submission boundary, qword count,
+reset count, and command-body byte is identical; the ordered oracle SHA-256 is
+`bfd51e8757bbcfcaf6788b7734bc77f687f091f41a4b06845dcca9071fd64d28`.
+The permanent regression pins all seven parent bodies.
+
+The complete parent/candidate UOp oracle observes **268 lowering outcomes /
+252 RKImages / 16 honest rejections**.  Every record and encoded image is
+byte-identical at ordered SHA-256
+`7e5064151f5ce3e607f2e1d90d90de979a01eeb770dee94039f01b5a3b736c0c`.
+The actual production `Tensor.schedule_linear -> to_program` plain and ReLU
+matmuls remain one `(3,4,5)` CMAC with zero EW stages and respective image
+SHA-256 values
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`
+and
+`ed0f42d71e8049f79e621b28f6699c5950203025a5990fbfa8334b0418cf89ea`.
+
+Host verification reports **140 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  Fable
+Judge reports **VERIFIED WITH CAVEATS**: all host claims reproduce and no
+weakened check, scope creep, or debris is present; the sole caveat is the
+prohibited live hardware bracket.  No device, health, reset, reboot, hardware
+execution, or full hardware census command was run because the board remains
+untrusted; fresh-boot CMAC acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — terminal ReLU joins the fixed CMAC body at 2,356 lines
 
 This isolated milestone follows `f3e911238`.  Its predeclared and observed

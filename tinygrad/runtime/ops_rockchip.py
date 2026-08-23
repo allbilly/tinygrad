@@ -218,7 +218,7 @@ class RockchipProgram(Program['RockchipDevice']):
       cached = self._scratch_ew_bodies.get(ops)
       if cached is None:
         stages = []
-        for op in ops: stages.extend(self._tile(wr.ref(op), _MAX_EW_ELEMS_FP16, addr, scratch=True, patch=True))
+        for op in ops: stages.extend(self._tile(op, _MAX_EW_ELEMS_FP16, addr, stateful=True, int16_output=True, int16_input=True))
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return
@@ -278,9 +278,7 @@ class RockchipProgram(Program['RockchipDevice']):
         if bodies and body_precision not in (0, 16):
           self._submit_pcchain(bodies)
           bodies.clear()
-        stages = []
-        for start in self._tile(wr.ref(op), 8, addr, 1, convert=True, patch=True): stages += [start]
-        bodies.extend(stages)
+        bodies.extend(self._tile(op, 8, addr, 1, dst_step=4, src_step=2, stateful=True, int32_output=True, int16_input=True))
         body_precision = 0
         continue
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
@@ -289,7 +287,8 @@ class RockchipProgram(Program['RockchipDevice']):
           self._submit_pcchain(bodies)
           bodies.clear()
         body_precision, itemsize, limit = precision, precision//8, _MAX_EW_ELEMS_FP16//(precision//16)
-        for stage in self._tile(wr.ref(op), limit, addr, itemsize, precision): bodies += [patch_stage(stage,addr)]
+        bodies.extend(self._tile(op, limit, addr, itemsize, stateful=True, int32_output=precision == 32,
+          int32_input=precision == 32, int16_output=precision == 16, int16_input=precision == 16))
         continue
       if op.int32_input or op.int32_output:
         if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
@@ -319,20 +318,13 @@ class RockchipProgram(Program['RockchipDevice']):
           self._submit_standalone(patch_stage(stage, address))
           self.dev.reset_npu()
         continue
-      for stage in self._tile(wr.ref(op), _MAX_EW_ELEMS_FP16, addr, live=True): bodies += [patch_stage(stage,addr)]
+      bodies.extend(self._tile(op, _MAX_EW_ELEMS_FP16, addr, stateful=op.stateful or op.int16_output,
+        int16_output=op.int16_output))
     if bodies: self._submit_pcchain(bodies)
 
-  def _tile(self, ref, limit, addr, itemsize=2, bits=0, live=False, convert=False, scratch=False, patch=False):
-    for start in range(0, ref().count, limit):
-      if live: flags = dict(stateful=ref().stateful or ref().int16_output, int16_output=ref().int16_output)
-      elif bits: flags = dict(stateful=True, int32_output=bits == 32, int32_input=bits == 32,
-                              int16_output=bits == 16, int16_input=bits == 16)
-      elif convert: flags = dict(dst_step=4, src_step=2, stateful=True, int32_output=True, int16_input=True)
-      else: flags = dict(stateful=True, int16_output=True, int16_input=True) if scratch else {}
-      if patch: yield patch_stage(_offset_stage(ref(), min(limit, ref().count-start), start*itemsize, **flags), addr)
-      else:
-        stage = _offset_stage(ref(), min(limit, ref().count-start), start*itemsize, **flags)
-        yield stage
+  def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, **flags):
+    for start in range(0, op.count, limit):
+      yield patch_stage(_offset_stage(op, min(limit, op.count-start), start*itemsize, **flags), address)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs

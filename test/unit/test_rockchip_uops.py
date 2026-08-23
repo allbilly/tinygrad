@@ -426,6 +426,42 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   assert program.dev.resets == 1 and len(submits) == 2 and submits[1][1] == {"standalone":True}
 
 
+def test_runtime_tiling_modes_keep_exact_stage_bodies():
+  class FakeDevice:
+    def __init__(self): self.resets = 0
+    def reset_npu(self): self.resets += 1
+    def _forget_program(self, _program): pass
+    def _gpu_free(self, _buffer): pass
+  scratch = tuple(RKArg(RKBufferKind.SCRATCH, index, index*32) for index in range(3))
+  external = tuple(RKArg(RKBufferKind.ARG, index, index*32) for index in range(3))
+  add, large = _EW_CFG[Ops.ADD], _MAX_EW_ELEMS_FP16+3
+  cases = (
+    ("6fef992e01c99f01880ddd0363b4f4472c05097528700dc4f4c1748c695e6056", ((31,31),),
+      RKEWOp(scratch[0],scratch[1],scratch[2],large,add,int16_input=True,int16_output=True)),
+    ("d8269792e064feb474483980a269a3df704b71fde4dd366b58afed686da58db2", ((32,32),),
+      RKEWOp(scratch[0],scratch[1],scratch[2],11,add,int16_input=True,int32_output=True)),
+    ("f7d8fb289a5ee91ebb11e059ebab0ee16d46ad93094d6937e56a4bb83060c270", ((31,31),),
+      RKEWOp(scratch[0],external[1],scratch[2],large,add,int16_input=True,int16_output=True)),
+    ("a8dffe2406a897e0d7f225ac7b4fba7879ca8d476dc410ba15b552d9e733145f", ((31,31),),
+      RKEWOp(scratch[0],scratch[1],scratch[2],_MAX_EW_ELEMS_FP16//2+3,add,int32_input=True,int32_output=True)),
+    ("b16caeded014eca42e067c91c6e7b07094bafa4fb5eb4b0a62a1239b82aee7d5", ((18,18),),
+      RKEWOp(external[0],external[1],external[2],large,add)),
+    ("bb30c192a115976317e2ed0341666192a4d3bcf758e0910f5f1ec09a1d44b215", ((31,),),
+      RKEWOp(external[0],external[1],external[2],17,add,stateful=True)),
+    ("2f075321eab33020cf9ae176f91235110c26e2e01e3d4790070c5f6e85f00d88", ((31,31),),
+      RKEWOp(external[0],external[1],external[2],large,add,int16_output=True)),)
+  def address(kind:RKBufferKind, index:int) -> int: return 0x10000000+int(kind)*0x01000000+index*0x00100000
+  for expected_hash,expected_shape,op in cases:
+    program = object.__new__(rockchip_runtime.RockchipProgram)
+    program.dev, program.image, program._scratch_ew_bodies = FakeDevice(), SimpleNamespace(ew_ops=(op,)), {}
+    submissions = []
+    program._submit_pcchain = lambda bodies:submissions.append(tuple(bodies))
+    program._run_ew_ops(address, lambda _kind,_index:None)
+    assert tuple(tuple(map(len, submission)) for submission in submissions) == expected_shape and program.dev.resets == 0
+    packed = b"".join(struct.pack(f"<{len(body)}Q", *body) for submission in submissions for body in submission)
+    assert hashlib.sha256(packed).hexdigest() == expected_hash
+
+
 def test_native_ew_configs_keep_their_exact_register_values():
   assert tuple(rockchip_renderer._EW_CFG[op] for op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV)) == (
     0x108202c0,0x108402c0,0x108003c4,0x108002c0,0x108303c0)
