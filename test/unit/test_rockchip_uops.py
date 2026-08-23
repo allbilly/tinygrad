@@ -855,6 +855,19 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
                                 lhs_values.reshape(3,5).astype(np.float32)@rhs_values.astype(np.float32))
 
 
+def test_tensor_mean_routes_scaled_production_cmac_weights():
+  with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",8,dtypes.half,num=1004))
+    ast = source.mean().schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  images = [decode_image(u.arg) for u in program.src if u.op is Ops.BINARY]
+  image = next(image for image in images if image.cmac is not None)
+  assert (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,8)
+  assert image.constants == struct.pack("<e",0.125) and image.cmac.out_fp16 and not image.ew_ops
+  assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+
+
 def test_static_dot_reduce_owns_accurate_physical_recipe():
   out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,)), UOp.param(2, dtypes.half, (6,))
   row, axis = UOp.range(2, 0), UOp.range(3, 1, AxisType.REDUCE)
@@ -954,6 +967,20 @@ def test_fp32_pure_add_tree_routes_cmac_at_the_half_output_boundary():
   image = _lower_uop_program(_program(dtypes.half, lambda _i:value.cast(dtypes.half), count=1))
   assert image is not None and image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,64)
   assert image.cmac.out_fp16 and not image.ew_ops and decode_image(encode_image(image)) == image
+
+
+def test_scaled_pure_sum_routes_cmac_weights_but_scaled_dot_stays_generic():
+  lhs, rhs = UOp.param(1, dtypes.half, (8,)), UOp.param(2, dtypes.half, (8,))
+  sums = [lhs.index(i).load().cast(dtypes.float) for i in range(8)]
+  dots = [lhs.index(i).load().cast(dtypes.float)*rhs.index(i).load().cast(dtypes.float) for i in range(8)]
+  for terms in (sums,dots):
+    value = terms[0]
+    for term in terms[1:]: value = value+term
+    value = value*0.125
+    image = _lower_uop_program(_program(dtypes.half,lambda _i:value.cast(dtypes.half),count=1))
+    assert image is not None
+    if terms is sums: assert image.cmac is not None and image.constants == struct.pack("<e",0.125) and not image.ew_ops
+    else: assert image.cmac is None and image.ew_ops
 
 
 def test_nested_fp32_product_sum_is_committed_before_outer_half_add():

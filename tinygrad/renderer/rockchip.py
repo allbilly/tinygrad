@@ -462,28 +462,22 @@ def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, 
     envs = [{**env, r: i} for env in envs for i in range(bound)]
   return envs
 
-@dataclass(frozen=True)
-class RKLoopReduction:
-  store:UOp; out:UOp; nodes:list[UOp]; rows:int; envs:list[dict[UOp, int]]; reduce_range:UOp; groups:int; update:UOp; post_scale:float
-
-def _loop_reduction_match(output:RKOutput) -> RKLoopReduction|None:
-  """Parse the output, accumulator update, shape, and optional final scale of a loop reduction."""
-  store, out, _, _, root = output; nodes, rows, out_ranges = list(root.toposort()), int(out.src[0].arg), _index_ranges(store.src[0].src[1])
-  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
-  if rows <= 0 or len(reduce_ranges) != 1: return None
-  reduce_range = reduce_ranges[0]
-  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
-  try: envs = _iter_range_env(out_ranges)
-  except RuntimeError: return None
-  if len(envs) != rows or tuple(int(_eval_expr(store.src[0].src[1], env, {})) for env in envs) != tuple(range(rows)): return None
-  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
+def _cmac_loop(output:RKOutput) -> tuple[UOp,UOp,int,float]|None:
+  """Extract one additive local loop and its candidate output scale."""
+  store,_,_,_,post = output; root = post; nodes,out_ranges = list(post.toposort()),_index_ranges(store.src[0].src[1])
+  axes = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
+  if len(axes) != 1 or axes[0].src[0].op is not Ops.CONST or (groups:=int(axes[0].src[0].arg)) <= 0: return None
+  axis = axes[0]; updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and axis in u.toposort()]; scale = 1.0  # noqa: E501
   if len(updates) != 1: return None
   if root.op is Ops.MAX:
-    unclamped, epsilon = next(((value, const) for value,const in (root.src, root.src[::-1]) if const.op is Ops.CONST), (None, None))
-    if unclamped is None or epsilon is None or _fp16_bits(float(epsilon.arg)) != 0: return None
-    root = unclamped
-  if (post:=_reduction_post_parts(root, out.dtype, strict=True)) is None: return None
-  return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post[0])
+    if (pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or _fp16_bits(float(pair[1].arg)) != 0: return None  # noqa: E501
+    root = pair[0]
+  if root.op is Ops.MUL:
+    if (pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or not math.isfinite(scale:=float(pair[1].arg)): return None  # noqa: E501
+    root = pair[0]
+  update = _strip_cast(updates[0].src[1]); acc = next((x for x in update.src if _local_load(x) is not None),None) if update.op is Ops.ADD else None
+  if _local_load(root) is None or acc is None: return None
+  return _strip_cast(update.src[1 if update.src[0] is acc else 0]),axis,groups,scale
 
 @functools.lru_cache(maxsize=8)
 def _static_vector_env(out_index:UOp, count:int, *expressions:UOp, reject:str="static_index") -> tuple[dict[UOp, np.ndarray], np.ndarray]:
@@ -641,19 +635,6 @@ def _ew_ops(stages:Iterable[tuple[RKArg, RKArg, RKArg, Ops|int]], count:int,
                       stateful=stateful, **flags)
                for i,(dst,lhs,rhs,cfg) in enumerate(stages))
 
-def _reduction_post_parts(value:UOp, output_dtype:DType, *, strict:bool=False) -> tuple[float, UOp|None, UOp|None]|None:
-  local_refs = [u for u in value.toposort() if _local_load(u) is not None]
-  if strict and (value.op is Ops.SQRT and len(value.src) == 1 or
-      value.op is Ops.FDIV and len(value.src) == 2 and value.src[0].op is Ops.CONST and
-      float(value.src[0].arg) == 1.0 and _local_load(value.src[1]) is not None or len(local_refs) == 1 and any(
-      node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half, dtypes.float) and abs(float(node.arg)-1/3) < 1e-6
-      for node in value.toposort())): return None
-  if _local_load(value) is not None: return 1.0, None, None
-  if value.op is Ops.MUL and (load:=next((x for x in value.src if _local_load(x) is not None), None)) is not None and \
-     (scale:=value.src[1 if value.src[0] is load else 0]).op is Ops.CONST: return float(scale.arg), None, None
-  if strict or not local_refs: return None
-  return 1.0, value, next((u for u in local_refs if u.dtype.scalar() is output_dtype.scalar()), local_refs[-1])
-
 def _spaced_reduction(ops:list[RKEWOp], mid:list[RKGather], source:RKArg, count:int, allocate:Callable[[int], RKArg], cfg:int,
                       *, int16:bool=False) -> RKArg:
   stride = round_up(2, 64); spaced = allocate(count*stride//2)
@@ -706,22 +687,20 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
   """Factor a real sum/dot/matmul into one fixed CMAC stage and raw physical gathers."""
   _,out,rows,out_index,root = output
   if rows <= 0 or out.dtype.scalar() not in (dtypes.half,dtypes.float): return None
-  axis:UOp|None = None; terms:tuple[UOp, ...]
-  if (loop:=_loop_reduction_match(output)) is not None:
-    if loop.post_scale != 1.0 or loop.update.op is not Ops.ADD or \
-       (acc:=next((x for x in loop.update.src if _local_load(x) is not None), None)) is None: return None
-    terms, axis, groups, envs = (_strip_cast(loop.update.src[1 if loop.update.src[0] is acc else 0]),), loop.reduce_range, loop.groups, loop.envs
+  axis:UOp|None = None; terms:tuple[UOp, ...]; scale = 1.0
+  if (loop:=_cmac_loop(output)) is not None:
+    term,axis,groups,scale = loop; terms = (term,)
   else:
     root = _strip_cast(root)
     if root.op is Ops.REDUCE and root.arg in ((Ops.ADD,),Ops.ADD) and len(root.src) == 2 and root.src[1].op is Ops.RANGE and \
        root.src[1].src[0].op is Ops.CONST:
       terms, axis, groups = (_strip_cast(root.src[0]),), root.src[1], int(root.src[1].src[0].arg)
-    elif (scaled:=_scaled_add_terms(root)) is not None and scaled[1] == 1.0 and len(scaled[0]) >= 4:
-      terms, groups = scaled[0], len(scaled[0])
+    elif (scaled:=_scaled_add_terms(root)) is not None and len(scaled[0]) >= 4:
+      terms,scale = scaled; groups = len(terms)
     else: return None
-    try: envs = _iter_range_env(_index_ranges(out_index))
-    except RuntimeError: return None
-    if len(envs) != rows or tuple(int(_eval_expr(out_index, env, {})) for env in envs) != tuple(range(rows)): return None
+  try: envs = _iter_range_env(_index_ranges(out_index))
+  except RuntimeError: return None
+  if len(envs) != rows or tuple(int(_eval_expr(out_index, env, {})) for env in envs) != tuple(range(rows)): return None
   if not 0 < groups <= _MAX_GENERIC_UNROLL: return None
   parsed:list[tuple[tuple[UOp,UOp], ...]] = []
   for term in terms:
@@ -771,7 +750,12 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
   ai,ao,_ = _cmac_layout(m,n,groups)
   if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1 or \
      m*ai+ao*ai+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
-  constant = right is None; shift = int(constant)
+  constant = right is None
+  if not constant and scale != 1.0: return None
+  try: constants = struct.pack("<e",scale) if constant else b""
+  except (OverflowError,struct.error): return None
+  if constant and float(struct.unpack("<e",constants)[0]) != scale: return None
+  shift = int(constant)
   a_slot,b_slot,c_slot = shift,shift+1,shift+2; a_base = bases[left] if diagonal else bases[left][::n]; a_delta = deltas[left]
   a_offsets = tuple(base+a_delta[k] if k < groups else -1 for base in a_base for k in range(ai))
   if right is None: b_offsets = tuple(0 if ob*16+ni < n and ib*32+ki < groups else -1
@@ -792,7 +776,7 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
   post = (RKGather(c_slot,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
                    src_kind=RKBufferKind.SCRATCH),)
   cmac = RKCMAC(RKArg(RKBufferKind.SCRATCH,c_slot),RKArg(RKBufferKind.SCRATCH,a_slot),RKArg(RKBufferKind.SCRATCH,b_slot),m,n,groups,fp16)
-  return RKImage(RKTarget.RK3588,scratch,struct.pack("<e",1.0) if constant else b"",gathers=gathers,post_gathers=post,cmac=cmac)
+  return RKImage(RKTarget.RK3588,scratch,constants,gathers=gathers,post_gathers=post,cmac=cmac)
 
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64; return vector_bytes, vector_bytes//2, rows*vector_bytes//2

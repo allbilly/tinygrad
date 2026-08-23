@@ -7832,3 +7832,36 @@ Host verification reports **118 passed** for
 success, clean diff checks, and exactly **445 tests collected** in the required
 Rockchip environment.  No device command or hardware claim is part of this
 dead-code milestone; the fresh-boot CMAC acceptance gate above remains pending.
+
+## 2026-08-23 — scaled pure sums through specialized CMAC parsing
+
+This isolated milestone follows `367d539390c0d81001eeff23b5015a166708c4ae`.
+Its predeclared executable budget was at most **+25 additions**, at least
+**-35 deletions**, and net at most **-10**.  The observed renderer diff is
+exactly **+25/-39, net -14**: renderer size moves **2610 -> 2596**, repository
+total **28150 -> 28136**, and runtime remains **472**.
+
+The general `RKLoopReduction`, `_loop_reduction_match`, and
+`_reduction_post_parts` surfaces are removed.  Their CMAC-only replacement is
+`_cmac_loop`, which extracts one additive local loop and its optional output
+scale.  Pure sums may now use that scale as the existing packed FP16 CMAC B
+weight when it is finite and represented exactly by FP16.  A scaled dot still
+rejects CMAC and follows the existing native EW lowering; non-FP16-exact scales
+also fail closed.  No generic reduction IR or CPU/GPU numeric fallback was
+added.
+
+The real production `to_program` path now routes an eight-element Tensor mean
+to native CMAC `(M,N,K) = (1,1,8)` with constant weight bits `0x3000` (0.125),
+no EW stage, and no host gather/scatter.  Direct comparison with the parent
+shows byte-identical serialized images for the existing FP32 sum
+(`8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9`)
+and `3x5 @ 5x4` matmul
+(`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`).
+
+Host verification reports **120 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, census, reboot, or reset command was run: CMAC hardware acceptance is
+still pending a proven fresh boot, pre-health, the serial production 445-case
+census, and post-health on that same boot.
