@@ -7923,3 +7923,30 @@ at SHA-256 `8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9`
 and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
 No device, health, reset, reboot, or census command was run; the proven
 fresh-boot hardware bracket remains pending.
+
+## 2026-08-24 — native EW and CMAC normalization cleanup
+
+This isolated milestone follows `80f6bb25d`.  Its predeclared and observed
+renderer budget is exactly **+9/-16, net -7** executable lines.  Renderer size
+moves **2583 -> 2576**, repository total **28115 -> 28108**, and runtime
+remains **464**.
+
+The one-use native EW register-field intermediates are replaced by the final
+`_EW_CFG_COMMON`, special `_EW_CFG_*`, and ordinary `_EW_CFG` values.  A
+separate load of the parent renderer confirms that all eleven resulting
+register values are exactly identical.  `_cmac_scaled_root` now performs the
+same repeated CAST/MUL normalization in one loop statement, while
+`_cmac_loop` shares its short-circuit rejection guard.  No matcher admission,
+wire value, CMAC shape, operation order, execution class, fallback, or runtime
+behavior changes.
+
+Host verification reports **123 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, including direct exact-register and
+finite/nonfinite CMAC-scale contracts.  Mypy passes all **216 files**,
+repository-wide Ruff passes, diff checks are clean, and the required Rockchip
+environment collects exactly **445 tests**.  Production FP32-sum and
+`3x5 @ 5x4` CMAC images remain byte-identical at SHA-256
+`8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9`
+and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+No device, health, reset, reboot, or census command was run; the proven
+fresh-boot hardware bracket remains pending.

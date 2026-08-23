@@ -400,6 +400,22 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   assert program.dev.resets == 1 and len(submits) == 2 and submits[1][1] == {"standalone":True}
 
 
+def test_native_ew_configs_keep_their_exact_register_values():
+  assert tuple(rockchip_renderer._EW_CFG[op] for op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV)) == (
+    0x108202c0,0x108402c0,0x108003c4,0x108002c0,0x108303c0)
+  assert tuple(getattr(rockchip_renderer,name) for name in
+    ("_EW_CFG_RELU6","_EW_CFG_MIN","_EW_CFG_ABS","_EW_CFG_NEG","_EW_CFG_FLOOR","_EW_CFG_CEIL")) == (
+    0x108004c0,0x108102c0,0x108502c0,0x108602c0,0x108702c0,0x108802c0)
+
+
+def test_cmac_scale_normalization_keeps_nested_casts_and_rejects_nonfinite_products():
+  root = UOp.const(3.0,dtypes.float)
+  scaled = ((root*0.5).cast(dtypes.float)*0.25).cast(dtypes.float)
+  assert (normalized:=rockchip_renderer._cmac_scaled_root(scaled)) is not None
+  assert normalized[0].key == root.key and normalized[1] == 0.125
+  assert rockchip_renderer._cmac_scaled_root(root*float("inf")) is None
+
+
 def test_generic_fp16_uops_lower_in_dependency_order():
   lhs, rhs = UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:lhs.index(i).load() + rhs.index(i).load() * 2.0))

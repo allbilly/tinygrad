@@ -228,13 +228,11 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 (_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_LOCAL_STEPS, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _EW_ELEMS_32BIT, _FP16_EXACT_INTEGER) = (  # noqa: E501
   0x1001, 0x2001, 64000, 1 << 14, 1 << 20, 4096, 1 << 20, 1 << 18, 1 << 22, 8*dtypes.half.itemsize//dtypes.float.itemsize, 1 << 11)
 # Native EW register fields.
-(_EW_DATA_MODE_FP16, _EW_EDATA_SIZE_FP16, _EW_ALU_MIN, _EW_ALU_ADD, _EW_ALU_FDIV, _EW_ALU_SUB, _EW_ALU_ABS, _EW_ALU_NEG,
- _EW_ALU_FLOOR, _EW_ALU_CEIL, _EW_RELUX_EN, _EW_RELU_BYPASS, _EW_OP_CVT_BYPASS, _EW_LUT_BYPASS, _EW_OP_SRC_DMA, _EW_OP_TYPE_MUL) = (
-   1 << 28, 2 << 22, 1 << 16, 2 << 16, 3 << 16, 4 << 16, 5 << 16, 6 << 16, 7 << 16, 8 << 16, 1 << 10, 1 << 9, 1 << 8, 1 << 7, 1 << 6, 1 << 2)
-_EW_CFG_COMMON = _EW_DATA_MODE_FP16 | _EW_EDATA_SIZE_FP16 | _EW_LUT_BYPASS | _EW_OP_SRC_DMA
+_EW_RELU_BYPASS, _EW_OP_CVT_BYPASS = 1 << 9, 1 << 8
+_EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
 (_EW_CFG_RELU6, _EW_CFG_MIN, _EW_CFG_ABS, _EW_CFG_NEG, _EW_CFG_FLOOR, _EW_CFG_CEIL) = tuple(
-  _EW_CFG_COMMON|flags for flags in (_EW_RELUX_EN, _EW_RELU_BYPASS|_EW_ALU_MIN, _EW_RELU_BYPASS|_EW_ALU_ABS,
-  _EW_RELU_BYPASS|_EW_ALU_NEG, _EW_RELU_BYPASS|_EW_ALU_FLOOR, _EW_RELU_BYPASS|_EW_ALU_CEIL))
+  _EW_CFG_COMMON|flags for flags in (1<<10, _EW_RELU_BYPASS|(1<<16), _EW_RELU_BYPASS|(5<<16),
+  _EW_RELU_BYPASS|(6<<16), _EW_RELU_BYPASS|(7<<16), _EW_RELU_BYPASS|(8<<16)))
 # Software stage tags and DPU data-format registers.
 _EW_STAGE_FP32_OUT, _EW_STAGE_FP32_IN = 1 << 29, 1 << 30
 _DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4<<29)|(4<<26)|4,
@@ -246,7 +244,7 @@ _DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4
  _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RAW_MIN, _NATIVE_RELU6, _NATIVE_SIGN) = tuple(
    "rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add raw_min relu6 sign".split())
 _EW_RELUX_CMP_RELU6, _INT16_EW = struct.unpack("<I", struct.pack("<f", 6.0))[0], dict(int16_input=True, int16_output=True)
-_EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,_EW_ALU_ADD), (Ops.SUB,_EW_ALU_SUB), (Ops.MUL,_EW_OP_CVT_BYPASS|_EW_OP_TYPE_MUL), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|_EW_ALU_FDIV))}  # noqa: E501
+_EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,2<<16), (Ops.SUB,4<<16), (Ops.MUL,_EW_OP_CVT_BYPASS|1<<2), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|3<<16))}  # noqa: E501
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
@@ -467,11 +465,9 @@ def _cmac_loop(output:RKOutput) -> tuple[UOp,UOp,int,float]|None:
   store,_,_,_,post = output; root = post; nodes,out_ranges = list(post.toposort()),_index_ranges(store.src[0].src[1])
   axes = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
   if len(axes) != 1 or axes[0].src[0].op is not Ops.CONST or (groups:=int(axes[0].src[0].arg)) <= 0: return None
-  axis = axes[0]; updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and axis in u.toposort()]; scale = 1.0  # noqa: E501
-  if len(updates) != 1: return None
-  if root.op is Ops.MAX:
-    if (pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or _fp16_bits(float(pair[1].arg)) != 0: return None  # noqa: E501
-    root = pair[0]
+  axis = axes[0]; updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and axis in u.toposort()]
+  if len(updates) != 1 or root.op is Ops.MAX and ((pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or _fp16_bits(float(pair[1].arg)) != 0): return None  # noqa: E501
+  if root.op is Ops.MAX: root = typing_cast(tuple[UOp,UOp],pair)[0]
   if (scaled:=_cmac_scaled_root(root)) is None: return None
   root,scale = scaled
   update = _strip_cast(updates[0].src[1]); acc = next((x for x in update.src if _local_load(x) is not None),None) if update.op is Ops.ADD else None
@@ -675,10 +671,7 @@ def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> I
 
 def _cmac_scaled_root(root:UOp) -> tuple[UOp, float]|None:
   scale = 1.0
-  while True:
-    root = _strip_cast(root)
-    if (pair:=_const_operand(root, Ops.MUL)) is None: break
-    root,scale = pair[0],scale*float(pair[1].arg)
+  while (pair:=_const_operand(root:=_strip_cast(root), Ops.MUL)) is not None: root,scale = pair[0],scale*float(pair[1].arg)
   return (root,scale) if math.isfinite(scale) else None
 
 def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
