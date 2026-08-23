@@ -366,12 +366,11 @@ def _inverted_condition(u:UOp, typed:bool=False) -> UOp|None: return None if u.o
 
 def _local_load(u:UOp) -> UOp|None: return u if (u:=_strip_cast(u)).op is Ops.LOAD and _root_param(u.src[0]) is None else None
 
-def _semantic_loads(u:UOp, cache:dict[UOp, tuple[UOp, ...]]|None=None, local:bool=False) -> tuple[UOp, ...]:
-  if cache is not None and u in cache: return cache[u]
+@functools.lru_cache(maxsize=4096)
+def _semantic_loads(u:UOp, local:bool=False) -> tuple[UOp, ...]:
   sources = () if u.op in (Ops.RANGE, Ops.SPECIAL) else u.src[:1] if u.op is Ops.AFTER else u.src
   load = _local_load(u) if local else u if u.op is Ops.LOAD else None
-  result = (load,) if load is not None else tuple(dict.fromkeys(y for x in sources for y in _semantic_loads(x, cache, local)))
-  return cache.setdefault(u, result) if cache is not None else result
+  return (load,) if load is not None else tuple(dict.fromkeys(y for x in sources for y in _semantic_loads(x, local)))
 
 def _static_cast(value, dtype:DType, vector:bool=False):
   if vector or isinstance(value, np.ndarray): return np.asarray(value, dtype=np.dtype(dtype.scalar().fmt) if dtype.scalar().fmt is not None else None)
@@ -382,26 +381,6 @@ _STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.SPECIAL, Ops.CAST, Ops.ADD, Ops.MUL, Op
                Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.XOR, Ops.MAX}
 _STATIC_INT_ALU = {Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD, Ops.AND, Ops.OR, Ops.XOR}
 _STATIC_SCALAR_ALU = _STATIC_OPS - {Ops.CONST, Ops.RANGE, Ops.SPECIAL, Ops.CAST, Ops.WHERE} | _STATIC_INT_ALU
-def _static_alu(op:Ops, dtype:DType, values:tuple, vector:bool):
-  if vector:
-    if op in (Ops.CDIV, Ops.CMOD):
-      with np.errstate(divide="ignore", invalid="ignore"): quotient = np.where(values[1] != 0, np.trunc(values[0] / values[1]), 0)
-      value = quotient if op is Ops.CDIV else values[0]-quotient*values[1]
-    elif op in (Ops.FLOORDIV, Ops.FLOORMOD):
-      quotient = np.zeros(np.broadcast_shapes(values[0].shape, values[1].shape), dtype=np.result_type(values[0], values[1]))
-      np.floor_divide(values[0], values[1], out=quotient, where=values[1] != 0)
-      value = quotient if op is Ops.FLOORDIV else values[0]-quotient*values[1]
-    elif op is Ops.MAX or op is Ops.WHERE or op is Ops.TRUNC or op is Ops.RECIPROCAL:
-      value = np.where(*values) if op is Ops.WHERE else np.where(values[0] < values[1], values[1], values[0]) if op is Ops.MAX else \
-        np.vectorize(int, otypes=[np.int64])(values[0]) if op is Ops.TRUNC else 1.0 / values[0]
-    else:
-      try: value = python_alu[op](*values)
-      except KeyError: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {op.name}")
-  else:
-    if op not in _STATIC_SCALAR_ALU: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {op.name}")
-    value = (1.0 / float(values[0]) if op is Ops.RECIPROCAL else int(values[0])) if op is Ops.RECIPROCAL or op is Ops.TRUNC else \
-      exec_alu(op, dtype, tuple(int(x) for x in values) if op in _STATIC_INT_ALU else values, truncate_output=False)
-  return _static_cast(value, dtype, vector)
 
 def _eval_expr(u:UOp, env:Mapping[UOp, int|float|bool|np.ndarray], cache:dict[UOp, int|float|bool|np.ndarray], vector:bool=False) -> int|float|bool|np.ndarray:  # noqa: E501
   if u in cache: return cache[u]
@@ -412,7 +391,24 @@ def _eval_expr(u:UOp, env:Mapping[UOp, int|float|bool|np.ndarray], cache:dict[UO
     _static_cast(_eval_expr(u.src[0], env, cache, vector), u.dtype, vector))
   elif u.op is Ops.WHERE and not vector:
     return cache.setdefault(u, _static_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype))
-  else: return cache.setdefault(u, _static_alu(u.op, u.dtype, tuple(_eval_expr(src, env, cache, vector) for src in u.src), vector))
+  values = tuple(_eval_expr(src, env, cache, vector) for src in u.src)
+  if vector:
+    if u.op in (Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD):
+      floor = u.op in (Ops.FLOORDIV, Ops.FLOORMOD)
+      with np.errstate(divide="ignore", invalid="ignore"): quotient = np.where(values[1] != 0,
+        np.floor_divide(values[0], values[1]) if floor else np.trunc(values[0] / values[1]), 0)
+      value = quotient if u.op in (Ops.CDIV, Ops.FLOORDIV) else values[0]-quotient*values[1]
+    elif u.op in (Ops.MAX, Ops.WHERE, Ops.TRUNC, Ops.RECIPROCAL): value = np.where(*values) if u.op is Ops.WHERE else \
+      np.where(values[0] < values[1], values[1], values[0]) if u.op is Ops.MAX else \
+      np.vectorize(int, otypes=[np.int64])(values[0]) if u.op is Ops.TRUNC else 1.0 / values[0]
+    else:
+      try: value = python_alu[u.op](*values)
+      except KeyError: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+  else:
+    if u.op not in _STATIC_SCALAR_ALU: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+    value = (1.0 / float(values[0]) if u.op is Ops.RECIPROCAL else int(values[0])) if u.op in (Ops.RECIPROCAL, Ops.TRUNC) else \
+      exec_alu(u.op, u.dtype, tuple(int(x) for x in values) if u.op in _STATIC_INT_ALU else values, truncate_output=False)
+  return cache.setdefault(u, _static_cast(value, u.dtype, vector))
 
 def _is_static_expr(u:UOp) -> bool: return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
 
@@ -1077,25 +1073,18 @@ def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=F
   """Lower an exact FP16 expression through the requested native integer output ABI."""
   store, out_param, count, _, _ = output
   if count <= 0: return RKImage(RKTarget.RK3588)
-  out_slot, replacement = out_param.arg.slot, store.replace(src=(store.src[0].replace(dtype=dtypes.half,
-    src=(out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half)), *store.src[0].src[1:])), value, *store.src[2:]))
+  out_slot, replacement = out_param.arg.slot, store.replace(src=(store.src[0].replace(dtype=dtypes.half, src=(out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half)), *store.src[0].src[1:])), value, *store.src[2:]))  # noqa: E501
   image = _lower_uop_program(list(replacement.toposort()), vectorize_reductions=False) if int32 else \
     _lower_uop_program(list(UOp(Ops.SINK, src=(replacement,)).toposort()), vectorize_reductions=False, recipes_ready=True)
   if image is None: raise RuntimeError("RKPLAN_REJECT:composed_uops")
   terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
-  if terminal != [len(image.ew_ops)-1] or image.mid_gathers or image.post_gathers:
-    raise RuntimeError("RKPLAN_REJECT:predicate_terminal" if int32 else "RKPLAN_REJECT:uint8_terminal")
-  result_slot, auxiliary_slot = len(image.scratch), len(image.scratch)+1; result = RKArg(RKBufferKind.SCRATCH, result_slot)
+  if terminal != [len(image.ew_ops)-1] or image.mid_gathers or image.post_gathers: raise RuntimeError("RKPLAN_REJECT:predicate_terminal" if int32 else "RKPLAN_REJECT:uint8_terminal")  # noqa: E501
+  result_slot, auxiliary_slot = len(image.scratch), len(image.scratch)+1; prefix = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=(result:=RKArg(RKBufferKind.SCRATCH, result_slot))))  # noqa: E501
   if int32:
-    ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
-           RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, RKArg(RKBufferKind.SCRATCH, auxiliary_slot), count, _EW_CFG[Ops.MAX],
-                  stateful=True, int32_output=True, bool_output=bool_output))
-    return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(ceildiv(count, 4)*64)), ew_ops=ops)
-  int_result = RKArg(RKBufferKind.SCRATCH, auxiliary_slot)
-  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
-         RKEWOp(int_result, result, result, count, _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True, int16_output=True))
-  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=ops,
-                 post_gathers=(_raw_gather(int_result, out_slot, count),))
+    return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(ceildiv(count, 4)*64)), ew_ops=(*prefix,
+      RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, RKArg(RKBufferKind.SCRATCH, auxiliary_slot), count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True, bool_output=bool_output)))  # noqa: E501
+  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=(*prefix,
+    RKEWOp(int_result:=RKArg(RKBufferKind.SCRATCH, auxiliary_slot), result, result, count, _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True, int16_output=True)), post_gathers=(_raw_gather(int_result, out_slot, count),))  # noqa: E501
 
 def _half_backed_value(value:UOp) -> UOp|None:
   """Normalize a half-backed numeric expression for the exact raw FP16 comparator."""
@@ -2091,21 +2080,15 @@ def _finite_int_max_neutrals(root:UOp) -> UOp:
   cache:dict[tuple[UOp, bool], UOp] = {}
   stack:list[tuple[UOp, bool, bool]] = [(root, False, False)]
   while stack:
-    u,under_max,ready = stack.pop()
-    key = (u, under_max)
+    u,under_max,ready = stack.pop(); key,active = (u,under_max), under_max or u.op is Ops.MAX and u.dtype.scalar() is dtypes.int
     if key in cache: continue
-    active = under_max or u.op is Ops.MAX and u.dtype.scalar() is dtypes.int
-    if active and u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min:
-      cache[key] = u.const_like(-2048)
-    elif ready:
-      src = tuple(cache[(source, active)] for source in u.src)
-      if (root.op is Ops.MAX and u.op is Ops.WHERE and src[1].op is Ops.CONST and
-          src[1].dtype.scalar() in (dtypes.half, dtypes.float) and math.isinf(float(src[1].arg)) and float(src[1].arg) < 0.0):
-        src = (src[0], src[1].const_like(-65504.0), src[2])
-      cache[key] = u.replace(src=src)
-    else:
+    if not ready:
       stack.append((u, under_max, True))
       stack.extend((src, active, False) for src in reversed(u.src))
+      continue
+    src = tuple(cache[(source,active)] for source in u.src)
+    if root.op is Ops.MAX and u.op is Ops.WHERE and src[1].op is Ops.CONST and src[1].dtype.scalar() in (dtypes.half,dtypes.float) and math.isinf(float(src[1].arg)) and float(src[1].arg) < 0.0: src = (src[0],src[1].const_like(-65504.0),src[2])  # noqa: E501
+    cache[key] = u.const_like(-2048) if active and u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg) == dtypes.int.min else u.replace(src=src)  # noqa: E501
   return cache[(root, False)]
 
 def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
@@ -2136,14 +2119,13 @@ def _local_buffer(u:UOp) -> UOp|None:
 
 def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
   """Execute ordered static local accumulators without recovering a tensor operation."""
-  local_cache:dict[UOp, tuple[UOp, ...]] = {}
-  local_loads, definitions = _semantic_loads(root, local_cache, True), typing_cast(dict[UOp, _RKStaticLocalDef], {})
+  local_loads, definitions = _semantic_loads(root, True), typing_cast(dict[UOp, _RKStaticLocalDef], {})
   expanded:dict[tuple[UOp, tuple[tuple[UOp, int], ...]], UOp] = {}
   active:set[tuple[UOp, tuple[tuple[UOp, int], ...]]] = set()
   budget = [_MAX_STATIC_LOCAL_STEPS]
   def expand_dependencies(expr:UOp, owner:UOp, env:dict[UOp, int]) -> UOp:
     substitutions = {axis:axis.const_like(value) for axis,value in env.items()}
-    substitutions.update({load:expand_load(load, env) for load in _semantic_loads(expr, local_cache, True)
+    substitutions.update({load:expand_load(load, env) for load in _semantic_loads(expr, True)
                           if _local_buffer(load) is not owner})
     return expr.substitute(substitutions, walk=True)
   def expand_load(load:UOp, env:dict[UOp, int]) -> UOp:
@@ -2160,7 +2142,7 @@ def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
          load_axes[0].op not in (Ops.RANGE, Ops.SPECIAL) or load_axes[0].src[0].op is not Ops.CONST or \
          (load_extent:=int(load_axes[0].src[0].arg)) <= 0 or load_extent > int(buffer.src[0].arg): raise _RKGenericReject
       updates = {node.op for node in root.toposort() if node.dtype.scalar() is dtypes.bool and node.op in (Ops.AND, Ops.OR) and any(
-        _local_buffer(local) is buffer for local in _semantic_loads(node, local_cache, True))}
+        _local_buffer(local) is buffer for local in _semantic_loads(node, True))}
       if len(updates) != 1: raise _RKGenericReject
       expanded = expand_dependencies(stores[0].src[1], buffer, env).substitute({axes[0]:load_index}, walk=True)
       if store_extent < int(buffer.src[0].arg):

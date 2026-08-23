@@ -8254,6 +8254,55 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — collapse immutable compiler plumbing at 2,433 lines
+
+This isolated milestone follows `32425ff3c`.  Its predeclared executable
+renderer budget was exactly **+45/-63, net -18**.  The observed raw renderer
+diff is **+37/-55, net -18** because the common typed-output prefix and the
+ready-node neutral rewrite each required fewer replacement lines on both sides
+than budgeted.  Authoritative `sz.py` size moves renderer **2451 -> 2433** and
+repository total **27983 -> 27965** (**-18**); runtime remains **464**.
+
+Four existing owners now contain their remaining one-caller plumbing.
+`_eval_expr` directly owns scalar and vector static ALU evaluation, making
+`_static_alu` obsolete.  Immutable `_semantic_loads` uses one bounded cache,
+deleting its optional caller-supplied cache and `_unroll_static_local`'s
+threaded `local_cache`.  `_typed_half_image` shares the terminal FP16 result
+prefix before its BOOL/INT32 and UINT8 ABI tails, while
+`_finite_int_max_neutrals` assigns every ready node through one iterative
+branch.  Existing comments and docstrings remain.  No admission, arithmetic
+recipe, image field, wire encoding, runtime path, CMAC behavior, test, or
+CPU/GPU numeric fallback changed.
+
+A committed-parent/candidate oracle observed **249 lowering outcomes / 233
+image-bearing outcomes** across the complete Rockchip UOp module.  Every
+admission result, encoded image, and resource record is byte-identical; both
+sides have ordered SHA-256
+`a91ed527e713979a82329f0c993efb2d3c98bdcc5f0ca53b78bbc3ab15d3b276`.
+A separate generated oracle covers all static division/modulo/bitwise modes
+plus semantic-load order in **15 records**; parent and candidate both hash to
+`7238953b0c3ea1a760cda45a855bda1473939d8c21a00ca436ed74b463d806ea`.
+
+Six actual production `Tensor.schedule_linear -> to_program` kernels for
+UINT8 conversion, BOOL conversion, weighted sum, maximum, mean, and matmul are
+also byte-identical at aggregate SHA-256
+`d78f750e6105ab18f509d8e6af802bc3f302cabc25bf7113e5b75704d03b4108`.
+Their individual candidate image hashes are respectively
+`bcf01b1015d95d27a817d78665d904f7aff232cfd5a23d062c2a2ee6a6b433c8`,
+`fb55dbfb2151f7fdadca7d8af6d307d85c592f5f198344f4b4ddd202f44b7090`,
+`ed9102ae6d693c8b2f978efc0652ec114594fad8bd312669748cb75e855d088a`,
+`cbb8d1ad588865b34a0408f05b546ac58cbc60b2d2a80844cb445fbc8a21de5b`,
+`9b2f550e74a6f09a06e6ea0ae1f6b15d0496e2d1d2301f8c7d0f917350c0022d`,
+and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+
+Host verification reports **130 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full hardware census command was
+run because the board remains untrusted; fresh-boot acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — compose multi-source CMAC surfaces at 2,451 lines
 
 This isolated milestone follows `be526ee1d`.  Its predeclared renderer budget
