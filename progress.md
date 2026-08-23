@@ -8254,6 +8254,65 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — short FP32 contractions use compact CMAC records at 2,419 lines
+
+This isolated milestone follows `7eeee5d97`.  Its predeclared and observed
+renderer budget is exactly **+27/-34 executable lines, net -7**.
+Authoritative `sz.py` size moves renderer **2426 -> 2419** and repository
+total **27958 -> 27951**; runtime remains **464**.
+
+`_lower_cmac_reduction` now keeps each term's source slots, already-bounded
+output offsets, and coefficient in one record.  This replaces the parallel
+`parsed`/`indexed`/`weights` state and the late all-terms offset expansion.
+The selector-cell budget is charged immediately before each term's offsets
+are materialized.  Fixed scratch-slot and one-use final image locals are also
+removed.  No generic reduction IR, wire field, runtime phase, scheduler hook,
+CPU/GPU numeric fallback, or CMAC-to-EW sequence is added.
+
+A terminal FP32 ADD tree stored as either HALF or FLOAT is now recognized as
+an additive boundary even when optimization has exposed only two or three
+product terms.  The actual production
+`Tensor.schedule_linear -> to_program` path therefore moves FP32-accumulating
+K=2 and K=3 dots from **33** and **76** EW stages to one `(1,1,2)` and
+`(1,1,3)` CMAC respectively for HALF output; direct FLOAT output moves from
+**4** and **6** EW stages to the same CMAC shapes.  All four routes have zero
+EW stages.  Their HALF-output candidate image SHA-256 values are
+`73de5f6eece716c5db2c12fa6d518e4beb08c5c33a1d28f2e33560dfdc40bb93`
+and
+`ff73caac5f3d4a4af578bc04239b63e35729ddd244d3e84290afec624e6a1355`.
+The FLOAT-output hashes are
+`775a73b78e686d7a7fe6ce6cd412491073163dfd488c91335ef04c794ee2fdf4`
+and
+`fcf2ae38f30934cd755119d4889af4d211a461cca30ac99e82871859c13e7f21`.
+All four fixed CMAC images are 4,425 bytes, versus respective parent encodings
+of 1,586, 417, 3,446, and 579 bytes, so this is a coverage and stage-count
+result rather than an encoded-size claim.  The existing production K=4 CMAC
+remains byte-identical at SHA-256
+`f5c8f042a3c11bbd2b52bcd460341da339485d3adfcfd39d06e3e2b478ec34ec`.
+
+A raw packing/mathematical oracle checked **2,000** deterministic K=2/K=3
+small-integer cases.  Every CMAC A/B surface contains the exact FP16 operands
+and its FP32 matrix product equals the direct FP32 dot; the ordered surface
+record SHA-256 is
+`307e66cc4a7d47986d8c3af94827ffbbdeb47408dad110dc70ef0f8eaa9e3aaa`.
+A committed-parent/candidate oracle observed **252 lowering outcomes / 236
+image-bearing outcomes** across all pre-existing Rockchip UOp tests.  Exactly
+the intended short FP32 fixture changes; the other **251 outcomes** are
+byte-identical on both sides at ordered SHA-256
+`68452a93903c2c6e594c1d749ac997ff2f9eacab6d5a912f3e06bfd914faf6e9`.
+Scaled two-input dots, activations, nested post-reduction operations, invalid
+weights, and ordinary HALF post-bias rounding boundaries remain honest EW
+fallbacks.
+
+Host verification reports **132 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full hardware census command was
+run because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — broadcast linear terms share CMAC surfaces at 2,426 lines
 
 This isolated milestone follows `7530041b5`.  Its final safety-adjusted

@@ -1038,13 +1038,29 @@ def test_generic_image_allows_many_small_ew_stages():
   assert decode_image(encode_image(image)) == image
 
 
-def test_fp32_add_mul_tree_uses_half_expansion_at_output_boundary():
+def test_short_fp32_add_mul_tree_routes_cmac_at_output_boundary():
   out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   lane = UOp.range(2, 0)
   products = [lhs.index(lane*2+k).load().cast(dtypes.float) * rhs.index(lane*2+k).load().cast(dtypes.float) for k in range(2)]
   value = products[0].alu(Ops.ADD, products[1]).cast(dtypes.half)
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
-  assert image is not None and len(image.ew_ops) > 10
+  assert image is not None and image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (2,2,2) and not image.ew_ops
+
+
+def test_short_tensor_dot_routes_production_cmac():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    for k in (2,3):
+      for fp16 in (True,False):
+        lhs = Tensor(UOp.new_buffer("ROCKCHIP",k,dtypes.half,num=1020+2*k))
+        rhs = Tensor(UOp.new_buffer("ROCKCHIP",k,dtypes.half,num=1021+2*k))
+        result = (lhs*rhs).sum(dtype=dtypes.float)
+        ast = (result.cast(dtypes.half) if fp16 else result).schedule_linear().src[0].src[0]
+        to_program_cache.clear()
+        program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+        image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+        assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k,image.cmac.out_fp16) == (1,1,k,fp16)
+        assert not image.ew_ops and tuple(gather.src_index for gather in image.gathers if not gather.values) == (1,2)
+        assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
 
 
 def test_static_fp32_subgraph_rounds_only_after_coordinate_cancellation():
