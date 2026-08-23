@@ -472,9 +472,8 @@ def _cmac_loop(output:RKOutput) -> tuple[UOp,UOp,int,float]|None:
   if root.op is Ops.MAX:
     if (pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or _fp16_bits(float(pair[1].arg)) != 0: return None  # noqa: E501
     root = pair[0]
-  if root.op is Ops.MUL:
-    if (pair:=next(((value,const) for value,const in (root.src,root.src[::-1]) if const.op is Ops.CONST),None)) is None or not math.isfinite(scale:=float(pair[1].arg)): return None  # noqa: E501
-    root = pair[0]
+  if (scaled:=_cmac_scaled_root(root)) is None: return None
+  root,scale = scaled
   update = _strip_cast(updates[0].src[1]); acc = next((x for x in update.src if _local_load(x) is not None),None) if update.op is Ops.ADD else None
   if _local_load(root) is None or acc is None: return None
   return _strip_cast(update.src[1 if update.src[0] is acc else 0]),axis,groups,scale
@@ -674,14 +673,13 @@ def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> I
     if node.op is op and (dtype is None or node.dtype.scalar() is dtype) and (not plain or node.arg is None): stack.extend(reversed(node.src))
     else: yield node
 
-def _scaled_add_terms(root:UOp) -> tuple[tuple[UOp, ...], float]|None:
+def _cmac_scaled_root(root:UOp) -> tuple[UOp, float]|None:
   scale = 1.0
   while True:
-    if root.op is Ops.CAST: root = root.src[0]; continue
-    value, factor = next(((a, b) for a,b in (root.src, root.src[::-1]) if b.op is Ops.CONST), (None, None)) if root.op is Ops.MUL else (None, None)
-    if value is None or factor is None: break
-    scale *= float(factor.arg); root = value
-  return (tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD)), scale) if root.op is Ops.ADD and math.isfinite(scale) else None
+    root = _strip_cast(root)
+    if (pair:=_const_operand(root, Ops.MUL)) is None: break
+    root,scale = pair[0],scale*float(pair[1].arg)
+  return (root,scale) if math.isfinite(scale) else None
 
 def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
   """Factor a real sum/dot/matmul into one fixed CMAC stage and raw physical gathers."""
@@ -691,12 +689,12 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
   if (loop:=_cmac_loop(output)) is not None:
     term,axis,groups,scale = loop; terms = (term,)
   else:
-    root = _strip_cast(root)
+    if (scaled:=_cmac_scaled_root(root)) is None: return None
+    root,scale = scaled
     if root.op is Ops.REDUCE and root.arg in ((Ops.ADD,),Ops.ADD) and len(root.src) == 2 and root.src[1].op is Ops.RANGE and \
        root.src[1].src[0].op is Ops.CONST:
       terms, axis, groups = (_strip_cast(root.src[0]),), root.src[1], int(root.src[1].src[0].arg)
-    elif (scaled:=_scaled_add_terms(root)) is not None and len(scaled[0]) >= 4:
-      terms,scale = scaled; groups = len(terms)
+    elif root.op is Ops.ADD and len(terms:=tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD))) >= 4: groups = len(terms)
     else: return None
   try: envs = _iter_range_env(_index_ranges(out_index))
   except RuntimeError: return None
@@ -752,9 +750,8 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
      m*ai+ao*ai+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
   constant = right is None
   if not constant and scale != 1.0: return None
-  try: constants = struct.pack("<e",scale) if constant else b""
-  except (OverflowError,struct.error): return None
-  if constant and float(struct.unpack("<e",constants)[0]) != scale: return None
+  if constant and float_to_fp16(scale) != scale: return None
+  constants = struct.pack("<e",scale) if constant else b""
   shift = int(constant)
   a_slot,b_slot,c_slot = shift,shift+1,shift+2; a_base = bases[left] if diagonal else bases[left][::n]; a_delta = deltas[left]
   a_offsets = tuple(base+a_delta[k] if k < groups else -1 for base in a_base for k in range(ai))
@@ -769,10 +766,8 @@ def _lower_cmac_reduction(output:RKOutput) -> RKImage|None:
     RKGather(0 if constant else params[typing_cast(int,right)].arg.slot,b_slot,len(b_offsets),offsets=b_offsets,
              src_kind=RKBufferKind.SCRATCH if constant else RKBufferKind.ARG))
   fp16 = out.dtype.scalar() is dtypes.half
-  def output_offset(i:int) -> int:
-    row,col = (i,i) if diagonal else divmod(i,n)
-    return row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col)
-  output_offsets = tuple(map(output_offset, range(rows)))
+  positions = ((i,i) if diagonal else divmod(i,n) for i in range(rows))
+  output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for row,col in positions)
   post = (RKGather(c_slot,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
                    src_kind=RKBufferKind.SCRATCH),)
   cmac = RKCMAC(RKArg(RKBufferKind.SCRATCH,c_slot),RKArg(RKBufferKind.SCRATCH,a_slot),RKArg(RKBufferKind.SCRATCH,b_slot),m,n,groups,fp16)

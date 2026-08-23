@@ -145,32 +145,24 @@ class RockchipProgram(Program['RockchipDevice']):
     self._pcchain_bodies = packed_bodies
     self._submit(cmd, task, n)
 
-  def _submit_standalone(self, body:tuple[int, ...]) -> None:
-    """Submit one stateful DPU stage with the direct PC tail used by the vendor examples."""
-    commands = body + (_pc(rk.TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18),)
+  def _submit_standalone(self, body:tuple[int, ...], cmac:bool=False) -> None:
+    """Submit one stateful DPU or CMAC body with its operation-specific direct PC tail."""
+    tail = (_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),
+            _pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),)
+    enable,commands = (0xd if cmac else 0x18),body+tail
     cmd_size, task_need = len(commands)*8+_CMD_PREFETCH_GUARD, _TASK_DESC_BYTES
     cmd = self._ensure_buffer("_standalone_cmd_buf", cmd_size, _CMD_BUF_MIN)
     task = self._ensure_buffer("_standalone_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
     ctypes.memset(int(cmd.va_addr), 0, cmd_size)
     ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64 * len(commands))(*commands), len(commands)*8)
-    desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(commands), 0, self._dma(cmd))
+    desc = rk.struct_rknpu_task(0, 0 if cmac else 4, enable, 0x300, 0x1ffff, 0, len(body) if cmac else len(commands), 0, self._dma(cmd))
     ctypes.memmove(int(task.va_addr), ctypes.addressof(desc), _TASK_DESC_BYTES)
-    self._submit(cmd, task, 1, standalone=True)
+    if cmac: self.dev.reset_npu()
+    self._submit(cmd, task, 1, standalone=True, **({"retry":False} if cmac else {}))
 
   def _run_cmac(self, address) -> None:
     """Run one fixed CMAC body with its proven terminal tail and no timeout replay."""
-    if (op:=self.image.cmac) is None: return
-    body = patch_stage(emit_cmac_stage(op), address)
-    commands = body+(_pc(0x0001,0), _pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),
-      _pc(rk.TARGET_VERSION,0), _pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd))
-    cmd = self._ensure_buffer("_standalone_cmd_buf", len(commands)*8+_CMD_PREFETCH_GUARD, _CMD_BUF_MIN)
-    task = self._ensure_buffer("_standalone_task_buf", _TASK_DESC_BYTES, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
-    ctypes.memset(int(cmd.va_addr),0,len(commands)*8+_CMD_PREFETCH_GUARD)
-    ctypes.memmove(int(cmd.va_addr),(ctypes.c_uint64*len(commands))(*commands),len(commands)*8)
-    desc = rk.struct_rknpu_task(0,0,0xd,0x300,0x1ffff,0,len(body),0,self._dma(cmd))
-    ctypes.memmove(int(task.va_addr),ctypes.addressof(desc),_TASK_DESC_BYTES)
-    self.dev.reset_npu()
-    self._submit(cmd,task,1,standalone=True,retry=False)
+    if (op:=self.image.cmac) is not None: self._submit_standalone(patch_stage(emit_cmac_stage(op),address),True)
 
   def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
     """Convert aligned four-lane atoms on DPU; host movement preserves raw lane representations."""

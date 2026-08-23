@@ -391,6 +391,13 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (0,0xd,0x300,0x1ffff,45)
   assert program.dev.resets == 1 and len(submits) == 1 and submits[0][1] == {"standalone":True,"retry":False}
+  body = (1,2,3)
+  program._submit_standalone(body)
+  assert tuple((ctypes.c_uint64*4).from_address(cmd.va_addr)) == body+(rockchip_runtime._pc(
+    rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0x18),)
+  desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
+  assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (4,0x18,0x300,0x1ffff,4)
+  assert program.dev.resets == 1 and len(submits) == 2 and submits[1][1] == {"standalone":True}
 
 
 def test_generic_fp16_uops_lower_in_dependency_order():
@@ -980,6 +987,19 @@ def test_scaled_pure_sum_routes_cmac_weights_but_scaled_dot_stays_generic():
     image = _lower_uop_program(_program(dtypes.half,lambda _i:value.cast(dtypes.half),count=1))
     assert image is not None
     if terms is sums: assert image.cmac is not None and image.constants == struct.pack("<e",0.125) and not image.ew_ops
+    else: assert image.cmac is None and image.ew_ops
+
+
+def test_nested_scaled_direct_reduce_routes_cmac_but_scaled_dot_stays_generic():
+  out, lhs, rhs = UOp.param(0,dtypes.half,(2,)),UOp.param(1,dtypes.half,(8,)),UOp.param(2,dtypes.half,(8,))
+  row,axis = UOp.range(2,0),UOp.range(4,1,AxisType.REDUCE)
+  for dot in (False,True):
+    value = lhs.index(row*4+axis).load().cast(dtypes.float)
+    if dot: value = value*rhs.index(row*4+axis).load().cast(dtypes.float)
+    reduced = UOp(Ops.REDUCE,dtypes.float,src=(value,axis),arg=(Ops.ADD,))*0.5*0.25
+    image = _lower_uop_program(list(out.index(row).store(reduced.cast(dtypes.half)).end(row,axis).sink().toposort()))
+    assert image is not None
+    if not dot: assert image.cmac is not None and image.constants == struct.pack("<e",0.125) and not image.ew_ops
     else: assert image.cmac is None and image.ew_ops
 
 

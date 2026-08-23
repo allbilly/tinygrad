@@ -7894,3 +7894,32 @@ images remain byte-identical at SHA-256
 and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
 No device command was run; the fresh-boot CMAC hardware bracket remains
 pending.
+
+## 2026-08-24 — broader CMAC scales and shared standalone submission
+
+This isolated milestone follows `ebe5a518d`.  The predeclared renderer budget
+was at most **+22/-26, net at most -4**, and the runtime budget was at most
+**+8/-16, net -8**.  The observed executable diff is **+14/-19, net -5** in
+the renderer and **+8/-16, net -8** in the runtime, for **+22/-35, net -13**
+combined.  Renderer size moves **2588 -> 2583**, runtime **472 -> 464**, and
+repository total **28128 -> 28115**.
+
+`_cmac_scaled_root` replaces `_scaled_add_terms` and now gives local-loop,
+direct `REDUCE`, and unrolled `ADD` pure sums one finite, FP16-exact constant
+scale path, including nested outer scales.  Scaled dots continue to reject
+CMAC and use native EW lowering.  `_run_cmac` now delegates buffer allocation,
+descriptor setup, and submission to `_submit_standalone`; its 45-qword body,
+four-qword tail, operation index, enable mask, reset, and no-retry behavior
+remain distinct from the ordinary DPU standalone path.  No generic reduction
+IR or CPU/GPU numeric fallback was added.
+
+Host verification reports **121 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, including a nested scaled direct
+reduction, scaled-dot rejection, and exact DPU/CMAC standalone descriptors and
+tails.  Mypy passes all **216 files**, repository-wide Ruff passes, diff checks
+are clean, and the required Rockchip environment collects exactly **445
+tests**.  Production FP32-sum and `3x5 @ 5x4` CMAC images remain byte-identical
+at SHA-256 `8ffc4abe7b5d6ce966396b5a26094668fa7722d77687a7a0608fdbb2b274b2a9`
+and `064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`.
+No device, health, reset, reboot, or census command was run; the proven
+fresh-boot hardware bracket remains pending.
