@@ -462,6 +462,47 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
     assert hashlib.sha256(packed).hexdigest() == expected_hash
 
 
+def test_runtime_chain_flush_preserves_mixed_boundaries():
+  scratch = tuple(RKArg(RKBufferKind.SCRATCH,index,index*64) for index in range(3))
+  external = tuple(RKArg(RKBufferKind.ARG,index,index*64) for index in range(3))
+  add = _EW_CFG[Ops.ADD]
+  def op(*,count=17,barrier=False,compare=False,int16_in=False,int16_out=False,int32_in=False,int32_out=False,
+         numeric=False,scratch_args=False):
+    args = scratch if scratch_args else external
+    return RKEWOp(args[0],args[1],args[2],count,add|(rockchip_renderer._EW_STAGE_FP32_OUT if numeric else 0),
+      submit_barrier=barrier,compare=compare,int16_input=int16_in,int16_output=int16_out,
+      int32_input=int32_in,int32_output=int32_out)
+  cases = (
+    ((op(),op(barrier=True),op()), (("submit",(18,)),("submit",(18,18)))),
+    ((op(int16_in=True,int16_out=True,scratch_args=True),op(int32_in=True,int32_out=True,scratch_args=True),
+      op(int16_in=True,int32_out=True,scratch_args=True),op()),
+     (("submit",(31,)),("submit",(31,)),("submit",(32,32,32,18)))),
+    ((op(int16_in=True,int16_out=True,scratch_args=True),op()),
+     (("submit",(31,)),("reset",), ("submit",(18,)))),
+    ((op(),op(int32_in=True,scratch_args=True),op()),
+     (("submit",(18,)),("conversion",17,True,False),("submit",(18,)))),
+    ((op(),op(compare=True),op()),
+     (("submit",(18,)),("reset",),("standalone",37),("reset",),("submit",(18,)))),
+    ((op(),*(op(count=1,numeric=True) for _ in range(17))),
+     (("submit",(18,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
+  )
+  def address(kind:RKBufferKind,index:int) -> int: return 0x10000000+int(kind)*0x100000+index*0x10000
+  for ops,expected in cases:
+    events = []
+    class FakeDevice:
+      def reset_npu(self): events.append(("reset",))
+      def _forget_program(self,_program): pass
+      def _gpu_free(self,_buffer): pass
+    program = object.__new__(rockchip_runtime.RockchipProgram)
+    program.dev,program.image,program._scratch_ew_bodies = FakeDevice(),SimpleNamespace(ew_ops=ops),{}
+    program._submit_pcchain = lambda bodies:events.append(("submit",tuple(map(len,bodies))))
+    program._submit_standalone = lambda body,*_args,**_kwargs:events.append(("standalone",len(body)))
+    program._run_int32_conversion = lambda value,*_args:events.append(
+      ("conversion",value.count,value.int32_input,value.int32_output))
+    program._run_ew_ops(address,lambda _kind,_index:None)
+    assert tuple(events) == expected
+
+
 def test_native_ew_configs_keep_their_exact_register_values():
   assert tuple(rockchip_renderer._EW_CFG[op] for op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV)) == (
     0x108202c0,0x108402c0,0x108003c4,0x108002c0,0x108303c0)

@@ -8254,6 +8254,56 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — one owner finalizes EW command chains at 444 runtime lines
+
+This isolated milestone follows `a4e8802d8`.  Its predeclared and observed
+production runtime budget is exactly **+14/-24 executable lines, net -10**.
+Authoritative `sz.py` size moves runtime **454 -> 444** and repository total
+**27877 -> 27867**; the CMAC-focused renderer remains **2355**.
+
+`RockchipProgram._run_ew_ops` now gives its local `flush` owner the repeated
+work of submitting a pending PC chain, optionally resetting after a precision
+transition, clearing the submitted bodies, and returning precision state to
+neutral.  This replaces eight open-coded finalization sequences across
+barriers, terminal FP32 output, INT16/INT32 transitions, conversion, compare,
+and function exit.  The existing submit -> optional reset -> clear ordering is
+preserved.  No command recipe, chain boundary, reset point, renderer/image
+format, numeric path, CPU/GPU fallback, retry, timeout, or tolerance changes.
+
+A permanent mixed-boundary regression covers six sequences: submit barriers,
+INT16 -> INT32 -> conversion -> plain transitions, native precision returning
+to ordinary FP16, generic INT32 conversion, compare isolation, and 17 terminal
+FP32 stages split at the 16-stage cap.  It records every submission's command
+body lengths, conversion boundary, standalone compare body, and reset order.
+The broader parent/candidate oracle hashes exact command bodies as well as
+those event boundaries; both sides have SHA-256
+`92a8a0ba76b1afb0d4ea5866fbde516ad1c90489e440b000506d29bb16039ece`.
+
+Four actual production `Tensor.schedule_linear -> to_program` graphs then run
+their decoded EW images through the fake physical runtime: ABS, minimum,
+comparison, and native INT16 add.  Parent and candidate preserve their image
+SHA-256 values respectively as
+`3f3c1465a2e4970839a8a15675d53f56e2f58afa793b36d08ac556b3f8c85533`,
+`7230b73ee7b39133536d38615b32f316fd80ad49aaee468de3678845baab446e`,
+`82ab9212bd028c8599086bd2cd4bf76ec6c37d4ceee0fd9fabc993dd71f4b2a2`,
+and
+`b8ebfd858fc68a140d028899259b20e848051d7acb6db26134208ffcdb263186`.
+Their combined encoded-image and submit/reset schedule record is byte-identical
+at SHA-256
+`5e0ac0badc8e3350128919355d8f6fd4861a402e1be9212ee7419336edd90b59`.
+
+Host verification reports **142 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  Fable
+Judge reports **VERIFIED WITH CAVEATS**: all host claims reproduce, the test
+change only adds strict transition assertions, and no weakened check, scope
+creep, or in-tree debris is present; the sole caveat is the prohibited live
+hardware bracket.  No device, health, reset, reboot, hardware execution, or full
+hardware census command was run because the board remains untrusted;
+fresh-boot acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — filter physical CMAC candidates before ranking at 2,355 lines
 
 This isolated milestone follows `80a1d95f1`.  Its predeclared and observed
