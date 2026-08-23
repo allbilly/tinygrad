@@ -8254,6 +8254,65 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — broadcast linear terms share CMAC surfaces at 2,426 lines
+
+This isolated milestone follows `7530041b5`.  Its final safety-adjusted
+predeclared and observed renderer budget is exactly **+29/-36 executable
+lines, net -7**.  Authoritative
+`sz.py` size moves renderer **2433 -> 2426** and repository total **27965 ->
+27958**; runtime remains **464**.
+
+`_lower_cmac_reduction.align` and its nested `gather_surface` planner replace
+the fixed one-source/two-source arity split, shared-affine-delta proof, and
+separate constant-B versus dynamic-surface branches.  The matcher evaluates
+each already-bounded compile-time output offset, then places row-stable terms
+on CMAC A and column-stable terms on CMAC B.  Different source strides and
+scalar, row, or column broadcasts therefore require no new IR.  A missing
+operand denotes one finite FP16-exact coefficient packed into that surface, so
+two-input products and one-input linear terms may share one terminal CMAC
+accumulation.  Existing pure sums, weighted sums, dots, diagonal contractions,
+matmuls, and multi-source surfaces retain their encoded images.
+The selector-cell cap is checked before constructing the explicit offset
+tuples as well as after physical gather expansion.
+
+The actual production `Tensor.schedule_linear -> to_program` path now lowers
+explicit FP32-accumulating `2x3 @ 3x2 + bias` graphs with column, row, and
+scalar bias, followed by one final HALF cast, to native CMAC `(M,N,K) =
+(2,2,4)` with four raw gathers, one output gather, and zero EW stages.  The
+column-bias parent used 103 EW stages.  The respective CMAC image SHA-256 values
+are `aeace0307420a55a9cd5bad87e1a9a19648e08e0b8b2b47896273e9c6fff00b3`,
+`69daf96e9935d4fba475052c915e817c603f8f79afa6aeb99c3eecca82484c43`,
+and `ff1bb777d89c5cb3c76b02a3d400b974920c77f7b77643290258d48562159379`.
+Their encodings are 8,855, 6,935, and 6,935 bytes; the first is larger than the
+parent's 4,715-byte encoding because composed surfaces retain explicit
+raw-offset overlays, so this is a coverage and source-deletion result rather
+than a serialized-size claim.  A raw packing oracle materializes all three
+surface pairs and verifies that their FP32 matrix products exactly equal the
+corresponding broadcast `lhs @ rhs + bias` values.
+
+The ordinary HALF `matmul + bias` graph deliberately remains generic because
+Tinygrad rounds the matmul before adding bias.  Parent and candidate retain the
+same 10,728-stage image and SHA-256
+`6782828d7c27dfea5e497794c31de7322a1cdbc435553bdbd048a23cb71d023e`;
+no unsafe CMAC-then-EW sequence crosses that precision boundary.
+
+A committed-parent/candidate lowering oracle observed **249 outcomes / 233
+image-bearing outcomes** across all pre-existing Rockchip UOp tests.  Every
+admission result, encoded image, and resource record is byte-identical at
+aggregate SHA-256
+`5427fa95d0050cb6efa84dc466e3e41b51ff1c6b537d4d0a4cfe20f4c6a8a7c9`.
+The added production regression validates all three new admissions and exact
+packed-surface arithmetic.
+
+Host verification reports **131 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No runtime
+or Tinygrad-core path, CPU/GPU numeric fallback, tolerance, or test contract
+changed.  No device, health, reset, reboot, or hardware census command was run
+because the board remains untrusted; fresh-boot CMAC acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — collapse immutable compiler plumbing at 2,433 lines
 
 This isolated milestone follows `32425ff3c`.  Its predeclared executable

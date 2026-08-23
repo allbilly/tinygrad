@@ -624,7 +624,7 @@ def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> I
     else: yield node
 
 def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
-  """Factor a real weighted sum/dot/matmul into one fixed CMAC stage and raw physical gathers."""
+  """Factor a real weighted sum/dot/matmul and pre-round linear terms into one fixed CMAC stage."""
   _,out,rows,out_index,root = output
   if rows <= 0 or out.dtype.scalar() not in (dtypes.half,dtypes.float): return None
   graph = root.toposort(); local_loads = _semantic_loads(root, local=True) if any(u.op is Ops.BUFFER for u in graph) else (); local_add = bool(local_loads) and all(load.dtype.scalar() is dtypes.float for load in local_loads); additive = local_add or any(u.op is Ops.REDUCE and (u.arg is Ops.ADD or isinstance(u.arg, tuple) and u.arg and u.arg[0] is Ops.ADD) for u in graph)  # noqa: E501
@@ -653,47 +653,42 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     if len(operands) not in (1,2) or not math.isfinite(weight) or \
        len(operands) == 1 and float_to_fp16(weight) != weight or len(operands) == 2 and weight != 1.0: return None
     parsed.append(tuple(operands)); weights.append(weight)
-  def index_shape(operands): return tuple(None if (affine:=_linear_index(item[1])) is None else affine[1] for item in operands)
-  arity,shape = len(parsed[0]),index_shape(parsed[0])
-  if any(item is None for item in shape): return None
-  for i,term_operands in enumerate(parsed): parsed[i] = term_operands if index_shape(term_operands) == shape else \
-    term_operands[::-1] if arity == 2 and index_shape(term_operands[::-1]) == shape else ()
-  if any(not term_operands for term_operands in parsed): return None
-  bases:list[tuple[int, ...]] = []; deltas:list[tuple[int, ...]] = []
-  try:
-    for side in range(arity):
-      expressions = tuple(item[side][1] for item in parsed); affine = typing_cast(tuple, _linear_index(expressions[0]))
-      bases.append(tuple(int(_eval_expr(expressions[0], env, {})) for env in envs))
-      deltas.append(tuple(typing_cast(tuple,_linear_index(expr))[0]-affine[0] for expr in expressions))
+  # Bound explicit per-output offset materialization before allocating its Python tuples.
+  if rows*sum(map(len,parsed)) > _MAX_DYNAMIC_SELECTOR_CELLS: return None
+  try: indexed = tuple(tuple(tuple(int(_eval_expr(operand[1],env,{})) for env in envs) for operand in operands) for operands in parsed)
   except (RuntimeError,ValueError): return None
-  if any(min(bases[side])+deltas[side][term] < 0 or max(bases[side])+deltas[side][term] >= int(param.src[0].arg) for term,term_operands in enumerate(parsed) for side,(param,_) in enumerate(term_operands)): return None  # noqa: E501
-  diagonal = False
-  if arity == 1: m,n,left,right = rows,1,0,None
+  if any(min(values) < 0 or max(values) >= int(operand[0].src[0].arg) for operands,term_values in zip(parsed,indexed) for operand,values in zip(operands,term_values)): return None  # noqa: E501
+  CMACSource = tuple[tuple[UOp,UOp],tuple[int, ...]]
+  # A is row-stable and B is column-stable; explicit offset tables allow source-stride differences and broadcasts.
+  def align(m:int, n:int) -> tuple[tuple[CMACSource|None,CMACSource|None], ...]:
+    aligned:list[tuple[CMACSource|None,CMACSource|None]] = []
+    for operands,term_values in zip(parsed,indexed):
+      row,col = zip(*((all(values[i*n+j] == values[i*n] for i in range(m) for j in range(n)),all(values[i*n+j] == values[j] for i in range(m) for j in range(n))) for values in term_values))  # noqa: E501
+      order = ((0,None) if row[0] else (None,0) if col[0] else None) if len(operands) == 1 else (0,1) if row[0] and col[1] else (1,0) if row[1] and col[0] else None  # noqa: E501
+      if order is None: return ()
+      aligned.append((None if order[0] is None else (operands[order[0]],term_values[order[0]]),None if order[1] is None else (operands[order[1]],term_values[order[1]])))  # noqa: E501
+    return tuple(aligned)
+  if not any(len(operands) == 2 for operands in parsed): m,n,diagonal,normalized = rows,1,False,align(rows,1)
   else:
-    candidates = [(m*ai+ao*ai+2*m*ao,-n,left,right,m,n) for left,right in ((0,1),(1,0))
-      for n in range(1,rows+1) if rows%n == 0 for m in (rows//n,) for ai,ao,_ in (_cmac_layout(m,n,groups),)
-      if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and
-      all(bases[left][i*n+j] == bases[left][i*n] for i in range(m) for j in range(n)) and all(bases[right][i*n+j] == bases[right][j] for i in range(m) for j in range(n))]  # noqa: E501
-    if candidates: _,_,left,right,m,n = min(candidates)
-    else: m = n = rows; left,right,diagonal = 0,1,True
+    candidates = [(m*ai+ao*ai+2*m*ao,-n,m,n,normalized) for n in range(1,rows+1) if rows%n == 0 for m in (rows//n,)
+      for ai,ao,_ in (_cmac_layout(m,n,groups),) if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and (normalized:=align(m,n))]  # noqa: E501
+    if candidates: _,_,m,n,normalized = min(candidates, key=lambda item:item[:2]); diagonal = False
+    else:
+      m = n = rows; diagonal = True; normalized = tuple(((operands[0],term_values[0]),(operands[1],term_values[1]) if len(operands) == 2 else None) for operands,term_values in zip(parsed,indexed))  # noqa: E501
   ai,ao,_ = _cmac_layout(m,n,groups)
-  if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1 or \
-     len({term_operands[left][0].arg.slot for term_operands in parsed})*m*ai+(ao*ai if right is None else len({term_operands[right][0].arg.slot for term_operands in parsed})*ao*ai)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None  # noqa: E501
-  a_slot,b_slot,c_slot = 0,1,2; a_base = bases[left] if diagonal else bases[left][::n]; a_delta = deltas[left]
-  a_cells = tuple((base+a_delta[k],k) if k < groups else (-1,-1) for base in a_base for k in range(ai))
-  if right is None:
-    b_values = tuple(_fp16_bits(weights[ib*32+ki]) if ob*16+ni < n and ib*32+ki < groups else 0 for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
-  else:
-    b_base,b_delta = bases[right][:n],deltas[right]
-    b_cells = tuple((b_base[ob*16+ni]+b_delta[k],k) if ob*16+ni < n and (k:=ib*32+ki) < groups else (-1,-1) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
-  surfaces = ((left,a_slot,a_cells),)+(() if right is None else ((right,b_slot,b_cells),))
-  gathers = tuple(RKGather(source,dst,len(cells),offsets=tuple(offset if term >= 0 and parsed[term][side][0].arg.slot == source else -1 for offset,term in cells),partial=bool(i)) for side,dst,cells in surfaces  # noqa: E501
-    for i,source in enumerate(dict.fromkeys(term_operands[side][0].arg.slot for term_operands in parsed)))
-  if right is None: gathers += (RKGather(out.arg.slot,b_slot,len(b_values),values=b_values),)
+  if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1: return None
+  a_slot,b_slot,c_slot = 0,1,2
+  a_cells = tuple(((source[0][0].arg.slot,source[1][row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(weights[k]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
+  b_cells = tuple(((source[0][0].arg.slot,source[1][ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(weights[k]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
+  def gather_surface(dst:int, cells:tuple[tuple[int|None,int], ...]) -> tuple[RKGather, ...]:
+    sources = tuple(dict.fromkeys(source for source,_ in cells if source is not None)); values = tuple(value if source is None else 0 for source,value in cells); seeded = not sources or any(values)  # noqa: E501
+    return ((RKGather(out.arg.slot,dst,len(cells),values=values),) if seeded else ()) + tuple(RKGather(source,dst,len(cells),offsets=tuple(value if owner == source else -1 for owner,value in cells),partial=seeded or bool(i)) for i,source in enumerate(sources))  # noqa: E501
+  gathers = tuple(gather for dst,cells in ((a_slot,a_cells),(b_slot,b_cells)) for gather in gather_surface(dst,cells))
+  if sum(gather.count for gather in gathers)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
   scratch = (RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4))
   fp16 = out.dtype.scalar() is dtypes.half
-  positions = ((i,i) if diagonal else divmod(i,n) for i in range(rows))
-  output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for row,col in positions)
+  output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col)
+    for i in range(rows) for row,col in ((i,i) if diagonal else divmod(i,n),))
   post = (RKGather(c_slot,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
                    src_kind=RKBufferKind.SCRATCH),)
   cmac = RKCMAC(RKArg(RKBufferKind.SCRATCH,c_slot),RKArg(RKBufferKind.SCRATCH,a_slot),RKArg(RKBufferKind.SCRATCH,b_slot),m,n,groups,fp16)

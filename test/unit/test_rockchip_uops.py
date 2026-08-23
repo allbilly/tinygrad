@@ -938,6 +938,39 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
                                 lhs_values.reshape(3,5).astype(np.float32)@rhs_values.astype(np.float32))
 
 
+def test_fp32_contraction_biases_route_one_production_cmac_surface():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    lhs = Tensor(UOp.new_buffer("ROCKCHIP",6,dtypes.half,num=1007)).reshape(2,3)
+    rhs = Tensor(UOp.new_buffer("ROCKCHIP",6,dtypes.half,num=1008)).reshape(3,2)
+    biases = ((Tensor(UOp.new_buffer("ROCKCHIP",2,dtypes.half,num=1009)),np.asarray((7,8),dtype=np.float16)),
+      (Tensor(UOp.new_buffer("ROCKCHIP",2,dtypes.half,num=1010)).reshape(2,1),np.asarray(((7,),(8,)),dtype=np.float16)),
+      (Tensor(UOp.new_buffer("ROCKCHIP",1,dtypes.half,num=1011)),np.asarray((7,),dtype=np.float16)))
+  lhs_values = np.arange(1,7,dtype=np.float16).reshape(2,3)
+  rhs_values = np.arange(1,7,dtype=np.float16).reshape(3,2)
+  for bias,bias_values in biases:
+    ast = (lhs.matmul(rhs,dtype=dtypes.float)+bias.cast(dtypes.float)).cast(dtypes.half).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+    image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+    assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (2,2,4)
+    assert not image.ew_ops and len(image.gathers) == 4 and sum(bool(gather.values) for gather in image.gathers) == 1
+    sources = {1:lhs_values.view(np.uint16).reshape(-1),2:rhs_values.view(np.uint16).reshape(-1),
+               3:bias_values.view(np.uint16).reshape(-1)}
+    scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+    for gather in image.gathers:
+      destination,offsets = scratch[gather.dst_index],np.asarray(gather.offsets)
+      if gather.values: destination[:gather.count] = gather.values
+      else:
+        valid = offsets >= 0
+        if not gather.partial: destination[:gather.count] = gather.fill_bits
+        destination[:gather.count][valid] = sources[gather.src_index][offsets[valid]]
+    packed_lhs = scratch[image.cmac.lhs.index].view(np.float16).reshape(2,32)
+    packed_rhs = scratch[image.cmac.rhs.index].view(np.float16).reshape(2,1,16,32).transpose(0,2,1,3).reshape(32,32)
+    np.testing.assert_array_equal(packed_lhs[:,:4].astype(np.float32)@packed_rhs[:2,:4].T.astype(np.float32),
+                                  lhs_values.astype(np.float32)@rhs_values.astype(np.float32)+bias_values.astype(np.float32))
+    assert image.execution_class is RKExecutionClass.NATIVE and decode_image(encode_image(image)) == image
+
+
 def test_tensor_mean_routes_scaled_production_cmac_weights():
   with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP",8,dtypes.half,num=1004))
