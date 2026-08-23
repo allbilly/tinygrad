@@ -8254,6 +8254,63 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — compose multi-source CMAC surfaces at 2,451 lines
+
+This isolated milestone follows `be526ee1d`.  Its predeclared renderer budget
+was exactly **+22/-29 executable lines, net -7**.  The final raw diff is
+**+23/-30, net -7** because the post-draft safety audit replaced one existing
+cell-cap line so every partial source surface is charged.  Authoritative
+`sz.py` size moves renderer **2458 -> 2451** and repository total **27990 ->
+27983** (**-7**); runtime remains **464**.
+
+`_lower_cmac_reduction` now aligns contraction operands by their affine index
+shape rather than requiring every term to use the first term's argument slots.
+Each CMAC input surface may therefore be assembled from several argument
+buffers: its first raw gather clears/fills the surface, and later gathers are
+partial raw-lane overlays.  This makes the fixed `slots`/`params` admission and
+the two single-source gather constructors obsolete.  The replacement remains
+local to the existing CMAC owner; it adds no generic reduction IR, wire field,
+runtime phase, scheduler hook, or CPU/GPU numeric fallback.
+
+Admission remains tied to one arithmetic boundary.  Every term must have the
+same one-source or two-source arity, all source-specific bounds are checked,
+and the existing selector-cell cap now counts each materialized partial
+surface.  Mixed product-plus-bias graphs retain their FP16 rounding boundary
+and generic EW path; scaled two-dynamic-input dots, activations, and any
+post-CMAC operation also remain fallback.  In particular, this change does not
+introduce the unsafe CMAC-then-EW sequence implicated by the board timeout.
+
+Two actual production `Tensor.schedule_linear -> to_program` graphs are new
+admissions.  `(x.sum(float32)+y.sum(float32)).half()` moves from **286 EW
+stages / 12,310 encoded bytes** to one `(1,1,16)` CMAC with three gathers /
+2,538 bytes, SHA-256
+`447a6625e44cab5790647245cdb5faed6156e57c76dff80021d5acbcdb02984d`.
+The sum of two independent FP32 dot reductions moves from **973 EW stages /
+40,608 bytes** to `(1,1,16)` CMAC with four gathers / 8,715 bytes, SHA-256
+`60607911d9989916b00fd5056b320c2488a4e41e4818bd0b479bce52e3dbd061`.
+A raw packing/mathematical oracle checked **200** exact small-integer cases
+across those two routes.
+
+A committed-parent/candidate oracle observed **244 lowering outcomes / 228
+image-bearing outcomes** across the complete Rockchip UOp module: **226
+existing images are byte-identical**, 16 rejections remain shared, and exactly
+the two production fixtures above are new CMAC admissions.  The ordered record
+SHA-256 is
+`6ad70614f54e2be3d65f075f7e0d63f2c0d09da5127f58ac8aa83605b97a5256`.
+The existing `3x5 @ 5x4` CMAC remains byte-identical at
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`;
+the mixed-bias fallback remains byte-identical at
+`386294cf61807cc67ac73b5d375e8bac492b6f26b2a2dcf96f934d617cface8d`.
+
+Host verification reports **130 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full hardware census command was
+run because the board remains untrusted; fresh-boot CMAC acceptance and its
+pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
+pending.
+
 ## 2026-08-24 — unify typed load ownership at 2,458 lines
 
 This isolated milestone follows `1c8101a01`.  Its predeclared renderer budget

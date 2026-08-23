@@ -657,51 +657,44 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     if len(operands) not in (1,2) or not math.isfinite(weight) or \
        len(operands) == 1 and float_to_fp16(weight) != weight or len(operands) == 2 and weight != 1.0: return None
     parsed.append(tuple(operands)); weights.append(weight)
-  slots = tuple(x[0].arg.slot for x in parsed[0])
-  for i,parsed_operands in enumerate(parsed):
-    if len(slots) == 2 and tuple(x[0].arg.slot for x in parsed_operands) == slots[::-1]: parsed[i] = parsed_operands[::-1]
-    if tuple(x[0].arg.slot for x in parsed[i]) != slots: return None
+  def index_shape(operands): return tuple(None if (affine:=_linear_index(item[1])) is None else affine[1] for item in operands)
+  arity,shape = len(parsed[0]),index_shape(parsed[0])
+  if any(item is None for item in shape): return None
+  for i,term_operands in enumerate(parsed): parsed[i] = term_operands if index_shape(term_operands) == shape else \
+    term_operands[::-1] if arity == 2 and index_shape(term_operands[::-1]) == shape else ()
+  if any(not term_operands for term_operands in parsed): return None
   bases:list[tuple[int, ...]] = []; deltas:list[tuple[int, ...]] = []
   try:
-    for side in range(len(slots)):
-      expressions = tuple(item[side][1] for item in parsed)
-      affine = _linear_index(expressions[0]); others = tuple(_linear_index(expr) for expr in expressions[1:])
-      if affine is None or any(item is None or item[1] != affine[1] for item in others): return None
+    for side in range(arity):
+      expressions = tuple(item[side][1] for item in parsed); affine = typing_cast(tuple, _linear_index(expressions[0]))
       bases.append(tuple(int(_eval_expr(expressions[0], env, {})) for env in envs))
-      deltas.append((0,)+tuple(item[0]-affine[0] for item in others if item is not None))
+      deltas.append(tuple(typing_cast(tuple,_linear_index(expr))[0]-affine[0] for expr in expressions))
   except (RuntimeError,ValueError): return None
-  params = tuple(parsed[0][side][0] for side in range(len(slots)))
-  if any(min(base)+min(delta) < 0 or max(base)+max(delta) >= int(param.src[0].arg)
-         for param,base,delta in zip(params,bases,deltas)): return None
+  if any(min(bases[side])+deltas[side][term] < 0 or max(bases[side])+deltas[side][term] >= int(param.src[0].arg) for term,term_operands in enumerate(parsed) for side,(param,_) in enumerate(term_operands)): return None  # noqa: E501
   diagonal = False
-  if len(slots) == 1: m,n,left,right = rows,1,0,None
+  if arity == 1: m,n,left,right = rows,1,0,None
   else:
-    candidates = []
-    for left,right in ((0,1),(1,0)):
-      for n in (value for value in range(1,rows+1) if rows%value == 0):
-        m = rows//n; ai,ao,_ = _cmac_layout(m,n,groups)
-        if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or \
-           any(bases[left][i*n+j] != bases[left][i*n] for i in range(m) for j in range(n)) or \
-           any(bases[right][i*n+j] != bases[right][j] for i in range(m) for j in range(n)): continue
-        candidates.append((m*ai+ao*ai+2*m*ao,-n,left,right,m,n))
+    candidates = [(m*ai+ao*ai+2*m*ao,-n,left,right,m,n) for left,right in ((0,1),(1,0))
+      for n in range(1,rows+1) if rows%n == 0 for m in (rows//n,) for ai,ao,_ in (_cmac_layout(m,n,groups),)
+      if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and
+      all(bases[left][i*n+j] == bases[left][i*n] for i in range(m) for j in range(n)) and all(bases[right][i*n+j] == bases[right][j] for i in range(m) for j in range(n))]  # noqa: E501
     if candidates: _,_,left,right,m,n = min(candidates)
     else: m = n = rows; left,right,diagonal = 0,1,True
   ai,ao,_ = _cmac_layout(m,n,groups)
   if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1 or \
-     m*ai+ao*ai+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
+     len({term_operands[left][0].arg.slot for term_operands in parsed})*m*ai+(ao*ai if right is None else len({term_operands[right][0].arg.slot for term_operands in parsed})*ao*ai)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None  # noqa: E501
   a_slot,b_slot,c_slot = 0,1,2; a_base = bases[left] if diagonal else bases[left][::n]; a_delta = deltas[left]
-  a_offsets = tuple(base+a_delta[k] if k < groups else -1 for base in a_base for k in range(ai))
+  a_cells = tuple((base+a_delta[k],k) if k < groups else (-1,-1) for base in a_base for k in range(ai))
   if right is None:
-    b_values = tuple(_fp16_bits(weights[ib*32+ki]) if ob*16+ni < n and ib*32+ki < groups else 0
-      for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32)); b_offsets = typing_cast(tuple[int, ...], ())
+    b_values = tuple(_fp16_bits(weights[ib*32+ki]) if ob*16+ni < n and ib*32+ki < groups else 0 for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
   else:
     b_base,b_delta = bases[right][:n],deltas[right]
-    b_offsets = tuple(b_base[ob*16+ni]+b_delta[ib*32+ki] if ob*16+ni < n and ib*32+ki < groups else -1
-      for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32)); b_values = ()
+    b_cells = tuple((b_base[ob*16+ni]+b_delta[k],k) if ob*16+ni < n and (k:=ib*32+ki) < groups else (-1,-1) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
+  surfaces = ((left,a_slot,a_cells),)+(() if right is None else ((right,b_slot,b_cells),))
+  gathers = tuple(RKGather(source,dst,len(cells),offsets=tuple(offset if term >= 0 and parsed[term][side][0].arg.slot == source else -1 for offset,term in cells),partial=bool(i)) for side,dst,cells in surfaces  # noqa: E501
+    for i,source in enumerate(dict.fromkeys(term_operands[side][0].arg.slot for term_operands in parsed)))
+  if right is None: gathers += (RKGather(out.arg.slot,b_slot,len(b_values),values=b_values),)
   scratch = (RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4))
-  gathers = (RKGather(params[left].arg.slot,a_slot,len(a_offsets),offsets=a_offsets),
-    RKGather(out.arg.slot if right is None else params[right].arg.slot,b_slot,len(b_values or b_offsets),
-             offsets=b_offsets,values=b_values))
   fp16 = out.dtype.scalar() is dtypes.half
   positions = ((i,i) if diagonal else divmod(i,n) for i in range(rows))
   output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for row,col in positions)

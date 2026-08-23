@@ -1066,6 +1066,37 @@ def test_fp32_pure_add_tree_routes_cmac_at_the_half_output_boundary():
   assert image.cmac.out_fp16 and not image.ew_ops and decode_image(encode_image(image)) == image
 
 
+def test_multiple_production_fp32_reductions_share_cmac_surfaces():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    sources = [Tensor(UOp.new_buffer("ROCKCHIP",8,dtypes.half,num=1010+i)) for i in range(4)]
+    outputs = ((sources[0].sum(dtype=dtypes.float)+sources[1].sum(dtype=dtypes.float)).cast(dtypes.half),
+      ((sources[0]*sources[1]).sum(dtype=dtypes.float)+(sources[2]*sources[3]).sum(dtype=dtypes.float)).cast(dtypes.half))
+    images = []
+    for output in outputs:
+      to_program_cache.clear()
+      program = to_program(output.schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
+      images.append(decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg))
+  for image,source_slots in zip(images,((1,2),(1,3,2,4))):
+    assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,16) and not image.ew_ops
+    dynamic = tuple(gather for gather in image.gathers if not gather.values)
+    assert tuple(gather.src_index for gather in dynamic) == source_slots
+    assert tuple(gather.partial for gather in dynamic) == tuple(i%2 == 1 for i in range(len(dynamic)))
+    assert tuple(tuple(i for i,offset in enumerate(gather.offsets) if offset >= 0) for gather in dynamic) == \
+      ((tuple(range(8)),tuple(range(8,16)))*2)[:len(dynamic)]
+    assert all(tuple(offset for offset in gather.offsets if offset >= 0) == tuple(range(8)) for gather in dynamic)
+    assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
+
+
+def test_multisource_cmac_resource_cap_charges_each_partial_surface(monkeypatch):
+  sources = (UOp.param(1,dtypes.half,(8,)),UOp.param(2,dtypes.half,(8,)))
+  terms = [source.index(i).load().cast(dtypes.float) for source in sources for i in range(8)]
+  value = terms[0]
+  for term in terms[1:]: value = value+term
+  monkeypatch.setattr(rockchip_renderer,"_MAX_DYNAMIC_SELECTOR_CELLS",1070)
+  uops = _program(dtypes.half,lambda _i:value.cast(dtypes.half),count=1)
+  assert (output:=rockchip_renderer._outs(uops)[1]) is not None and rockchip_renderer._lower_cmac_reduction(output,uops) is None
+
+
 def test_scaled_pure_sum_routes_cmac_weights_but_scaled_dot_stays_generic():
   lhs, rhs = UOp.param(1, dtypes.half, (8,)), UOp.param(2, dtypes.half, (8,))
   sums = [lhs.index(i).load().cast(dtypes.float) for i in range(8)]
@@ -1104,7 +1135,7 @@ def test_nested_fp32_product_sum_is_committed_before_outer_half_add():
   product_sum = products[0]
   for product in products[1:]: product_sum = product_sum + product
   image = _lower_uop_program(_program(dtypes.half, lambda _i:product_sum.cast(dtypes.half) + bias, count=1))
-  assert image is not None and len(image.ew_ops) > 20 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert image is not None and image.cmac is None and len(image.ew_ops) > 20 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
 def test_independent_fp32_reductions_are_committed_before_outer_half_division():
