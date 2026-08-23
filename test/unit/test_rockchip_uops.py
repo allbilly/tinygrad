@@ -2043,6 +2043,39 @@ def test_dependent_reduction_range_preserves_vector_output_axis():
   assert len(vector.ew_ops) == len(scalar.ew_ops) < 200 and len(large.ew_ops) < 300
 
 
+def test_cmac_candidate_filter_keeps_later_valid_layout():
+  def lower(depth:int) -> RKImage:
+    with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+      source = Tensor(UOp.new_buffer("ROCKCHIP",2*depth,dtypes.half,num=1040).reshape((2,depth)))
+      ast = source.sum(axis=1,dtype=dtypes.float).cast(dtypes.half).schedule_linear().src[0].src[0]
+      to_program_cache.clear()
+      program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+    return decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  boundary, expanded = lower(384), lower(385)
+  assert boundary.cmac is not None and (boundary.cmac.m,boundary.cmac.n,boundary.cmac.k) == (2,1,384)
+  assert expanded.cmac is not None and (expanded.cmac.m,expanded.cmac.n,expanded.cmac.k) == (1,2,385)
+  assert boundary.post_gathers[0].offsets == (0,64) and expanded.post_gathers[0].offsets == (0,1)
+  assert all(not image.ew_ops and len(image.gathers) == 2 and decode_image(encode_image(image)) == image for image in (boundary,expanded))
+  source_values = (np.arange(770)%17-8).astype(np.float16).reshape(2,385)
+  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in expanded.scratch]
+  for gather in expanded.gathers:
+    destination = scratch[gather.dst_index]
+    if gather.values: destination[:gather.count] = gather.values
+    else:
+      offsets, source_bits = np.asarray(gather.offsets), source_values.view(np.uint16).reshape(-1)
+      valid = offsets >= 0
+      if not gather.partial: destination[:gather.count] = gather.fill_bits
+      destination[:gather.count][valid] = source_bits[offsets[valid]]
+  cmac = expanded.cmac
+  lhs = scratch[cmac.lhs.index].view(np.float16).reshape(cmac.m,-1)
+  ai,ao = lhs.shape[1],len(scratch[cmac.rhs.index])//lhs.shape[1]
+  rhs = scratch[cmac.rhs.index].view(np.float16).reshape(ao//16,ai//32,16,32).transpose(0,2,1,3).reshape(ao,ai)
+  product, physical = lhs.astype(np.float32)@rhs.astype(np.float32).T, np.zeros(cmac.m*ao*2,dtype=np.float16)
+  for row in range(cmac.m):
+    for col in range(cmac.n): physical[row*ao*2+col//16*32+col%16] = product[row,col]
+  np.testing.assert_array_equal(physical[np.asarray(expanded.post_gathers[0].offsets)],source_values.sum(axis=1,dtype=np.float32))
+
+
 def test_mapped_loop_reduction_composes_generic_post_uops():
   out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (65,))
   axis = UOp.range(65, 0, AxisType.REDUCE)

@@ -8254,6 +8254,61 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — filter physical CMAC candidates before ranking at 2,355 lines
+
+This isolated milestone follows `80a1d95f1`.  Its predeclared and observed
+production renderer budget is exactly **+8/-9 executable lines, net -1**.
+Authoritative `sz.py` size moves renderer **2356 -> 2355** and repository
+total **27878 -> 27877**; runtime remains **454**.
+
+`_lower_cmac_reduction` now places factored and diagonal layouts in one
+candidate set, applies every existing CMAC physical limit to each layout, and
+only then ranks the survivors.  This deletes the separate diagonal fallback,
+late physical validation, and diagonal-only output-offset branch.  Diagonal
+physical cells are expressed through the same `outputs` permutation as every
+other layout.  No generic reduction IR, new wire field, runtime phase,
+CPU/GPU numeric fallback, tolerance, or existing assertion is added or
+weakened.
+
+The old ordering selected `(M,N,K) = (2,1,385)` for a production two-row
+FP32-accumulating sum and then rejected it because multi-row CMAC input is
+limited to 384 lanes, even though `(1,2,385)` was already a valid later
+factorization.  The actual production `Tensor.schedule_linear -> to_program`
+path now keeps that valid layout: it has zero EW stages, two gathers, output
+offsets `(0,1)`, and SHA-256
+`e9da143a258722242eb29492d30a6008d1602c476b2e5d3fb88ae9a01aaa3fb4`.
+The parent fallback had 386 EW stages, 385 gathers, and SHA-256
+`0e0e2104177840ca1a14a5b3ca94e3fb2a255ceb286a8dad187f2a96ea86525a`.
+The CMAC encoding is 54,285 bytes versus the fallback's 35,903 bytes, so this
+is a coverage and source-deletion result rather than a serialized-size claim.
+
+The permanent regression materializes both raw CMAC surfaces and reconstructs
+the physical output, proving exact FP32 sums before HALF storage.  The
+384-lane boundary remains byte-identical as `(2,1,384)`, output offsets
+`(0,64)`, 27,853 bytes, and SHA-256
+`313ab439c5f1192afc73957f42a91f064b89cc741de82853d4770320c60a5a4d`.
+A committed-parent/candidate oracle reran the original 140-test source and
+observed **268 lowering outcomes / 252 RKImages / 16 honest rejections**;
+every pre-existing record is identical, with compact ordered-record SHA-256
+`3b6aa3c20d1460b98af7ecbf00b9dba70759db2483984edcdcd6054f4cebf3fd`.
+Production plain and ReLU matmuls also remain byte-identical at respective
+SHA-256 values
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`
+and
+`ed0f42d71e8049f79e621b28f6699c5950203025a5990fbfa8334b0418cf89ea`.
+
+Host verification reports **141 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  Fable
+Judge reports **VERIFIED WITH CAVEATS**: every host claim reproduces, the
+focused test exercises the production compiler path, and no weakened check,
+scope creep, or analogous post-ranking CMAC validation remains; the sole
+caveat is the prohibited live hardware bracket.  No device, health, reset,
+reboot, hardware execution, or full hardware census command was run because
+the board remains untrusted; fresh-boot CMAC acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — explicit EW tiling ownership makes CMAC room at 454 runtime lines
 
 This isolated milestone follows `54cbbdf13`.  Its predeclared and observed

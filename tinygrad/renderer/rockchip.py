@@ -648,13 +648,13 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
       if order is None: return ()
       aligned.append((None if order[0] is None else operands[order[0]],None if order[1] is None else operands[order[1]],weight))
     return tuple(aligned)
-  if (candidates := [(not any(len(operands) == 2 for operands,_ in parsed) and n != 1,bool(lanes),m*ai+ao*ai+2*m*ao,-n,m,n,outputs,normalized) for affine in (_linear_index(out_index),) for m,n,lanes,outputs in itertools.chain(((rows//n,n,(),()) for n in range(1,rows+1) if rows%n == 0),  # noqa: E501
-    ((limit,rows//limit,tuple(high*stride*limit+row*stride+low for row in range(limit) for high in range(rows//stride//limit) for low in range(stride)),tuple((i//stride%limit)*(rows//limit)+i//(stride*limit)*stride+i%stride for i in range(rows))) for _,stride,limit in ((_affine_output_axes(typing_cast(tuple[int, dict[UOp, int]], affine),rows) if affine is not None else None) or ())))  # noqa: E501
-    for ai,ao,_ in (_cmac_layout(n,groups),) if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and (normalized:=align(m,n,lanes))]): _,_,_,_,m,n,outputs,normalized = min(candidates, key=lambda item:item[:4]); diagonal = False  # noqa: E501
-  else:
-    m = n = rows; diagonal = True; outputs = (); normalized = tuple((operands[0] if operands else None,operands[1] if len(operands) == 2 else None,weight) for operands,weight in parsed)  # noqa: E501
-  ai,ao,_ = _cmac_layout(n,groups)
-  if m > 0x7ff or ai > 0xffff or ao > 0x3fff or m*ai*2 > 10*32768 or ai > 12*32 and m != 1: return None
+  candidates = [(diagonal,not any(len(operands) == 2 for operands,_ in parsed) and n != 1,bool(lanes),m*ai+ao*ai+2*m*ao,-n,ai,ao,m,n,outputs,normalized) for diagonal,m,n,lanes,outputs,normalized in itertools.chain(  # noqa: E501
+    ((False,m,n,lanes,outputs,align(m,n,lanes)) for affine in (_linear_index(out_index),) for m,n,lanes,outputs in itertools.chain(((rows//n,n,(),()) for n in range(1,rows+1) if rows%n == 0),  # noqa: E501
+      ((limit,rows//limit,tuple(high*stride*limit+row*stride+low for row in range(limit) for high in range(rows//stride//limit) for low in range(stride)),tuple((i//stride%limit)*(rows//limit)+i//(stride*limit)*stride+i%stride for i in range(rows))) for _,stride,limit in ((_affine_output_axes(typing_cast(tuple[int, dict[UOp, int]], affine),rows) if affine is not None else None) or ())))),  # noqa: E501
+    ((True,rows,rows,(),tuple(i*rows+i for i in range(rows)),tuple((operands[0] if operands else None,operands[1] if len(operands) == 2 else None,weight) for operands,weight in parsed)),))  # noqa: E501
+    for ai,ao,_ in (_cmac_layout(n,groups),) if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and (m == 1 or ai <= 12*32) and normalized]  # noqa: E501
+  if not candidates: return None
+  diagonal,_,_,_,_,ai,ao,m,n,outputs,normalized = min(candidates, key=lambda item:item[:5])
   a_cells = tuple(((source.param.arg.slot,source.offsets[row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(1.0 if normalized[k][1] is None else normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
   b_cells = tuple(((source.param.arg.slot,source.offsets[ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
   def gather_surface(dst:int, cells:tuple[tuple[int|None,int], ...]) -> tuple[RKGather, ...]:
@@ -663,8 +663,7 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   gathers = tuple(gather for dst,cells in enumerate((a_cells,b_cells)) for gather in gather_surface(dst,cells))
   if sum(gather.count for gather in gathers)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
   fp16 = out.dtype.scalar() is dtypes.half
-  output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col)
-    for i in (outputs or range(rows)) for row,col in ((i,i) if diagonal else divmod(i,n),))
+  output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for i in (outputs or range(rows)) for row,col in (divmod(i,n),))  # noqa: E501
   return RKImage(RKTarget.RK3588,(RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4)),gathers=gathers,
     post_gathers=(RKGather(2,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
                            src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),m,n,groups,fp16,relu_root is not None))  # noqa: E501
