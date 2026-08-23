@@ -8216,3 +8216,40 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot CMAC acceptance and its
 pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain
 pending.
+
+## 2026-08-24 — collapse single-owner composite math plumbing at 2,478 lines
+
+This isolated milestone follows `0f8d0e5ec`.  Its predeclared renderer budget
+was **+25/-39 executable lines, net -14**.  The observed token-aware diff is
+**+26/-41, net -15**: moving the recognizer boundary counted one additional
+replacement on each side, while direct EXP2 scale ownership removed one more
+old result line than estimated.  Authoritative `sz.py` size moves renderer
+**2493 -> 2478** and repository total **28025 -> 28010** (**-15**); runtime
+remains **464**.
+
+Six helpers had exactly one production owner.  `_fold_atan` now owns the
+former `_unit_ratio_source` normalization match.  `_fold_inverse_hyperbolic`
+now owns the canonical LOG2 pattern, bounded asinh/acosh recipe, large-value
+correction, and region selection formerly split among
+`_hyperbolic_log_source`, `_hyperbolic_tail`, `_dpu_region`, and
+`_dpu_inverse_hyperbolic`.  `_dpu_exp2` directly owns the exact exponent scale
+formerly forwarded through `_dpu_pow2_integer`.  All six helpers are deleted;
+their explanatory docstrings remain beside the replacement logic as comments.
+No generic IR, new arithmetic recipe, admission change, wire/runtime path,
+CPU/GPU numeric fallback, test change, or CMAC behavior change was introduced.
+
+A committed-parent/candidate lowering oracle observed **242 outcomes / 226
+RKImages** across the complete Rockchip UOp module.  Every admission result
+and every encoded image is byte-identical; the ordered record SHA-256 is
+`2f05709ca821f92667ada10d28698473d5516782e7b2a114c249e75f3c4aee95`.
+Four actual production `Tensor.schedule_linear -> to_program` programs for
+atan, asinh, acosh, and EXP2 retain their individual image hashes and aggregate
+SHA-256 `9a4faa6a5eeda465059c23d5c612fe9b31d71bc05b9929050e0d45963ec6ac0e`.
+
+Host verification reports **128 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full census command was run
+because the board remains untrusted; fresh-boot acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.

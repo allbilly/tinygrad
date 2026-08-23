@@ -2588,20 +2588,16 @@ def _square_offset(radicand:UOp, source:UOp, values:tuple[float, ...]) -> float|
                                              for u in radicand.src): return None
   return next((float(u.arg) for u in radicand.src if u.op is Ops.CONST and float(u.arg) in values), None)
 
-def _unit_ratio_source(root:UOp) -> UOp|None:
-  """Match Tinygrad's x/sqrt(1+x*x) normalization."""
-  candidates = ((root.src[0], root.src[1]),) if root.op is Ops.FDIV else tuple((source, inverse.src[0])
-    for source,inverse in (root.src, root.src[::-1]) if inverse.op is Ops.RECIPROCAL and len(inverse.src) == 1)
-  for source, denominator in candidates:
-    if denominator.op is Ops.SQRT and len(denominator.src) == 1 and _square_offset(denominator.src[0], source, (1.0,)) is not None: return source
-  return None
-
 def _fold_atan(root:UOp) -> UOp|None:
   """Replace Tinygrad's asin-based atan with a compact range-reduced DPU polynomial."""
   nodes = root.toposort()
   sources:dict[bytes, UOp] = {}
   for u in nodes:
-    if u.op in (Ops.MUL, Ops.FDIV) and (source:=_unit_ratio_source(u)) is not None: sources[source.key] = source
+    # Match Tinygrad's x/sqrt(1+x*x) normalization.
+    candidates = ((u.src[0],u.src[1]),) if u.op is Ops.FDIV else tuple((source,inverse.src[0]) for source,inverse in
+      (u.src,u.src[::-1]) if inverse.op is Ops.RECIPROCAL and len(inverse.src) == 1) if u.op is Ops.MUL else ()
+    if (source:=next((source for source,denominator in candidates if denominator.op is Ops.SQRT and len(denominator.src) == 1 and
+                     _square_offset(denominator.src[0],source,(1.0,)) is not None),None)) is not None: sources[source.key] = source
   constants = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float)}
   if len(sources) != 1 or any(not any(abs(v-target) < tolerance for v in constants) for target,tolerance in
                               ((math.pi/2, 1e-12), (1.570796305, 1e-10), (-0.0012624911, 1e-8))): return None
@@ -2614,42 +2610,30 @@ def _fold_atan(root:UOp) -> UOp|None:
   selected = angle.alu(Ops.ADD, large.alu(Ops.MUL, reflected.alu(Ops.SUB, angle)))
   return selected.alu(Ops.MUL, source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))))
 
-def _hyperbolic_log_source(root:UOp) -> tuple[UOp, int]|None:
-  """Match log(x + sqrt(x*x +/- 1)) after natural log expands to LOG2 times ln(2)."""
-  if root.op is not Ops.MUL: return None
-  for logarithm, scale in (root.src, root.src[::-1]):
-    if (scale.op is not Ops.CONST or abs(float(scale.arg)-math.log(2)) > 1e-12 or logarithm.op is not Ops.LOG2 or
-        len(logarithm.src) != 1 or (argument:=logarithm.src[0]).op is not Ops.ADD): continue
-    for source, radical in (argument.src, argument.src[::-1]):
-      if radical.op is Ops.SQRT and len(radical.src) == 1 and (offset:=_square_offset(radical.src[0], source, (-1.0, 1.0))) is not None:
-        return source, int(offset)
-  return None
-
 def _poly_horner(source:UOp, coefficients:tuple[float, ...]) -> UOp:
   return functools.reduce(lambda r,c: r.alu(Ops.MUL, source).alu(Ops.ADD, source.const_like(c)),
                           coefficients[-2::-1], source.const_like(coefficients[-1]))
 
-def _hyperbolic_tail(magnitude:UOp, coefficients:tuple[float, ...]) -> UOp:
-  """Approximate log(2*x) plus an inverse-even-power correction for large positive x."""
-  one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
-  inverse = one.alu(Ops.FDIV, magnitude); inverse_square = inverse.alu(Ops.MUL, inverse)
-  correction = inverse_square.alu(Ops.MUL, _poly_horner(inverse_square, coefficients))
-  return magnitude.alu(Ops.LOG2).alu(Ops.MUL, ln2).alu(Ops.ADD, ln2).alu(Ops.ADD, correction)
-
-def _dpu_region(value:UOp, threshold:UOp, small:UOp, large:UOp, mask:Callable[[UOp], UOp]=_finite_positive_mask, reverse:bool=False) -> UOp: return small.alu(Ops.ADD, mask(threshold.alu(Ops.SUB, value) if reverse else value.alu(Ops.SUB, threshold)).alu(Ops.MUL, large.alu(Ops.SUB, small)))  # noqa: E501
-
-def _dpu_inverse_hyperbolic(source:UOp, offset:int, one:UOp, ln2:UOp) -> UOp:
+def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
+  """Stabilize Tinygrad's FP16 asinh/acosh expansions without LUT or CMAC."""
+  if root.op is not Ops.MUL: return None
+  # Match log(x + sqrt(x*x +/- 1)) after natural log expands to LOG2 times ln(2).
+  matched = next(((source,int(offset)) for logarithm,scale in (root.src,root.src[::-1]) if scale.op is Ops.CONST and
+    not abs(float(scale.arg)-math.log(2)) > 1e-12 and logarithm.op is Ops.LOG2 and len(logarithm.src) == 1 and
+    (argument:=logarithm.src[0]).op is Ops.ADD for source,radical in (argument.src,argument.src[::-1]) if
+    radical.op is Ops.SQRT and len(radical.src) == 1 and (offset:=_square_offset(radical.src[0],source,(-1.0,1.0))) is not None),None)
+  if matched is None: return None
+  source, offset = matched; source = source.cast(dtypes.half); one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
   asinh, threshold = offset == 1, _half(1.5 if offset == 1 else 2.0); magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS) if asinh else source  # noqa: E501
   bounded = _native_min(magnitude, threshold) if asinh else _native_min(source, threshold).alu(Ops.MAX, _half(-2.0)); square = bounded.alu(Ops.MUL, bounded)  # noqa: E501
   small = bounded.alu(Ops.MUL, _poly_horner(square, (0.99989513, -0.16376462, 0.06135906, -0.01879756, 0.00268578))) if asinh else bounded.alu(Ops.ADD, square.alu(Ops.SUB, one).sqrt()).alu(Ops.LOG2).alu(Ops.MUL, ln2)  # noqa: E501
-  safe = (magnitude if asinh else source).alu(Ops.MAX, threshold); large = _hyperbolic_tail(safe, (0.25, -3/32, 5/96) if asinh else (-0.25, -3/32, -5/96))  # noqa: E501
-  selected = _dpu_region(magnitude if asinh else source, threshold, small, large); return selected.alu(Ops.MUL, source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, _half(2**-24)))) if asinh else selected  # noqa: E501
-
-def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
-  """Stabilize Tinygrad's FP16 asinh/acosh expansions without LUT or CMAC."""
-  if (matched:=_hyperbolic_log_source(root)) is None: return None
-  source, offset = matched; source = source.cast(dtypes.half); one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
-  return _dpu_inverse_hyperbolic(source, offset, one, ln2)
+  safe = (magnitude if asinh else source).alu(Ops.MAX,threshold)
+  # Approximate log(2*x) plus an inverse-even-power correction for large positive x.
+  inverse = one.alu(Ops.FDIV,safe); inverse_square = inverse.alu(Ops.MUL,inverse)
+  correction = inverse_square.alu(Ops.MUL,_poly_horner(inverse_square,(0.25,-3/32,5/96) if asinh else (-0.25,-3/32,-5/96)))
+  large = safe.alu(Ops.LOG2).alu(Ops.MUL,ln2).alu(Ops.ADD,ln2).alu(Ops.ADD,correction)
+  selected = small.alu(Ops.ADD,_finite_positive_mask((magnitude if asinh else source).alu(Ops.SUB,threshold)).alu(Ops.MUL,large.alu(Ops.SUB,small)))  # noqa: E501
+  return selected.alu(Ops.MUL,source.alu(Ops.FDIV,magnitude.alu(Ops.MAX,_half(2**-24)))) if asinh else selected
 
 def _dpu_math_base(source:UOp) -> tuple[UOp, UOp, UOp, Callable[[UOp], UOp]]:
   source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0)
@@ -2707,24 +2691,19 @@ def _dpu_sin(source:UOp) -> UOp:
     cosine = _poly_horner(square, (1.0, -1/2, 1/24, -1/720, 1/40320)).alu(Ops.MUL, one.alu(Ops.SUB, reflected.alu(Ops.MUL, _half(2.0)))); result = result.alu(Ops.ADD, residual.alu(Ops.MUL, cosine))  # noqa: E501
   return result.alu(Ops.ADD, invalid)
 
-def _dpu_pow2_integer(exponent:UOp) -> UOp:
-  """Build `2**exponent` for the FP16 exponent range with exact native DPU arithmetic."""
-  half_dtype, zero, one = dtypes.half, UOp.const(0.0, dtypes.half), UOp.const(1.0, dtypes.half)
-  scale, quotient = UOp.const(2**-24, half_dtype), _native_min(exponent.alu(Ops.ADD, _half(24.0)).alu(Ops.MAX, zero), _half(39.0))
-  for factor,repeats in ((2.0, 1), (4.0, 1), (16.0, 1), (256.0, 1), (256.0, 2), (256.0, 4)):
-    halved = UOp(Ops.MAX, half_dtype, src=((half_floor:=quotient.alu(Ops.MUL, UOp.const(0.5, half_dtype))), half_floor), arg=_NATIVE_FLOOR)
-    bit = quotient.alu(Ops.SUB, halved.alu(Ops.MUL, UOp.const(2.0, half_dtype)))
-    for _ in range(repeats): scale = scale.alu(Ops.MUL, one.alu(Ops.ADD, bit.alu(Ops.MUL, UOp.const(factor-1.0, half_dtype))))
-    quotient = halved
-  return scale
-
 def _dpu_exp2(source:UOp) -> UOp:
   """Approximate FP16 EXP2 without LUTs using native FLOOR, Horner arithmetic, and exact exponent scaling."""
-  source, _, one, mask_fn = _dpu_math_base(source)
+  source, zero, one, mask_fn = _dpu_math_base(source)
   bounded = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, UOp.const(-24.0, dtypes.half)), UOp.const(15.9921875, dtypes.half)), arg=_NATIVE_MIN)
   integer = UOp(Ops.MAX, dtypes.half, src=(bounded, bounded), arg=_NATIVE_FLOOR)
-  result = _poly_horner(bounded.alu(Ops.SUB, integer), (1, 0.6931471806, 0.2402265069, 0.0555041087, 0.0096181291, 0.0013333558)).alu(
-    Ops.MUL, _dpu_pow2_integer(integer))
+  # Build `2**exponent` for the FP16 exponent range with exact native DPU arithmetic.
+  scale,quotient = UOp.const(2**-24,dtypes.half),_native_min(integer.alu(Ops.ADD,_half(24.0)).alu(Ops.MAX,zero),_half(39.0))
+  for factor,repeats in ((2.0,1),(4.0,1),(16.0,1),(256.0,1),(256.0,2),(256.0,4)):
+    halved = UOp(Ops.MAX,dtypes.half,src=((half_floor:=quotient.alu(Ops.MUL,UOp.const(0.5,dtypes.half))),half_floor),arg=_NATIVE_FLOOR)
+    bit = quotient.alu(Ops.SUB,halved.alu(Ops.MUL,UOp.const(2.0,dtypes.half)))
+    for _ in range(repeats): scale = scale.alu(Ops.MUL,one.alu(Ops.ADD,bit.alu(Ops.MUL,UOp.const(factor-1.0,dtypes.half))))
+    quotient = halved
+  result = _poly_horner(bounded.alu(Ops.SUB,integer),(1,0.6931471806,0.2402265069,0.0555041087,0.0096181291,0.0013333558)).alu(Ops.MUL,scale)
   below, above = mask_fn(UOp.const(-24.0, dtypes.half).alu(Ops.SUB, source)), mask_fn(source.alu(Ops.SUB, UOp.const(15.9921875, dtypes.half)))
   finite = UOp(Ops.MUL, dtypes.half, src=(result, one.alu(Ops.SUB, below)), arg=_NATIVE_MASK_MUL)
   return finite.alu(Ops.ADD, one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one))
