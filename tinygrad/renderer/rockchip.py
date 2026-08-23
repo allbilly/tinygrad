@@ -848,24 +848,6 @@ def _bounded_index_gate(gate:UOp, bounded:UOp, limit:int|None=None) -> int|None:
   return limit if any((comparison:=_inverted_condition(u, typed=True)) is not None and comparison.op is Ops.CMPLT and
     comparison.src[0].key == bounded.key and comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg) == 0 for u in nodes) else None
 
-def _bounded_dynamic_axes(address:UOp, gate:UOp) -> tuple[tuple[UOp, UOp, int, bool], ...]|None:
-  """Prove every dynamic INT32 address axis has one exact static extent and bounds gate."""
-  address_nodes = address.toposort()
-  normalized = tuple((u, index, int(addition[1].arg)) for u in address_nodes
-    if u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT and u.src[0].src[1].op is Ops.CONST and int(u.src[0].src[1].arg) == 0
-    and (index:=u.src[0].src[0]).op is Ops.LOAD and index.dtype.scalar() is dtypes.int and u.src[2].key == index.key
-    and (addition:=_const_operand(u.src[1], Ops.ADD)) is not None and addition[0].key == index.key and int(addition[1].arg) > 0)
-  normalized_by_load = {dynamic.key:(root, extent) for root,dynamic,extent in normalized}
-  loads = tuple({u.key:u for u in address_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
-  if not loads or len(normalized_by_load) != len(normalized): return None
-  axes:list[tuple[UOp, UOp, int, bool]] = []
-  for dynamic in loads:
-    root, extent, wrapped = (*normalized_by_load[dynamic.key], True) if dynamic.key in normalized_by_load else \
-      (dynamic, _bounded_index_gate(gate, dynamic), False)
-    if extent is None or wrapped and _bounded_index_gate(gate, root, extent) is None: return None
-    axes.append((root, dynamic, extent, wrapped))
-  return tuple(axes)
-
 def _native_int16_byte_mask(builder:_RKBuilder, index_slot:int, index_offsets:tuple[int, ...]|tuple[tuple[int, ...], ...],
                             coordinate_sets:tuple[tuple[tuple[int, ...], ...], ...], count:int, vector_lanes:int) -> RKArg|None:
   """Compare arbitrary INT32 values exactly as four unsigned bytes using native INT16 DPU EW."""
@@ -923,19 +905,18 @@ def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predi
   if (source_count:=int(source.src[0].arg)) <= 0 or len(terms)%source_count or any(offsets.count(i) != len(terms)//source_count for i in range(source_count)): return None  # noqa: E501
   return (source, scales[0]*(len(terms)//source_count)) if 1 <= scales[0]*(len(terms)//source_count) <= max_scale else None
 
-def _bounded_predicate_coordinate_plan(output:RKOutput, dtype:DType, predicate:Callable[[UOp], UOp|None],
-                                       encodable:Callable[[int], bool]) -> tuple[UOp, int, UOp, tuple[int, ...], tuple[tuple[int, ...], ...], int]|None:  # noqa: E501
-  """Prove a bounded predicate count plus dynamic-rank coordinate selection and fill program."""
-  _, _, count, out_index, root = output
+def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
+  """Prove and execute bounded integer predicate coordinates through native INT16 byte masks."""
+  _, out, count, out_index, root = output
   if not 1 <= count <= _FP16_EXACT_INTEGER or root.op is not Ops.WHERE or len(root.src) != 3: return None
   if (fill:=root.src[2]).op is not Ops.CONST or fill.dtype.scalar() is not dtypes.int: return None
   fill_value = int(fill.arg)
   totals = [(u.src[1], info) for u in root.toposort() if u.op is Ops.CMPLT and u.src[0].key == out_index.key and
-            (info:=_full_predicate_count(u.src[1], out_index, count, dtype, predicate, 8)) is not None]
+            (info:=_full_predicate_count(u.src[1], out_index, count, dtype, lambda x:_nonzero_load(x, dtype), 8)) is not None]
   if len(totals) != 1: return None
-  total, (source, rank) = totals[0]
+  total_expr, (source, rank) = totals[0]
   if (coordinate_count:=int(source.src[0].arg)*rank) < 1 or coordinate_count > _FP16_EXACT_INTEGER: return None
-  source_loads = {u.key for u in total.toposort() if u.op is Ops.LOAD}
+  source_loads = {u.key for u in total_expr.toposort() if u.op is Ops.LOAD}
   index_loads = [u for u in root.toposort() if u.op is Ops.LOAD and u.key not in source_loads]
   if len(index_loads) != 1 or {u.key for u in root.toposort() if u.op is Ops.LOAD} != source_loads|{index_loads[0].key}: return None
   index_load = index_loads[0]
@@ -943,21 +924,14 @@ def _bounded_predicate_coordinate_plan(output:RKOutput, dtype:DType, predicate:C
       int(index_plan.param.src[0].arg) != count: return None
   try:
     coordinate_rows = tuple(_static_values(out_index, root.substitute(
-      {total:total.const_like(count), index_load:index_load.const_like(i)}), count, int) for i in range(coordinate_count))
+      {total_expr:total_expr.const_like(count), index_load:index_load.const_like(i)}), count, int) for i in range(coordinate_count))
     for selected_count in range(count+1):
-      got = _static_values(out_index, root.substitute({total:total.const_like(selected_count), index_load:index_load.const_like(0)}), count, int)
+      got = _static_values(out_index, root.substitute({total_expr:total_expr.const_like(selected_count), index_load:index_load.const_like(0)}), count, int)  # noqa: E501
       if got != tuple(coordinate_rows[0][lane] if lane < selected_count else fill_value for lane in range(count)): return None
-    if index_plan.offsets != tuple(range(count)) or not encodable(fill_value) or \
-       any(not encodable(value) for row in coordinate_rows for value in row): return None
+    if index_plan.offsets != tuple(range(count)) or not -32768 <= fill_value <= 32767 or \
+       any(not -32768 <= value <= 32767 for row in coordinate_rows for value in row): return None
   except (RuntimeError, OverflowError, struct.error): return None
-  return source, rank, index_plan.param, index_plan.offsets, coordinate_rows, fill_value
-
-def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
-  """Execute bounded integer predicate coordinates through native INT16 byte masks."""
-  _, out, count, _, _ = output
-  if (plan:=_bounded_predicate_coordinate_plan(output, dtype, lambda u:_nonzero_load(u, dtype),
-                                               lambda value:-32768 <= value <= 32767)) is None: return None
-  source, rank, index_param, index_offsets, coordinate_rows, fill_value = plan
+  index_param, index_offsets = index_plan.param, index_plan.offsets
   source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows); _, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)  # noqa: E501
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
 
@@ -968,11 +942,8 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
       offsets=(i*dtype.itemsize+byte,), dst_addend=i*source_vector_lanes*2, dst_stride=2, itemsize=1) for i in range(source_count))
   for value in byte_masks: builder.i16(value, one, source_matrix_lanes, _EW_CFG_MIN, value)
   source_mask = _reduce_byte_masks(builder, byte_masks, source_matrix_lanes, _EW_CFG[Ops.MAX], in_place=True)
-  total = _reduce_rows(builder.ops, [replace(source_mask, addend=source_mask.addend+row*64) for row in range(source_count)],
-                       1, _EW_CFG[Ops.ADD], int16=True)
-  if rank != 1:
-    rank_value = builder.constant(source.arg.slot, 1, _int16_bits(rank))
-    builder.i16(total, rank_value, 1, _EW_CFG[Ops.MUL], total)
+  total = _reduce_rows(builder.ops, [replace(source_mask, addend=source_mask.addend+row*64) for row in range(source_count)], 1, _EW_CFG[Ops.ADD], int16=True)  # noqa: E501
+  if rank != 1: builder.i16(total, builder.constant(source.arg.slot, 1, _int16_bits(rank)), 1, _EW_CFG[Ops.MUL], total)
   candidates = tuple((candidate,)*count for candidate in range(coordinate_count))
   if (equal:=_native_int16_byte_mask(builder, index_param.arg.slot, index_offsets, (candidates,), count, vector_lanes)) is None: return None
   gather_after, total_vector, output_coordinate, zero, one, coordinate_matrix = len(builder.ops),*(builder.scratch(matrix_lanes*2) for _ in range(5))
@@ -1014,7 +985,21 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
       load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
   data_param, data_index, gate, gate_nodes = _root_param(load.src[0]), load.src[0].src[1], load.src[2], load.src[2].toposort()
   bool_loads = tuple(u for u in gate_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool)
-  if (axes:=_bounded_dynamic_axes(data_index, gate)) is None: return None
+  address_nodes = data_index.toposort()
+  normalized = tuple((u, index, int(addition[1].arg)) for u in address_nodes
+    if u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT and u.src[0].src[1].op is Ops.CONST and int(u.src[0].src[1].arg) == 0
+    and (index:=u.src[0].src[0]).op is Ops.LOAD and index.dtype.scalar() is dtypes.int and u.src[2].key == index.key
+    and (addition:=_const_operand(u.src[1], Ops.ADD)) is not None and addition[0].key == index.key and int(addition[1].arg) > 0)
+  normalized_by_load = {dynamic.key:(root, extent) for root,dynamic,extent in normalized}
+  dynamic_loads = tuple({u.key:u for u in address_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
+  if not dynamic_loads or len(normalized_by_load) != len(normalized): return None
+  dynamic_axes:list[tuple[UOp, UOp, int, bool]] = []
+  for dynamic in dynamic_loads:
+    axis, extent, wrapped = (*normalized_by_load[dynamic.key], True) if dynamic.key in normalized_by_load else \
+      (dynamic, _bounded_index_gate(gate, dynamic), False)
+    if extent is None or wrapped and _bounded_index_gate(gate, axis, extent) is None: return None
+    dynamic_axes.append((axis, dynamic, extent, wrapped))
+  axes = tuple(dynamic_axes)
   loads = tuple(axis[1] for axis in axes); params = typing_cast(tuple[UOp, ...], tuple(_root_param(u.src[0]) if u.src and u.src[0].op is Ops.INDEX else None for u in loads))  # noqa: E501
   if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or len(bool_loads) > 1 or
       any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params) or
@@ -1066,8 +1051,8 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
   builder, blocks = _RKBuilder(), []
   for start,stop in ((start,min(candidates,start+block_rows)) for start in range(0,candidates,block_rows)):
     rows, matrix_lanes, axis_masks = stop-start, (stop-start)*vector_lanes, typing_cast(list[RKArg], [])
-    for axis,((index_slot, offsets), values) in enumerate(zip(grouped_indices, zip(*combinations))):
-      alternatives = (values, *((tuple(value-axes[axis][2] for value in values),) if axes[axis][3] else ()))
+    for axis_index,((index_slot, offsets), values) in enumerate(zip(grouped_indices, zip(*combinations))):
+      alternatives = (values, *((tuple(value-axes[axis_index][2] for value in values),) if axes[axis_index][3] else ()))
       coordinate_sets = tuple(tuple((value,)*group_count for value in alternative[start:stop]) for alternative in alternatives)
       if (mask:=_native_int16_byte_mask(builder, index_slot, offsets, coordinate_sets, group_count, vector_lanes)) is None: return None
       axis_masks.append(mask)
@@ -1215,22 +1200,17 @@ def _has_runtime_address(root:UOp) -> bool:
              if load.op is Ops.LOAD and load.src and load.src[0].op is Ops.INDEX
              for node in (*load.src[0].src[1].toposort(), *(load.src[2].toposort() if len(load.src) > 2 else ())))
 
-def _runtime_affine_index(u:UOp, out_index:UOp, count:int) -> tuple[UOp, UOp, int, int, int, int, int]|None:
-  """Resolve `static_lane_base + runtime_index * scale` without reading the runtime index on the renderer."""
-  infos = tuple(info for node in u.toposort() if (info:=_runtime_index(node)) is not None)
-  if len(infos) != 1: return None
-  load, param, _, itemsize = info = infos[0]
-  try:
-    if (lane_offset:=_runtime_lane_offset(info, out_index, count)) is None: return None
-    zero, one = (_static_values(out_index, u.substitute({load:load.const_like(value)}), count, int) for value in (0, 1))
-  except RuntimeError: return None
-  lane_stride = zero[1]-zero[0] if count > 1 else 0
-  return (load, param, itemsize, lane_offset, zero[0], one[0]-zero[0], lane_stride) if \
-    len({a-b for a,b in zip(one, zero)}) == 1 and zero == tuple(zero[0]+lane*lane_stride for lane in range(count)) else None
-
 def _runtime_load_address(index:UOp, out_index:UOp, count:int, loads:tuple[UOp, ...]) -> tuple[tuple[UOp, UOp, int, int, int, int, int], bool]|None:
-  """Resolve a runtime address and retain whether it is affine or table-addressed."""
-  if (runtime_index:=_runtime_affine_index(index, out_index, count)) is not None: return runtime_index, True
+  """Resolve an affine or table-addressed runtime index without reading it on the renderer."""
+  infos = tuple(info for node in index.toposort() if (info:=_runtime_index(node)) is not None)
+  if len(infos) == 1 and (lane_offset:=_runtime_lane_offset(infos[0], out_index, count)) is not None:
+    load, param, _, itemsize = infos[0]
+    try: zero, one = (_static_values(out_index, index.substitute({load:load.const_like(value)}), count, int) for value in (0, 1))
+    except RuntimeError: pass
+    else:
+      lane_stride = zero[1]-zero[0] if count > 1 else 0
+      if len({a-b for a,b in zip(one, zero)}) == 1 and zero == tuple(zero[0]+lane*lane_stride for lane in range(count)):
+        return (load, param, itemsize, lane_offset, zero[0], one[0]-zero[0], lane_stride), True
   if len(runtime_loads:={info[0].key:info for node in loads if (info:=_runtime_index(node)) is not None}) != 1: return None
   runtime_load, index_param, _, index_itemsize = runtime_info = next(iter(runtime_loads.values()))
   if (lane_offset:=_runtime_lane_offset(runtime_info, out_index, count)) is None: return None

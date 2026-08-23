@@ -8064,3 +8064,46 @@ repository-wide Ruff success, clean diff checks, and exactly **445 tests
 collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
 health, reset, reboot, or hardware census command was run; fresh-boot CMAC
 acceptance and its pre/post `simple_add.py` bracket remain pending.
+
+## 2026-08-24 — collapse single-owner dynamic planners
+
+This isolated milestone follows `4d2153124`.  Its predeclared renderer budget
+was at most **+42 additions**, at least **-52 deletions**, and net at most
+**-10 executable source lines**.  The observed raw renderer diff is
+**+40/-60, net -20**.  Authoritative `sz.py` size moves renderer **2530 ->
+2516** and repository total **28062 -> 28048** (**-14**); runtime remains
+**464**.
+
+Three planner layers had exactly one production owner.  `_runtime_load_address`
+now owns the former `_runtime_affine_index` proof before falling through to
+the unchanged table-addressed contract.  `_lower_bounded_integer_predicate_coordinates`
+now owns the fixed nonzero predicate, signed-INT16 encodability proof, and
+native emitter formerly split through `_bounded_predicate_coordinate_plan`.
+`_lower_dynamic_typed_load` now owns the exact bound/negative-normalization
+proof formerly forwarded through `_bounded_dynamic_axes`.  These three
+helpers are deleted; no generic IR, wire field, runtime path, CPU/GPU numeric
+fallback, admission broadening, or test deletion was added.
+
+The first two removals reached only **2521** lines, one short of the declared
+target, because the inlined bodies shared more unchanged diff context than
+predicted.  Rather than use formatting-only churn, the final candidate also
+removed the third single-owner dynamic-axis helper named above.  Mypy then
+exposed two inlined-local namespace collisions (`total` and `axis`); names
+were separated without changing the graph or image, and the complete
+verification was rerun.
+
+A committed-parent/candidate lowering oracle again observed **242 outcomes /
+226 RKImages** across all Rockchip UOp tests.  Every admission result and
+encoded image remains byte-identical at aggregate SHA-256
+`c62655755cab3cb37a04484aafc05aaf6e8a174b41d20bdf88bed9b5926d5a8b`.
+Seven actual production `Tensor.schedule_linear -> to_program` programs
+(argmax, bool cast, uint8 cast, sum, mean, multi-axis sum, and matmul) remain
+byte-identical at aggregate record SHA-256
+`36bde9d0ded5569f6ac34882fe7a723b1994bcf34d613816f6db6a2f1a46def8`.
+
+Host verification reports **127 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, or hardware census command was run; fresh-boot CMAC
+acceptance and its pre/post `simple_add.py` bracket remain pending.
