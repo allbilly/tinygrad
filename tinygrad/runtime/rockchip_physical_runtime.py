@@ -50,7 +50,7 @@ _CMAC_GUARD_SPANS = (
   ("_cmd_buf", rkp.CMAC_V1_COMMAND_IMAGE_BYTES, rkp.CMAC_V1_COMMAND_RESERVATION_BYTES - rkp.CMAC_V1_COMMAND_IMAGE_BYTES),
   ("_task_buf", rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES, _PAGE - rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES),
 )
-_BufferSnapshot = tuple[int, int, int, int, int, int]
+_BufferSnapshot = tuple[int, int, int, int, int, int, int, int]
 
 # Stable event IDs.  These are a finite vocabulary, not a second telemetry
 # policy or an attempt counter encoded as an event name.
@@ -166,6 +166,13 @@ def _obj_addr(buffer: HCQBuffer) -> int:
   return value
 
 
+def _handle(buffer: HCQBuffer) -> int:
+  value = getattr(getattr(buffer, "meta", None), "handle", None)
+  if type(value) is not int or not 0 <= value <= _U32_MAX:
+    raise PhysicalRuntimeReject("dma", "buffer GEM handle is invalid")
+  return value
+
+
 def _dma(program: object, buffer: HCQBuffer) -> int:
   resolver = getattr(program, "_dma", None)
   if not callable(resolver):
@@ -179,7 +186,8 @@ def _dma(program: object, buffer: HCQBuffer) -> int:
 
 
 def _buffer_snapshot(program: object, buffer: HCQBuffer) -> _BufferSnapshot:
-  return (id(buffer), int(buffer.va_addr), buffer.size, _allocation_size(buffer), _dma(program, buffer), _obj_addr(buffer))
+  return (id(buffer), id(buffer.base), int(buffer.va_addr), buffer.size, _allocation_size(buffer),
+          _dma(program, buffer), _obj_addr(buffer), _handle(buffer))
 
 
 def _owned_buffer_snapshot(program: object, buffer: object, logical_size: int, role: str) -> _BufferSnapshot:
@@ -400,19 +408,19 @@ class RockchipPhysicalEffects:
       if not isinstance(buffer, HCQBuffer) or _buffer_snapshot(self.program, buffer) != expected:
         self._reject("dma_binding", "caller buffer identity or span changed after preflight")
       current.append((arg, expected))
-      ranges.append((expected[4], expected[3]))
+      ranges.append((expected[5], expected[4]))
     if any(a < c + d and c < a + b for index,(a,b) in enumerate(ranges) for c,d in ranges[index+1:]):
       self._reject("dma_alias", "caller DMA spans overlap before native patch or submit")
     for span in self.native.spans:
       if span.buffer not in self._dma_by_arg:
         self._reject("span_contract", "native span is not bound to a caller resource")
-      allocation = next(item[1][3] for item in current if item[0] == span.buffer)
+      allocation = next(item[1][4] for item in current if item[0] == span.buffer)
       if allocation != span.allocation or span.offset + span.size > allocation:
         self._reject("span_contract", "caller allocation no longer covers immutable native span")
     for role,arg in self._resource_args.items():
       if self._resource_buffers.get(role) is not self.bufs[arg.index]:
         self._reject("dma_binding", "caller resource role changed after preflight")
-    self._dma_by_arg = {arg: snapshot[4] for arg, snapshot in current}
+    self._dma_by_arg = {arg: snapshot[5] for arg, snapshot in current}
 
   def _revalidate_assets(self) -> None:
     current = []
@@ -579,9 +587,13 @@ class RockchipPhysicalEffects:
     try:
       command_buffer = allocate(command_size)
       self._cmd_buf = command_buffer
+      if isinstance(command_buffer, HCQBuffer):
+        self._command_snapshot = _buffer_snapshot(self.program, command_buffer)
       command_snapshot = _owned_buffer_snapshot(self.program, command_buffer, command_size, "command")
       task_buffer = allocate(task_size, rk.RKNPU_MEM_KERNEL_MAPPING)
       self._task_buf = task_buffer
+      if isinstance(task_buffer, HCQBuffer):
+        self._task_snapshot = _buffer_snapshot(self.program, task_buffer)
       task_snapshot = _owned_buffer_snapshot(self.program, task_buffer, task_size, "task")
       command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
       self._command_snapshot, self._task_snapshot = command_snapshot, task_snapshot
@@ -620,8 +632,11 @@ class RockchipPhysicalEffects:
         asset = self.native.assets[index]
         buffer = allocate(asset.size)
         self._asset_buffers[index] = buffer
+        if isinstance(buffer, HCQBuffer):
+          self._asset_snapshot[index] = _buffer_snapshot(self.program, buffer)
         snapshot = _owned_buffer_snapshot(self.program, buffer, asset.size, f"asset[{index}]")
-        allocation, dma = snapshot[3], snapshot[4]
+        self._asset_snapshot[index] = snapshot
+        allocation, dma = snapshot[4], snapshot[5]
         caller_ranges = [(_dma(self.program, resource), _allocation_size(resource)) for resource in self._resource_buffers.values()]
         prior_assets = [(_dma(self.program, resource), _allocation_size(resource))
                         for asset_index, resource in self._asset_buffers.items() if asset_index != index]
@@ -713,6 +728,38 @@ class RockchipPhysicalEffects:
       self._reject("sync", "device has no sync primitive")
     sync(buffer, flags)
 
+  def _refuse_cleanup(self, detail: str) -> NoReturn:
+    self._unknown = True
+    self.last_reason = "cleanup"
+    self.telemetry.reject("cleanup_unknown")
+    raise PhysicalOwnershipUnknown(detail)
+
+  def _validate_cleanup_snapshots(self) -> None:
+    """Refuse every free if any owned metadata no longer names the allocation."""
+    try:
+      if self._cmd_buf is None:
+        if self._command_snapshot is not None:
+          self._refuse_cleanup("native command allocation disappeared before cleanup")
+      elif self._command_snapshot is None or not isinstance(self._cmd_buf, HCQBuffer) or \
+           _buffer_snapshot(self.program, self._cmd_buf) != self._command_snapshot:
+        self._refuse_cleanup("native command metadata changed; refusing free")
+      if self._task_buf is None:
+        if self._task_snapshot is not None:
+          self._refuse_cleanup("native task allocation disappeared before cleanup")
+      elif self._task_snapshot is None or not isinstance(self._task_buf, HCQBuffer) or \
+           _buffer_snapshot(self.program, self._task_buf) != self._task_snapshot:
+        self._refuse_cleanup("native task metadata changed; refusing free")
+      if set(self._asset_snapshot) != set(self._asset_buffers):
+        self._refuse_cleanup("native asset snapshot coverage changed; refusing free")
+      for index, buffer in self._asset_buffers.items():
+        if not isinstance(buffer, HCQBuffer) or _buffer_snapshot(self.program, buffer) != self._asset_snapshot[index]:
+          self._refuse_cleanup(f"native asset[{index}] metadata changed; refusing free")
+    except PhysicalOwnershipUnknown:
+      raise
+    except Exception as exc:
+      self._refuse_cleanup("native allocation metadata could not be verified before free")
+      raise AssertionError from exc
+
   def _cleanup(self) -> None:
     if self._unknown or self._closed:
       return
@@ -722,6 +769,7 @@ class RockchipPhysicalEffects:
       self.last_reason = "cleanup"
       self.telemetry.reject("cleanup_unknown")
       raise PhysicalOwnershipUnknown("native allocation cleanup primitive is unavailable")
+    self._validate_cleanup_snapshots()
     errors: list[Exception] = []
     buffers: list[tuple[str, HCQBuffer]] = [
       (attr, buffer) for attr in ("_cmd_buf", "_task_buf") if (buffer := getattr(self, attr)) is not None

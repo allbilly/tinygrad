@@ -520,9 +520,9 @@ def test_cmac_asset_dma_snapshot_is_revalidated_before_patch() -> None:
   effects._preflight()
   effects._ensure_asset_buffers()
   effects._asset_buffers[0].meta.dma_addr += 0x1000
-  with pytest.raises(PhysicalRuntimeReject, match="asset"):
+  with pytest.raises(PhysicalOwnershipUnknown, match="refusing free"):
     effects.execute(preflight=False)
-  assert effects.closed and not effects.ownership_unknown
+  assert not effects.closed and effects.ownership_unknown and program.dev.freed == []
   names = [event[0] for event in program.dev.events if isinstance(event, tuple)]
   assert "reset" not in names and "submit" not in names
 
@@ -537,8 +537,9 @@ def test_owned_command_task_metadata_snapshot_is_revalidated_before_patch(attr: 
   buffer.meta.obj_addr += 1
   with pytest.raises(PhysicalRuntimeReject, match="allocation metadata"):
     effects._write_command_and_task()
-  effects._cleanup()
-  assert effects.closed and not effects.ownership_unknown
+  with pytest.raises(PhysicalOwnershipUnknown, match="refusing free"):
+    effects._cleanup()
+  assert not effects.closed and effects.ownership_unknown and program.dev.freed == []
 
 
 def test_owned_command_metadata_snapshot_is_revalidated_immediately_before_submit() -> None:
@@ -551,9 +552,9 @@ def test_owned_command_metadata_snapshot_is_revalidated_immediately_before_submi
     effects.command_buffer.meta.obj_addr += 1
 
   effects.barrier_before = tamper_before_submit  # type: ignore[method-assign]
-  with pytest.raises(PhysicalRuntimeReject, match="allocation metadata"):
+  with pytest.raises(PhysicalOwnershipUnknown, match="refusing free"):
     effects.execute()
-  assert effects.closed and not effects.ownership_unknown
+  assert not effects.closed and effects.ownership_unknown and program.dev.freed == []
   assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 0
 
 
@@ -566,10 +567,65 @@ def test_asset_metadata_snapshot_is_revalidated_immediately_before_submit() -> N
     effects._asset_buffers[0].meta.obj_addr += 1
 
   effects.barrier_before = tamper_before_submit  # type: ignore[method-assign]
-  with pytest.raises(PhysicalRuntimeReject, match="asset"):
+  with pytest.raises(PhysicalOwnershipUnknown, match="refusing free"):
     effects.execute()
-  assert effects.closed and not effects.ownership_unknown
+  assert not effects.closed and effects.ownership_unknown and program.dev.freed == []
   assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 0
+
+
+def _tamper_buffer_identity(buffer: HCQBuffer, field: str) -> None:
+  if field == "handle":
+    buffer.meta.handle += 1
+  else:
+    buffer._base = HCQBuffer(buffer.va_addr, buffer.size, buffer.meta)
+
+
+@pytest.mark.parametrize("field", ("handle", "base"))
+@pytest.mark.parametrize("role", ("command", "task", "asset"))
+def test_owned_handle_or_base_tamper_before_submit_refuses_free(role: str, field: str) -> None:
+  native = _cmac_asset_native() if role == "asset" else _cmac_native()
+  program, effects = _setup(native)
+  original_barrier_before = effects.barrier_before
+
+  def tamper_before_submit() -> None:
+    original_barrier_before()
+    buffer = effects._asset_buffers[0] if role == "asset" else getattr(effects, {"command": "_cmd_buf", "task": "_task_buf"}[role])
+    assert buffer is not None
+    _tamper_buffer_identity(buffer, field)
+
+  effects.barrier_before = tamper_before_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalOwnershipUnknown, match="refusing free"):
+    effects.execute()
+  assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+  assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 0
+
+
+@pytest.mark.parametrize("field", ("handle", "base"))
+@pytest.mark.parametrize("role", ("command", "task", "asset", "output"))
+def test_handle_or_base_tamper_after_submit_is_terminal_before_readback(role: str, field: str) -> None:
+  native = _cmac_asset_native() if role == "asset" else _cmac_native()
+  program, effects = _setup(native)
+  original_submit = program._submit_physical
+
+  def tampering_submit(command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
+    receipt = original_submit(command, task, contract)
+    if role == "command":
+      buffer = command
+    elif role == "task":
+      buffer = task
+    elif role == "asset":
+      buffer = effects._asset_buffers[0]
+    else:
+      buffer = effects._resource_buffers["output"]
+    _tamper_buffer_identity(buffer, field)
+    return receipt
+
+  program._submit_physical = tampering_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalOwnershipUnknown, match="readback"):
+    effects.execute()
+  assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+  assert not any(event[0] == "sync" and event[2] == driver.RKNPU_MEM_SYNC_FROM_DEVICE
+                 for event in program.dev.events if isinstance(event, tuple))
 
 
 def test_native_plan_and_span_snapshot_is_revalidated_before_patch() -> None:
