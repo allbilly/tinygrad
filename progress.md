@@ -8254,6 +8254,74 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — terminal ReLU joins the fixed CMAC body at 2,356 lines
+
+This isolated milestone follows `f3e911238`.  Its predeclared and observed
+production budget is exactly **+23/-24 executable renderer lines, net -1** and
+**+1/-3 executable runtime lines, net -2**.  Authoritative `sz.py` size moves
+the renderer **2357 -> 2356**, runtime **464 -> 462**, and repository total
+**27889 -> 27886** (**-3**).
+
+`_lower_cmac_reduction` now recognizes a terminal zero-clamped contraction at
+either the FP32 accumulator boundary or the canonical HALF storage/`WHERE`
+boundary.  The existing `RKCMAC` record uses one previously unused bit in its
+output-format byte to request ReLU; `emit_cmac_stage` changes only
+`REG_DPU_BS_CFG` from the bypass value `0x53` to the ReLU value `0x12`.  The
+body remains exactly 45 qwords with the same three relocations and the runtime
+retains the same four-qword CMAC tail, reset, and no-retry submission.  There
+is no second stage, new command stream, generic reduction IR, CPU/GPU numeric
+fallback, host arithmetic, or relaxed tolerance.
+
+The first finished draft failed its adversarial review: an ordered `WHERE`
+representing `minimum(contraction, 0)` folds to an `Ops.MAX` carrier tagged
+`_NATIVE_MIN`, which the draft mistook for ReLU.  The promoted recognizer now
+requires an untagged MAX.  A dedicated contraction-boundary regression proves
+the tagged minimum returns `None` from CMAC admission and retains its terminal
+EW store, while the corresponding untagged ReLU still routes to CMAC.
+
+The broader `_relu_operand` owns the ordered-`WHERE` normalization formerly
+duplicated inside `_fold_relu_cap`, so that nested helper is deleted.  The
+stale `_NATIVE_RAW_MIN` marker and its unreachable layout branch are also
+removed, and the two-line `_run_cmac` wrapper is inlined at its sole runtime
+caller while retaining its contract comment.  Existing plain CMAC records
+keep format bit zero and therefore preserve their wire bytes and commands.
+
+The actual production `Tensor.schedule_linear -> to_program` path for
+`(3x5 @ 5x4).relu()` moves from **65,763 EW stages / 2,637,908 encoded bytes**
+at SHA-256
+`3c5d63a358adc386aea6e4095521504b52837e6a8590692e2feff770893a6081`
+to one native CMAC `(M,N,K) = (3,4,5)`, zero EW stages, a 45-qword body, and
+4,725 encoded bytes at SHA-256
+`ed0f42d71e8049f79e621b28f6699c5950203025a5990fbfa8334b0418cf89ea`.
+The raw packing oracle materializes both CMAC surfaces and the output gather,
+then checks the ReLU FP32 matrix result before HALF storage.  Ordinary
+`3x5 @ 5x4` remains byte-identical at
+`064e6704eb2a26182182aa86ef5ec63b18f986a8d4cf9a1df28682edddec2f8a`;
+its 45-qword stage hash remains
+`4c9a492c1c921bbb8d63511088aa95a7d0dc471ebccf511cdd4fc008e796b1bd`.
+
+A committed-parent/candidate oracle ran the same original 137-test source on
+both revisions and captured all nested production lowerings.  Both sides
+record exactly **266 calls** with identical input records.  Exactly one output
+changes: the intended FP32 activation fixture moves from 34 EW stages to ReLU
+CMAC `(2,2,2)`; the other **265 lowering outcomes are byte-identical**.  The
+parent passes 137/137 assertions; the candidate passes 136 and reaches the
+single expected legacy assertion that explicitly demanded the obsolete EW
+fallback.  The updated suite replaces that assertion with the CMAC contract.
+
+Host verification reports **139 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  The promoted
+renderer, runtime, and unit-test SHA-256 values are respectively
+`737d1f2479e18011a2b7420b052ae830c592d526489d30eb91f54d7d96e9c6bb`,
+`1663c66ee99c858cbae9f7eceecfa77eecf8392031b0717bbdb9eac22a1baa24`,
+and `86d1772da78c6872fd2abeb68c6715cf53871da129e1ecdaf9c1c386a9466e87`,
+exactly matching the fully tested private prototype.  No device, health,
+reset, reboot, hardware execution, or full census command was run because the
+board remains untrusted; fresh-boot acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — retire obsolete expanded ABS/MINIMUM folds at 2,357 lines
 
 This isolated milestone follows `eab77f7d0`.  The initially declared renderer

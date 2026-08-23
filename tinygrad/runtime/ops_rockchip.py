@@ -160,10 +160,6 @@ class RockchipProgram(Program['RockchipDevice']):
     if cmac: self.dev.reset_npu()
     self._submit(cmd, task, 1, standalone=True, **({"retry":False} if cmac else {}))
 
-  def _run_cmac(self, address) -> None:
-    """Run one fixed CMAC body with its proven terminal tail and no timeout replay."""
-    if (op:=self.image.cmac) is not None: self._submit_standalone(patch_stage(emit_cmac_stage(op),address),True)
-
   def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
     """Convert aligned four-lane atoms on DPU; host movement preserves raw lane representations."""
     to_int32 = op.int32_output
@@ -431,7 +427,8 @@ class RockchipProgram(Program['RockchipDevice']):
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
     if self.image.ew_ops: self.dev._native_int16 = native_int16
-    if self.image.cmac is not None: self._run_cmac(address)
+    # Run one fixed CMAC body with its proven terminal tail and no timeout replay.
+    if (cmac:=self.image.cmac) is not None: self._submit_standalone(patch_stage(emit_cmac_stage(cmac),address),True)
     if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if self.image.host_scatters:
       touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \

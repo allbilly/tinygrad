@@ -64,8 +64,8 @@ class RKEWOp:
 
 @dataclass(frozen=True)
 class RKCMAC:
-  """One fixed FP16 matrix contraction; gathers own only its physical packing."""
-  dst: RKArg; lhs: RKArg; rhs: RKArg; m: int; n: int; k: int; out_fp16: bool = True
+  """One fixed FP16 matrix contraction with an optional terminal BS ReLU; gathers own only its physical packing."""
+  dst: RKArg; lhs: RKArg; rhs: RKArg; m: int; n: int; k: int; out_fp16: bool = True; relu: bool = False
 
 @dataclass(frozen=True)
 class RKImage:
@@ -168,8 +168,8 @@ def encode_image(image:RKImage) -> bytes:
     out += _EWOP.pack(int(op.dst.kind), op_flags, op.dst.index, int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index,
                       op.count, op.ew_cfg, op.dst.addend, op.lhs.addend, op.rhs.addend)
   if (cmac:=image.cmac) is not None:
-    out += _CMAC.pack(int(cmac.dst.kind), int(cmac.lhs.kind), int(cmac.rhs.kind), int(cmac.out_fp16), cmac.dst.index, cmac.lhs.index,
-                      cmac.rhs.index, cmac.dst.addend, cmac.lhs.addend, cmac.rhs.addend, cmac.m, cmac.n, cmac.k)
+    out += _CMAC.pack(int(cmac.dst.kind), int(cmac.lhs.kind), int(cmac.rhs.kind), int(cmac.out_fp16)|int(cmac.relu)<<1,
+                      cmac.dst.index, cmac.lhs.index, cmac.rhs.index, cmac.dst.addend, cmac.lhs.addend, cmac.rhs.addend, cmac.m, cmac.n, cmac.k)
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
@@ -210,8 +210,8 @@ def decode_image(blob:bytes) -> RKImage:
   cmac = None
   if flags:
     dk,lk,rk_,fp16,di,li,ri,da,la,ra,m,n,k = _CMAC.unpack_from(blob, off); off += _CMAC.size
-    if max(dk,lk,rk_) > 1 or fp16 > 1 or min(da,la,ra) < 0 or min(m,n,k) <= 0: raise ValueError("invalid RKCMAC")
-    cmac = RKCMAC(RKArg(RKBufferKind(dk),di,da), RKArg(RKBufferKind(lk),li,la), RKArg(RKBufferKind(rk_),ri,ra),m,n,k,bool(fp16))
+    if max(dk,lk,rk_) > 1 or fp16 > 3 or min(da,la,ra) < 0 or min(m,n,k) <= 0: raise ValueError("invalid RKCMAC")
+    cmac = RKCMAC(RKArg(RKBufferKind(dk),di,da), RKArg(RKBufferKind(lk),li,la), RKArg(RKBufferKind(rk_),ri,ra),m,n,k,bool(fp16&1),bool(fp16&2))
     _validate_cmac(cmac, scratch)
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
   return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:ngather-mid_count-post_count]), tuple(ew_ops),
@@ -240,9 +240,8 @@ _DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4
 # Batch-size and batch-normalization registers used by compare stages.
 (_BS_BN_BYPASS, _BS_OW_FP32_SCALAR, _BS_CFG_COMPARE, _BS_ALU_COMPARE, _BS_MUL_COMPARE, _BN_CFG_COMPARE, _BN_MUL_COMPARE,
  _BN_RELUX_COMPARE) = (1|(1<<1)|(1<<4)|(1<<6), (1<<8)|(1<<5)|(1<<2)|(1<<1), 0x40040, 0x33800000, 0x40000000, 0x40082, 0x7c000000, 0x3f800000)
-(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_MASK_MUL, _NATIVE_MIN,
- _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD, _NATIVE_RAW_MIN, _NATIVE_RELU6, _NATIVE_SIGN) = tuple(
-   "rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add raw_min relu6 sign".split())
+(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD,
+ _NATIVE_RELU6, _NATIVE_SIGN) = tuple("rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add relu6 sign".split())
 _EW_RELUX_CMP_RELU6, _INT16_EW = struct.unpack("<I", struct.pack("<f", 6.0))[0], dict(int16_input=True, int16_output=True)
 _EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,2<<16), (Ops.SUB,4<<16), (Ops.MUL,_EW_OP_CVT_BYPASS|1<<2), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|3<<16))}  # noqa: E501
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
@@ -260,7 +259,7 @@ def _validate_cmac(op:RKCMAC, scratch:tuple[RKScratch, ...]|None=None) -> None:
   if scratch is not None and any(not 0 <= arg.index < len(scratch) or arg.addend+need > scratch[arg.index].size for arg,need in zip(args,needs)): raise ValueError("CMAC exceeds scratch buffer")  # noqa: E501
 
 def emit_cmac_stage(op:RKCMAC) -> RKStage:
-  """Emit the proven 45-qword GEMM body; the four-qword PC tail stays runtime-owned."""
+  """Emit the 45-qword GEMM body; terminal BS ReLU preserves the runtime-owned four-qword PC tail."""
   C,O,D,ai,ao,ek = 0x201,0x801,_DPU,*_cmac_layout(op.n, op.k)
   _validate_cmac(op)
   row_bytes = ai*2; grains = max(80, (ceildiv(2*32768, row_bytes)+1)&~1); banks = min(11, max(1, ceildiv(op.m*row_bytes, 32768)))
@@ -279,7 +278,7 @@ def emit_cmac_stage(op:RKCMAC) -> RKStage:
     (D,rk.REG_DPU_DATA_FORMAT,(precision<<29)|(2<<26)|2), (D,rk.REG_DPU_DST_BASE_ADDR,0), (D,rk.REG_DPU_DST_SURF_STRIDE,1<<4),
     (D,rk.REG_DPU_DATA_CUBE_WIDTH,0), (D,rk.REG_DPU_DATA_CUBE_HEIGHT,op.m-1),
     (D,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,(notch<<16)|notch), (D,rk.REG_DPU_DATA_CUBE_CHANNEL,((ao-1)<<16)|(ao-1)),
-    (D,rk.REG_DPU_BS_CFG,0x53), (D,rk.REG_DPU_BS_OW_CFG,(size_e<<8)|(size_e<<5)|(size_e<<2)|2),
+    (D,rk.REG_DPU_BS_CFG,0x12 if op.relu else 0x53), (D,rk.REG_DPU_BS_OW_CFG,(size_e<<8)|(size_e<<5)|(size_e<<2)|2),
     (D,rk.REG_DPU_WDMA_SIZE_0,ao-1), (D,rk.REG_DPU_WDMA_SIZE_1,(op.m-1)<<16), (D,rk.REG_DPU_BN_CFG,0x53),
     (D,rk.REG_DPU_EW_CFG,0x383), (D,rk.REG_DPU_OUT_CVT_SCALE,(1<<16)|1 if op.out_fp16 else 0), (D,rk.REG_DPU_SURFACE_ADD,4<<4))
   return RKStage(tuple(_cmd(*reg) for reg in regs), ((18,op.lhs),(24,op.rhs),(31,op.dst)))
@@ -538,7 +537,8 @@ def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bi
 def _gather_cache_key(plans:Iterable[RKGather]) -> tuple: return tuple(v[0:1]+v[2:11]+v[12:14] for v in map(astuple, plans))
 
 def _relu_operand(u:UOp) -> UOp|None:
-  if u.op is not Ops.MAX or u.dtype.scalar() is not dtypes.half: return None
+  if u.op is Ops.WHERE and (folded:=_fold_ordered_where(u)) is not None: u = folded
+  if u.op is not Ops.MAX or u.arg is not None or u.dtype.scalar() not in (dtypes.half,dtypes.float): return None
   if u.src[0].op is Ops.CONST and float(u.src[0].arg) == 0.0: return u.src[1]
   if u.src[1].op is Ops.CONST and float(u.src[1].arg) == 0.0: return u.src[0]
   return None
@@ -617,6 +617,9 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Factor a real weighted sum/dot/matmul and pre-round linear terms into one fixed CMAC stage."""
   _,out,rows,out_index,root = output
   if rows <= 0 or out.dtype.scalar() not in (dtypes.half,dtypes.float): return None
+  relu_root = _relu_operand(root)
+  if relu_root is None and (fp32_root:=_typed_cast_source(root,dtypes.half,dtypes.float)) is not None: relu_root = _relu_operand(fp32_root)
+  if relu_root is not None: root = relu_root
   graph = root.toposort(); local_loads = _semantic_loads(root, local=True) if any(u.op is Ops.BUFFER for u in graph) else (); local_add = bool(local_loads) and all(load.dtype.scalar() is dtypes.float for load in local_loads); additive = local_add or (_strip_cast(root).op is Ops.ADD and _strip_cast(root).dtype.scalar() is dtypes.float) or any(u.op is Ops.REDUCE and (u.arg is Ops.ADD or isinstance(u.arg, tuple) and u.arg and u.arg[0] is Ops.ADD) for u in graph)  # noqa: E501
   try: root = _unroll_static_reduces(_unroll_static_local(uops, root) if local_loads else root, precise=False)
   except (_RKGenericReject, RuntimeError, ValueError): return None
@@ -664,7 +667,7 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     for i in (outputs or range(rows)) for row,col in ((i,i) if diagonal else divmod(i,n),))
   return RKImage(RKTarget.RK3588,(RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4)),gathers=gathers,
     post_gathers=(RKGather(2,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
-                           src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),m,n,groups,fp16))
+                           src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),m,n,groups,fp16,relu_root is not None))  # noqa: E501
 
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64; return vector_bytes, vector_bytes//2, rows*vector_bytes//2
@@ -1421,15 +1424,14 @@ class RKContext:
       self._emit(negative_mask, negative, negative, _EW_CFG[Ops.MAX], compare=True)
       self._emit(positive_mask, lhs, lhs, _EW_CFG[Ops.MAX], compare=True)
       return self._emit(self._scratch(dtypes.half, RKLayout.FP16, u=u), positive_mask, negative_mask, _EW_CFG[Ops.SUB])
-    if u.op is Ops.MAX and u.arg in (_NATIVE_MIN, _NATIVE_RAW_MIN):
-      if expected is RKLayout.FP16 and u.arg == _NATIVE_MIN:
-        zero = self.lower(UOp.const(0.0, dtypes.half))
-        neg_lhs, neg_rhs = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
-        self._emit(neg_lhs, zero, lhs, _EW_CFG[Ops.SUB])
-        self._emit(neg_rhs, zero, rhs, _EW_CFG[Ops.SUB])
-        self._emit(neg_lhs, neg_lhs, neg_rhs, _EW_CFG[Ops.MAX])
-        return self._emit(self._scratch(dtypes.half, RKLayout.FP16, u=u) if u is self.root else neg_lhs, zero, neg_lhs, _EW_CFG[Ops.SUB])
-      return self._emit(self._scratch(dtype, RKLayout.INT16 if u.arg == _NATIVE_MIN else expected, u=u), lhs, rhs, _EW_CFG_MIN)
+    if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
+      if expected is not RKLayout.FP16: return self._emit(self._scratch(dtype, RKLayout.INT16, u=u), lhs, rhs, _EW_CFG_MIN)
+      zero = self.lower(UOp.const(0.0, dtypes.half))
+      neg_lhs, neg_rhs = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
+      self._emit(neg_lhs, zero, lhs, _EW_CFG[Ops.SUB])
+      self._emit(neg_rhs, zero, rhs, _EW_CFG[Ops.SUB])
+      self._emit(neg_lhs, neg_lhs, neg_rhs, _EW_CFG[Ops.MAX])
+      return self._emit(self._scratch(dtypes.half, RKLayout.FP16, u=u) if u is self.root else neg_lhs, zero, neg_lhs, _EW_CFG[Ops.SUB])
     cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else \
       _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
@@ -2397,12 +2399,9 @@ def _fold_threshold_where(x:UOp) -> UOp|None:
 
 def _fold_relu_cap(x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
-  def relu(u:UOp) -> UOp|None:
-    if (source:=_relu_operand(u)) is not None: return source
-    return _relu_operand(folded) if u.op is Ops.WHERE and (folded:=_fold_ordered_where(u)) is not None else None
   for positive, negative in (x.src, x.src[::-1]):
-    source, scaled = relu(positive), _const_operand(negative, Ops.MUL, -1.0)
-    if source is None or scaled is None or (upper:=relu(scaled[0])) is None: continue
+    source, scaled = _relu_operand(positive), _const_operand(negative, Ops.MUL, -1.0)
+    if source is None or scaled is None or (upper:=_relu_operand(scaled[0])) is None: continue
     source_base, source_shift = (source, 0.0) if (term:=_const_operand(source, Ops.ADD)) is None else (term[0], float(term[1].arg))
     upper_base, upper_shift = (upper, 0.0) if (term:=_const_operand(upper, Ops.ADD)) is None else (term[0], float(term[1].arg))
     if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: continue

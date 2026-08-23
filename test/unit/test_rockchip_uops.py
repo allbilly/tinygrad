@@ -275,6 +275,13 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
   assert len(stage.commands) == 45 and tuple(index for index,_ in stage.relocs) == (18, 24, 31)
   body = patch_stage(stage, lambda _kind,index:(0x100000,0x200000,0x300000)[index])
   assert hashlib.sha256(struct.pack("<45Q", *body)).hexdigest() == "d754ae668b210999c7d568131c0387e46be9c934ad3812b51fb956c789e3db22"
+  relu_image = replace(image, cmac=replace(cmac, relu=True))
+  assert decode_image(encode_image(relu_image)) == relu_image
+  relu_stage = emit_cmac_stage(relu_image.cmac)
+  changed = [(old,new) for old,new in zip(stage.commands,relu_stage.commands) if old != new]
+  assert len(relu_stage.commands) == 45 and len(changed) == 1
+  assert changed[0][0]&0xffff == changed[0][1]&0xffff == rockchip_renderer.rk.REG_DPU_BS_CFG
+  assert ((changed[0][0]>>16)&0xffffffff,(changed[0][1]>>16)&0xffffffff) == (0x53,0x12)
 
 def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
   rng = np.random.default_rng(0x3588)
@@ -400,7 +407,7 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   program._ensure_buffer = lambda attr,*_args,**_kwargs: cmd if "cmd" in attr else task
   program._submit = lambda *args,**kwargs: submits.append((args,kwargs))
   addresses = (0x100000,0x200000,0x300000)
-  program._run_cmac(lambda _kind,index:addresses[index])
+  program._submit_standalone(patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index]),True)
   commands = tuple((ctypes.c_uint64*49).from_address(cmd.va_addr))
   assert commands[:45] == patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index])
   assert commands[45:] == (rockchip_runtime._pc(0x0001,0),
@@ -968,6 +975,34 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
                                 lhs_values.reshape(3,5).astype(np.float32)@rhs_values.astype(np.float32))
 
 
+def test_real_matmul_relu_routes_one_production_cmac_stage():
+  with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
+    lhs = Tensor(UOp.new_buffer("ROCKCHIP", 15, dtypes.half, num=1030).reshape((3,5)))
+    rhs = Tensor(UOp.new_buffer("ROCKCHIP", 20, dtypes.half, num=1031).reshape((5,4)))
+    ast = (lhs@rhs).relu().schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast, RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and image.cmac.relu and (image.cmac.m,image.cmac.n,image.cmac.k) == (3,4,5)
+  assert not image.ew_ops and len(emit_cmac_stage(image.cmac).commands) == 45
+  lhs_values = (np.arange(15)-7).astype(np.float16).reshape(3,5)
+  rhs_values = (np.arange(20)%5-2).astype(np.float16).reshape(5,4)
+  sources = {image.gathers[0].src_index:lhs_values.view(np.uint16).reshape(-1),
+             image.gathers[1].src_index:rhs_values.view(np.uint16).reshape(-1)}
+  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  for gather in image.gathers:
+    offsets = np.asarray(gather.offsets)
+    valid = offsets >= 0
+    scratch[gather.dst_index][:gather.count] = gather.fill_bits
+    scratch[gather.dst_index][:gather.count][valid] = sources[gather.src_index][offsets[valid]]
+  packed_lhs = scratch[image.cmac.lhs.index].view(np.float16).reshape(3,32)
+  packed_rhs = scratch[image.cmac.rhs.index].view(np.float16).reshape(2,1,16,32).transpose(0,2,1,3).reshape(32,32)
+  physical = np.zeros(3*32*2,dtype=np.float16)
+  physical.reshape(3,64)[:,:4] = np.maximum(packed_lhs.astype(np.float32)@packed_rhs.astype(np.float32).T,0)[:,:4].astype(np.float16)
+  np.testing.assert_array_equal(physical[np.asarray(image.post_gathers[0].offsets)],
+                                np.maximum(lhs_values.astype(np.float32)@rhs_values.astype(np.float32),0).astype(np.float16).reshape(-1))
+
+
 def test_zero_gated_padded_convolution_routes_production_cmac():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP",324,dtypes.half,num=1012)).reshape(1,4,9,9)
@@ -1364,13 +1399,24 @@ def test_fp32_storage_reuses_generic_algebra_after_nested_half_casts():
   assert image is not None and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
-def test_fp32_boundary_activation_preserves_accurate_reduction():
+def test_fp32_boundary_activation_routes_terminal_cmac_relu():
   out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
   lane = UOp.range(2, 0)
   products = [lhs.index(lane*2+k).load().cast(dtypes.float) * rhs.index(lane*2+k).load().cast(dtypes.float) for k in range(2)]
   value = products[0].alu(Ops.ADD, products[1]).maximum(UOp.const(0.0, dtypes.float)).cast(dtypes.half)
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
-  assert image is not None and len(image.ew_ops) > 10 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert image is not None and image.cmac is not None and image.cmac.relu and (image.cmac.m,image.cmac.n,image.cmac.k) == (2,2,2)
+  assert not image.ew_ops and decode_image(encode_image(image)) == image
+
+
+def test_terminal_minimum_is_not_misclassified_as_cmac_relu():
+  out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (4,)), UOp.param(2, dtypes.half, (4,))
+  lane, zero = UOp.range(2, 0), UOp.const(0.0, dtypes.half)
+  products = [lhs.index(lane*2+k).load().cast(dtypes.float) * rhs.index(lane*2+k).load().cast(dtypes.float) for k in range(2)]
+  reduced = products[0].alu(Ops.ADD, products[1]).cast(dtypes.half)
+  value = (reduced < zero).where(reduced, zero)
+  image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
+  assert image is not None and image.cmac is None and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
 def test_static_local_accumulator_is_structurally_executed():
