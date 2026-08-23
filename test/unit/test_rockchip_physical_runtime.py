@@ -86,6 +86,10 @@ class _SpyDevice:
     self.events.append(("reset",))
 
 
+class _DerivedHCQBuffer(HCQBuffer):
+  pass
+
+
 class _SpyProgram:
   def __init__(self, native: rk.RKNativeOp, *, fail_submit: bool = False, alias_dma: bool = False, corrupt_guard: bool = False,
                fail_second_alloc: bool = False):
@@ -413,6 +417,53 @@ def test_asset_and_command_allocations_are_tracked_on_task_failure() -> None:
   assert sorted(size for size, _ in program.dev.freed) == sorted((rkp.CMAC_V1_RHS_ASSET_SIZE, rkp.CMAC_V1_COMMAND_RESERVATION_BYTES))
 
 
+def test_native_command_allocation_requires_exact_hcq_type() -> None:
+  program, effects = _setup(_cmac_native())
+  original = program.dev._gpu_alloc
+
+  def allocate(size: int, flags: int = 0) -> HCQBuffer:
+    buffer = original(size, flags)
+    if flags == 0:
+      return _DerivedHCQBuffer(buffer.va_addr, buffer.size, buffer.meta)
+    return buffer
+
+  program.dev._gpu_alloc = allocate  # type: ignore[method-assign]
+  with pytest.raises(PhysicalRuntimeReject, match="exact HCQBuffer"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert all(event[0] != "reset" for event in program.dev.events if isinstance(event, tuple))
+
+
+def test_native_task_and_asset_allocations_require_exact_logical_size() -> None:
+  program, effects = _setup(_cmac_native())
+  original = program.dev._gpu_alloc
+
+  def allocate(size: int, flags: int = 0) -> HCQBuffer:
+    buffer = original(size, flags)
+    if flags == driver.RKNPU_MEM_KERNEL_MAPPING:
+      return HCQBuffer(buffer.va_addr, buffer.size + 1, buffer.meta)
+    return buffer
+
+  program.dev._gpu_alloc = allocate  # type: ignore[method-assign]
+  with pytest.raises(PhysicalRuntimeReject, match="task logical size"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+
+  program, effects = _setup(_cmac_asset_native())
+  original = program.dev._gpu_alloc
+
+  def allocate_asset(size: int, flags: int = 0) -> HCQBuffer:
+    buffer = original(size, flags)
+    if flags == 0:
+      return HCQBuffer(buffer.va_addr, buffer.size + 1, buffer.meta)
+    return buffer
+
+  program.dev._gpu_alloc = allocate_asset  # type: ignore[method-assign]
+  with pytest.raises(PhysicalRuntimeReject, match=r"asset\[0\] logical size"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+
+
 def test_non_contract_submit_receipt_is_terminal_unknown() -> None:
   program, effects = _setup(_cmac_native())
   program._submit_physical = lambda _command, _task, _contract: object()  # type: ignore[method-assign]
@@ -428,7 +479,7 @@ def test_rockchip_program_receipt_parser_does_not_fabricate_submit_id() -> None:
   result = driver.struct_rknpu_submit(flags=contract.flags, timeout=contract.timeout_ms, task_number=contract.task_count,
                                       core_mask=contract.core_mask, fence_fd=contract.fence_fd)
   program._submit = lambda *_args, **_kwargs: result  # type: ignore[method-assign]
-  assert program._submit_physical(object(), object(), contract) == PhysicalSubmitReceipt(0, False, None)
+  assert program._submit_physical(object(), object(), contract) == PhysicalSubmitReceipt(0, True, None)
 
 
 def test_rockchip_program_receipt_parser_rejects_mismatched_ioctl_payload() -> None:
@@ -439,6 +490,17 @@ def test_rockchip_program_receipt_parser_rejects_mismatched_ioctl_payload() -> N
                                       core_mask=contract.core_mask, fence_fd=contract.fence_fd)
   program._submit = lambda *_args, **_kwargs: result  # type: ignore[method-assign]
   with pytest.raises(RuntimeError, match="mismatched receipt"):
+    program._submit_physical(object(), object(), contract)
+
+
+def test_rockchip_program_receipt_parser_rejects_nonblocking_contract() -> None:
+  program = object.__new__(RockchipProgram)
+  program.dev = SimpleNamespace(_forget_program=lambda _program: None)
+  contract = replace(rk.RKNativeSubmit(*rkp.CMAC_V1_SUBMIT), flags=rkp.CMAC_V1_SUBMIT[0] | (1 << 1))
+  result = driver.struct_rknpu_submit(flags=contract.flags, timeout=contract.timeout_ms, task_number=contract.task_count,
+                                      core_mask=contract.core_mask, fence_fd=contract.fence_fd)
+  program._submit = lambda *_args, **_kwargs: result  # type: ignore[method-assign]
+  with pytest.raises(RuntimeError, match="blocking contract"):
     program._submit_physical(object(), object(), contract)
 
 
@@ -463,6 +525,51 @@ def test_cmac_asset_dma_snapshot_is_revalidated_before_patch() -> None:
   assert effects.closed and not effects.ownership_unknown
   names = [event[0] for event in program.dev.events if isinstance(event, tuple)]
   assert "reset" not in names and "submit" not in names
+
+
+@pytest.mark.parametrize("attr", ("_cmd_buf", "_task_buf"))
+def test_owned_command_task_metadata_snapshot_is_revalidated_before_patch(attr: str) -> None:
+  program, effects = _setup(_cmac_native())
+  effects._preflight()
+  effects._ensure_buffers()
+  buffer = getattr(effects, attr)
+  assert buffer is not None
+  buffer.meta.obj_addr += 1
+  with pytest.raises(PhysicalRuntimeReject, match="allocation metadata"):
+    effects._write_command_and_task()
+  effects._cleanup()
+  assert effects.closed and not effects.ownership_unknown
+
+
+def test_owned_command_metadata_snapshot_is_revalidated_immediately_before_submit() -> None:
+  program, effects = _setup(_cmac_native())
+  original_barrier_before = effects.barrier_before
+
+  def tamper_before_submit() -> None:
+    original_barrier_before()
+    assert effects.command_buffer is not None
+    effects.command_buffer.meta.obj_addr += 1
+
+  effects.barrier_before = tamper_before_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalRuntimeReject, match="allocation metadata"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 0
+
+
+def test_asset_metadata_snapshot_is_revalidated_immediately_before_submit() -> None:
+  program, effects = _setup(_cmac_asset_native())
+  original_barrier_before = effects.barrier_before
+
+  def tamper_before_submit() -> None:
+    original_barrier_before()
+    effects._asset_buffers[0].meta.obj_addr += 1
+
+  effects.barrier_before = tamper_before_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalRuntimeReject, match="asset"):
+    effects.execute()
+  assert effects.closed and not effects.ownership_unknown
+  assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("submit") == 0
 
 
 def test_native_plan_and_span_snapshot_is_revalidated_before_patch() -> None:
@@ -511,7 +618,7 @@ def test_dma_snapshot_revalidation_runs_again_immediately_before_submit() -> Non
 
   effects._revalidate_bindings = spy  # type: ignore[method-assign]
   effects.execute()
-  assert calls == 2
+  assert calls == 3  # before patch, immediately before submit, and before readback
 
 
 def test_submit_exception_is_unknown_and_holds_command_and_task() -> None:
@@ -520,6 +627,22 @@ def test_submit_exception_is_unknown_and_holds_command_and_task() -> None:
     effects.execute()
   assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
   assert [event[0] for event in program.dev.events if isinstance(event, tuple)].count("reset") == 1
+
+
+def test_driver_receipt_mismatch_is_terminal_unknown_after_submit() -> None:
+  native = _cmac_native()
+  dev = _SpyDevice()
+  image = rk.RKImage(rk.RKTarget.RK3588, version=32, native=native)
+  program = RockchipProgram(dev, TinyELF(rk.encode_image(image), "cmac_receipt_mismatch", Target(), ()))
+  bufs = (dev.buffer(64), dev.buffer(2048), dev.buffer(256))
+  ctypes.memset(int(bufs[1].va_addr) + 256, 0, 1792)
+  bad = driver.struct_rknpu_submit(flags=rkp.CMAC_V1_SUBMIT[0], timeout=rkp.CMAC_V1_SUBMIT[1] + 1,
+                                   task_number=rkp.CMAC_V1_SUBMIT[4], core_mask=rkp.CMAC_V1_SUBMIT[2], fence_fd=rkp.CMAC_V1_SUBMIT[3])
+  program._submit = lambda *_args, **_kwargs: bad  # type: ignore[method-assign]
+  effects = program._preflight_native(bufs)
+  with pytest.raises(PhysicalOwnershipUnknown, match="physical submit crossed driver boundary"):
+    effects.execute(preflight=False)
+  assert effects.ownership_unknown and not effects.closed and dev.freed == []
 
 
 def test_cleanup_failure_is_unknown_and_retains_unfreed_allocations() -> None:
@@ -543,6 +666,23 @@ def test_cmac_command_guard_corruption_is_unknown_after_submit() -> None:
   with pytest.raises(PhysicalOwnershipUnknown, match="readback"):
     effects.execute()
   assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+
+
+def test_output_dma_mismatch_after_submit_is_terminal_before_readback() -> None:
+  program, effects = _setup(_cmac_native())
+  original_submit = program._submit_physical
+
+  def tampering_submit(command: HCQBuffer, task: HCQBuffer, contract: object) -> PhysicalSubmitReceipt:
+    receipt = original_submit(command, task, contract)
+    effects._resource_buffers["output"].meta.dma_addr += 0x1000
+    return receipt
+
+  program._submit_physical = tampering_submit  # type: ignore[method-assign]
+  with pytest.raises(PhysicalOwnershipUnknown, match="readback"):
+    effects.execute()
+  assert effects.ownership_unknown and not effects.closed and program.dev.freed == []
+  assert not any(event[0] == "sync" and event[2] == driver.RKNPU_MEM_SYNC_FROM_DEVICE
+                 for event in program.dev.events if isinstance(event, tuple))
 
 
 def test_unproven_reset_is_fail_closed_and_has_zero_effects() -> None:

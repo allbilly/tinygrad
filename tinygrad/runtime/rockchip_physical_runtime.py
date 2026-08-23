@@ -50,6 +50,7 @@ _CMAC_GUARD_SPANS = (
   ("_cmd_buf", rkp.CMAC_V1_COMMAND_IMAGE_BYTES, rkp.CMAC_V1_COMMAND_RESERVATION_BYTES - rkp.CMAC_V1_COMMAND_IMAGE_BYTES),
   ("_task_buf", rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES, _PAGE - rkp.CMAC_V1_TASK_DESCRIPTOR_BYTES),
 )
+_BufferSnapshot = tuple[int, int, int, int, int, int]
 
 # Stable event IDs.  These are a finite vocabulary, not a second telemetry
 # policy or an attempt counter encoded as an event name.
@@ -158,6 +159,13 @@ def _allocation_size(buffer: HCQBuffer) -> int:
   return value
 
 
+def _obj_addr(buffer: HCQBuffer) -> int:
+  value = getattr(getattr(buffer, "meta", None), "obj_addr", None)
+  if type(value) is not int or value < 0:
+    raise PhysicalRuntimeReject("dma", "buffer object address is invalid")
+  return value
+
+
 def _dma(program: object, buffer: HCQBuffer) -> int:
   resolver = getattr(program, "_dma", None)
   if not callable(resolver):
@@ -168,6 +176,20 @@ def _dma(program: object, buffer: HCQBuffer) -> int:
   if value + _allocation_size(buffer) > 1 << 32:
     raise PhysicalRuntimeReject("dma", "DMA allocation exceeds uint32")
   return value
+
+
+def _buffer_snapshot(program: object, buffer: HCQBuffer) -> _BufferSnapshot:
+  return (id(buffer), int(buffer.va_addr), buffer.size, _allocation_size(buffer), _dma(program, buffer), _obj_addr(buffer))
+
+
+def _owned_buffer_snapshot(program: object, buffer: object, logical_size: int, role: str) -> _BufferSnapshot:
+  if type(buffer) is not HCQBuffer:
+    raise PhysicalRuntimeReject("allocator", f"native {role} allocation is not an exact HCQBuffer")
+  if type(buffer.size) is not int or buffer.size != logical_size:
+    raise PhysicalRuntimeReject("allocator", f"native {role} logical size is not {logical_size}")
+  if _allocation_size(buffer) < logical_size:
+    raise PhysicalRuntimeReject("allocator", f"native {role} allocation is smaller than {logical_size}")
+  return _buffer_snapshot(program, buffer)
 
 
 def cmac_logical_output(raw_bytes: bytes, logical_lanes: int, swizzle: Sequence[int]) -> bytes:
@@ -205,8 +227,10 @@ class RockchipPhysicalEffects:
     self._resource_buffers: dict[str, HCQBuffer] = {}
     self._resource_args: dict[str, RKArg] = {}
     self._dma_by_arg: dict[RKArg, int] = {}
-    self._asset_snapshot: tuple[tuple[int, int, int, int, int, int], ...] = ()
-    self._binding_snapshot: tuple[tuple[RKArg, int, int, int, int, int], ...] = ()
+    self._asset_snapshot: dict[int, _BufferSnapshot] = {}
+    self._command_snapshot: _BufferSnapshot | None = None
+    self._task_snapshot: _BufferSnapshot | None = None
+    self._binding_snapshot: tuple[tuple[RKArg, _BufferSnapshot], ...] = ()
     self._span_snapshot: tuple[RKNativeSpan, ...] = ()
     self._native_fingerprint: bytes | None = None
     self._prepared = False
@@ -359,9 +383,7 @@ class RockchipPhysicalEffects:
       self._resource_buffers[role] = buffer
       self._resource_args[role] = arg
       self._dma_by_arg[arg] = dma
-    self._binding_snapshot = tuple(
-      (arg, id(self.bufs[arg.index]), int(self.bufs[arg.index].va_addr), self.bufs[arg.index].size,
-       _allocation_size(self.bufs[arg.index]), self._dma_by_arg[arg]) for arg in refs)
+    self._binding_snapshot = tuple((arg, _buffer_snapshot(self.program, self.bufs[arg.index])) for arg in refs)
     self._span_snapshot = self.native.spans
 
   def _revalidate_bindings(self) -> None:
@@ -369,42 +391,50 @@ class RockchipPhysicalEffects:
       self._reject("dma_binding", "native caller bindings were not snapshotted")
     if self.native is not self._native_identity or self.native.spans != self._span_snapshot:
       self._reject("span_contract", "native immutable plan or spans changed after preflight")
-    current: list[tuple[RKArg, int, int, int, int, int]] = []
+    current: list[tuple[RKArg, _BufferSnapshot]] = []
     ranges: list[tuple[int, int]] = []
-    for arg, buffer_id, va_addr, requested, allocation, expected_dma in self._binding_snapshot:
+    for arg, expected in self._binding_snapshot:
       if not 0 <= arg.index < len(self.bufs):
         self._reject("dma_binding", "native argument index changed")
       buffer = self.bufs[arg.index]
-      if not isinstance(buffer, HCQBuffer) or id(buffer) != buffer_id or int(buffer.va_addr) != va_addr or buffer.size != requested:
+      if not isinstance(buffer, HCQBuffer) or _buffer_snapshot(self.program, buffer) != expected:
         self._reject("dma_binding", "caller buffer identity or span changed after preflight")
-      actual_allocation, actual_dma = _allocation_size(buffer), _dma(self.program, buffer)
-      if actual_allocation != allocation or actual_dma != expected_dma:
-        self._reject("dma_binding", "caller DMA or allocation span changed after preflight")
-      current.append((arg, id(buffer), int(buffer.va_addr), buffer.size, actual_allocation, actual_dma))
-      ranges.append((actual_dma, actual_allocation))
+      current.append((arg, expected))
+      ranges.append((expected[4], expected[3]))
     if any(a < c + d and c < a + b for index,(a,b) in enumerate(ranges) for c,d in ranges[index+1:]):
       self._reject("dma_alias", "caller DMA spans overlap before native patch or submit")
     for span in self.native.spans:
       if span.buffer not in self._dma_by_arg:
         self._reject("span_contract", "native span is not bound to a caller resource")
-      allocation = next(item[4] for item in current if item[0] == span.buffer)
+      allocation = next(item[1][3] for item in current if item[0] == span.buffer)
       if allocation != span.allocation or span.offset + span.size > allocation:
         self._reject("span_contract", "caller allocation no longer covers immutable native span")
     for role,arg in self._resource_args.items():
       if self._resource_buffers.get(role) is not self.bufs[arg.index]:
         self._reject("dma_binding", "caller resource role changed after preflight")
-    self._dma_by_arg = {arg: dma for arg,_,_,_,_,dma in current}
+    self._dma_by_arg = {arg: snapshot[4] for arg, snapshot in current}
 
   def _revalidate_assets(self) -> None:
     current = []
-    for index, buffer_id, va_addr, requested, allocation, expected_dma in self._asset_snapshot:
+    for index, expected in sorted(self._asset_snapshot.items()):
       buffer = self._asset_buffers.get(index)
-      if buffer is None or id(buffer) != buffer_id or int(buffer.va_addr) != va_addr or buffer.size != requested or \
-         _allocation_size(buffer) != allocation or _dma(self.program, buffer) != expected_dma:
+      if buffer is None or type(buffer) is not HCQBuffer or _buffer_snapshot(self.program, buffer) != expected:
         self._reject("asset", "immutable asset DMA span changed after allocation")
-      current.append((index, buffer_id, va_addr, requested, allocation, expected_dma))
-    if tuple(current) != self._asset_snapshot:
+      current.append((index, expected))
+    if dict(current) != self._asset_snapshot:
       self._reject("asset", "immutable asset allocation was not snapshotted")
+
+  def _revalidate_owned_buffers(self) -> None:
+    if self._command_snapshot is None or self._task_snapshot is None:
+      self._reject("allocator", "native command/task allocations were not snapshotted")
+    command_buffer, task_buffer = self._cmd_buf, self._task_buf
+    if command_buffer is None or task_buffer is None or type(command_buffer) is not HCQBuffer or type(task_buffer) is not HCQBuffer:
+      self._reject("allocator", "native command/task allocation type changed after allocation")
+    if _buffer_snapshot(self.program, command_buffer) != self._command_snapshot:
+      self._reject("allocator", "native command allocation metadata changed after allocation")
+    if _buffer_snapshot(self.program, task_buffer) != self._task_snapshot:
+      self._reject("allocator", "native task allocation metadata changed after allocation")
+    self._revalidate_assets()
 
   def _revalidate_native_fingerprint(self) -> None:
     if self._native_fingerprint is None:
@@ -549,11 +579,12 @@ class RockchipPhysicalEffects:
     try:
       command_buffer = allocate(command_size)
       self._cmd_buf = command_buffer
+      command_snapshot = _owned_buffer_snapshot(self.program, command_buffer, command_size, "command")
       task_buffer = allocate(task_size, rk.RKNPU_MEM_KERNEL_MAPPING)
       self._task_buf = task_buffer
+      task_snapshot = _owned_buffer_snapshot(self.program, task_buffer, task_size, "task")
       command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
-      if _allocation_size(command_buffer) < command_size or _allocation_size(task_buffer) < task_size:
-        self._reject("allocator", "native allocation is smaller than contract")
+      self._command_snapshot, self._task_snapshot = command_snapshot, task_snapshot
       ranges = [
         (_dma(self.program, command_buffer), _allocation_size(command_buffer)),
         (_dma(self.program, task_buffer), _allocation_size(task_buffer)),
@@ -588,13 +619,9 @@ class RockchipPhysicalEffects:
           self._reject("asset", "asset relocation index is out of range")
         asset = self.native.assets[index]
         buffer = allocate(asset.size)
-        if not isinstance(buffer, HCQBuffer):
-          self._reject("asset", "immutable asset allocator returned a foreign buffer")
         self._asset_buffers[index] = buffer
-        allocation = _allocation_size(buffer)
-        if allocation < asset.size:
-          self._reject("asset", "immutable asset allocation is smaller than its payload")
-        dma = _dma(self.program, buffer)
+        snapshot = _owned_buffer_snapshot(self.program, buffer, asset.size, f"asset[{index}]")
+        allocation, dma = snapshot[3], snapshot[4]
         caller_ranges = [(_dma(self.program, resource), _allocation_size(resource)) for resource in self._resource_buffers.values()]
         prior_assets = [(_dma(self.program, resource), _allocation_size(resource))
                         for asset_index, resource in self._asset_buffers.items() if asset_index != index]
@@ -603,10 +630,10 @@ class RockchipPhysicalEffects:
         ctypes.memset(int(buffer.va_addr), 0, allocation)
         for start, count in asset.ranges:
           _write(buffer, asset.payload[start:start + count], start)
-      snapshot = tuple(
-        (index, id(buffer), int(buffer.va_addr), buffer.size, _allocation_size(buffer), _dma(self.program, buffer))
-        for index, buffer in sorted(self._asset_buffers.items()))
-      self._asset_snapshot = snapshot
+      self._asset_snapshot = {
+        index: _owned_buffer_snapshot(self.program, buffer, self.native.assets[index].size, f"asset[{index}]")
+        for index, buffer in sorted(self._asset_buffers.items())
+      }
     except PhysicalRuntimeReject:
       raise
     except Exception as exc:
@@ -634,7 +661,7 @@ class RockchipPhysicalEffects:
   def _write_command_and_task(self) -> None:
     command_buffer, task_buffer = self._require_buffer("_cmd_buf"), self._require_buffer("_task_buf")
     self._revalidate_native_fingerprint()
-    self._revalidate_assets()
+    self._revalidate_owned_buffers()
     self._revalidate_bindings()
     patched = self._patch_commands()
     command_image = struct.pack(f"<{len(patched)}Q", *patched) + struct.pack(f"<{len(self.native.tail)}Q", *self.native.tail)
@@ -715,7 +742,8 @@ class RockchipPhysicalEffects:
       self.last_reason = "cleanup"
       self.telemetry.reject("cleanup_unknown")
       raise PhysicalOwnershipUnknown("native command/task cleanup ownership is unknown") from errors[0]
-    self._asset_snapshot = ()
+    self._asset_snapshot = {}
+    self._command_snapshot = self._task_snapshot = None
     self._assets_uploaded = False
     self._closed = True
 
@@ -796,7 +824,7 @@ class RockchipPhysicalEffects:
     if not callable(submitter):
       self._reject("submit", "program has no physical submit primitive")
     self._revalidate_native_fingerprint()
-    self._revalidate_assets()
+    self._revalidate_owned_buffers()
     self._revalidate_bindings()
     self._in_flight = True
     self.telemetry.pc_submits += 1
@@ -812,7 +840,7 @@ class RockchipPhysicalEffects:
       self.telemetry.reject("submit_unknown")
       raise PhysicalOwnershipUnknown("physical submit returned a non-contract receipt")
     receipt = result
-    if type(receipt.status) is not int or type(receipt.ownership_known) is not bool or not receipt.ownership_known or receipt.submit_id is None:
+    if type(receipt.status) is not int or type(receipt.ownership_known) is not bool or not receipt.ownership_known:
       self._unknown = True
       self.telemetry.reject("submit_unknown")
       raise PhysicalOwnershipUnknown("physical submit ownership is unknown")
@@ -821,7 +849,8 @@ class RockchipPhysicalEffects:
       self._cleanup()
       raise PhysicalRuntimeReject("submit", f"physical submit returned {receipt.status}")
     self.telemetry.native_submit += 1
-    self.telemetry.native_submit_ids.append(receipt.submit_id)
+    if receipt.submit_id is not None:
+      self.telemetry.native_submit_ids.append(receipt.submit_id)
     return receipt
 
   def _validate_cmac_output(self) -> None:
@@ -852,6 +881,12 @@ class RockchipPhysicalEffects:
     if not self._in_flight or self._unknown:
       self._reject("lifecycle", "native barrier-after is out of order")
     try:
+      # The driver boundary has been crossed.  Any owned-buffer or caller
+      # metadata mismatch is therefore terminal unknown ownership, and must
+      # be caught before a FROM_DEVICE sync or output readback.
+      self._revalidate_native_fingerprint()
+      self._revalidate_owned_buffers()
+      self._revalidate_bindings()
       if self.kind is RKNativeKind.CMAC:
         self._sync(self._require_buffer("_cmd_buf"), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
         self._sync(self._require_buffer("_task_buf"), rk.RKNPU_MEM_SYNC_FROM_DEVICE)

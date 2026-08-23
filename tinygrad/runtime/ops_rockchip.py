@@ -108,7 +108,7 @@ class RockchipProgram(Program['RockchipDevice']):
     return submit_result
 
   def _submit_physical(self, cmd:HCQBuffer, task:HCQBuffer, contract:object) -> PhysicalSubmitReceipt:
-    """Submit one physical task with no timeout retry or reset retry."""
+    """Submit one blocking physical task; ioctl return is the completion receipt."""
     result = self._submit(cmd, task, 1, standalone=True, retry=False, submit_contract=contract, sync_before_submit=False)
     if type(result) is not rk.struct_rknpu_submit:
       raise RuntimeError("RKNPU submit wrapper returned a foreign payload")
@@ -116,11 +116,11 @@ class RockchipProgram(Program['RockchipDevice']):
     actual = (result.flags, result.timeout, result.task_number, result.core_mask, result.fence_fd)
     if actual != (expected[0], expected[1], expected[2], expected[3], expected[4]):
       raise RuntimeError("RKNPU submit wrapper returned a mismatched receipt")
-    # The current struct has no returned job ID.  This contract also does not
-    # request RKNPU_JOB_FENCE_OUT, so fence_fd is only the -1 input fence.
-    # Preserve that fact instead of fabricating submit_count as an identity;
-    # the effects layer will halt with terminal unknown ownership.
-    return PhysicalSubmitReceipt(0, False, None)
+    if expected[0] != (rk.RKNPU_JOB_PC | rk.RKNPU_JOB_PINGPONG) or expected[4] != -1:
+      raise RuntimeError("RKNPU physical submit is not the proven blocking contract")
+    # flags=5 has NONBLOCK clear, so the ioctl returns only after the driver's
+    # completion wait.  The ABI has no public job ID or output fence here.
+    return PhysicalSubmitReceipt(0, True, None)
 
   def _run_native(self, *bufs:HCQBuffer, wait:bool=False) -> float|None:
     start = time.perf_counter()
