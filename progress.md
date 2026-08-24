@@ -8289,9 +8289,16 @@ Host verification reports **146 passed** for
 `test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
 repository-wide Ruff success, clean diff checks, and exactly **445 tests
 collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  The Fable
-Judge verdict is **VERIFIED WITH CAVEATS**, with the live hardware bracket as
-its sole caveat.  The user has now authorized the serial 445-case run on the
-new boot; its pre-health -> census -> post-health result is pending this commit.
+Judge host verdict is **VERIFIED WITH CAVEATS**.
+
+After pinning clean commit `e4808c8a4`, the user authorized the serial live
+gate on boot `8ec6177f-8f44-490c-8d66-f02a4be34ed7`.  Its first and only device
+command, the required pre-health `simple_add.py`, failed while mapping the
+third buffer with `OSError: [Errno 6] No such device or address`.  The **445
+tests were not started**, post-health was not run, and no retry, reset, repair,
+or other device command followed.  The fail-closed artifacts are under
+`/home/orangepi/rk-live-445-e4808c8a4-20260824T1000`; live hardware acceptance
+therefore remains pending a separately authorized fresh reboot and bracket.
 
 ## 2026-08-24 — immutable lowering records share physical ownership at 2,343 lines
 
