@@ -4,7 +4,7 @@ import base64, functools, heapq, itertools, math, os, struct
 import numpy as np
 from dataclasses import astuple, dataclass, replace
 from enum import IntEnum
-from typing import Any, Callable, Iterable, Mapping, cast, cast as typing_cast
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, cast, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16
 from tinygrad.helpers import ceildiv, round_up
@@ -132,8 +132,7 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   constants = b"" if not by_slot else b"".join(by_slot.get(slot, b"\0\0") for slot in range(max(by_slot)+1))
   return replace(image, scratch=tuple(physical), constants=constants)
 
-@dataclass(frozen=True)
-class RKStage: commands: tuple[int, ...]; relocs: tuple[tuple[int, RKArg], ...]
+class RKStage(NamedTuple): commands: tuple[int, ...]; relocs: tuple[tuple[int, RKArg], ...]
 
 def encode_image(image:RKImage) -> bytes:
   gathers = image.gathers + image.mid_gathers + image.post_gathers
@@ -517,12 +516,9 @@ def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
   low,high=(min(plan.offsets,default=0),max(plan.offsets,default=-1)) if plan.offsets else (plan.base+sum(min(delta,0) for delta in deltas),plan.base+sum(max(delta,0) for delta in deltas))  # noqa: E501
   if low < (0 if not plan.offsets else -1) or high >= source_count: raise RuntimeError("RKPLAN_REJECT:gather_index")
 
-@dataclass(frozen=True)
-class RKTypedLoadPlan:
+class RKTypedLoadPlan(NamedTuple):
   """Typed source metadata shared by static-offset and physical-gather consumers."""
-  param: UOp
-  gather: RKGather
-  offsets: tuple[int, ...]
+  param:UOp; gather:RKGather
 
 def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None, require_offsets:bool=False) -> RKTypedLoadPlan|None:  # noqa: E501
   if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX: return None
@@ -530,9 +526,9 @@ def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bi
   gate = load.src[2] if len(load.src) > 2 else None
   fill_bits = fill_bits if fill_bits is not None else _fp16_bits(load.src[1].arg if len(load.src) > 1 else 0) if dtype is dtypes.half else 0
   try:
-    _validate_gather_bounds(gather:=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits),int(param.src[0].arg)); offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count) if require_offsets else ()  # noqa: E501
+    _validate_gather_bounds(gather:=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits),int(param.src[0].arg)); gather=replace(gather,base=0,axes=(),offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count)) if require_offsets else gather  # noqa: E501
   except RuntimeError: return None
-  return RKTypedLoadPlan(param, gather, offsets)
+  return RKTypedLoadPlan(param, gather)
 
 def _gather_cache_key(plans:Iterable[RKGather]) -> tuple: return tuple(v[0:1]+v[2:11]+v[12:14] for v in map(astuple, plans))
 
@@ -800,10 +796,10 @@ def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predi
         scale, term = int(constants[0].arg), next(u for u in term.src if u not in constants)
       if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or \
          (load:=predicate(term.src[0])) is None or [u for u in term.toposort() if u.op is Ops.LOAD] != [load]: return None
-      if (parsed:=_typed_load_plan(load, dtype, out_index, count, require_offsets=True)) is None or len(set(parsed.offsets)) != 1: return None
+      if (parsed:=_typed_load_plan(load, dtype, out_index, count, require_offsets=True)) is None or len(set(parsed.gather.offsets)) != 1: return None
       if source is not None and parsed.param.arg.slot != source.arg.slot: return None
       source = parsed.param
-      offsets.append(parsed.offsets[0])
+      offsets.append(parsed.gather.offsets[0])
       scales.append(scale)
   except RuntimeError: return None
   if source is None or not scales or len(set(scales)) != 1: return None
@@ -833,10 +829,10 @@ def _lower_bounded_integer_predicate_coordinates(output:RKOutput, dtype:DType=dt
     for selected_count in range(count+1):
       got = _static_values(out_index, root.substitute({total_expr:total_expr.const_like(selected_count), index_load:index_load.const_like(0)}), count, int)  # noqa: E501
       if got != tuple(coordinate_rows[0][lane] if lane < selected_count else fill_value for lane in range(count)): return None
-    if index_plan.offsets != tuple(range(count)) or not -32768 <= fill_value <= 32767 or \
+    if index_plan.gather.offsets != tuple(range(count)) or not -32768 <= fill_value <= 32767 or \
        any(not -32768 <= value <= 32767 for row in coordinate_rows for value in row): return None
   except (RuntimeError, OverflowError, struct.error): return None
-  index_param, index_offsets = index_plan.param, index_plan.offsets
+  index_param, index_offsets = index_plan.param, index_plan.gather.offsets
   source_count, coordinate_count = int(source.src[0].arg), len(coordinate_rows); _, vector_lanes, matrix_lanes = _stripe_layout(count, coordinate_count)  # noqa: E501
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
 
@@ -1332,8 +1328,7 @@ class RKContext:
         src_kind=RKBufferKind.SCRATCH,after=len(self.ew_ops)))
       return RKValue(compact.arg,dtypes.float,self.count,RKLayout.FP16)
     if dtype is dtypes.bool:
-      return self._slot(self.materialized_slots,replace(typed_plan.gather,base=0,axes=(),offsets=typed_plan.offsets,
-        fill_bits=int(bool(default.arg)) if default is not None else 0,dst_stride=2,itemsize=1),dtype,RKLayout.BOOL_INT16,self.count*2)
+      return self._slot(self.materialized_slots,replace(typed_plan.gather,fill_bits=int(bool(default.arg)) if default is not None else 0,dst_stride=2,itemsize=1),dtype,RKLayout.BOOL_INT16,self.count*2)  # noqa: E501
     if gate is None and u.src[0].src[1].key == self.out_index.key and int(typed_plan.param.src[0].arg) == self.count:
       return RKValue(RKArg(RKBufferKind.ARG,typed_plan.param.arg.slot),dtype,self.count,layout)
     return self._slot(self.materialized_slots,replace(typed_plan.gather,itemsize=dtype.itemsize),dtype,layout,self.count*dtype.itemsize)
@@ -1502,7 +1497,7 @@ class RKContext:
         if layout is None: raise _RKGenericReject
         if layout is RKLayout.INT32 and u is self.root and 1 <= self.count*4 <= _MAX_EW_ELEMS_FP16 and \
            (parsed:=_typed_load_plan(source, dtypes.int, self.out_index, self.count, require_offsets=True)) is not None:
-          param, offsets = parsed.param, parsed.offsets
+          param, offsets = parsed.param, parsed.gather.offsets
           lanes, stride, slot = self.count*4, round_up(self.count*4*2, 64), len(self.scratch)
           self.scratch.append(RKScratch(stride*3))
           raw_arg, constant_arg, inverted_arg = (RKArg(RKBufferKind.SCRATCH, slot, row*stride) for row in range(3))
@@ -2107,9 +2102,7 @@ def _unroll_static_local(uops:list[UOp], root:UOp) -> UOp:
     return expanded.setdefault(key, accumulator)
   return root.substitute({load:expand_load(load, {}) for load in local_loads}, walk=True)
 
-@dataclass(frozen=True)
-class _RKStaticLocalDef:
-  initial:UOp; update_op:Ops; term:UOp; loops:tuple[UOp, ...]
+class _RKStaticLocalDef(NamedTuple): initial:UOp; update_op:Ops; term:UOp; loops:tuple[UOp, ...]
 
 def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticLocalDef]:
   """Parse scalar local accumulators without assigning tensor-operation meaning to their loops."""

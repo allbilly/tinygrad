@@ -8254,6 +8254,45 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — immutable lowering records share physical ownership at 2,343 lines
+
+This isolated milestone follows `023b6869f`.  Its predeclared and observed
+production renderer budget is exactly **+13/-20 executable lines, net -7**.
+Authoritative `sz.py` size moves renderer **2350 -> 2343** and repository
+total **27862 -> 27855**; runtime remains **444**.
+
+`_typed_load_plan` now makes `RKGather` the sole owner of an explicit offset
+map when a consumer requires one.  This deletes `RKTypedLoadPlan.offsets` and
+the BOOL load consumer's second base/axis/offset remap while retaining the same
+bounded gather and fill bits.  `RKStage`, `RKTypedLoadPlan`, and
+`_RKStaticLocalDef` are now typed immutable tuple records, making their three
+frozen-dataclass wrappers obsolete without changing their named fields or
+constructor call sites.  A complete function-call profile first confirmed all
+three records and their producers remain live; repository search found no
+external users of these internal types.  No admission, arithmetic recipe,
+image field, wire encoding, runtime path, scheduler hook, CPU/GPU numeric
+fallback, tolerance, or test changed.
+
+A committed-parent/candidate lowering oracle observed **282 outcomes / 266
+images / 41 CMAC images / 16 rejections** across all 146 pre-existing Rockchip
+UOp tests.  Every admission, encoded image, and resource record is
+byte-identical; both normalized records hash to
+`5c6a6f9adcc2780a8d80fed7045dcfd3a12d5e880490462455b606e037800080`.
+Actual production `Tensor.schedule_linear -> to_program` plain and ReLU matmul
+images, plus their emitted 45-qword CMAC stages, are also byte-identical at
+aggregate record SHA-256
+`c285d5c531223c832f8925b8c768a484fa82ba57d2a589683533d21b9869edb7`.
+
+Host verification reports **146 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  The final
+Fable Judge verdict is **VERIFIED WITH CAVEATS**, with the prohibited live
+hardware bracket as its sole caveat.  No device, health, reset, reboot,
+hardware execution, or full hardware census command was run because the board
+remains untrusted; fresh-boot acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — large affine contractions keep compact CMAC plans at 2,350 lines
 
 This isolated milestone follows `c0791e753`.  Its predeclared and observed
