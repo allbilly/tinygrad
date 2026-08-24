@@ -8254,6 +8254,40 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — share EW pipeline finalization at 2,316 lines
+
+This hardware-accepted milestone follows `9406b1d09`.  Its predeclared and
+observed token-aware renderer budget is exactly **+12/-15 executable lines,
+net -3**.  The raw diff is **+13/-15** because the retained lazy-compare
+contract comment is excluded by `sz.py`.  Authoritative size moves renderer
+**2319 -> 2316**, repository total **27830 -> 27827**, and runtime remains
+**443**.
+
+`_stage_template` now assigns both the special and ordinary DPU register
+sequences to one `pipeline` value and appends their common RDMA tail once.
+The compare-only words remain lazy, the cache key and validation boundary are
+unchanged, and register/relocation order is identical.  No UOp admission,
+arithmetic recipe, image schema, runtime behavior, CMAC path, CPU/GPU numeric
+fallback, tolerance, or test contract changed.
+
+An exhaustive committed-parent/candidate stage oracle checked **66,560**
+private template cases and **64,512** public wrapper cases.  Both sides have
+**26,560/40,000** template successes/errors and **31,360/33,152** wrapper
+successes/errors; their complete JSON files are byte-identical at SHA-256
+`bb45bddcd5e599c7546bdf35b0c8e0295511daadc43e580ca65c8408a18ebb28`.
+Cache identity, signature, exact exception type/message, command words,
+relocations, and compare truthiness counts also match.
+
+Rockchip UOp verification reports **152 passed** with `-n12`; mypy reports no
+issues in **216 source files**; repository-wide Ruff and `git diff --check`
+pass.  The required serial hardware census actually ran through the production
+`to_program` path with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`:
+**433 passed, 12 suite-declared skips, 154 subtests passed in 1372.98 seconds**,
+covering all **445** collected cases with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health gate passed before
+and after the census with `SUBMIT ret=0` and exact output
+`[8 8 8 8 8 8 8 8]`.
+
 ## 2026-08-24 — CMAC rejection preserves exact generic arithmetic at 2,319 lines
 
 This hardware-accepted milestone follows `fc7ec0161`.  Its observed

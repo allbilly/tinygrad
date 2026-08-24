@@ -278,13 +278,12 @@ def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=Fal
                     -> tuple[tuple[int, ...], tuple[int, ...]]:
   """Emit one DPU EW register template, sharing its physical prefix and RDMA tail across every precision."""
   D, R = _DPU, rk
-  special, native_int16, native_int32 = (compare or stateful or int32_output or int32_input or int16_output or int16_input or
-    fp32_output or fp32_input), int16_input and int16_output, int32_input and int32_output
+  special, native_int16, native_int32, c = (compare or stateful or int32_output or int32_input or int16_output or int16_input or
+    fp32_output or fp32_input), int16_input and int16_output, int32_input and int32_output, compare
   int16_to_int32 = int16_input and int32_output and not int16_output and not int32_input
   limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if native_int32 else _EW_ELEMS_32BIT if \
     int32_output or int32_input or fp32_output or fp32_input else _MAX_EW_ELEMS_FP16
-  if not 0 < count <= limit:
-    raise ValueError(f"{'stateful EW' if special else 'EW fp16'} count {count} out of range")
+  if not 0 < count <= limit: raise ValueError(f"{'stateful EW' if special else 'EW fp16'} count {count} out of range")
   lanes, is_div = (4 if int32_input or fp32_input else 8), ew_cfg == _EW_CFG[Ops.FDIV]
   width, data_format = (count + lanes-1) // lanes - 1, next(format_ for flag,format_ in zip(
     (fp32_output, fp32_input, native_int16, native_int32, int16_to_int32, int32_output, int16_output, int32_input, True), _DPU_DATA_FORMATS) if flag)
@@ -293,24 +292,23 @@ def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=Fal
     (D,R.REG_DPU_DATA_CUBE_WIDTH,width),(D,R.REG_DPU_DATA_CUBE_HEIGHT,0),(D,R.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
     (D,R.REG_DPU_DATA_CUBE_CHANNEL,0 if fp32_output and count == 1 else ((lanes-1)<<16)|(lanes-1)))
   if special:
-    pipeline:tuple[tuple[int, int, int], ...] = ((D,R.REG_DPU_BS_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BN_CFG,_BS_BN_BYPASS),
-      (D,R.REG_DPU_BS_ALU_CFG,0),(D,R.REG_DPU_BS_MUL_CFG,0),
+    # Keep the compare phase lazy so invalid ordinary EW configs do not inspect it.
+    pipeline = (((D,R.REG_DPU_BS_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BN_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BS_ALU_CFG,0),(D,R.REG_DPU_BS_MUL_CFG,0),
       (D,R.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 or fp32_output and count == 1 else 2),
       (D,R.REG_DPU_WDMA_SIZE_0,0 if fp32_output and count == 1 else 3 if fp32_output else lanes-1),(D,R.REG_DPU_WDMA_SIZE_1,width),
       (D,R.REG_DPU_BN_MUL_CFG,0),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,0))
-    if compare: pipeline += ((D,R.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(D,R.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),
-      (D,R.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),(D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),
-      (D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE))
-    ew = _EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else \
-      ew_cfg & ~_EW_OP_CVT_BYPASS if native_int16 or int16_to_int32 else ew_cfg
-    regs += pipeline + ((D,R.REG_DPU_EW_CFG,ew),(D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),
+      + (((D,R.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(D,R.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),(D,R.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),
+      (D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE)) if c else ())
+      + ((D,R.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else \
+      ew_cfg & ~_EW_OP_CVT_BYPASS if native_int16 or int16_to_int32 else ew_cfg),
+      (D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),
       (D,R.REG_DPU_OUT_CVT_SCALE,0 if fp32_output else 1 if int32_output or int16_output or is_div else (1<<16)|1),
-      (D,R.REG_DPU_OUT_CVT_SHIFT,0),(D,R.REG_DPU_SURFACE_ADD,(2 if native_int16 or int16_to_int32 else 4)<<4))
+      (D,R.REG_DPU_OUT_CVT_SHIFT,0),(D,R.REG_DPU_SURFACE_ADD,(2 if native_int16 or int16_to_int32 else 4)<<4)))
   else:
-    regs += ((D,R.REG_DPU_EW_CFG,ew_cfg),) + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ()) + (
+    pipeline = ((D,R.REG_DPU_EW_CFG,ew_cfg),) + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ()) + (
       ((D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),(D,R.REG_DPU_OUT_CVT_SHIFT,0),
        (D,R.REG_DPU_SURFACE_ADD,1<<6)) if is_div else ()) + ((D,R.REG_DPU_OUT_CVT_SCALE,1 if is_div else (1<<16)|1),)
-  regs += ((_RDMA,R.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
+  regs += pipeline + ((_RDMA,R.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
     (_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
     (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
   rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if int16_input else 2
