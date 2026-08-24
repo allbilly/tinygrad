@@ -8332,6 +8332,56 @@ explicit unrun post-health status.  Hardware acceptance remains pending a
 newly authorized fresh-boot bracket after this numeric EW-path failure is
 diagnosed and corrected.
 
+## 2026-08-24 — biased eight-product convolution restores the proven Kahan image at 2,335 lines
+
+This corrective milestone follows failed-census documentation commit
+`995ead33a` and production commit `9b946bb0c`.  Its predeclared and observed
+renderer budget is exactly **+32/-33 executable lines, net -1**.
+Authoritative `sz.py` size moves renderer **2336 -> 2335** and repository total
+**27848 -> 27847**; runtime remains **444**.
+
+Host-only bisection found that the deterministic biased-convolution graph had
+not reached CMAC.  The last complete 445-passing baseline `be8bd9622` emitted
+**98/96-stage** product-residual/Kahan images, while the first broad CMAC
+replacement `ff99ce6b0` and the failed candidate both emitted the same
+**480/478-stage** generic precise-add images.  The removed
+`_lower_vectorized_mul_add_reduction` was therefore the accepting historical
+route for this case.
+
+`_lower_biased_eight_product_reduction` restores only that hardware-proven
+contract: exactly eight FP16 product terms, one FP16 bias load, and optional
+ReLU.  It vectorizes the eight products and their residuals into 17 physical
+EW stages, then applies the literal 16-lane Kahan sequence before the bias and
+optional ReLU boundary.  CMAC remains the first production choice and this
+fallback does not add a generic IR, CMAC-to-EW sequence, runtime phase, or
+CPU/GPU numeric fallback.  Existing comments and docstrings remain.
+
+The actual production `Tensor.schedule_linear -> to_program` graph now emits
+the exact previously passing binaries.  Bias plus ReLU is **98 EW stages, 16
+gathers, 17 mid-gathers, 5,539 bytes**, SHA-256
+`2a2363213d2e86522c45f9523b75f8f6efcf21c9452fd20d2127093c0e630f6f`.
+Bias only is **96 EW stages, 16 gathers, 17 mid-gathers, 5,441 bytes**, SHA-256
+`7d4ea7789747715e7efc1fe4d6f275b4afae4f2d0631a42c8a7efb4f56ec4802`.
+A new production-path unit test pins both hashes and verifies neither image is
+CMAC.
+
+A serial committed-parent/candidate differential oracle observed **282
+lowering calls / 266 encoded images / 41 CMAC images / 16 `None` outcomes**
+across the complete pre-existing Rockchip UOp module.  Every record is
+byte-identical, so only the new failed-census fixture changes.  Host
+verification reports **147 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  The Fable
+Judge verdict is **VERIFIED WITH CAVEATS**.
+
+No device, health, reset, reboot, or hardware pytest command was run after the
+failed census because boot `4d252bad-f0d3-415a-af17-b617f95b7ae1` remains
+fail-closed.  The last actual 445 result is still **34 passed, then case 35
+failed**; this host fix is not a 445 pass claim.  Live acceptance requires a
+newly authorized fresh-boot run bracketed by pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health checks.
+
 ## 2026-08-24 — immutable lowering records share physical ownership at 2,343 lines
 
 This isolated milestone follows `023b6869f`.  Its predeclared and observed
