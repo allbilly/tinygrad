@@ -147,18 +147,17 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _submit_standalone(self, body:tuple[int, ...], cmac:bool=False) -> None:
     """Submit one stateful DPU or CMAC body with its operation-specific direct PC tail."""
-    tail = (_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),
-            _pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),)
+    tail = (_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),)  # noqa: E501
     enable,commands = (0xd if cmac else 0x18),body+tail
     cmd_size, task_need = len(commands)*8+_CMD_PREFETCH_GUARD, _TASK_DESC_BYTES
-    cmd = self._ensure_buffer("_standalone_cmd_buf", cmd_size, _CMD_BUF_MIN)
-    task = self._ensure_buffer("_standalone_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
+    cmd,task = self._ensure_buffer("_standalone_cmd_buf",cmd_size,_CMD_BUF_MIN),self._ensure_buffer("_standalone_task_buf",task_need,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501
     ctypes.memset(int(cmd.va_addr), 0, cmd_size)
     ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64 * len(commands))(*commands), len(commands)*8)
-    desc = rk.struct_rknpu_task(0, 0 if cmac else 4, enable, 0x300, 0x1ffff, 0, len(body) if cmac else len(commands), 0, self._dma(cmd))
-    ctypes.memmove(int(task.va_addr), ctypes.addressof(desc), _TASK_DESC_BYTES)
+    ctypes.memmove(int(task.va_addr),ctypes.byref(rk.struct_rknpu_task(0,0 if cmac else 4,enable,0x300,0x1ffff,0,len(body) if cmac else len(commands),0,self._dma(cmd))),_TASK_DESC_BYTES)  # noqa: E501
     if cmac: self.dev.reset_npu()
-    self._submit(cmd, task, 1, standalone=True, **({"retry":False} if cmac else {}))
+    try: self._submit(cmd, task, 1, standalone=True, **({"retry":False} if cmac else {}))
+    finally:
+      if cmac: self.dev.reset_npu()
 
   def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
     """Convert aligned four-lane atoms on DPU; host movement preserves raw lane representations."""
@@ -389,7 +388,7 @@ class RockchipProgram(Program['RockchipDevice']):
       return self._dma(buffer(kind, index))
     start = time.perf_counter()
     native_int16 = any(op.int16_input or op.int16_output for op in self.image.ew_ops)
-    if self.image.ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
+    if self.image.ew_ops and (self.dev._native_int16 and not native_int16 or any(op.ew_cfg & _EW_NUMERIC_OUT for op in self.image.ew_ops)): self.dev.reset_npu()  # noqa: E501
     def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
       touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
       touched.update((g.dst_kind, g.dst_index) for g in gathers)

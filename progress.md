@@ -8254,6 +8254,39 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — CMAC rejection preserves exact generic arithmetic at 2,319 lines
+
+This hardware-accepted milestone follows `fc7ec0161`.  Its observed
+token-aware production budget is renderer **+38/-48 executable lines, net
+-10** and runtime **+7/-8, net -1**.  Authoritative `sz.py` size moves renderer
+**2329 -> 2319**, runtime **444 -> 443**, and repository total **27841 ->
+27830** (**-11**).
+
+CMAC admission now enforces the donor's thirteen encoded K blocks and leaves
+scalar FP32-output sums on the exact generic DPU reduction path.  Batched dot
+and composite product sums preserve product residuals when CMAC rejects,
+large static-local FP32 additions are balanced before lowering, and emitted
+FP16-pair bitcasts use raw four-byte gathers rather than numeric conversion.
+The runtime resets stale numeric-output state before the first affected DPU
+stage and brackets standalone CMAC submission with reset while retaining the
+existing no-retry rule.  No CPU/GPU/host numeric fallback, tolerance change,
+hand-built renderer shortcut, or non-production compiler path was introduced.
+
+The exact production `Tensor.schedule_linear -> to_program` path is covered by
+new regressions for the K-block boundary, scalar FP32 sum fallback, 417-lane
+generic reduction, batched dot, composite cross-entropy product sums, raw
+FP16-pair bitcasts, static-local balancing, and reset ownership.  Rockchip UOp
+verification reports **152 passed** with `-n12`; mypy reports no issues in
+**216 source files**; repository-wide Ruff and `git diff --check` pass.
+
+The required serial hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` through the production
+`to_program` path: **433 passed, 12 suite-declared skips, 154 subtests passed
+in 1325.52 seconds**, covering all **445** collected cases with zero failures.
+The authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` health
+gate passed before and after the accepted run with `SUBMIT ret=0` and exact
+eight-lane output `[8 8 8 8 8 8 8 8]`.  `task_handover.md` is absent.
+
 ## 2026-08-24 — centralize RKContext physical records at 2,336 lines
 
 This isolated milestone follows `c3ee8b34e`.  The predeclared renderer budget

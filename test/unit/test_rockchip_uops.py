@@ -272,6 +272,9 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
   try: emit_cmac_stage(replace(cmac, m=2, k=385))
   except ValueError: pass
   else: raise AssertionError("multi-row CMAC exceeded the donor CBUF contract")
+  try: emit_cmac_stage(replace(cmac, m=1, k=417))
+  except ValueError: pass
+  else: raise AssertionError("CMAC exceeded the thirteen encoded K blocks")
   stage = emit_cmac_stage(cmac)
   assert len(stage.commands) == 45 and tuple(index for index,_ in stage.relocs) == (18, 24, 31)
   body = patch_stage(stage, lambda _kind,index:(0x100000,0x200000,0x300000)[index])
@@ -391,6 +394,24 @@ def test_cmac_submit_never_replays_a_timeout(monkeypatch):
   assert program.submit_count == program.dev.submit_count == program.dev.task_count == 0
 
 
+def test_numeric_output_program_resets_before_its_first_dpu_stage():
+  class FakeDevice:
+    _native_int16, resets = False, 0
+    def _touch_program(self, _program): pass
+    def _forget_program(self, _program): pass
+    def _gpu_free(self, _buffer): pass
+    def _sync_buffers(self, _buffers, _flags): pass
+    def reset_npu(self): self.resets += 1
+  op = RKEWOp(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,0),1,
+              _EW_CFG[Ops.ADD] | _EW_STAGE_FP32_OUT)
+  program = object.__new__(rockchip_runtime.RockchipProgram)
+  program.dev,program.image,program.scratch,program._scratch_arena = FakeDevice(),RKImage(RKTarget.RK3588,ew_ops=(op,)),(),None
+  program._ensure_scratch=lambda:None
+  program._run_ew_ops=lambda *_args,**_kwargs:None
+  program()
+  assert program.dev.resets == 1
+
+
 def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   class FakeDevice:
     resets = 0
@@ -417,14 +438,14 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
     rockchip_runtime._pc(rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0xd))
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (0,0xd,0x300,0x1ffff,45)
-  assert program.dev.resets == 1 and len(submits) == 1 and submits[0][1] == {"standalone":True,"retry":False}
+  assert program.dev.resets == 2 and len(submits) == 1 and submits[0][1] == {"standalone":True,"retry":False}
   body = (1,2,3)
   program._submit_standalone(body)
   assert tuple((ctypes.c_uint64*4).from_address(cmd.va_addr)) == body+(rockchip_runtime._pc(
     rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0x18),)
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (4,0x18,0x300,0x1ffff,4)
-  assert program.dev.resets == 1 and len(submits) == 2 and submits[1][1] == {"standalone":True}
+  assert program.dev.resets == 2 and len(submits) == 2 and submits[1][1] == {"standalone":True}
 
 
 def test_runtime_tiling_modes_keep_exact_stage_bodies():
@@ -630,10 +651,18 @@ def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
   assert decode_image(encode_image(image)) == image
 
 
-def test_production_fp16_pair_bitcast_remains_zero_kernel_movement():
+def test_production_fp16_pair_bitcast_fused_transfer_uses_raw_gather():
+  values = np.arange(24,dtype=np.float16).reshape(2,3,4)
   with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
-    source = Tensor(UOp.new_buffer("ROCKCHIP", 24, dtypes.half, num=1001)).reshape(2,3,4)
-    assert not source.bitcast(dtypes.int).schedule_linear().src
+    images = []
+    for source in (Tensor(values),Tensor(values).permute(1,0,2)):
+      schedule = source.bitcast(dtypes.int).schedule_linear()
+      ast = next(u.src[0] for u in schedule.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.SINK)
+      to_program_cache.clear()
+      program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+      images.append(decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY)))
+  assert all(len(image.gathers)==1 and image.gathers[0].itemsize==4 and not image.ew_ops for image in images)
+  assert [image.gathers[0].offsets for image in images] == [tuple(range(12)),(0,1,6,7,2,3,8,9,4,5,10,11)]
 
 
 def test_zero_count_raw_fp16_bitcast_uses_empty_generic_image():
@@ -1006,7 +1035,7 @@ def test_noopt_multi_axis_tensor_sum_routes_production_cmac():
   assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (3,1,8)
   assert not image.ew_ops and image.execution_class is RKExecutionClass.NATIVE
 
-def test_scalar_half_to_float_sum_routes_production_cmac():
+def test_scalar_half_to_float_sum_preserves_two_stage_dpu_contract():
   values = np.random.RandomState(0).uniform(-2, 2, size=(45, 3)).astype(np.float16).reshape(-1)
   with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP", values.size, dtypes.half, num=1001).reshape((45, 3)))
@@ -1015,14 +1044,22 @@ def test_scalar_half_to_float_sum_routes_production_cmac():
     to_program_cache.clear()
     program = to_program(ast, RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
-  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k,image.cmac.out_fp16) == (1,1,values.size,False)
-  assert not image.constants and len(image.scratch) == 3 and len(image.gathers) == 2 and len(image.post_gathers) == 1
-  assert _cmac_weights(image) == (rockchip_renderer._fp16_bits(1.0),)*values.size
-  assert image.gathers[0].offsets[:values.size] == tuple(range(values.size))
-  assert all(offset == -1 for offset in image.gathers[0].offsets[values.size:])
-  assert image.post_gathers[0].itemsize == 4 and image.post_gathers[0].offsets == (0,)
-  assert len(emit_cmac_stage(image.cmac).commands) == 45 and decode_image(encode_image(image)) == image
+  assert image.cmac is None and image.constants == struct.pack("<e",0.0) and len(image.ew_ops) == values.size+1
+  assert len(image.mid_gathers) == 1 and image.mid_gathers[0].after == values.size == image.gather_after
+  assert sum(bool(op.ew_cfg & _EW_STAGE_FP32_OUT) for op in image.ew_ops) == 1
+  assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG,0) and image.ew_ops[-1].ew_cfg & _EW_STAGE_FP32_OUT
+  assert not image.post_gathers and decode_image(encode_image(image)) == image
   assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
+
+
+def test_scalar_sum_beyond_cmac_k_blocks_uses_production_dpu_reduction():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=1):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",417,dtypes.half,num=1037))
+    to_program_cache.clear()
+    program=to_program(source.sum().schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
+  image=decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY))
+  assert image.cmac is None and len(image.ew_ops) == 418 and image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG,0)
+  assert image.execution_class is RKExecutionClass.NATIVE and decode_image(encode_image(image)) == image
 
 
 def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
@@ -1327,6 +1364,33 @@ def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   assert image.execution_class is RKExecutionClass.NATIVE and decode_image(encode_image(image)) == image
 
 
+def test_production_batched_dot_retains_product_residuals_after_cmac_rejects():
+  lhs_shape, rhs_shape = (8,45,65), (8,65,100)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    lhs = Tensor(UOp.new_buffer("ROCKCHIP",math.prod(lhs_shape),dtypes.half,num=1033)).reshape(*lhs_shape)
+    rhs = Tensor(UOp.new_buffer("ROCKCHIP",math.prod(rhs_shape),dtypes.half,num=1034)).reshape(*rhs_shape)
+    ast = lhs.dot(rhs).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is None and len(image.ew_ops) == 4011 and len(image.scratch) == 269 and len(image.gathers) == 130
+  assert image.execution_class is RKExecutionClass.NATIVE and _assert_decoded_image_bounds(image) == image
+
+
+def test_production_composite_product_sum_retains_kahan_order_after_cmac_rejects():
+  shape = (32,10)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    logits = Tensor(UOp.new_buffer("ROCKCHIP",math.prod(shape),dtypes.half,num=1035)).reshape(*shape)
+    target = Tensor(UOp.new_buffer("ROCKCHIP",math.prod(shape),dtypes.half,num=1036)).reshape(*shape)
+    ast = logits.cross_entropy(target,reduction="sum").schedule_linear().src[-1].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  counts = {op:sum(stage.ew_cfg == _EW_CFG[op] for stage in image.ew_ops) for op in (Ops.ADD,Ops.SUB,Ops.MUL)}
+  assert image.cmac is None and all(count > 1000 for count in counts.values())
+  assert image.execution_class is RKExecutionClass.NATIVE and _assert_decoded_image_bounds(image) == image
+
+
 def test_production_causal_attention_applies_infinite_mask_after_precise_dot():
   shape = (32,8,16,64)
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
@@ -1602,8 +1666,10 @@ def test_static_local_unroll_preserves_range_order_dependencies():
   uops = list(UOp.sink(initialize, update, out.index(lane).store(root)).toposort())
   expanded = _unroll_static_local(uops, root)
   assert dependency in expanded.toposort()
+  assert rockchip_renderer._is_static_expr(lane)
   assert any(node.key == lane.key and len(node.src) > 1 and node.src[1].key == dependency.key
              for node in expanded.toposort() if node.op is Ops.RANGE)
+  assert _lower_uop_program(uops) is not None
 
 
 def _indexed_local_bridge_program(source_dtype, op:Ops, *, groups:int=2, workers:int=1, local_size:int=2, reduce:int=2, carrier=dtypes.bool):
@@ -2197,17 +2263,23 @@ def test_cmac_candidate_filter_keeps_later_valid_layout():
   np.testing.assert_array_equal(physical[np.asarray(expanded.post_gathers[0].offsets)],source_values.sum(axis=1,dtype=np.float32))
 
 
-def test_mapped_loop_reduction_composes_generic_post_uops():
-  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (65,))
-  axis = UOp.range(65, 0, AxisType.REDUCE)
+def test_large_static_local_add_balances_before_generic_post_uops():
+  size = 1025
+  out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (size,))
+  axis = UOp.range(size, 0, AxisType.REDUCE)
   local = UOp.placeholder((1,), dtypes.float, 0, addrspace=AddrSpace.REG).index(0)
   initialize = local.store(UOp.const(0.0, dtypes.float))
   value = source.index(axis).load()
   update = local.store(local.load() + (value*value).cast(dtypes.float))
-  post = (local.load().cast(dtypes.half)*UOp.const(1/65, dtypes.half)).sqrt()
+  post = (local.load().cast(dtypes.half)*UOp.const(1/size, dtypes.half)).sqrt()
   output = out.index(0).store(post)
-  image = _lower_uop_program(list(UOp.sink(initialize, update, output).toposort()))
-  assert image is not None and image.gather_after < len(image.ew_ops)
+  uops = list(UOp.sink(initialize,update,output).toposort())
+  expanded = _unroll_static_local(uops,post)
+  depth:dict[UOp,int] = {}
+  for node in expanded.toposort(): depth[node] = 1+max((depth[source] for source in node.src),default=0)
+  assert depth[expanded] < 64
+  image = _lower_uop_program(uops)
+  assert image is not None and image.cmac is None and image.gather_after < len(image.ew_ops)
   assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG, 0)
 
 
