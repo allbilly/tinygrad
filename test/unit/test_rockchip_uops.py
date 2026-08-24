@@ -290,6 +290,15 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
                   mid_gathers=(RKGather(2,0,1,src_kind=RKBufferKind.SCRATCH,after=0),))
   assert decode_image(encode_image(mixed)) == mixed
 
+def test_image_codec_rejects_malformed_and_trailing_payloads():
+  blob = encode_image(RKImage(RKTarget.RK3588, (RKScratch(64),)))
+  payload = rockchip_renderer.zlib.decompress(blob[6:])
+  malformed = (b"", blob[:4]+b"\0\0"+blob[6:], blob[:-1], blob+b"\0",
+    blob[:6]+rockchip_renderer.zlib.compress(payload+b"\0", 1),
+    blob[:6]+rockchip_renderer.zlib.compress(rockchip_renderer.marshal.dumps((), 4), 1))
+  for candidate in malformed:
+    with pytest.raises(ValueError, match="invalid RKImage"): decode_image(candidate)
+
 def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
   rng = np.random.default_rng(0x3588)
   lhs = rng.integers(-(1<<31), 1<<31, 100, dtype=np.int64).astype(np.int32)
@@ -653,8 +662,8 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(image.ew_ops), len(image.mid_gathers)))
-  assert records == [("3f3c1465a2e4970839a8a15675d53f56e2f58afa793b36d08ac556b3f8c85533",5954,123,16),
-                     ("7230b73ee7b39133536d38615b32f316fd80ad49aaee468de3678845baab446e",234,4,0)]
+  assert records == [("2a3520dc4502c3f07a5208c080b9d00b8ee538245447393b0ff9cb9c9bb6eac0",1387,123,16),
+                     ("27463746ed50f24f4b886838aa217776ccb88514d3489fb6e4eae375fab8daf1",158,4,0)]
 
 
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
@@ -699,7 +708,7 @@ def test_zero_count_raw_fp16_bitcast_uses_empty_generic_image():
     high = rhs.index(i).load().bitcast(dtypes.ushort).cast(dtypes.uint).alu(Ops.SHL, UOp.const(16, dtypes.int))
     return (low + high).bitcast(dtypes.int)
   image = _lower_uop_program(_program(dtypes.int, packed, count=0))
-  assert image is not None and not image.gathers and not image.ew_ops and len(encode_image(image)) == 40
+  assert image is not None and not image.gathers and not image.ew_ops and len(encode_image(image)) == 43
 
 
 def test_generic_bool_where_uses_canonical_int16_ternary():
@@ -1249,8 +1258,8 @@ def test_biased_eight_channel_convolutions_use_shared_kahan_recipe():
       records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(image.ew_ops),len(image.gathers),len(image.mid_gathers),
                       len(image.post_gathers),image.cmac))
   assert records == [
-    ("9189f6950591b32b9c54857ab67851dbb5897ea2573de185ca4ad9c50f2da2c8",11211,253,17,0,0,None),
-    ("6985815feca2067253f2ac9568d03ea1a5ec0900ec8105e86f98400f944386b1",11123,251,17,0,0,None)]
+    ("1340784b8b80cbbbcb316bde795092057bd1bc9c31a90da66dad550aa672110f",2093,253,17,0,0,None),
+    ("f73dccd6beb937af8bfcb3d37b3f9af13046e52ced43dbd7f191684f63ee6cae",2069,251,17,0,0,None)]
 
 
 def test_fp32_contraction_biases_route_one_production_cmac_surface():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 # ruff: noqa: E702
-import base64, functools, heapq, itertools, math, os, struct
+import base64, functools, heapq, io, itertools, marshal, math, os, struct, zlib
 import numpy as np
 from dataclasses import astuple, dataclass, replace
 from enum import IntEnum
@@ -14,11 +14,7 @@ from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, 
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 31
-_HEADER = struct.Struct("<4sHHHHHHIIIIII")  # magic/version/target, scratch/gather/host counts, ops/constants, phase split, flags
-_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIii"), struct.Struct("<IIi")
-_HOST_ADDRESS, _EWOP, _CMAC = struct.Struct("<BBBBBHHHIIIIIIiiiiii"), struct.Struct("<BBHIIIIIIiii"), struct.Struct("<BBBBHHHiiiIII")
-_ITEM_FORMAT, _RKIMAGE_U16_MAX = {1:"B", 2:"H", 4:"I"}, (1 << 16) - 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 32, (1 << 16) - 1
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
@@ -133,73 +129,43 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
 
 class RKStage(NamedTuple): commands: tuple[int, ...]; relocs: tuple[tuple[int, RKArg], ...]
 
-def encode_image(image:RKImage) -> bytes:
-  gathers = image.gathers + image.mid_gathers + image.post_gathers
-  if image.cmac is not None and (image.host_gathers or image.host_scatters): raise ValueError("CMAC cannot mix with host addressing")
+def _plain_image(value): return tuple(map(_plain_image, value)) if isinstance(value, tuple) else int(value) if isinstance(value, IntEnum) else value
+def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool: return all(isinstance(x,int) and -(1<<(bits-1)) <= x < 1<<(bits-1) if signed else isinstance(x,int) and 0 <= x < 1<<bits for x in values)  # noqa: E501
+
+def _validate_image(image:RKImage) -> None:
+  gathers, hosts = image.gathers+image.mid_gathers+image.post_gathers, image.host_gathers+image.host_scatters
+  if image.version != RKIMAGE_VERSION or image.target is not RKTarget.RK3588 or not isinstance(image.constants,bytes) or not _fits((len(image.ew_ops),len(image.constants),len(image.mid_gathers),len(image.post_gathers),image.gather_after)) or any(len(x) > _RKIMAGE_U16_MAX for x in (image.scratch,gathers,image.host_gathers,image.host_scatters)): raise ValueError("invalid RKImage header")  # noqa: E501
+  if image.cmac is not None and hosts: raise ValueError("CMAC cannot mix with host addressing")
   if image.cmac is not None: _validate_cmac(image.cmac, image.scratch)
-  if image.mid_gathers and any(not 0 <= (g.after if g.after >= 0 else image.gather_after) <= len(image.ew_ops) for g in image.mid_gathers): raise ValueError("invalid mid-gather split")  # noqa: E501
-  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC,image.version,int(image.target),len(image.scratch),len(gathers),len(image.host_gathers),
-    len(image.host_scatters),len(image.ew_ops),len(image.constants),len(image.mid_gathers),len(image.post_gathers),image.gather_after,int(image.cmac is not None)))  # noqa: E501
-  for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
-  for g in gathers:
-    out += _GATHER.pack(g.dst_index, g.src_index, g.count, kind := 3 if g.partial else 2 if g.values else 1 if g.offsets else 0,
-      len(g.axes), g.itemsize, int(g.dst_kind), int(g.src_kind),
-      g.base, g.fill_bits, g.dst_stride, g.dst_addend, g.after) + (struct.pack(f"<{g.count}{_ITEM_FORMAT[g.itemsize]}", *g.values) if kind == 2 else
-      struct.pack(f"<{g.count}i", *g.offsets) if kind in (1, 3) else b"".join(_GATHER_AXIS.pack(*axis) for axis in g.axes))
-  for host in image.host_gathers + image.host_scatters:
-    if host.itemsize not in _ITEM_FORMAT or host.index_itemsize not in (2, 4): raise ValueError("invalid RKHostAddress item size")
-    args=(host.src,host.index,host.dst); out += _HOST_ADDRESS.pack(*(int(arg.kind) for arg in args),host.itemsize,host.index_itemsize,
-      *(arg.index for arg in args),host.count,host.src_count,host.dst_count,host.fill_bits,0,host.index_limit,
-      *(arg.addend for arg in args), host.base, host.index_scale, host.lane_stride)
+  if any(not _fits((s.size,s.alignment)) for s in image.scratch): raise ValueError("invalid RKScratch")
+  if image.mid_gathers and (not 0 <= image.gather_after < len(image.ew_ops) or any(not 0 <= (g.after if g.after >= 0 else image.gather_after) <= len(image.ew_ops) for g in image.mid_gathers)): raise ValueError("invalid mid-gather split")  # noqa: E501
+  if not image.mid_gathers and image.gather_after != 0: raise ValueError("invalid mid-gather split")
+  if any(g.itemsize not in (1,2,4) or not _fits((g.src_index,g.dst_index),16) or not _fits((g.count,g.fill_bits,g.dst_stride)) or not _fits((g.base,g.dst_addend,g.after),signed=True) or g.dst_stride < 1 or g.dst_addend < 0 or len(g.axes) > 255 or bool(g.values)+bool(g.offsets)+bool(g.axes) > 1 or g.partial and not g.offsets or g.values and (len(g.values) != g.count or not _fits(g.values,g.itemsize*8)) or g.offsets and (len(g.offsets) != g.count or not _fits(g.offsets,signed=True)) or any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes) for g in gathers): raise ValueError("invalid RKGather")  # noqa: E501
+  if any(h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.src.index,h.index.index,h.dst.index),16) or not _fits((h.count,h.src_count,h.dst_count,h.fill_bits,h.index_limit)) or not _fits((h.src.addend,h.index.addend,h.dst.addend,h.base,h.index_scale,h.lane_stride),signed=True) for h in hosts): raise ValueError("invalid RKHostAddress")  # noqa: E501
   for op in image.ew_ops:
-    if op.bool_output and not op.int32_output: raise ValueError("bool output requires INT32 conversion")
     int16_to_int32 = op.int16_input and op.int32_output and not op.int16_output and not op.int32_input
-    if (op.int16_output or op.int16_input) and (op.int32_output or op.int32_input) and not int16_to_int32: raise ValueError("conflicting integer precision")  # noqa: E501
-    op_flags=int(op.submit_barrier)|int(op.compare)<<1|int(op.stateful)<<2|int(op.int32_output)<<3|int(op.int32_input)<<4|int(op.bool_output)<<5|int(op.int16_output)<<6|int(op.int16_input)<<7  # noqa: E501
-    out += _EWOP.pack(int(op.dst.kind),op_flags,op.dst.index,int(op.lhs.kind),op.lhs.index,int(op.rhs.kind),op.rhs.index,op.count,op.ew_cfg,op.dst.addend,op.lhs.addend,op.rhs.addend)  # noqa: E501
-  if (cmac:=image.cmac) is not None:
-    out += _CMAC.pack(int(cmac.dst.kind),int(cmac.lhs.kind),int(cmac.rhs.kind),int(cmac.out_fp16)|int(cmac.relu)<<1,cmac.dst.index,
-      cmac.lhs.index,cmac.rhs.index,cmac.dst.addend,cmac.lhs.addend,cmac.rhs.addend,cmac.m,cmac.n,cmac.k)  # noqa: E501
-  return bytes(out) + image.constants
+    if not _fits((op.dst.index,),16) or not _fits((op.lhs.index,op.rhs.index,op.count,op.ew_cfg)) or not _fits((op.dst.addend,op.lhs.addend,op.rhs.addend),signed=True) or op.bool_output and not op.int32_output or (op.int16_output or op.int16_input) and (op.int32_output or op.int32_input) and not int16_to_int32: raise ValueError("invalid RKEWOp flags")  # noqa: E501
+
+def encode_image(image:RKImage) -> bytes:
+  _validate_image(image); return RKIMAGE_MAGIC+struct.pack("<H", image.version)+zlib.compress(marshal.dumps(_plain_image(astuple(image)), 4), 1)
 
 def decode_image(blob:bytes) -> RKImage:
-  magic,version,target,nscratch,ngather,nhost_gather,nhost_scatter,nop,nconst,mid_count,post_count,gather_after,flags=_HEADER.unpack_from(blob)
-  if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags & ~1 or flags and (nhost_gather or nhost_scatter) or  # noqa: E501
-      (mid_count and not 0 <= gather_after < nop) or (not mid_count and gather_after != 0)): raise ValueError("invalid RKImage header")
-  off,scratch=_HEADER.size+nscratch*_SCRATCH.size, tuple(RKScratch(*_SCRATCH.unpack_from(blob,_HEADER.size+i*_SCRATCH.size))for i in range(nscratch))
-  gathers:list[RKGather] = []
-  for _ in range(ngather):
-    dst_index,src_index,count,kind,naxes,itemsize,dst_kind,src_kind,base,fill_bits,dst_stride,dst_addend,after=_GATHER.unpack_from(blob,off); off+=_GATHER.size  # noqa: E501
-    if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in _ITEM_FORMAT or dst_kind not in (0, 1) or src_kind not in (0, 1) or
-        dst_stride < 1 or dst_addend < 0): raise ValueError("invalid RKGather")
-    axes, offsets, values = (((), (), struct.unpack_from(f"<{count}{_ITEM_FORMAT[itemsize]}", blob, off)) if kind == 2 else
-      ((), struct.unpack_from(f"<{count}i", blob, off), ()) if kind in (1, 3) else
-      (tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)), (), ()))
-    off += itemsize*count if kind == 2 else 4*count if kind in (1, 3) else naxes*_GATHER_AXIS.size
-    gathers.append(RKGather(src_index, dst_index, count, base if kind == 0 else 0, axes, offsets, fill_bits, values, kind == 3,
-      dst_stride, dst_addend, RKBufferKind(dst_kind), itemsize, RKBufferKind(src_kind), after))
-  host_addresses, ew_ops = typing_cast(list[RKHostAddress], []), typing_cast(list[RKEWOp], [])
-  for _ in range(nhost_gather+nhost_scatter):
-    src_kind, index_kind, dst_kind, itemsize, index_itemsize, src_index, index_index, dst_index, count, src_count, dst_count, \
-      fill_bits, host_flags, index_limit, src_addend, index_addend, dst_addend, base, index_scale, lane_stride = _HOST_ADDRESS.unpack_from(blob, off); off += _HOST_ADDRESS.size  # noqa: E501
-    if (src_kind not in (0,1) or index_kind not in (0,1) or dst_kind not in (0,1) or itemsize not in _ITEM_FORMAT or
-        index_itemsize not in (2,4) or host_flags or min(count,src_count,dst_count,index_limit) < 0): raise ValueError("invalid RKHostAddress")
-    host_addresses.append(RKHostAddress(RKArg(RKBufferKind(src_kind),src_index,src_addend),RKArg(RKBufferKind(index_kind),index_index,index_addend),
-      RKArg(RKBufferKind(dst_kind),dst_index,dst_addend),
-      count, src_count, dst_count, itemsize, index_itemsize, fill_bits, index_limit, base, index_scale, lane_stride))
-  for _ in range(nop):
-    dk, op_flags, di, lk, li, rk_, ri, count, ew_cfg, da, la, ra = _EWOP.unpack_from(blob, off); off += _EWOP.size
-    if op_flags & ~0xff or op_flags & 0x20 and not op_flags & 0x08 or \
-       op_flags & 0xc0 and op_flags & 0x18 and not (op_flags & 0x88 == 0x88 and not op_flags & 0x50): raise ValueError("invalid RKEWOp flags")
-    ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk),di,da),RKArg(RKBufferKind(lk),li,la),RKArg(RKBufferKind(rk_),ri,ra),count,ew_cfg,*(bool(op_flags & 1<<bit) for bit in range(8))))  # noqa: E501
-  cmac = None
-  if flags:
-    dk,lk,rk_,fp16,di,li,ri,da,la,ra,m,n,k = _CMAC.unpack_from(blob, off); off += _CMAC.size
-    if max(dk,lk,rk_) > 1 or fp16 > 3 or min(da,la,ra) < 0 or min(m,n,k) <= 0: raise ValueError("invalid RKCMAC")
-    cmac=RKCMAC(RKArg(RKBufferKind(dk),di,da),RKArg(RKBufferKind(lk),li,la),RKArg(RKBufferKind(rk_),ri,ra),m,n,k,bool(fp16&1),bool(fp16&2)); _validate_cmac(cmac,scratch)  # noqa: E501
-  if off + nconst != len(blob): raise ValueError("invalid RKImage size")
-  return RKImage(RKTarget(target),scratch,blob[off:],version,tuple(gathers[:ngather-mid_count-post_count]),tuple(ew_ops),
-    tuple(gathers[ngather-mid_count-post_count:ngather-post_count]),gather_after,tuple(gathers[-post_count:] if post_count else ()),tuple(host_addresses[:nhost_gather]),tuple(host_addresses[nhost_gather:]),cmac)  # noqa: E501
+  def arg(x): return RKArg(RKBufferKind(x[0]), *x[1:])
+  def gather(x): return RKGather(x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],x[8],x[9],x[10],RKBufferKind(x[11]),x[12],RKBufferKind(x[13]),x[14])  # noqa: E501
+  def host(x): return RKHostAddress(*(arg(v) for v in x[:3]), *x[3:])
+  def ew(x): return RKEWOp(*(arg(v) for v in x[:3]), *x[3:])
+  def cmac(x): return RKCMAC(*(arg(v) for v in x[:3]), *x[3:])
+  try:
+    if blob[:4] != RKIMAGE_MAGIC or struct.unpack_from("<H", blob, 4)[0] != RKIMAGE_VERSION: raise ValueError
+    codec=zlib.decompressobj(); payload=codec.decompress(blob[6:])
+    if codec.unused_data or not codec.eof: raise ValueError
+    stream=io.BytesIO(payload); values=marshal.load(stream)
+    if stream.tell() != len(payload): raise ValueError
+    target,scratch,constants,version,gathers,ops,mid,gather_after,post,host_gathers,host_scatters,contract=values
+    image=RKImage(RKTarget(target),tuple(RKScratch(*x) for x in scratch),constants,version,tuple(map(gather,gathers)),tuple(map(ew,ops)),
+      tuple(map(gather,mid)),gather_after,tuple(map(gather,post)),tuple(map(host,host_gathers)),tuple(map(host,host_scatters)),None if contract is None else cmac(contract))  # noqa: E501
+    _validate_image(image); return image
+  except (EOFError, TypeError, ValueError, IndexError, KeyError, struct.error, zlib.error): raise ValueError("invalid RKImage") from None
 
 def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tuple[int, ...]:
   commands = list(stage.commands)

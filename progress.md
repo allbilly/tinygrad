@@ -8254,6 +8254,49 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — replace the handwritten RKImage codec at 2,264 lines
+
+This hardware-accepted milestone follows `ad9fb9a52`.  Its predeclared and
+observed token-aware renderer budget is exactly **+34/-70 executable lines,
+net -36**.  The raw renderer diff is **+34/-68** because changed physical
+lines do not map one-for-one to the token-aware `sz.py` count.  Authoritative
+size moves renderer **2300 -> 2264** and repository total **27811 -> 27775**;
+runtime remains **443**.
+
+`encode_image` and `decode_image` now own a versioned marshal/zlib encoding of
+one primitive tuple, with explicit reconstruction of every `RKImage` record.
+`_validate_image` preserves the old integer-width and semantic checks before
+encoding and after decoding.  A boundary-checked object stream rejects bad magic or
+version, truncated compression, trailing compressed bytes, trailing marshal
+bytes, and malformed root values.  The five fixed `struct.Struct` schemas and
+their field-by-field scratch, gather, host-address, EW, and CMAC loops are
+obsolete; the private wire version moves from 31 to 32.  Production
+`to_program`, command emission, runtime ordering, and arithmetic lowering are
+unchanged, and no CPU/GPU/host numeric fallback or hand-built render shortcut
+was added.
+
+Across **204** images emitted by the full Rockchip host UOp module, encoded
+size falls from **16,923,744 to 3,643,697 bytes** and the largest image falls
+from **3,516,604 to 643,487 bytes**.  A JSON/zlib alternative was rejected: it
+used **4,258,811 bytes**, 16.9% more than marshal on the same corpus.  The
+production ABS and MINIMUM fixtures now encode to **1,387 and 158 bytes**;
+the two biased eight-channel convolution fixtures encode to **2,093 and 2,069
+bytes**.  Exact hashes and sizes remain pinned in the unit suite, and a new
+malformed-stream regression covers both compression and object boundaries.
+
+Final host verification reports **155 passed** with
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The required
+serial production `to_program` hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`: **433 passed, 12
+suite-declared skips, and 154 subtests passed in 1626.46 seconds**, accounting
+for all **445** cases with zero failures.  The observational ownership trace
+recorded **138 CMAC reduction hits across 67 tests** and **9 CMAC storage
+epilogue hits across 5 tests**, confirming the native contraction path stayed
+live.  The authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py`
+health gate passed before and after the census with `SUBMIT ret=0` and exact
+output `[8 8 8 8 8 8 8 8]`.
+
 ## 2026-08-24 — compose CMAC storage epilogues at 2,300 lines
 
 This hardware-accepted milestone follows `583cf0841`.  Its final predeclared
