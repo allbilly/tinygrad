@@ -1157,19 +1157,16 @@ class RKContext:
   def __init__(self, output:RKOutput, *, accurate_adds:bool=True):
     self.store, self.out_param, self.count, self.out_index, self.root = output
     self.out = RKArg(RKBufferKind.ARG, self.out_param.arg.slot)
-    self.values:dict[UOp, RKValue] = {}
-    self.scratch:list[RKScratch] = []
-    self.constants:dict[bytes, int] = {}
-    self.materialized_slots:dict[tuple, int] = {}
+    # Initialize per-context state before checking the root-derived layout.
+    self.values, self.scratch = {}, []  # type: dict[UOp, RKValue], list[RKScratch]
+    self.constants, self.materialized_slots = {}, {}  # type: dict[bytes, int], dict[tuple, int]
     self.raw_components:dict[RKArg, tuple[RKValue, ...]] = {}
     self.int32_divmod:dict[tuple[UOp, UOp], tuple[tuple[RKArg, ...], tuple[RKArg, ...], RKArg, RKArg]] = {}
     self.int16_masks:dict[RKArg, int] = {}
     self.fp16_components:dict[RKArg, tuple[RKValue, RKArg, RKArg]] = {}
     self.fp16_ordered:dict[RKArg, tuple[RKArg, RKArg]] = {}
-    self.gathers:list[RKGather] = []
-    self.host_gathers:list[RKHostAddress] = []
-    self.mid_gathers:list[RKGather] = []
-    self.post_gathers:list[RKGather] = []
+    self.gathers, self.host_gathers = [], []  # type: list[RKGather], list[RKHostAddress]
+    self.mid_gathers, self.post_gathers = [], []  # type: list[RKGather], list[RKGather]
     self.ew_ops:list[RKEWOp] = []
     self.mask_program, nodes = any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in self.root.toposort()), self.root.toposort()
     int_range = _exact_int_range(self.root) if self.root.dtype.scalar() is dtypes.int else None
@@ -1860,6 +1857,8 @@ class RKContext:
     return self._raw_where(u)
 
   def _widen_int16(self, u:UOp, source:RKValue) -> RKValue:
+    # UINT values reaching this helper are INT32-backed typed-load or constant carriers.
+    if source.dtype is dtypes.uint and source.layout is RKLayout.INT32: return replace(source, dtype=dtypes.int)
     if source.layout not in (RKLayout.INT16, RKLayout.BOOL_INT16) or (u is not self.root and self.int_layout is not RKLayout.INT32) or \
        (u is self.root and self.out_param.dtype.scalar() is not dtypes.int):
       raise _RKGenericReject
@@ -1873,8 +1872,7 @@ class RKContext:
     elif (dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool) and u in self.static_nodes and
           not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
       value = self._static(u)
-    elif u.op is Ops.INDEX: value = self.lower(u.load())
-    elif u.op is Ops.LOAD: value = self._load(u)
+    elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
     elif u.op is Ops.BITCAST and len(u.src) == 1:
       source = self.lower(u.src[0])
       if dtype is dtypes.int16 and u.src[0].dtype.scalar() is dtypes.half and source.layout is RKLayout.FP16:
@@ -1905,8 +1903,8 @@ class RKContext:
             dtype is dtypes.half and source.layout in (RKLayout.BOOL_MASK, RKLayout.INT_FP16) or
             dtype is dtypes.int16 and source.layout in (RKLayout.INT16, RKLayout.BOOL_INT16) or
             dtype is dtypes.int and source.layout is RKLayout.BOOL_INT16 and self.int_layout is RKLayout.INT16):
-        value = RKValue(source.arg, dtype, self.count,
-                        RKLayout.FP16 if source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16) else RKLayout.INT16)
+        # The admitted targets select the physical lane without changing storage ownership.
+        value = replace(source, dtype=dtype, layout=RKLayout.FP16 if dtype in (dtypes.half,dtypes.float) else RKLayout.INT16)
       elif dtype is dtypes.int and source.layout in (RKLayout.FP16, RKLayout.BOOL_MASK):
         if self.int_layout is RKLayout.INT_FP16:
           if source.layout is RKLayout.BOOL_MASK: value = RKValue(source.arg, dtype, self.count, self.int_layout)
@@ -1915,8 +1913,6 @@ class RKContext:
           value = self._scratch(dtype, self.int_layout)
           self.ew_ops.append(RKEWOp(value.arg, source.arg, source.arg, self.count, _EW_CFG[Ops.MAX], stateful=True, int16_output=True))
         else: raise _RKGenericReject
-      elif dtype is dtypes.int and source_dtype is dtypes.uint and source.layout is RKLayout.INT32:
-        value = RKValue(source.arg, dtype, self.count, source.layout)
       elif dtype is dtypes.int: value = self._widen_int16(u, source)
       else: raise _RKGenericReject(f"cast {source.layout.name}->{dtype}")
     elif u.op is Ops.ADD and dtype is dtypes.half and u.arg is None and self.accurate_adds:

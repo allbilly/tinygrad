@@ -8254,6 +8254,45 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — centralize RKContext physical records at 2,336 lines
+
+This isolated milestone follows `c3ee8b34e`.  The predeclared renderer budget
+was **+8/-15 executable lines, net -7**, including a line-neutral signed-scale
+CMAC experiment.  A bit-exact arithmetic probe found that distributing a
+negative binary outer scale changes signed zero at the accumulation boundary,
+so that admission and its test edit were rejected before integration.  The
+final behavior-preserving renderer budget is **+7/-14 executable lines, net
+-7**; its raw diff is **+10/-14** because three explanatory comments are
+retained.  Authoritative `sz.py` size moves renderer **2343 -> 2336** and
+repository total **27855 -> 27848**; runtime remains **444**.
+
+`RKContext.__init__` now groups the related typed empty containers which share
+one per-context lifetime.  `RKContext._widen_int16` owns the existing INT32-
+backed UINT-to-INT representation change, replacing its separate `lower`
+branch.  `RKContext.lower` also shares INDEX/LOAD dispatch and uses immutable
+record replacement for physical-only cast retyping.  Existing comments and
+all semantic checks remain.  No CMAC admission, arithmetic recipe, image
+field, wire encoding, runtime path, scheduler hook, CPU/GPU numeric fallback,
+tolerance, or test changed.
+
+A committed-parent/candidate lowering oracle observed **282 outcomes / 266
+images / 41 CMAC images / 16 rejections** across all 146 Rockchip UOp tests.
+Every admission, encoded image, and resource record is byte-identical; both
+normalized records hash to
+`5c6a6f9adcc2780a8d80fed7045dcfd3a12d5e880490462455b606e037800080`.
+Actual production `Tensor.schedule_linear -> to_program` plain and ReLU matmul
+images, plus their emitted 45-qword CMAC stages, remain byte-identical at
+aggregate record SHA-256
+`c285d5c531223c832f8925b8c768a484fa82ba57d2a589683533d21b9869edb7`.
+
+Host verification reports **146 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  The Fable
+Judge verdict is **VERIFIED WITH CAVEATS**, with the live hardware bracket as
+its sole caveat.  The user has now authorized the serial 445-case run on the
+new boot; its pre-health -> census -> post-health result is pending this commit.
+
 ## 2026-08-24 — immutable lowering records share physical ownership at 2,343 lines
 
 This isolated milestone follows `023b6869f`.  Its predeclared and observed
