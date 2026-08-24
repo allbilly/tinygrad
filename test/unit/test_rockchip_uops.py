@@ -1224,17 +1224,38 @@ def test_tensor_mean_routes_scaled_production_cmac_weights():
   assert image.execution_class is RKExecutionClass.NATIVE and not image.host_gathers and not image.host_scatters
 
 
-def test_arange_weighted_tensor_sum_routes_production_cmac():
+def test_arange_weighted_tensor_sum_routes_binary_outer_scale_cmac():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP",5,dtypes.half,num=1006))
-    ast = (source*Tensor.arange(1,6).cast(dtypes.half)).sum().schedule_linear().src[0].src[0]
-    to_program_cache.clear()
-    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
-  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
-  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,5)
-  assert image.gathers[0].offsets[:5] == tuple(range(5))
-  assert _cmac_weights(image) == tuple(rockchip_renderer._fp16_bits(value) for value in range(1,6))
-  assert not image.constants and not image.ew_ops and image.execution_class is RKExecutionClass.NATIVE
+    weighted = source*Tensor.arange(1,6).cast(dtypes.half)
+    def scaled(*factors:float) -> Tensor:
+      value = weighted.sum(dtype=dtypes.float)
+      for factor in factors: value = value*factor
+      return value.cast(dtypes.half)
+    outputs = (weighted.sum(),scaled(0.5),scaled(0.75),scaled(-0.5),(source.sum(dtype=dtypes.float)*0.75).cast(dtypes.half))
+    images = []
+    for output in outputs:
+      to_program_cache.clear()
+      program = to_program(output.schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
+      images.append(decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg))
+  for image,scale in zip(images[:2],(1.0,0.5)):
+    assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,5)
+    assert image.gathers[0].offsets[:5] == tuple(range(5))
+    assert _cmac_weights(image) == tuple(rockchip_renderer._fp16_bits(scale*value) for value in range(1,6))
+    assert not image.constants and not image.ew_ops and image.execution_class is RKExecutionClass.NATIVE
+  assert all(image.cmac is None and image.ew_ops for image in images[2:])
+  def lower_factors(factors:tuple[float, ...]) -> RKImage|None:
+    out,source = UOp.param(0,dtypes.half,(1,)),UOp.param(1,dtypes.half,(4,))
+    terms = [source.index(i).load().cast(dtypes.float)*UOp.const(weight,dtypes.float)
+             for i,weight in enumerate((0.5,-0.25,2.0,0.125))]
+    value = functools.reduce(lambda total,term:total+term,terms[1:],terms[0])
+    for factor in factors: value = value*UOp.const(factor,dtypes.float)
+    return _lower_uop_program(list(out.index(0).store(value.cast(dtypes.half)).sink().toposort()))
+  exact = lower_factors((0.25,2.0))
+  rejected = tuple(lower_factors(factors) for factors in ((0.1,5.0),(0.1,10.0),(2.0**127,2.0**-127)))
+  assert exact is not None and exact.cmac is not None and _cmac_weights(exact) == tuple(
+    rockchip_renderer._fp16_bits(value) for value in (0.25,-0.125,1.0,0.0625))
+  assert all(image is not None and image.cmac is None and image.ew_ops for image in rejected)
 
 
 def test_static_dot_reduce_owns_accurate_physical_recipe():

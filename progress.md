@@ -8254,6 +8254,77 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — binary outer scales broaden weighted CMAC at 2,352 lines
+
+This isolated milestone follows `55710b1d5`.  Its initial renderer budget was
+**+4/-7 executable lines, net -3**.  The safety-adjusted budget, declared
+before the final correction, is **+6/-9, net -3** because explicit scale
+provenance replaces two previously unchanged lines; the observed production
+diff matches that revised budget exactly.  Authoritative `sz.py` size moves
+renderer **2355 -> 2352** and repository total **27867 -> 27864**; runtime
+remains **444**.
+
+`_lower_cmac_reduction` now folds an outer scale into one-source CMAC weights
+only when every factor still visible in the scheduled UOps is positive and a
+power of two, every cumulative peeled scale remains exactly representable in
+FP16, and every final term weight remains finite and FP16-exact.  This admits
+real weighted binary-scaled reductions without crossing a floating-point
+rounding boundary.  The same owner now constructs its two physical gather
+surfaces directly, deleting the one-use `gather_surface`; the typed-load plan
+assignment and rejection also share one line.  Existing comments and
+docstrings remain.  No generic reduction IR, wire field, runtime path,
+CPU/GPU numeric fallback, tolerance, or hardware retry was added.
+
+Negative and non-binary visible factors, an unsafe net-one composite chain,
+extreme binary chains whose intermediate scale leaves the exact carrier,
+scaled two-source dots, and non-scale post-reduction operations remain EW.
+The stronger guard also removes a legacy unsafe admission for an unweighted
+sum scaled by `0.75`.  These checks necessarily apply to the production
+scheduled UOps; factor provenance already canonicalized away by the scheduler
+cannot be recovered in the renderer.
+
+An actual production `Tensor.schedule_linear -> to_program` weighted sum
+scaled by `0.5` moves from **142 EW stages / five gathers / 6,225 bytes**,
+SHA-256
+`b7d32fa45e2d9278085fc43875792d73de52b22605be4bf3466f6812ed209f8d`,
+to `(1,1,5)` CMAC with two input gathers and one post-gather / 2,377 bytes,
+SHA-256
+`5e40284edd9bc4e6677940cb4f62f101d94e9dd0b11fc1ce7d75fcc7740c4f81`.
+The unsafe unweighted `0.75` case moves from CMAC / 2,377 bytes, SHA-256
+`7cdd244283c8f2b06e04d6b5a620ac25a48e75fc2a66916d7975a2dc9e0b20ba`,
+to **82 EW stages / 3,737 bytes**, SHA-256
+`3320dbce9384ff0a8fbc4174a4a6d53bf2bc763f02f0613cc4532f1f1ac6ef09`.
+Unscaled weighted CMAC, weighted non-binary and negative fallbacks, scaled-dot
+fallback, and `3x5 @ 5x4` CMAC remain byte-identical; the seven-case candidate
+production record hashes to
+`f908a98f5176dc92b5daadd819d251421a0ae6955f085c294c0f19f1dec12d9e`.
+
+The semantic/packing oracle checks six admitted scales over **427,680 vectors
+per scale** plus **1,000 physical packed vectors per scale**, as well as four
+safe visible factor chains; its image-record SHA-256 remains
+`1fe2c6caff337a5f0cca9afc4ec2bd9680fdaeae0488d3cd410a7149d916b9b2`.
+It proves why the rejected visible chains cannot be reassociated: `(0.1,5)`,
+`(0.1,10)`, large-then-small binary, and small-then-large binary chains differ
+on respectively **53,173**, **53,173**, **251,413**, and **6,405** vectors;
+unweighted `0.75` differs on **28,224**.  A second randomized oracle covers
+**64 valid cumulative-scale chains x 50,000 vectors** with chain-set SHA-256
+`f383c9db6b183e0849a77f1ee3ac9fbb4664d4af4768925702c9f7643d5ce499`.
+A committed-parent/candidate oracle observes **270 lowering outcomes / 254
+RKImages** across the complete pre-existing Rockchip UOp module with zero
+changes; both compact record sets hash to
+`a7c2754f9c258e96cc80005c7ae4847911eb9e237a2383edbb26e8c46b6df7c3`.
+
+Host verification reports **142 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  Two
+adversarial refutations kept unsafe drafts out of the commit; the final Fable
+Judge verdict is **VERIFIED WITH CAVEATS**, with the prohibited live hardware
+bracket as its sole caveat.  No device, health, reset, reboot, hardware
+execution, or full hardware census command was run because the board remains
+untrusted; fresh-boot CMAC acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — one owner finalizes EW command chains at 444 runtime lines
 
 This isolated milestone follows `a4e8802d8`.  Its predeclared and observed

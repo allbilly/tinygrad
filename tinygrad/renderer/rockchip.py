@@ -623,8 +623,8 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   graph = root.toposort(); local_loads = _semantic_loads(root, local=True) if any(u.op is Ops.BUFFER for u in graph) else (); local_add = bool(local_loads) and all(load.dtype.scalar() is dtypes.float for load in local_loads); additive = local_add or (_strip_cast(root).op is Ops.ADD and _strip_cast(root).dtype.scalar() is dtypes.float) or any(u.op is Ops.REDUCE and (u.arg is Ops.ADD or isinstance(u.arg, tuple) and u.arg and u.arg[0] is Ops.ADD) for u in graph)  # noqa: E501
   try: root = _unroll_static_reduces(_unroll_static_local(uops, root) if local_loads else root, precise=False)
   except (_RKGenericReject, RuntimeError, ValueError): return None
-  scale = 1.0
-  while (pair:=_const_operand(root:=_strip_cast(root), Ops.MUL)) is not None: root,scale = pair[0],scale*float(pair[1].arg)
+  scale,exact_scale = 1.0,True
+  while (pair:=_const_operand(root:=_strip_cast(root), Ops.MUL)) is not None: root,factor=pair[0],float(pair[1].arg); scale*=factor; exact_scale=exact_scale and factor > 0.0 and math.frexp(factor)[0] == 0.5 and float_to_fp16(scale) == scale  # noqa: E501
   terms = tuple(_strip_cast(term) for term in _iter_binary(root, Ops.ADD)) if root.op is Ops.ADD else \
     (_strip_cast(root),) if additive else ()
   terms = tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)); groups = len(terms)
@@ -633,9 +633,8 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   parsed:list[tuple[tuple[RKTypedLoadPlan, ...], float]] = []; cells = 0
   for term in terms:
     factors = tuple(map(_strip_cast, _iter_binary(_strip_cast(term), Ops.MUL, plain=True))); constants = tuple(node for node in factors if node.op is Ops.CONST); loads = tuple(node for node in factors if node.op is not Ops.CONST)  # noqa: E501
-    if len(constants) > 2 or len(constants) > 1 and term.dtype.scalar() is not dtypes.float or constants and scale != 1.0 or any(float_to_fp16(float(node.arg)) != float(node.arg) for node in constants) or len(loads) > 2 or any(len(load.src) > 1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0 or math.copysign(1.0,float(load.src[1].arg)) < 0.0) for load in loads) or not math.isfinite(weight:=scale*math.prod(float(node.arg) for node in constants)) or len(loads) < 2 and float_to_fp16(weight) != weight or len(loads) == 2 and weight != 1.0 or rows*len(loads) > _MAX_DYNAMIC_SELECTOR_CELLS-cells: return None  # noqa: E501
-    plans = typing_cast(tuple[RKTypedLoadPlan, ...], tuple(_typed_load_plan(load,dtypes.half,out_index,rows,require_offsets=True) for load in loads))  # noqa: E501
-    if None in plans: return None
+    if len(constants) > 2 or len(constants) > 1 and term.dtype.scalar() is not dtypes.float or not exact_scale or any(float_to_fp16(float(node.arg)) != float(node.arg) for node in constants) or len(loads) > 2 or any(len(load.src) > 1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0 or math.copysign(1.0,float(load.src[1].arg)) < 0.0) for load in loads) or not math.isfinite(weight:=scale*math.prod(float(node.arg) for node in constants)) or len(loads) < 2 and float_to_fp16(weight) != weight or len(loads) == 2 and weight != 1.0 or rows*len(loads) > _MAX_DYNAMIC_SELECTOR_CELLS-cells: return None  # noqa: E501
+    if None in (plans:=typing_cast(tuple[RKTypedLoadPlan, ...], tuple(_typed_load_plan(load,dtypes.half,out_index,rows,require_offsets=True) for load in loads))): return None  # noqa: E501
     parsed.append((plans,weight)); cells += rows*len(loads)
   # A is row-stable and B is column-stable; explicit offset tables allow source-stride differences and broadcasts.
   def align(m:int, n:int, lanes:tuple[int, ...]=()) -> tuple[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float], ...]:
@@ -657,10 +656,8 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   diagonal,_,_,_,_,ai,ao,m,n,outputs,normalized = min(candidates, key=lambda item:item[:5])
   a_cells = tuple(((source.param.arg.slot,source.offsets[row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(1.0 if normalized[k][1] is None else normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
   b_cells = tuple(((source.param.arg.slot,source.offsets[ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
-  def gather_surface(dst:int, cells:tuple[tuple[int|None,int], ...]) -> tuple[RKGather, ...]:
-    sources = tuple(dict.fromkeys(source for source,_ in cells if source is not None)); values = tuple(value if source is None else 0 for source,value in cells); seeded = not sources or any(values)  # noqa: E501
-    return ((RKGather(out.arg.slot,dst,len(cells),values=values),) if seeded else ()) + tuple(RKGather(source,dst,len(cells),offsets=tuple(value if owner == source else -1 for owner,value in cells),partial=seeded or bool(i)) for i,source in enumerate(sources))  # noqa: E501
-  gathers = tuple(gather for dst,cells in enumerate((a_cells,b_cells)) for gather in gather_surface(dst,cells))
+  gathers = tuple(gather for dst,cells in enumerate((a_cells,b_cells)) for sources,values in ((tuple(dict.fromkeys(source for source,_ in cells if source is not None)),tuple(value if source is None else 0 for source,value in cells)),) for seeded in (not sources or any(values),)  # noqa: E501
+    for gather in (((RKGather(out.arg.slot,dst,len(cells),values=values),) if seeded else ()) + tuple(RKGather(source,dst,len(cells),offsets=tuple(value if owner == source else -1 for owner,value in cells),partial=seeded or bool(i)) for i,source in enumerate(sources))))  # noqa: E501
   if sum(gather.count for gather in gathers)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
   fp16 = out.dtype.scalar() is dtypes.half
   output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for i in (outputs or range(rows)) for row,col in (divmod(i,n),))  # noqa: E501
