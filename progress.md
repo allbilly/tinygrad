@@ -8300,6 +8300,38 @@ or other device command followed.  The fail-closed artifacts are under
 `/home/orangepi/rk-live-445-e4808c8a4-20260824T1000`; live hardware acceptance
 therefore remains pending a separately authorized fresh reboot and bracket.
 
+## 2026-08-24 — fresh-boot 445 census stops at biased convolution
+
+The user authorized a second exact live census after the board reached fresh
+boot `4d252bad-f0d3-415a-af17-b617f95b7ae1`.  The candidate was clean at
+documentation commit `94eea7e1c` with production code commit `e4808c8a4`.
+The authoritative pre-health
+`.venv/bin/python ~/rk3588/examples/simple_add.py` passed with exit 0 and the
+expected eight output lanes equal to eight.
+
+The actual serial command used the required
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` environment and ran
+`test/backend/test_rockchip.py -q -x -n0`.  It stopped at collected case 35,
+`TestRockchipConvOps.test_biased_conv2d`, after **34 passed** and **6 subtests
+passed**.  One of 200 FP16 output elements exceeded the unchanged
+`atol=rtol=0.005` contract: actual `1.150390625`, expected `1.1376953125`,
+absolute difference `0.0126953125`.  Pytest exited 1 after **52.87 s**.
+
+A subsequent host-only production `schedule_linear -> to_program` inspection
+of the same two-convolution graph produced two native images with **480** and
+**478** EW stages, 17 gathers each, and **no CMAC stage**.  The observed
+failure is therefore on the retained generic EW fallback, not evidence of a
+CMAC result mismatch.  This classification did not open or allocate the NPU.
+
+This is a failed 445-case census, not a pass.  The one-shot bracket stopped on
+that first failure: the test was not retried, post-health was not run, and no
+reset, repair, or further NPU command followed.  The persistent receipt is
+`/home/orangepi/rk-live-445-94eea7e1c-20260824-freshboot`, including the pinned
+head/tree/boot, passing pre-health log, complete census log, exit receipt, and
+explicit unrun post-health status.  Hardware acceptance remains pending a
+newly authorized fresh-boot bracket after this numeric EW-path failure is
+diagnosed and corrected.
+
 ## 2026-08-24 — immutable lowering records share physical ownership at 2,343 lines
 
 This isolated milestone follows `023b6869f`.  Its predeclared and observed
