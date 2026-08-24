@@ -8254,6 +8254,49 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — static semantics and physical carriers consolidate at 2,220 lines
+
+This hardware-accepted milestone follows `0888d01a3`.  Its predeclared
+replacement budget was exactly **+22/-47 executable lines, net -25**, and the
+authoritative target is met exactly: renderer **2245 -> 2220** and repository
+total **27756 -> 27731**; runtime remains **443**.  The mechanical removal of
+three semantic layout names touches otherwise unchanged branches, so the raw
+diff is **+77/-102** and the tokenized changed-line diff is **+76/-101**; both
+also resolve to the same net **-25** measured by `sz.py`.
+
+`_eval_expr` now delegates both scalar and vector compile-time ALU semantics
+to Tinygrad's existing `exec_alu`; `numpy.frompyfunc` only broadcasts that
+interpreter over compile-time index vectors.  This replaces separate NumPy
+recipes for division, modulo, maximum, WHERE, truncation, and reciprocal, plus
+the parallel `python_alu` dispatch.  `RKLayout` now describes only the three
+physical DPU carriers: FP16, INT16, and INT32.  `RKValue.dtype` retains BOOL,
+integer-on-FP16, and ordinary numeric meaning.  Cast and bool-coercion branches
+explicitly consult the semantic dtype where the former layout tags used to
+disambiguate them.  No runtime arithmetic, CPU/GPU numerical fallback, image
+field, wire format, native stage, CMAC admission, or test changed.
+
+A serial committed-parent/candidate lowering oracle observed **287 lowering
+outcomes / 270 encoded RKImages / 17 shared rejections** across the complete
+Rockchip UOp module, including its actual production
+`Tensor.schedule_linear -> to_program` fixtures.  The complete 76,183-byte
+records are byte-identical at SHA-256
+`593805af3e68fcef32b863ad8ca62feab6444d0fe5d2b681c7d78c034f6e009c`.
+The tested candidate renderer SHA-256 is
+`68a3c02b61b332580d6415f36ce6662bed97109b3ce04c930d672826b1280860`.
+
+Host verification reports **155 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The required
+serial production hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and exited zero: **433 passed,
+12 suite-declared skips, and 154 subtests passed in 1914.00 seconds**, exactly
+accounting for all **445** cases with zero failures.  The retained census log
+has SHA-256
+`f8eb4b32ee427f1bcb31d459de9fad8431b10758a0fde804c250b146839d4221`.
+The authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` health
+gate passed before and after the census with `reset_npu ret=0`, `SUBMIT ret=0`,
+and exact output `[8 8 8 8 8 8 8 8]`.
+
 ## 2026-08-24 — typed outputs share generic RKContext ownership at 2,245 lines
 
 This hardware-accepted milestone follows `150638c3d`.  Its final predeclared
