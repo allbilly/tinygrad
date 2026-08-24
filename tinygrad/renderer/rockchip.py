@@ -1596,29 +1596,71 @@ class RKContext:
       value = self.lower(nonzero)
       if value.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
       return RKValue(value.arg, dtypes.bool, self.count, value.layout)
-    if u.op in (Ops.CMPNE, Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_equality(u)
-    if u.op is Ops.CMPLT and all(src.dtype.scalar() is dtypes.half for src in u.src): return self._fp16_less(u)
-    if all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
-      sources = tuple(UOp.const(int(src.arg), dtypes.int) if src.dtype.scalar() is dtypes.weakint else src for src in u.src)
-      bounds = tuple(_exact_int_range(src) for src in sources)
+    if all(src.dtype.scalar() is dtypes.half for src in u.src): pass
+    elif all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
+      int_sources = typing_cast(tuple[UOp, UOp], tuple(UOp.const(int(src.arg), dtypes.int) if src.dtype.scalar() is dtypes.weakint else src for src in u.src))  # noqa: E501
+      bounds = tuple(_exact_int_range(src) for src in int_sources)
       if self.int_layout is RKLayout.INT_FP16 or self.int_layout is not RKLayout.INT32 and all(bound is not None and
         -2048 <= bound[0] <= bound[1] <= 2048 for bound in bounds):
-        value = self.lower(UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in sources), arg=u.arg))
+        value = self.lower(UOp(u.op, dtypes.bool, src=tuple(_int_fp16_expr(src) for src in int_sources), arg=u.arg))
         if value.layout not in (RKLayout.BOOL_MASK, RKLayout.BOOL_INT16): raise _RKGenericReject
         return value
-      return self._int32_compare(u.replace(src=sources))
-    if all(src.dtype.scalar() is dtypes.int16 for src in u.src):
+      u = u.replace(src=int_sources)
+      def operand(src:UOp) -> RKValue:
+        value = self._slot(self.materialized_slots, tuple(x & 0xffffffff for x in _static_values(self.out_index, src, self.count, int)),
+                           dtypes.int, RKLayout.INT32) if src in self.static_nodes else self.lower(src)
+        if value.layout is not RKLayout.INT32: raise _RKGenericReject
+        return value
+      lhs_value, rhs_value = (operand(src) for src in u.src)
+      lhs_bytes, rhs_bytes = self._raw(lhs_value), self._raw(rhs_value)
+      def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
+      constants = {value:self._constant(UOp.const(value, dtypes.int16)).arg for value in (0, 1, 127, 128, 256)}
+      if u.op is Ops.CMPLT:
+        lhs_components, rhs_components = [value.arg for value in lhs_bytes[::-1]], [value.arg for value in rhs_bytes[::-1]]
+        def biased_sign(value:RKArg) -> RKArg:
+          delta, positive, high, scaled, biased = (allocate() for _ in range(5))
+          self.ew_ops.extend(_ew_ops(((delta, value, constants[127], Ops.SUB), (positive, delta, constants[0], Ops.MAX),
+            (high, positive, constants[1], _EW_CFG_MIN), (scaled, high, constants[256], Ops.MUL),
+            (biased, value, constants[128], Ops.ADD), (biased, biased, scaled, Ops.SUB)), self.count, **_INT16_EW))
+          return biased
+        lhs_components[0], rhs_components[0] = biased_sign(lhs_components[0]), biased_sign(rhs_components[0])
+        mask = _ordered_byte_less(self.ew_ops, allocate, constants[0], constants[1], lhs_components, rhs_components, self.count)
+      else:
+        equal = constants[1]
+        for left,right in zip(lhs_bytes, rhs_bytes):
+          equal = self._i16(equal, self._i16_equal(left.arg, right.arg), _EW_CFG[Ops.MUL])
+        if u.op is Ops.CMPEQ: mask = equal
+        elif u.op is Ops.CMPNE: mask = self._i16(constants[1], equal, _EW_CFG[Ops.SUB])
+        else: raise _RKGenericReject
+      return RKValue(mask, dtypes.bool, self.count, RKLayout.BOOL_INT16)
+    elif all(src.dtype.scalar() is dtypes.int16 for src in u.src):
       if u.op not in (Ops.CMPLT, Ops.CMPNE): raise _RKGenericReject
-      lhs, rhs = u.src
-      delta = rhs.alu(Ops.SUB, lhs) if u.op is Ops.CMPLT else lhs.alu(Ops.SUB, rhs)
+      lhs_uop, rhs_uop = u.src
+      delta = rhs_uop.alu(Ops.SUB, lhs_uop) if u.op is Ops.CMPLT else lhs_uop.alu(Ops.SUB, rhs_uop)
       magnitude = delta.alu(Ops.MAX, UOp.const(0, dtypes.int16)) if u.op is Ops.CMPLT else \
         UOp(Ops.MAX, dtypes.int16, src=(delta, delta), arg=_NATIVE_ABS)
       value = self.lower(UOp(Ops.MAX, dtypes.int16, src=(magnitude, UOp.const(1, dtypes.int16)), arg=_NATIVE_MIN))
       if value.layout is not RKLayout.INT16: raise _RKGenericReject
       return RKValue(value.arg, dtypes.bool, self.count, RKLayout.BOOL_INT16)
-    sources = tuple(_half_backed_value(src) for src in u.src)
-    if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in sources): raise _RKGenericReject
-    return (self._fp16_less if u.op is Ops.CMPLT else self._fp16_equality)(u.replace(src=typing_cast(tuple[UOp, UOp], sources)))
+    else:
+      half_sources = tuple(_half_backed_value(src) for src in u.src)
+      if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
+      u = u.replace(src=typing_cast(tuple[UOp, UOp], half_sources))
+    # Evaluate IEEE FP16 equality through raw bytes and native INT16 arithmetic, without reset-heavy compare stages.
+    # Evaluate IEEE FP16 less-than as an ordered raw-byte comparison without reset-heavy compare stages.
+    values = tuple(self._operand(src, dtypes.half) for src in u.src)
+    if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
+    zero, one = (self._constant(UOp.const(number, dtypes.int16)).arg for number in (0, 1))
+    if u.op is Ops.CMPLT:
+      ordered, nan = tuple(self._fp16_ordered_values(value) for value in values), tuple(self._fp16_component_values(value)[2] for value in values)
+      result = _ordered_byte_less(self.ew_ops, lambda: self._scratch(dtypes.int16, RKLayout.INT16).arg, zero, one, ordered[0], ordered[1], self.count)
+      result = self._i16(result, self._i16(one, self._i16(nan[0], nan[1], _EW_CFG[Ops.MAX]), _EW_CFG[Ops.SUB]), _EW_CFG[Ops.MUL])
+    else:
+      lhs_low,lhs_high,lhs_nan,rhs_low,rhs_high,rhs_nan = (*self._fp16_component_values(values[0]), *self._fp16_component_values(values[1]))
+      low_equal,high_equal,numeric = self._i16_equal(lhs_low.arg,rhs_low.arg),self._i16_equal(lhs_high,rhs_high),self._i16(one,self._i16(lhs_nan,rhs_nan,_EW_CFG[Ops.MAX]),_EW_CFG[Ops.SUB])  # noqa: E501
+      result = self._i16(self._i16(low_equal,high_equal,_EW_CFG[Ops.MUL]),numeric,_EW_CFG[Ops.MUL])
+      if u.op is Ops.CMPNE: result = self._i16(one, result, _EW_CFG[Ops.SUB])
+    return RKValue(result, dtypes.bool, self.count, RKLayout.BOOL_INT16)
 
   def _i16(self, lhs:RKArg, rhs:RKArg, cfg:int, dst:RKArg|None=None) -> RKArg:
     result = RKValue(dst or self._scratch(dtypes.int16, RKLayout.INT16).arg, dtypes.int16, self.count, RKLayout.INT16)
@@ -1686,47 +1728,6 @@ class RKContext:
     packed_raw, sign = (quotient_raw, quotient_sign) if u.op is Ops.CDIV else (remainder_raw, remainder_sign)
     return self._raw(self._i16_twos_complement(packed_raw, sign), RKLayout.INT32, u=u)
 
-  def _int32_compare(self, u:UOp) -> RKValue:
-    def operand(src:UOp) -> RKValue:
-      value = self._slot(self.materialized_slots, tuple(x & 0xffffffff for x in _static_values(self.out_index, src, self.count, int)),
-                         dtypes.int, RKLayout.INT32) if src in self.static_nodes else self.lower(src)
-      if value.layout is not RKLayout.INT32: raise _RKGenericReject
-      return value
-    lhs, rhs = (operand(src) for src in u.src)
-    lhs_bytes, rhs_bytes = self._raw(lhs), self._raw(rhs)
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-    constants = {value:self._constant(UOp.const(value, dtypes.int16)).arg for value in (0, 1, 127, 128, 256)}
-    if u.op is Ops.CMPLT:
-      lhs_components, rhs_components = [value.arg for value in lhs_bytes[::-1]], [value.arg for value in rhs_bytes[::-1]]
-      def biased_sign(value:RKArg) -> RKArg:
-        delta, positive, high, scaled, biased = (allocate() for _ in range(5))
-        self.ew_ops.extend(_ew_ops(((delta, value, constants[127], Ops.SUB), (positive, delta, constants[0], Ops.MAX),
-          (high, positive, constants[1], _EW_CFG_MIN), (scaled, high, constants[256], Ops.MUL),
-          (biased, value, constants[128], Ops.ADD), (biased, biased, scaled, Ops.SUB)), self.count, **_INT16_EW))
-        return biased
-      lhs_components[0], rhs_components[0] = biased_sign(lhs_components[0]), biased_sign(rhs_components[0])
-      mask = _ordered_byte_less(self.ew_ops, allocate, constants[0], constants[1], lhs_components, rhs_components, self.count)
-    else:
-      equal = constants[1]
-      for left,right in zip(lhs_bytes, rhs_bytes):
-        equal = self._i16(equal, self._i16_equal(left.arg, right.arg), _EW_CFG[Ops.MUL])
-      if u.op is Ops.CMPEQ: mask = equal
-      elif u.op is Ops.CMPNE: mask = self._i16(constants[1], equal, _EW_CFG[Ops.SUB])
-      else: raise _RKGenericReject
-    return RKValue(mask, dtypes.bool, self.count, RKLayout.BOOL_INT16)
-
-  def _fp16_equality(self, u:UOp) -> RKValue:
-    """Evaluate IEEE FP16 equality through raw bytes and native INT16 arithmetic, without reset-heavy compare stages."""
-    values = tuple(self._operand(src, dtypes.half) for src in u.src)
-    if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
-    _, one = (self._constant(UOp.const(number, dtypes.int16)).arg for number in (0, 1))
-    lhs_low,lhs_high,lhs_nan,rhs_low,rhs_high,rhs_nan = (*self._fp16_component_values(values[0]), *self._fp16_component_values(values[1]))
-    low_equal, high_equal = self._i16_equal(lhs_low.arg, rhs_low.arg), self._i16_equal(lhs_high, rhs_high)
-    numeric = self._i16(one, self._i16(lhs_nan, rhs_nan, _EW_CFG[Ops.MAX]), _EW_CFG[Ops.SUB])
-    equal = self._i16(self._i16(low_equal, high_equal, _EW_CFG[Ops.MUL]), numeric, _EW_CFG[Ops.MUL])
-    if u.op is Ops.CMPNE: equal = self._i16(one, equal, _EW_CFG[Ops.SUB])
-    return RKValue(equal, dtypes.bool, self.count, RKLayout.BOOL_INT16)
-
   def _fp16_component_values(self, value:RKValue) -> tuple[RKValue, RKArg, RKArg]:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
@@ -1750,16 +1751,6 @@ class RKContext:
     ordered_high = self._i16(positive_high, self._i16(sign, high_delta, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD])
     low_delta = self._i16(self._i16(const255, low.arg, _EW_CFG[Ops.SUB]), low.arg, _EW_CFG[Ops.SUB])
     return self.fp16_ordered.setdefault(value.arg, (ordered_high, self._i16(low.arg, self._i16(sign, low_delta, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD])))
-
-  def _fp16_less(self, u:UOp) -> RKValue:
-    """Evaluate IEEE FP16 less-than as an ordered raw-byte comparison without reset-heavy compare stages."""
-    values = tuple(self._operand(src, dtypes.half) for src in u.src)
-    if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
-    zero, one = (self._constant(UOp.const(number, dtypes.int16)).arg for number in (0, 1))
-    ordered, nan = tuple(self._fp16_ordered_values(value) for value in values), tuple(self._fp16_component_values(value)[2] for value in values)
-    less = _ordered_byte_less(self.ew_ops, lambda: self._scratch(dtypes.int16, RKLayout.INT16).arg, zero, one, ordered[0], ordered[1], self.count)
-    numeric = self._i16(one, self._i16(nan[0], nan[1], _EW_CFG[Ops.MAX]), _EW_CFG[Ops.SUB])
-    return RKValue(self._i16(less, numeric, _EW_CFG[Ops.MUL]), dtypes.bool, self.count, RKLayout.BOOL_INT16)
 
   def _masked_where(self, u:UOp, dtype:DType, layout:RKLayout, selector:RKValue,
                     yes:RKValue, no:RKValue, one:RKValue) -> RKValue:

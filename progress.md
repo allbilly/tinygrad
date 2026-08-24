@@ -8332,6 +8332,45 @@ explicit unrun post-health status.  Hardware acceptance remains pending a
 newly authorized fresh-boot bracket after this numeric EW-path failure is
 diagnosed and corrected.
 
+## 2026-08-24 — comparison lowering has one owner at 2,329 lines
+
+This isolated cleanup follows `a25813be4`.  Its predeclared ownership budget
+is exactly **70 executable replacement lines for 76 old executable lines,
+net -6**.  The observed authoritative `sz.py` size moves renderer **2335 ->
+2329** and repository total **27847 -> 27841**; runtime remains **444**.  The
+raw source diff is +55/-64 because Git aligns relocated statements and counts
+comments and blank structure which `sz.py` excludes.
+
+`RKContext._compare` now directly owns the INT32 byte comparison and the IEEE
+FP16 equality/less-than lowering that previously forwarded through
+`_int32_compare`, `_fp16_equality`, and `_fp16_less`.  Those three sole-owner
+helpers are deleted.  Their FP16 contract docstrings remain verbatim as
+comments at the shared owner, including unordered-NaN handling and ordered
+raw-byte comparison.  The failed first draft combined the low/high equality
+masks before allocating the NaN mask; the existing production ABS hash caught
+that scratch/stage ordering change.  The final form retains the literal low,
+high, NaN, then combine construction order and does not update the test.  No
+matcher, arithmetic recipe, admission, image field, runtime path, test,
+tolerance, dependency, or CPU/GPU numeric fallback changed.
+
+A serial committed-parent/candidate oracle observed **284 lowering calls / 268
+encoded images / 41 CMAC images / 16 `None` outcomes** across the complete
+147-test Rockchip UOp module.  Every admission and image is byte-identical;
+both ordered streams have SHA-256
+`7cd5d944697e0972a654dab5b01e892c0cf1738661cf2855fd020192548daf31`.
+The Fable Judge independently reran both sides and returned **VERIFIED WITH
+CAVEATS**, with the sole caveat that no live NPU census was permitted on the
+fail-closed boot.
+
+Host verification reports **147 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  No device,
+health, reset, reboot, hardware execution, or full hardware census command was
+run.  The last actual 445 result therefore remains **34 passed, then case 35
+failed**; live acceptance still requires a newly authorized fresh-boot run
+bracketed by pre/post `.venv/bin/python ~/rk3588/examples/simple_add.py`.
+
 ## 2026-08-24 — biased eight-product convolution restores the proven Kahan image at 2,335 lines
 
 This corrective milestone follows failed-census documentation commit
