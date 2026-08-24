@@ -1327,6 +1327,23 @@ def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   assert image.execution_class is RKExecutionClass.NATIVE and decode_image(encode_image(image)) == image
 
 
+def test_production_causal_attention_applies_infinite_mask_after_precise_dot():
+  shape = (32,8,16,64)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    q,k,v = (Tensor(UOp.new_buffer("ROCKCHIP",math.prod(shape),dtypes.half,num=1030+i)).reshape(*shape) for i in range(3))
+    ast = q.scaled_dot_product_attention(k,v,is_causal=True).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  terminal = image.ew_ops[-1]
+  masks = [gather for gather in image.gathers if gather.dst_kind is terminal.rhs.kind and gather.dst_index == terminal.rhs.index and
+           gather.values and set(gather.values) == {0,rockchip_renderer._fp16_bits(-math.inf)}]
+  assert image.cmac is None and len(image.ew_ops) > 1000 and terminal.dst == RKArg(RKBufferKind.ARG,0)
+  assert terminal.ew_cfg == _EW_CFG[Ops.ADD] and len(masks) == 1
+  assert all(terminal.rhs not in (op.dst,op.lhs,op.rhs) for op in image.ew_ops[:-1])
+  assert image.execution_class is RKExecutionClass.NATIVE and _assert_decoded_image_bounds(image) == image
+
+
 def test_generic_image_allows_many_small_ew_stages():
   count = 1080
   out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.int, (count,)), UOp.param(2, dtypes.int, (count,))

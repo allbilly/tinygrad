@@ -1123,7 +1123,8 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
       (u.op in (Ops.MUL, Ops.SUB, Ops.MAX) and len(u.src) == 2)):
     return UOp(u.op, dtypes.half, src=tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg if u.op not in (Ops.MUL, Ops.NEG) else None)
   if u.op is Ops.ADD:
-    return _precise_mul_sum(_fp32_add_terms(u))
+    # Apply static nonfinite masks after the compensated finite sum: TwoSum arithmetic on infinity produces NaN.
+    terms=_fp32_add_terms(u); masks=[term for term in terms if _is_static_expr(term) and any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float) and not math.isfinite(float(node.arg)) for node in term.toposort())]; return functools.reduce(lambda value,mask:value.alu(Ops.ADD,mask),masks,_precise_mul_sum([term for term in terms if term not in masks]))  # noqa: E501
   raise _RKGenericReject
 
 def _nested_fp32_storage_cast(x:UOp) -> UOp|None:
@@ -1930,7 +1931,8 @@ class RKContext:
 
   def finish(self) -> RKImage:
     nodes = self.root.toposort()
-    if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) for node in nodes):
+    # Static selectors materialize directly, so only dynamic predicates make iterative lowering unsafe.
+    if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) and node not in self.static_nodes for node in nodes):
       for node in nodes:
         if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
           self.lower(node)
