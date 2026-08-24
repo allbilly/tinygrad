@@ -8254,6 +8254,63 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — bounded integer carriers share one semantic recipe at 2,212 lines
+
+This hardware-accepted milestone follows `d0f907fe3` in the isolated worktree
+(`dd28b0aa1` on the shared branch).  The final predeclared authoritative
+`sz.py` budget was net **-8** with an exact renderer target of **2212**, and
+that target is met: renderer **2220 -> 2212**, repository total **27731 ->
+27723**, and runtime remains **443**.  The raw renderer diff is **+72/-79**;
+comments and matched replacement lines make that raw net differ by one from
+the executable-token count.  The tested renderer SHA-256 is
+`e1d45570ae2c1277605a7f078a10275300d40f6c7ac3efc4978db4afec84f28c`.
+
+`_half_int_expr` replaces the raising `_int_fp16_expr` translator with one
+optional semantic-UOp recipe shared by bounded INT-to-HALF casts, integer
+comparisons, and CMOD.  It maps CONST, HALF/BOOL casts, ADD/SUB/MUL/MAX,
+WHERE, and CMOD without introducing another IR.  `RKContext` now selects
+INT16 for bounded integer roots and for supported half-derived parity embedded
+inside HALF output graphs; dynamic integer loads, CDIV, unsupported CMOD, and
+other wide values retain INT32.  `_narrow_compare` owns the common native
+INT16 comparison stages for both semantic INT and physical INT16 values, and
+the CMOD owner lowers the shared HALF recipe back into an INT16 semantic
+carrier.  No image field, wire format, runtime arithmetic, CPU/GPU numeric
+fallback, tolerance, or test changed.
+
+Two rejected drafts were not promoted.  The first routed bounded parity
+through the 3555-stage INT32 restoring divider and aborted in
+`test_broadcast_partial` during repeated INT32 conversion resets.  A CMOD-only
+repair reduced the production broadcast `pow` image to **666 EW stages / zero
+INT32 conversions**, but a complete hardware census exposed four missing
+ordinary INT-to-HALF owners: odd-power sign selection plus three sparse-loss
+and ignore-index cases.  Generalizing the existing semantic recipe restored
+the 45x65 `pow` image to **730 EW stages / zero INT32 conversions** and made
+the fixed NLL final image byte-identical to the accepted parent at SHA-256
+`b7ae8f6635e2e0eff7a589016c84f5c90fb598e24b8ce947bf26aaad577906ec`.
+All four regressions then actually passed together in **22.39 seconds**.
+
+A serial parent/candidate oracle observed **287 lowering outcomes / 270
+encoded RKImages / 17 shared rejections**, with zero ordering or admission
+mismatches.  The candidate's 76,182-byte ordered record has SHA-256
+`be0028438f81d2b017cc22e3105ef888915b3a0714dd733889f72e11bc2c5cc5`.
+Only four intended integer-carrier images differ.  The half-derived parity
+fixture moves from **122 to 128 EW stages** while scratch slots fall **26 to
+21** and mid-gathers **10 to 4**; the production-path `pow` and loss images
+above retain their accepted behavior.
+
+Host verification reports **155 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The required
+serial production hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and exited zero: **433 passed,
+12 suite-declared skips, and 154 subtests passed in 2005.71 seconds**, exactly
+accounting for all **445** cases with zero failures.  Its retained log has
+SHA-256
+`b88e0106b47fa2dd01ac9d69e7de553ffcbeed08dc0ef7d993f2fbe2a0fc1d84`.
+The authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` gate
+passed immediately before and after the census with `reset_npu ret=0`,
+`SUBMIT ret=0`, and exact output `[8 8 8 8 8 8 8 8]`.
+
 ## 2026-08-25 — static semantics and physical carriers consolidate at 2,220 lines
 
 This hardware-accepted milestone follows `0888d01a3`.  Its predeclared
