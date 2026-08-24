@@ -8254,6 +8254,51 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — typed outputs share generic RKContext ownership at 2,245 lines
+
+This hardware-accepted milestone follows `150638c3d`.  Its final predeclared
+and observed token-aware renderer budget is exactly **+11/-30 executable
+lines, net -19**.  The raw renderer diff is **+27/-50** because retained
+comments and moved ownership do not map one-for-one to `sz.py`.  Authoritative
+size moves renderer **2264 -> 2245** and repository total **27775 -> 27756**;
+runtime remains **443**.
+
+`RKContext.lower`, `RKContext._where`, and `RKContext.finish` now own native
+HALF-to-BOOL and HALF-to-UCHAR conversion, including the production
+cast-pushed ReLU form and UCHAR's final low-byte gather.  Generic
+`_lower_uop_program` consequently admits UCHAR output directly, making the
+standalone `_lower_fp16_uint8_cast` and recursive `_typed_half_image` image
+composers obsolete.  BOOL nonzero normalization is limited to the root or its
+previous direct-INDEX route so unrelated ABS/MINIMUM production images retain
+their established lowering.  No generic IR, wire/runtime change, CPU/GPU
+numeric fallback, hand-built renderer shortcut, or test change was added.
+
+Actual production `Tensor.schedule_linear -> to_program` records remain native.
+Direct UCHAR and ReLU-to-UCHAR retain **12 and 13 EW stages**, with candidate
+images **303 bytes / SHA-256
+`70e745138fef7a517a1cb1b9447e9aa1182fc01c90c637a05e39e1c7e5148f8d`**
+and **307 bytes / SHA-256
+`e31f5d75c9a558fa88180a0ba709f341cfbbab12110ba64670d760a9085dbf96`**.
+Direct BOOL simplifies from four stages to three, producing **138 bytes /
+SHA-256
+`352537519ea8a6447f676ef9ebb1b3ecc87cf86a4a08a1af2a6d790bf5badc56`**.
+A focused NPU probe verified signed zero, FP16 subnormals, infinities, NaN
+nonzero behavior, signed truncation modulo 256, and ReLU conversion; the five
+Rockchip cast/classification hardware tests also passed.
+
+Host verification reports **155 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The required
+serial production hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`: **433 passed, 12
+suite-declared skips, and 154 subtests passed in 1601.24 seconds**, accounting
+for all **445** cases with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health gate passed before
+and after the census with `SUBMIT ret=0` and exact output
+`[8 8 8 8 8 8 8 8]`.  The promoted renderer is byte-identical to the tested
+candidate at SHA-256
+`f4aa5e680f32be15e67db0636c978eda4d33e288fb18770997faa1d087f1a8b3`.
+
 ## 2026-08-24 — replace the handwritten RKImage codec at 2,264 lines
 
 This hardware-accepted milestone follows `ad9fb9a52`.  Its predeclared and

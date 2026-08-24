@@ -658,21 +658,6 @@ def _masked_rows(builder:_RKBuilder, value:RKArg, mask:RKArg, rows:int, lanes:in
   selected = builder.i16(value, mask, rows*lanes, _EW_CFG[Ops.MUL])
   return _reduce_rows(builder.ops, [replace(selected, addend=row*lanes*2) for row in range(rows)], count, _EW_CFG[Ops.ADD], int16=True)
 
-def _lower_fp16_uint8_cast(output:RKOutput) -> RKImage|None:
-  """Truncate FP16 modulo 256 on DPU, convert to INT16, then expose each low byte."""
-  root, zero = output[4], UOp.const(0.0, dtypes.half); source = _typed_cast_source(root, dtypes.uchar, dtypes.half)
-  if source is None and root.op is Ops.WHERE and root.dtype.scalar() is dtypes.uchar and len(root.src) == 3:
-    condition, positive, fallback = root.src
-    source = _typed_cast_source(positive, dtypes.uchar, dtypes.half)
-    if source is None or condition.op is not Ops.CMPLT or condition.src[0].op is not Ops.CONST or float(condition.src[0].arg) != 0.0 or \
-       condition.src[1].key != source.key or fallback.op is not Ops.CONST or int(fallback.arg) != 0: return None
-    source = source.alu(Ops.MAX, zero)
-  if source is None: return None
-  if (relu:=_relu_operand(source)) is not None: source = relu.alu(Ops.MAX, zero)
-  truncated = _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(source,)))
-  quotient = UOp(Ops.MAX, dtypes.half, src=((floor_input:=truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half))), floor_input), arg=_NATIVE_FLOOR)
-  return _typed_half_image(output, truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half))), False)
-
 def _int16_byte_bits(ops:list[RKEWOp], alloc:Callable[[], RKArg], const:dict[int, RKArg], value:RKArg, lanes:int, weighted=False)->tuple[RKArg, ...]:
   """Split unsigned byte lanes into exact native planes, optionally retaining each bit's scale."""
   result, remainder = typing_cast(list[RKArg|None], [None]*8), value
@@ -978,22 +963,11 @@ def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
                 loaded.src[0].op is Ops.INDEX and zero.op is Ops.CONST and zero.arg == 0]
   return candidates[0] if len(candidates) == 1 else None
 
-def _typed_half_image(output:RKOutput, value:UOp, int32:bool, bool_output:bool=False) -> RKImage:
-  """Lower an exact FP16 expression through the requested native integer output ABI."""
-  store, out_param, count, _, _ = output
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  out_slot, replacement = out_param.arg.slot, store.replace(src=(store.src[0].replace(dtype=dtypes.half, src=(out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half)), *store.src[0].src[1:])), value, *store.src[2:]))  # noqa: E501
-  image = _lower_uop_program(list(replacement.toposort()), vectorize_reductions=False) if int32 else \
-    _lower_uop_program(list(UOp(Ops.SINK, src=(replacement,)).toposort()), vectorize_reductions=False, recipes_ready=True)
-  if image is None: raise RuntimeError("RKPLAN_REJECT:composed_uops")
-  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
-  if terminal != [len(image.ew_ops)-1] or image.mid_gathers or image.post_gathers: raise RuntimeError("RKPLAN_REJECT:predicate_terminal" if int32 else "RKPLAN_REJECT:uint8_terminal")  # noqa: E501
-  result_slot, auxiliary_slot = len(image.scratch), len(image.scratch)+1; prefix = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=(result:=RKArg(RKBufferKind.SCRATCH, result_slot))))  # noqa: E501
-  if int32:
-    return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(ceildiv(count, 4)*64)), ew_ops=(*prefix,
-      RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, RKArg(RKBufferKind.SCRATCH, auxiliary_slot), count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True, bool_output=bool_output)))  # noqa: E501
-  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count))), ew_ops=(*prefix,
-    RKEWOp(int_result:=RKArg(RKBufferKind.SCRATCH, auxiliary_slot), result, result, count, _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True, int16_output=True)), post_gathers=(_raw_gather(int_result, out_slot, count),))  # noqa: E501
+def _fp16_nonzero_mask(root:UOp) -> UOp|None:
+  """Recognize a direct FP16-to-bool cast; ABS then positivity is exact for zero, infinity, and NaN."""
+  if (source:=_typed_cast_source(root, dtypes.bool, dtypes.half)) is not None: root = source != UOp.const(0.0, dtypes.half)
+  if (load:=_nonzero_load(root)) is None: return None
+  return _positive_mask(UOp(Ops.MAX, dtypes.half, src=(load, load), arg=_NATIVE_ABS))
 
 def _half_backed_value(value:UOp) -> UOp|None:
   """Normalize a half-backed numeric expression for the exact raw FP16 comparator."""
@@ -1004,12 +978,6 @@ def _half_backed_value(value:UOp) -> UOp|None:
   valid = value.dtype.scalar() in (dtypes.half, dtypes.float) and not any(not load.src or load.src[0].op is not Ops.INDEX or
     (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtypes.half for load in value.toposort() if load.op is Ops.LOAD)
   return (value if value.dtype.scalar() is dtypes.half else value.cast(dtypes.half)) if valid else None
-
-def _fp16_nonzero_mask(root:UOp) -> UOp|None:
-  """Recognize a direct FP16-to-bool cast; ABS then positivity is exact for zero, infinity, and NaN."""
-  if (source:=_typed_cast_source(root, dtypes.bool, dtypes.half)) is not None: root = source != UOp.const(0.0, dtypes.half)
-  if (load:=_nonzero_load(root)) is None: return None
-  return _positive_mask(UOp(Ops.MAX, dtypes.half, src=(load, load), arg=_NATIVE_ABS))
 
 @functools.lru_cache(maxsize=4096)
 def _exact_int_range(root:UOp) -> tuple[int, int]|None:
@@ -1172,7 +1140,7 @@ class RKContext:
       return self._slot(self.materialized_slots, (int(u.arg) & 0xffffffff,) * self.count, dtype, RKLayout.INT32)
     if dtype in (dtypes.half, dtypes.float) or dtype is dtypes.int and self.int_layout is RKLayout.INT_FP16:
       bits, layout = struct.pack("<e", float(u.arg)), RKLayout.FP16 if dtype in (dtypes.half, dtypes.float) else RKLayout.INT_FP16
-    elif dtype is dtypes.int16 or dtype is dtypes.int and self.int_layout is RKLayout.INT16:
+    elif dtype in (dtypes.int16, dtypes.uchar) or dtype is dtypes.int and self.int_layout is RKLayout.INT16:
       bits, layout = struct.pack("<H", _int16_bits(int(u.arg))), RKLayout.INT16
     elif dtype is dtypes.bool: bits, layout = struct.pack("<e", float(bool(u.arg))), RKLayout.BOOL_MASK
     else: raise _RKGenericReject(f"constant {dtype}")
@@ -1189,7 +1157,7 @@ class RKContext:
       if dtype is dtypes.bool and bool_layout is RKLayout.BOOL_INT16:
         return replace(self._constant(UOp.const(int(bool(scalar)), dtypes.int16)), dtype=dtype, layout=bool_layout)
       return self._constant(UOp.const(scalar, dtype))
-    encoders = {dtypes.half: (_fp16_bits, RKLayout.FP16), dtypes.int16: (_int16_bits, RKLayout.INT16),
+    encoders = {dtypes.half: (_fp16_bits, RKLayout.FP16), dtypes.int16: (_int16_bits, RKLayout.INT16), dtypes.uchar:(_int16_bits,RKLayout.INT16),
                 dtypes.bool: (int, bool_layout) if bool_layout is RKLayout.BOOL_INT16 else (_fp16_bits, RKLayout.BOOL_MASK)}
     if dtype in encoders:
       encode, layout = encoders[dtype]
@@ -1543,7 +1511,7 @@ class RKContext:
   def _compare(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
     if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
-    if u.op is Ops.CMPNE and any(src.op is Ops.INDEX for src in u.src) and (nonzero:=_fp16_nonzero_mask(u)) is not None:
+    if u.op is Ops.CMPNE and (u is self.root or any(src.op is Ops.INDEX for src in u.src)) and (nonzero:=_fp16_nonzero_mask(u)) is not None:  # noqa: E501
       value = self.lower(nonzero)
       if value.layout is not RKLayout.BOOL_MASK: raise _RKGenericReject
       return RKValue(value.arg, dtypes.bool, self.count, value.layout)
@@ -1751,6 +1719,8 @@ class RKContext:
 
   def _where(self, u:UOp) -> RKValue:
     if len(u.src) != 3: raise _RKGenericReject
+    if u is self.root and u.dtype.scalar() is dtypes.uchar and (source:=_typed_cast_source(u.src[1],dtypes.uchar,dtypes.half)) is not None and (condition:=u.src[0]).op is Ops.CMPLT and condition.src[0].op is Ops.CONST and float(condition.src[0].arg)==0.0 and condition.src[1].key==source.key and u.src[2].op is Ops.CONST and int(u.src[2].arg)==0:  # noqa: E501
+      return self.lower(source.alu(Ops.MAX,UOp.const(0.0,dtypes.half)).cast(dtypes.uchar))
     if u.dtype.scalar() is dtypes.bool:
       dynamic = [None if src in self.static_nodes else self.lower(src) for src in u.src]
       preferred = RKLayout.BOOL_INT16 if any(value is not None and value.layout is RKLayout.BOOL_INT16 for value in dynamic) else RKLayout.BOOL_MASK
@@ -1812,7 +1782,7 @@ class RKContext:
     if u in self.values: return self.values[u]
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
-    elif (dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool) and u in self.static_nodes and
+    elif (dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool, dtypes.uchar) and u in self.static_nodes and
           not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
       value = self._static(u)
     elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
@@ -1830,11 +1800,19 @@ class RKContext:
     elif u.op is Ops.CAST and len(u.src) == 1:
       source_dtype = u.src[0].dtype.scalar()
       int_range = _exact_int_range(u.src[0]) if source_dtype is dtypes.int else None
+      cast_source = relu.alu(Ops.MAX, UOp.const(0.0, dtypes.half)) if dtype is dtypes.uchar and (relu:=_relu_operand(u.src[0])) is not None else u.src[0]  # noqa: E501
       source = self._load(u.src[0]) if dtype is dtypes.half and source_dtype is dtypes.float and u.src[0].op is Ops.LOAD else \
         self.lower(_fp32_expr_to_half(u.src[0])) if dtype is dtypes.half and source_dtype is dtypes.float else \
         self.lower(_int_fp16_expr(u.src[0])) if dtype is dtypes.half and source_dtype is dtypes.int and int_range is not None and \
-        -_FP16_EXACT_INTEGER <= int_range[0] <= int_range[1] <= _FP16_EXACT_INTEGER else self.lower(u.src[0])
-      if source.layout is RKLayout.INT32 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.int):
+        -_FP16_EXACT_INTEGER <= int_range[0] <= int_range[1] <= _FP16_EXACT_INTEGER else self.lower(cast_source)
+      if dtype is dtypes.uchar and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
+        truncated = _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(cast_source,)))
+        quotient = UOp(Ops.MAX, dtypes.half, src=((floor_input:=truncated.alu(Ops.MUL, UOp.const(1.0/256.0, dtypes.half))), floor_input), arg=_NATIVE_FLOOR)  # noqa: E501
+        converted, value = self.lower(truncated.alu(Ops.SUB, quotient.alu(Ops.MUL, UOp.const(256.0, dtypes.half)))), self._scratch(dtype, RKLayout.INT16)  # noqa: E501
+        self.ew_ops.append(RKEWOp(value.arg, converted.arg, converted.arg, self.count, _EW_CFG[Ops.MAX], submit_barrier=True, stateful=True, int16_output=True))  # noqa: E501
+      elif dtype is dtypes.bool and source_dtype is dtypes.half and source.layout is RKLayout.FP16:
+        value = self.lower(_positive_mask(UOp(Ops.MAX, dtypes.half, src=(u.src[0],u.src[0]), arg=_NATIVE_ABS)))
+      elif source.layout is RKLayout.INT32 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.int):
         value, tile = self._scratch(dtypes.half, RKLayout.FP16), self._scratch(dtypes.int, RKLayout.INT32, (self.count+3)//4<<6).arg
         self.ew_ops.append(RKEWOp(value.arg, source.arg, tile, self.count, _EW_CFG[Ops.MAX], int32_input=True))
       elif source.layout is RKLayout.BOOL_INT16 and (dtype is dtypes.half or dtype is dtypes.float and source_dtype is dtypes.bool or
@@ -1883,7 +1861,7 @@ class RKContext:
     # Static selectors materialize directly, so only dynamic predicates make iterative lowering unsafe.
     if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) and node not in self.static_nodes for node in nodes):
       for node in nodes:
-        if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
+        if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool, dtypes.uchar) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
           self.lower(node)
     result, dtype = self.lower(self.root), self.out_param.dtype.scalar()
     if (dtype is dtypes.half and result.layout in (RKLayout.FP16, RKLayout.BOOL_MASK, RKLayout.INT_FP16) or
@@ -1895,6 +1873,8 @@ class RKContext:
           (tile:=self._scratch(dtypes.int, RKLayout.INT32, (self.count+3)//4<<6).arg)):
       self.ew_ops.append(RKEWOp(self.out, result.arg, tile, self.count, _EW_CFG[Ops.MAX], stateful=True, int32_output=True,
                                 bool_output=dtype is dtypes.bool))
+    elif dtype is dtypes.uchar and result.layout is RKLayout.INT16:
+      self.post_gathers.append(_raw_gather(result.arg, self.out_param.arg.slot, self.count))
     elif (dtype is dtypes.bool and result.layout is RKLayout.BOOL_INT16 or dtype is dtypes.int and result.layout is RKLayout.INT32):
       if dtype is dtypes.bool or result.arg != self.out:
         source = result.arg if dtype is dtypes.bool else replace(result.arg, addend=result.arg.addend//4)
@@ -2173,9 +2153,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if (cmac:=_try(local_output, (dtypes.half,dtypes.float), _lower_cmac_reduction, uops, v=vectorize_reductions)) is not None: return cmac
   if (mixed:=_try(strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops,v=vectorize_reductions)) is not None: return mixed
   if (scatter:=_try(strict_output, (dtypes.half, dtypes.int16), _lower_host_scatter)) is not None: return scatter
-  if (image:=_try(strict_output,dtypes.int,_lower_raw_fp16_bitcast)) is not None or (image:=_try(strict_output,dtypes.uchar,_lower_fp16_uint8_cast)) is not None: return image  # noqa: E501
-  if (bool_output:=_admit(strict_output, dtypes.bool)) is not None and \
-     (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_half_image(bool_output, nonzero, True, bool_output=True)
+  if (image:=_try(strict_output,dtypes.int,_lower_raw_fp16_bitcast)) is not None: return image
   for dtype in (dtypes.half, dtypes.int16, dtypes.int):
     if (image:=_try(strict_output, dtype, _lower_dynamic_typed_load, dtype)) is not None: return image
   if (extrema:=_try(local_output, dtypes.int, _lower_vectorized_scalar_local_extrema, uops, v=vectorize_reductions)) is not None: return extrema
@@ -2211,8 +2189,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
       storage_sink = storage_sink.substitute({u:_expand_math_uops(u) for u in storage_sink.toposort()
         if u.op is Ops.CAST and u.dtype is dtypes.half and len(u.src) == 1 and u.src[0].op is Ops.SIN and u.src[0].dtype is dtypes.float})
       storage_uops = list(graph_rewrite(storage_sink, _pm_storage_common, name="rockchip generic storage precision").toposort())
-  if (output:=local_output if storage_uops is None else _output_store(uops:=storage_uops, accepted, allow_local=True)) is None or \
-     output[1].dtype.scalar() is dtypes.uchar or len(output[0].src) != 2:
+  if (output:=local_output if storage_uops is None else _output_store(uops:=storage_uops, accepted, allow_local=True)) is None or len(output[0].src) != 2:  # noqa: E501
     if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject("output store")
     return None
   if output[2] <= 0: return RKImage(RKTarget.RK3588)
@@ -2230,7 +2207,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     if len(n) > _MAX_GENERIC_EXPANDED_NODES and os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject(f"expanded nodes {len(n)}")
     if len(n) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]: output = (output[0].replace(src=(output[0].src[0], root)), *output[1:4], root)
-    image = RKContext(output, accurate_adds=not recipes_ready and (storage_uops is None or storage_product_adds) and
+    image = RKContext(output, accurate_adds=output[1].dtype.scalar() is not dtypes.uchar and not recipes_ready and (storage_uops is None or storage_product_adds) and  # noqa: E501
                       len(n) <= _MAX_OPTIONAL_RECIPE_NODES and not _has_runtime_address(output[4])).finish()
     counts = (len(image.scratch), len(image.gathers)+len(image.mid_gathers)+len(image.post_gathers),
               len(image.host_gathers), len(image.host_scatters))
