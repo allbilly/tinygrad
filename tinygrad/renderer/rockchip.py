@@ -629,41 +629,39 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     (_strip_cast(root),) if additive else ()
   terms = tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg) == 0.0)); groups = len(terms)
   if local_loads and not local_add or groups < (1 if additive else 4) or groups > _MAX_GENERIC_UNROLL: return None
-  # Charge each term before materializing its output offsets, so rejection never builds beyond the selector-cell cap.
+  # Keep oversized affine contractions compact; reject nonaffine terms before materializing output offsets.
   parsed:list[tuple[tuple[RKTypedLoadPlan, ...], float]] = []; cells = 0
   for term in terms:
     factors = tuple(map(_strip_cast, _iter_binary(_strip_cast(term), Ops.MUL, plain=True))); constants = tuple(node for node in factors if node.op is Ops.CONST); loads = tuple(node for node in factors if node.op is not Ops.CONST)  # noqa: E501
-    if len(constants) > 2 or len(constants) > 1 and term.dtype.scalar() is not dtypes.float or not exact_scale or any(float_to_fp16(float(node.arg)) != float(node.arg) for node in constants) or len(loads) > 2 or any(len(load.src) > 1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0 or math.copysign(1.0,float(load.src[1].arg)) < 0.0) for load in loads) or not math.isfinite(weight:=scale*math.prod(float(node.arg) for node in constants)) or len(loads) < 2 and float_to_fp16(weight) != weight or len(loads) == 2 and weight != 1.0 or rows*len(loads) > _MAX_DYNAMIC_SELECTOR_CELLS-cells: return None  # noqa: E501
-    if None in (plans:=typing_cast(tuple[RKTypedLoadPlan, ...], tuple(_typed_load_plan(load,dtypes.half,out_index,rows,require_offsets=True) for load in loads))): return None  # noqa: E501
+    if len(constants) > 2 or len(constants) > 1 and term.dtype.scalar() is not dtypes.float or not exact_scale or any(float_to_fp16(float(node.arg)) != float(node.arg) for node in constants) or len(loads) > 2 or any(len(load.src) > 1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0 or math.copysign(1.0,float(load.src[1].arg)) < 0.0) for load in loads) or not math.isfinite(weight:=scale*math.prod(float(node.arg) for node in constants)) or len(loads) < 2 and float_to_fp16(weight) != weight or len(loads) == 2 and weight != 1.0 or rows*len(loads) > _MAX_DYNAMIC_SELECTOR_CELLS-cells and ((affine:=typing_cast(tuple[int, dict[UOp, int]]|None,_linear_index(out_index))) is None or affine[0] != 0 or _affine_output_axes(affine,rows) is None or any(load.op is not Ops.LOAD or len(load.src) > 2 or not load.src or load.src[0].op is not Ops.INDEX or (load_affine:=_linear_index(load.src[0].src[1])) is None or any(axis not in affine[1] for axis in load_affine[1]) for load in loads)): return None  # noqa: E501
+    if None in (plans:=typing_cast(tuple[RKTypedLoadPlan, ...], tuple(_typed_load_plan(load,dtypes.half,out_index,rows) for load in loads))): return None  # noqa: E501
     parsed.append((plans,weight)); cells += rows*len(loads)
   # A is row-stable and B is column-stable; explicit offset tables allow source-stride differences and broadcasts.
+  def value(plan:RKTypedLoadPlan, lane:int) -> int: gather=plan.gather; return gather.offsets[lane] if gather.offsets else gather.base+sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes)  # noqa: E501
   def align(m:int, n:int, lanes:tuple[int, ...]=()) -> tuple[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float], ...]:
     aligned:list[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float]] = []
     for operands,weight in parsed:
-      if lanes: operands = tuple(replace(plan,offsets=tuple(plan.offsets[lane] for lane in lanes)) for plan in operands)
+      def lane(i:int) -> int: return lanes[i] if lanes else i
       if not operands: aligned.append((None,None,weight)); continue
-      row,col = zip(*((all(plan.offsets[i*n+j] == plan.offsets[i*n] for i in range(m) for j in range(n)),all(plan.offsets[i*n+j] == plan.offsets[j] for i in range(m) for j in range(n))) for plan in operands))  # noqa: E501
+      row,col = zip(*(((not lanes and not plan.gather.offsets and all(limit == 1 or divisor%n == 0 for divisor,limit,_ in plan.gather.axes),not lanes and not plan.gather.offsets and all(limit == 1 or n%divisor == 0 and n//divisor%limit == 0 for divisor,limit,_ in plan.gather.axes)) if cells > _MAX_DYNAMIC_SELECTOR_CELLS else (all(value(plan,lane(i*n+j)) == value(plan,lane(i*n)) for i in range(m) for j in range(n)),all(value(plan,lane(i*n+j)) == value(plan,lane(j)) for i in range(m) for j in range(n)))) for plan in operands))  # noqa: E501
       order = ((0,None) if row[0] else (None,0) if col[0] else None) if len(operands) == 1 else (0,1) if row[0] and col[1] else (1,0) if row[1] and col[0] else None  # noqa: E501
       if order is None: return ()
       aligned.append((None if order[0] is None else operands[order[0]],None if order[1] is None else operands[order[1]],weight))
     return tuple(aligned)
-  candidates = [(diagonal,not any(len(operands) == 2 for operands,_ in parsed) and n != 1,bool(lanes),m*ai+ao*ai+2*m*ao,-n,ai,ao,m,n,outputs,normalized) for diagonal,m,n,lanes,outputs,normalized in itertools.chain(  # noqa: E501
+  candidates = [(diagonal,not any(len(operands) == 2 for operands,_ in parsed) and n != 1,bool(lanes),m*ai+ao*ai+2*m*ao,-n,ai,ao,m,n,lanes,outputs,normalized) for diagonal,m,n,lanes,outputs,normalized in itertools.chain(  # noqa: E501
     ((False,m,n,lanes,outputs,align(m,n,lanes)) for affine in (_linear_index(out_index),) for m,n,lanes,outputs in itertools.chain(((rows//n,n,(),()) for n in range(1,rows+1) if rows%n == 0),  # noqa: E501
       ((limit,rows//limit,tuple(high*stride*limit+row*stride+low for row in range(limit) for high in range(rows//stride//limit) for low in range(stride)),tuple((i//stride%limit)*(rows//limit)+i//(stride*limit)*stride+i%stride for i in range(rows))) for _,stride,limit in ((_affine_output_axes(typing_cast(tuple[int, dict[UOp, int]], affine),rows) if affine is not None else None) or ())))),  # noqa: E501
     ((True,rows,rows,(),tuple(i*rows+i for i in range(rows)),tuple((operands[0] if operands else None,operands[1] if len(operands) == 2 else None,weight) for operands,weight in parsed)),))  # noqa: E501
     for ai,ao,_ in (_cmac_layout(n,groups),) if m <= 0x7ff and ai <= 0xffff and ao <= 0x3fff and m*ai*2 <= 10*32768 and (m == 1 or ai <= 12*32) and normalized]  # noqa: E501
   if not candidates: return None
-  diagonal,_,_,_,_,ai,ao,m,n,outputs,normalized = min(candidates, key=lambda item:item[:5])
-  a_cells = tuple(((source.param.arg.slot,source.offsets[row if diagonal else row*n]) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(1.0 if normalized[k][1] is None else normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
-  b_cells = tuple(((source.param.arg.slot,source.offsets[ob*16+ni]) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
-  gathers = tuple(gather for dst,cells in enumerate((a_cells,b_cells)) for sources,values in ((tuple(dict.fromkeys(source for source,_ in cells if source is not None)),tuple(value if source is None else 0 for source,value in cells)),) for seeded in (not sources or any(values),)  # noqa: E501
-    for gather in (((RKGather(out.arg.slot,dst,len(cells),values=values),) if seeded else ()) + tuple(RKGather(source,dst,len(cells),offsets=tuple(value if owner == source else -1 for owner,value in cells),partial=seeded or bool(i)) for i,source in enumerate(sources))))  # noqa: E501
+  diagonal,_,_,_,_,ai,ao,m,n,lanes,outputs,normalized = min(candidates, key=lambda item:item[:5]); fp16 = out.dtype.scalar() is dtypes.half
+  a_cells = tuple(((source.param.arg.slot,value(source,lanes[row if diagonal else row*n] if lanes else row if diagonal else row*n)) if (source:=normalized[k][0]) is not None else (None,_fp16_bits(1.0 if normalized[k][1] is None else normalized[k][2]))) if k < groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
+  b_cells = tuple(((source.param.arg.slot,value(source,lanes[ob*16+ni] if lanes else ob*16+ni)) if (source:=normalized[k][1]) is not None else (None,_fp16_bits(normalized[k][2]))) if ob*16+ni < n and (k:=ib*32+ki) < groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32))  # noqa: E501
+  gathers = tuple(gather for dst,cells in enumerate((a_cells,b_cells)) for sources,values in ((tuple(dict.fromkeys(source for source,_ in cells if source is not None)),tuple(value if source is None else 0 for source,value in cells)),) for seeded in (not sources or any(values),) for gather in (((RKGather(out.arg.slot,dst,len(cells),values=values),) if seeded else ()) + tuple(RKGather(source,dst,len(cells),offsets=tuple(value if owner == source else -1 for owner,value in cells),partial=seeded or bool(i)) for i,source in enumerate(sources))))  # noqa: E501
   if sum(gather.count for gather in gathers)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
-  fp16 = out.dtype.scalar() is dtypes.half
   output_offsets = tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for i in (outputs or range(rows)) for row,col in (divmod(i,n),))  # noqa: E501
-  return RKImage(RKTarget.RK3588,(RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4)),gathers=gathers,
-    post_gathers=(RKGather(2,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
-                           src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),m,n,groups,fp16,relu_root is not None))  # noqa: E501
+  return RKImage(RKTarget.RK3588,(RKScratch(m*ai*2),RKScratch(ao*ai*2),RKScratch(m*ao*4)),gathers=gathers,post_gathers=(RKGather(2,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,  # noqa: E501
+    src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),m,n,groups,fp16,relu_root is not None))  # noqa: E501
 
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64; return vector_bytes, vector_bytes//2, rows*vector_bytes//2

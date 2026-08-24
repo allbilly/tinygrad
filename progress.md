@@ -8254,6 +8254,66 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — large affine contractions keep compact CMAC plans at 2,350 lines
+
+This isolated milestone follows `c0791e753`.  Its predeclared and observed
+production renderer budget is exactly **+12/-14 executable lines, net -2**.
+The raw renderer diff is **+13/-15** because it replaces one retained comment;
+comments remain excluded by `sz.py`.  Authoritative size moves renderer
+**2352 -> 2350** and repository total **27864 -> 27862**; runtime remains
+**444**.
+
+`_lower_cmac_reduction` now evaluates affine `RKGather` axes only for the
+physical CMAC lanes it selects.  This makes CMAC's unconditional
+`require_offsets=True` full-output materialization and copied lane-remap plans
+obsolete.  Below the existing selector budget, explicit-offset and reordered
+fallback behavior is unchanged.  Above it, only ungated canonical affine
+loads are eligible, and exact row/column divisibility proofs replace eager
+enumeration; nonaffine, gated, and reordered cases remain generic fallback.
+The replacement stays inside the existing CMAC owner and adds no generic IR,
+wire field, runtime path, scheduler hook, CPU/GPU numeric fallback, tolerance,
+or CMAC-then-EW sequence.
+
+Four actual production `Tensor.schedule_linear -> to_program` matmuls now use
+one CMAC, two input gathers, one output gather, and zero EW stages:
+`256x256 @ 256x256`, `192x256 @ 256x160`, `64x384 @ 384x384`, and
+`512x128 @ 128x128`.  Their candidate `(M,N,K)` records and image SHA-256
+values are respectively `(256,256,256)` /
+`8f0e3b2eb38c290929f01062471ea51bedc234a73e083b5050d2209fcac46159`,
+`(192,160,256)` /
+`8055dc41228e81a9943cf89d63ea957e63e3a4eded5130637f4b8df6cb301b13`,
+`(64,384,384)` /
+`5808af4615b16b3afcd89e226ae81c957773b3de711127aab6be94dd50031206`,
+and `(512,128,128)` /
+`b9b707ee230b6982178ecb21678df5491401eefa20ad073e0e1c1c395b79b3e6`.
+The square parent's generic image had **15,853 EW stages, 512 gathers, and
+33,554,432 gather cells**; the candidate has zero EW stages, two gathers, and
+131,072 input-gather cells.  Its encoding is 786,629 bytes versus the parent's
+665,472 because compact planning still serializes the two final physical
+offset surfaces, so this is a CMAC coverage, compiler-memory, and stage-count
+result rather than an encoded-size claim.  The parameterized production
+regression checks exact A/B packing, image roundtrip, and FP32 contraction
+equality for all four shapes.
+
+An independent affine-stability oracle checked **129,975** exhaustive and
+randomized predicate cases / **1,098,576 records** and passed at SHA-256
+`2512d17f3eedfc88c19b88661bf177852660a38014840908d659e2617b08e42f`.
+A committed-parent/candidate lowering oracle observed **278 outcomes / 262
+images / 37 CMAC images / 16 rejections** across all 142 pre-existing Rockchip
+UOp tests.  Every admission, encoded image, and resource record is
+byte-identical; both normalized record sets hash to
+`cebf86989b8f2055af6cfd7f51b3532bab904a726fb44ec85e68779533f6b256`.
+
+Host verification reports **146 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, clean diff checks, and exactly **445 tests
+collected** with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`.  The final
+Fable Judge verdict is **VERIFIED WITH CAVEATS**, with the prohibited live
+hardware bracket as its sole caveat.  No device, health, reset, reboot,
+hardware execution, or full hardware census command was run because the board
+remains untrusted; fresh-boot CMAC acceptance and its pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
+
 ## 2026-08-24 — binary outer scales broaden weighted CMAC at 2,352 lines
 
 This isolated milestone follows `55710b1d5`.  Its initial renderer budget was

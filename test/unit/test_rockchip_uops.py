@@ -1,5 +1,6 @@
 import ctypes, functools, hashlib, itertools, math, struct
 import numpy as np
+import pytest
 from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
@@ -1050,6 +1051,28 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
   np.testing.assert_array_equal(packed_rhs[:4,:5], rhs_values.T)
   np.testing.assert_array_equal(packed_lhs[:,:5].astype(np.float32)@packed_rhs[:4,:5].T.astype(np.float32),
                                 lhs_values.reshape(3,5).astype(np.float32)@rhs_values.astype(np.float32))
+
+
+@pytest.mark.parametrize(("m","k","n"), ((256,256,256),(192,256,160),(64,384,384),(512,128,128)))
+def test_large_affine_matmul_keeps_cmac_planning_compact(m:int, k:int, n:int):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    lhs = Tensor(UOp.new_buffer("ROCKCHIP",m*k,dtypes.half,num=1040)).reshape(m,k)
+    rhs = Tensor(UOp.new_buffer("ROCKCHIP",k*n,dtypes.half,num=1041)).reshape(k,n)
+    ast = (lhs@rhs).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (m,n,k)
+  assert len(image.gathers) == 2 and not image.ew_ops and decode_image(encode_image(image)) == image
+  lhs_offsets, rhs_offsets = (np.asarray(gather.offsets) for gather in image.gathers)
+  np.testing.assert_array_equal(lhs_offsets,np.arange(m*k))
+  expected_rhs = np.asarray([(ib*32+ki)*n+ob*16+ni for ob in range(n//16) for ib in range(k//32) for ni in range(16) for ki in range(32)])
+  np.testing.assert_array_equal(rhs_offsets,expected_rhs)
+  lhs_values = (np.arange(m*k).reshape(m,k)%7-3).astype(np.float16)
+  rhs_values = (np.arange(k*n).reshape(k,n)%5-2).astype(np.float16)
+  packed_rhs = rhs_values.reshape(-1)[rhs_offsets].reshape(n//16,k//32,16,32).transpose(0,2,1,3).reshape(n,k)
+  np.testing.assert_array_equal(lhs_values.astype(np.float32)@packed_rhs.T.astype(np.float32),
+                                lhs_values.astype(np.float32)@rhs_values.astype(np.float32))
 
 
 def test_real_matmul_relu_routes_one_production_cmac_stage():
