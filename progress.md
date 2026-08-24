@@ -8254,6 +8254,64 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-24 — compose CMAC storage epilogues at 2,300 lines
+
+This hardware-accepted milestone follows `583cf0841`.  Its final predeclared
+and observed token-aware renderer budget is exactly **+24/-40 executable
+lines, net -16**.  The raw renderer diff is **+27/-43**; comments and
+docstrings remain excluded from `sz.py`.  Authoritative size moves renderer
+**2316 -> 2300** and repository total **27827 -> 27811**; runtime remains
+**443** with a line-neutral execution-order change.
+
+CMAC images may now carry a native EW epilogue.  `_lower_cmac_storage_epilogue`
+finds an output-shaped FP32 contraction below a HALF storage boundary, lowers
+that prefix through the production `_lower_cmac_reduction` owner, commits the
+rounded result through an explicit identity gather into dedicated scratch,
+and recursively lowers the remaining HALF expression.  `_append_inplace_image`
+composes the two images, `_reuse_linear_scratch` accounts for the earlier CMAC
+lifetime, the existing image flag admits CMAC with EW/mid gathers but still
+rejects host addressing, and runtime executes the fixed CMAC stage before its
+gather/EW suffix.  A suffix that reads the output's old contents is rejected,
+so the handoff cannot clobber an in-place input.
+
+This makes the 31-executable-line
+`_lower_biased_eight_product_reduction` physical planner obsolete.  Direct
+eight-product reductions now select the already shared semantic
+`_kahan_mul_sum` recipe, preserving the biased-convolution accuracy contract
+without another layout-specific implementation.  Their two production
+images have **253/251 EW stages** and SHA-256 values
+`9189f6950591b32b9c54857ab67851dbb5897ea2573de185ca4ad9c50f2da2c8`
+and
+`6985815feca2067253f2ac9568d03ea1a5ec0900ec8105e86f98400f944386b1`.
+Other nested contractions now use CMAC followed by ordinary HALF add,
+division, or minimum epilogues while retaining the FP32-to-HALF rounding
+boundary.  Focused hardware add/division/minimum probes matched independent
+FP32-accumulate, HALF-round, HALF-epilogue references exactly.
+
+A committed-parent/candidate oracle compared **286 lowering outcomes / 270
+image-bearing outcomes** across all pre-existing Rockchip UOp tests.  **279
+outcomes are byte-identical**; the seven intended image changes span two
+biased-convolution Kahan images, three CMAC storage-epilogue fixtures, and one
+additional direct eight-product fixture.  The 279 unchanged records have
+ordered SHA-256
+`f6abd4502d5c911829b0b350316d7232aa2f1b66ad3062073f4a06c57d37492e`.
+
+The first live candidate attempt was correctly rejected: it reached case 35
+and exposed one biased-convolution tolerance miss.  After routing direct
+eight-product reductions through shared Kahan and fixing the scratch handoff's
+identity axis, that exact hardware case passed and the complete census was
+restarted from case 1.  Final host verification reports **154 passed** with
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The required
+serial production `to_program` hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`: **433 passed, 12
+suite-declared skips, and 154 subtests passed in 1352.47 seconds**, accounting
+for all **445** collected cases with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health gate passed before
+and after the accepted run with `SUBMIT ret=0` and exact output
+`[8 8 8 8 8 8 8 8]`.  No CPU/GPU/host numeric fallback, tolerance change,
+hand-built render shortcut, or image-version change was introduced.
+
 ## 2026-08-24 — share EW pipeline finalization at 2,316 lines
 
 This hardware-accepted milestone follows `9406b1d09`.  Its predeclared and

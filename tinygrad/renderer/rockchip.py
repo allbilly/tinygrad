@@ -100,10 +100,9 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
   mid_by_point:dict[int, list[RKGather]] = {}
   for gather in image.mid_gathers: mid_by_point.setdefault(gather.after if gather.after >= 0 else image.gather_after, []).append(gather)
   schedule = [tuple(RKArg(RKBufferKind.SCRATCH, slot) for slot in constant_slots.values())] + [gather_args(gather) for gather in image.gathers]
-  schedule += [(host.src, host.index, host.dst) for host in image.host_gathers]
+  schedule += [(host.src, host.index, host.dst) for host in image.host_gathers] + ([] if image.cmac is None else [(image.cmac.lhs, image.cmac.rhs, image.cmac.dst)])  # noqa: E501
   for index,op in enumerate(image.ew_ops): schedule += [gather_args(gather) for gather in mid_by_point.get(index, ())] + [(op.lhs, op.rhs, op.dst)]
-  schedule += [gather_args(gather) for gather in mid_by_point.get(len(image.ew_ops), ())] + \
-    ([] if image.cmac is None else [(image.cmac.lhs, image.cmac.rhs, image.cmac.dst)]) + [gather_args(gather) for gather in image.post_gathers]
+  schedule += [gather_args(gather) for gather in mid_by_point.get(len(image.ew_ops), ())] + [gather_args(gather) for gather in image.post_gathers]  # noqa: E501
   schedule += [(host.src, host.index, host.dst) for host in image.host_scatters]
   events:dict[int, tuple[int, int]] = {}
   for event,args in enumerate(schedule):
@@ -136,7 +135,7 @@ class RKStage(NamedTuple): commands: tuple[int, ...]; relocs: tuple[tuple[int, R
 
 def encode_image(image:RKImage) -> bytes:
   gathers = image.gathers + image.mid_gathers + image.post_gathers
-  if image.cmac is not None and (image.ew_ops or image.mid_gathers or image.host_gathers or image.host_scatters): raise ValueError("CMAC must be one fixed native stage")  # noqa: E501
+  if image.cmac is not None and (image.host_gathers or image.host_scatters): raise ValueError("CMAC cannot mix with host addressing")
   if image.cmac is not None: _validate_cmac(image.cmac, image.scratch)
   if image.mid_gathers and any(not 0 <= (g.after if g.after >= 0 else image.gather_after) <= len(image.ew_ops) for g in image.mid_gathers): raise ValueError("invalid mid-gather split")  # noqa: E501
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC,image.version,int(image.target),len(image.scratch),len(gathers),len(image.host_gathers),
@@ -165,7 +164,7 @@ def encode_image(image:RKImage) -> bytes:
 
 def decode_image(blob:bytes) -> RKImage:
   magic,version,target,nscratch,ngather,nhost_gather,nhost_scatter,nop,nconst,mid_count,post_count,gather_after,flags=_HEADER.unpack_from(blob)
-  if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags & ~1 or flags and (nop or mid_count or nhost_gather or nhost_scatter) or  # noqa: E501
+  if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags & ~1 or flags and (nhost_gather or nhost_scatter) or  # noqa: E501
       (mid_count and not 0 <= gather_after < nop) or (not mid_count and gather_after != 0)): raise ValueError("invalid RKImage header")
   off,scratch=_HEADER.size+nscratch*_SCRATCH.size, tuple(RKScratch(*_SCRATCH.unpack_from(blob,_HEADER.size+i*_SCRATCH.size))for i in range(nscratch))
   gathers:list[RKGather] = []
@@ -568,56 +567,41 @@ def _kahan_mul_sum(terms:list[UOp]) -> UOp:
 
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
   """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
-  return _kahan_mul_sum(terms) if 64 <= len(terms) <= 512 and all(term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) and any(any(_strip_cast(source).op is not Ops.LOAD for source in term.src) for term in terms) else _tag_precise_adds((parts:=_precise_sum_parts(terms))[0].alu(Ops.ADD,parts[1]))  # noqa: E501
+  return _kahan_mul_sum(terms) if all(term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) and (len(terms) == 8 and all(all(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) or 64 <= len(terms) <= 512 and any(any(_strip_cast(source).op is not Ops.LOAD for source in term.src) for term in terms)) else _tag_precise_adds((parts:=_precise_sum_parts(terms))[0].alu(Ops.ADD,parts[1]))  # noqa: E501
 
 def _ew_ops(stages:Iterable[tuple[RKArg, RKArg, RKArg, Ops|int]], count:int, **flags) -> tuple[RKEWOp, ...]:
   return tuple(RKEWOp(dst, lhs, rhs, count, cfg if not isinstance(cfg, Ops) else _EW_CFG[cfg],
                       **flags) for dst,lhs,rhs,cfg in stages)
 
-def _lower_biased_eight_product_reduction(output:RKOutput) -> RKImage|None:
-  """Restore the hardware-proven product-residual/Kahan path for one biased eight-term FP16 contraction."""
-  _,out,rows,out_index,root=output; relu_root=_relu_operand(root); summed=relu_root if relu_root is not None else root
-  if not 0 < rows <= _MAX_EW_ELEMS_FP16//8 or summed.op is not Ops.ADD or summed.arg is not None: return None
-  pair = next(((dot,_strip_cast(bias)) for dot,bias in (summed.src,summed.src[::-1]) if (candidate:=_strip_cast(bias)).op is Ops.LOAD and candidate.dtype.scalar() is dtypes.half), None)  # noqa: E501
-  if pair is None: return None
-  dot,bias=pair; dot=_strip_cast(dot); terms=tuple(_strip_cast(term) for term in _iter_binary(dot,Ops.ADD,dtypes.float)) if dot.op is Ops.ADD and dot.dtype.scalar() is dtypes.float else ()  # noqa: E501
-  if len(terms) != 8: return None
-  parsed:list[tuple[RKTypedLoadPlan, RKTypedLoadPlan]] = []
-  for term in terms:
-    if term.op is not Ops.MUL or term.arg is not None or len(term.src) != 2 or any(src.dtype.scalar() is not dtypes.half for src in term.src): return None  # noqa: E501
-    plans=tuple(_typed_load_plan(src,dtypes.half,out_index,rows) for src in term.src)
-    if any(plan is None for plan in plans): return None
-    parsed.append(typing_cast(tuple[RKTypedLoadPlan, RKTypedLoadPlan], plans))
-  if any(tuple(plan.param.arg.slot for plan in pair) != tuple(plan.param.arg.slot for plan in parsed[0]) for pair in parsed) or (bias_plan:=_typed_load_plan(bias,dtypes.half,out_index,rows)) is None: return None  # noqa: E501
-  lanes,z,stride=rows*8,int(relu_root is not None),round_up(rows*2,64); splitter,lhs,rhs,lhs_high,rhs_high,values,arena,bias_arg=(RKArg(RKBufferKind.SCRATCH,i) for i in (1,2+z,3+z,4+z,5+z,6+z,7+z,8+z))  # noqa: E501
-  product,error=values,replace(values,addend=lanes*2); stages=((product,lhs,rhs,Ops.MUL),(lhs_high,lhs,splitter,Ops.MUL),(rhs_high,lhs_high,lhs,Ops.SUB),(lhs_high,lhs_high,rhs_high,Ops.SUB),(lhs,lhs,lhs_high,Ops.SUB),(rhs_high,rhs,splitter,Ops.MUL),(error,rhs_high,rhs,Ops.SUB),(rhs_high,rhs_high,error,Ops.SUB),(rhs,rhs,rhs_high,Ops.SUB),  # noqa: E501
-    (error,lhs_high,rhs_high,Ops.MUL),(error,error,product,Ops.SUB),(lhs_high,lhs_high,rhs,Ops.MUL),(error,error,lhs_high,Ops.ADD),(rhs_high,lhs,rhs_high,Ops.MUL),(error,error,rhs_high,Ops.ADD),(lhs,lhs,rhs,Ops.MUL),(error,error,lhs,Ops.ADD))  # noqa: E501
-  ops=list(_ew_ops(stages,lanes,stateful=True)); active=[replace(arena,addend=i*stride) for i in range(16)]; total,correction,adjusted,updated=(replace(values,addend=i*stride) for i in range(4))  # noqa: E501
-  ops.extend(_ew_ops(((total,active[0],active[0],Ops.MAX),(correction,active[0],active[0],Ops.SUB)),rows,submit_barrier=True,stateful=True))
-  for source in active[1:]: ops.extend(_ew_ops(((adjusted,source,correction,Ops.SUB),(updated,total,adjusted,Ops.ADD),(correction,updated,total,Ops.SUB),(correction,correction,adjusted,Ops.SUB),(total,updated,updated,Ops.MAX)),rows,submit_barrier=True,stateful=True))  # noqa: E501
-  out_arg=RKArg(RKBufferKind.ARG,out.arg.slot); ops.append(RKEWOp(out_arg,total,total,rows,_EW_CFG[Ops.MAX],submit_barrier=True,stateful=True))
-  mid=[RKGather(values.index,arena.index,rows,base=i*rows,axes=((1,rows,1),),dst_addend=i*stride//2,src_kind=RKBufferKind.SCRATCH,after=17) for i in range(16)]  # noqa: E501
-  mid.append(replace(bias_plan.gather,dst_index=bias_arg.index,after=len(ops)))
-  bias_out=RKArg(RKBufferKind.SCRATCH,10) if z else out_arg; ops.append(RKEWOp(bias_out,out_arg,bias_arg,rows,_EW_CFG[Ops.ADD],submit_barrier=True,stateful=True))  # noqa: E501
-  if z: ops.extend(_ew_ops(((bias_arg,RKArg(RKBufferKind.SCRATCH,2),bias_out,Ops.MAX),(out_arg,bias_arg,bias_arg,Ops.MAX)),rows))
-  gathers=tuple(replace(plan.gather,dst_index=2+z+side,dst_addend=group*rows) for group,pair in enumerate(parsed) for side,plan in enumerate(pair))
-  scratch=(RKScratch(_scratch_bytes(rows*16)),RKScratch(_scratch_bytes(lanes)),*((RKScratch(_scratch_bytes(rows)),) if z else ()),
-    *(RKScratch(_scratch_bytes(lanes)) for _ in range(4)),RKScratch(_scratch_bytes(rows*16)),RKScratch(16*stride),
-    RKScratch(_scratch_bytes(rows)),*((RKScratch(_scratch_bytes(rows)),) if z else ()))
-  return RKImage(RKTarget.RK3588,scratch,struct.pack("<ee",1.0,65.0)+(b"\0\0" if z else b""),gathers=gathers,
-    ew_ops=tuple(ops),mid_gathers=tuple(mid),gather_after=17)
-
 def _append_inplace_image(first:RKImage, second:RKImage) -> RKImage|None:
   """Append an in-place EW image, scheduling its input materialization after the first image completes."""
-  if first.post_gathers or not second.ew_ops or second.host_gathers or second.host_scatters: return None
+  if not second.ew_ops or second.cmac is not None or second.host_gathers or second.host_scatters or \
+     first.post_gathers and first.cmac is None: return None
   fc,sc,kind,fs = len(first.constants)//2, len(second.constants)//2, RKBufferKind.SCRATCH, len(first.scratch)
   first, second = _map_image_args(first, lambda arg: replace(arg, index=arg.index+sc) if arg.kind is kind and arg.index >= fc else arg), \
                    _map_image_args(second, lambda arg: replace(arg,index=fc+arg.index if arg.index<sc else fs+arg.index) if arg.kind is kind else arg)
+  cmac_mid=tuple(replace(gather,after=0) for gather in first.post_gathers) if first.cmac is not None else ()
   second_ops=(replace(second.ew_ops[0],submit_barrier=True,stateful=True),*second.ew_ops[1:]); second_mid=tuple(replace(gather,after=len(first.ew_ops)) for gather in second.gathers)+tuple(  # noqa: E501
     replace(gather, after=len(first.ew_ops)+(gather.after if gather.after >= 0 else second.gather_after)) for gather in second.mid_gathers)
   scratch=first.scratch[:fc]+second.scratch[:sc]+first.scratch[fc:]+second.scratch[sc:]; return RKImage(RKTarget.RK3588,scratch,first.constants+second.constants,  # noqa: E501
-                 gathers=first.gathers, ew_ops=first.ew_ops+second_ops, mid_gathers=first.mid_gathers+second_mid,
-                 gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers))
+                 gathers=first.gathers, ew_ops=first.ew_ops+second_ops, mid_gathers=first.mid_gathers+cmac_mid+second_mid,
+                 gather_after=first.gather_after, post_gathers=tuple(replace(gather, after=-1) for gather in second.post_gathers),cmac=first.cmac)
+
+def _lower_cmac_storage_epilogue(output:RKOutput, uops:list[UOp]) -> RKImage|None:
+  """Commit one output-shaped FP32 contraction to HALF on CMAC before its ordinary HALF epilogue."""
+  store,out,count,index,root=output
+  fake_slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=out.arg.slot); fake=UOp.param(fake_slot,dtypes.half,(count,))
+  for boundary in (u for u in root.toposort() if u is not root and _typed_cast_source(u,dtypes.half,dtypes.float) is not None):
+    source=typing_cast(UOp,_typed_cast_source(boundary,dtypes.half,dtypes.float)); terms=tuple(_strip_cast(term) for term in _iter_binary(source,Ops.ADD)) if source.op is Ops.ADD else ()  # noqa: E501
+    if len(terms) == 8 and all(term.op is Ops.MUL and term.arg is None and all(src.dtype.scalar() is dtypes.half and _strip_cast(src).op is Ops.LOAD for src in term.src) for term in terms): continue  # noqa: E501
+    if (prefix:=_lower_cmac_reduction((store.replace(src=(store.src[0],boundary)),out,count,index,boundary),uops)) is None: continue
+    suffix_store=store.replace(src=(store.src[0],root.substitute({boundary:fake.index(index).load()})))
+    if any(_root_param(load.src[0]) is out for load in _semantic_loads(suffix_store)): continue
+    suffix=_lower_uop_program(list(UOp(Ops.SINK,src=(suffix_store,)).toposort()),vectorize_reductions=False)
+    if suffix is not None:
+      target=RKArg(RKBufferKind.SCRATCH,len(suffix.scratch)); suffix=replace(_alias_image_args(suffix,{fake_slot:target}),scratch=suffix.scratch+(RKScratch(_scratch_bytes(count)),),gathers=(RKGather(out.arg.slot,target.index,count,axes=((1,count,1),)),*suffix.gathers))  # noqa: E501
+    if suffix is not None and (combined:=_append_inplace_image(prefix,suffix)) is not None: return combined
+  return None
 
 def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> Iterable[UOp]:
   stack = [root]
@@ -2221,7 +2205,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
     return combined
   strict_output, local_output = (_admit(output, accepted) for output in (strict_output, local_output))
   if (cmac:=_try(local_output, (dtypes.half,dtypes.float), _lower_cmac_reduction, uops, v=vectorize_reductions)) is not None: return cmac
-  if (biased:=_try(strict_output,dtypes.half,_lower_biased_eight_product_reduction,v=vectorize_reductions)) is not None: return biased
+  if (mixed:=_try(strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops,v=vectorize_reductions)) is not None: return mixed
   if (scatter:=_try(strict_output, (dtypes.half, dtypes.int16), _lower_host_scatter)) is not None: return scatter
   if (image:=_try(strict_output,dtypes.int,_lower_raw_fp16_bitcast)) is not None or (image:=_try(strict_output,dtypes.uchar,_lower_fp16_uint8_cast)) is not None: return image  # noqa: E501
   if (bool_output:=_admit(strict_output, dtypes.bool)) is not None and \

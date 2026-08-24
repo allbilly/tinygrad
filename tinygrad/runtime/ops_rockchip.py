@@ -396,6 +396,8 @@ class RockchipProgram(Program['RockchipDevice']):
       apply_gathers(gathers, clear_scratch)
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}),
                              rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    # Run one fixed CMAC body with its proven terminal tail and no timeout replay.
+    if (cmac:=self.image.cmac) is not None: self._submit_standalone(patch_stage(emit_cmac_stage(cmac),address),True)
     if self.image.mid_gathers:
       cursor = 0
       by_point:dict[int, list[RKGather]] = {}
@@ -408,8 +410,6 @@ class RockchipProgram(Program['RockchipDevice']):
       self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
     else: self._run_ew_ops(address, buffer)
     if self.image.ew_ops: self.dev._native_int16 = native_int16
-    # Run one fixed CMAC body with its proven terminal tail and no timeout replay.
-    if (cmac:=self.image.cmac) is not None: self._submit_standalone(patch_stage(emit_cmac_stage(cmac),address),True)
     if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if self.image.host_scatters:
       touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \

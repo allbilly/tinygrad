@@ -286,6 +286,9 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
   assert len(relu_stage.commands) == 45 and len(changed) == 1
   assert changed[0][0]&0xffff == changed[0][1]&0xffff == rockchip_renderer.rk.REG_DPU_BS_CFG
   assert ((changed[0][0]>>16)&0xffffffff,(changed[0][1]>>16)&0xffffffff) == (0x53,0x12)
+  mixed = replace(image, ew_ops=(RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD]),),
+                  mid_gathers=(RKGather(2,0,1,src_kind=RKBufferKind.SCRATCH,after=0),))
+  assert decode_image(encode_image(mixed)) == mixed
 
 def _int32_division_samples() -> tuple[np.ndarray, np.ndarray]:
   rng = np.random.default_rng(0x3588)
@@ -446,6 +449,30 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (4,0x18,0x300,0x1ffff,4)
   assert program.dev.resets == 2 and len(submits) == 2 and submits[1][1] == {"standalone":True}
+
+
+def test_mixed_cmac_runtime_runs_fixed_stage_before_ew_epilogue():
+  events = []
+  class FakeDevice:
+    _native_int16 = False
+    def _touch_program(self, _program): pass
+    def _sync_buffers(self, _buffers, _flags): pass
+    def reset_npu(self): pass
+    def _forget_program(self, _program): pass
+    def _gpu_free(self, _buffer): pass
+  def memory(dma):
+    base=SimpleNamespace(va_addr=0)
+    return SimpleNamespace(va_addr=0,base=base,meta=SimpleNamespace(dma_addr=dma))
+  cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),1,1,4,True)
+  ew=RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD])
+  program=object.__new__(rockchip_runtime.RockchipProgram)
+  program.dev,program.image,program.scratch,program._scratch_arena=FakeDevice(),RKImage(RKTarget.RK3588,ew_ops=(ew,),cmac=cmac),tuple(
+    memory(0x100000*(i+1)) for i in range(3)),None
+  program._ensure_scratch=lambda:None
+  program._submit_standalone=lambda *_args,**_kwargs:events.append("cmac")
+  program._run_ew_ops=lambda *_args,**_kwargs:events.append("ew")
+  program()
+  assert events == ["cmac","ew"]
 
 
 def test_runtime_tiling_modes_keep_exact_stage_bodies():
@@ -1205,7 +1232,7 @@ def test_batched_zero_gated_convolution_reorders_one_production_cmac():
   assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
 
 
-def test_biased_eight_channel_convolutions_restore_proven_kahan_images():
+def test_biased_eight_channel_convolutions_use_shared_kahan_recipe():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP",200,dtypes.half,num=13001)).reshape(1,8,5,5)
     weight = Tensor(UOp.new_buffer("ROCKCHIP",64,dtypes.half,num=13002)).reshape(8,8,1,1)
@@ -1218,10 +1245,12 @@ def test_biased_eight_channel_convolutions_restore_proven_kahan_images():
       program = to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP")))
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
-      records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(image.ew_ops),len(image.gathers),len(image.mid_gathers),image.cmac))
+      assert encode_image(image) == blob and image.cmac is None
+      records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(image.ew_ops),len(image.gathers),len(image.mid_gathers),
+                      len(image.post_gathers),image.cmac))
   assert records == [
-    ("2a2363213d2e86522c45f9523b75f8f6efcf21c9452fd20d2127093c0e630f6f",5539,98,16,17,None),
-    ("7d4ea7789747715e7efc1fe4d6f275b4afae4f2d0631a42c8a7efb4f56ec4802",5441,96,16,17,None)]
+    ("9189f6950591b32b9c54857ab67851dbb5897ea2573de185ca4ad9c50f2da2c8",11211,253,17,0,0,None),
+    ("6985815feca2067253f2ac9568d03ea1a5ec0900ec8105e86f98400f944386b1",11123,251,17,0,0,None)]
 
 
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
@@ -1567,7 +1596,19 @@ def test_nested_fp32_product_sum_is_committed_before_outer_half_add():
   product_sum = products[0]
   for product in products[1:]: product_sum = product_sum + product
   image = _lower_uop_program(_program(dtypes.half, lambda _i:product_sum.cast(dtypes.half) + bias, count=1))
-  assert image is not None and image.cmac is None and len(image.ew_ops) > 20 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert image is not None and image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,4)
+  assert image.cmac.out_fp16 and len(image.ew_ops) == 1 and len(image.mid_gathers) == 3 and not image.post_gathers
+  assert image.mid_gathers[0].src_kind is RKBufferKind.SCRATCH and image.mid_gathers[0].dst_kind is RKBufferKind.ARG
+  assert image.mid_gathers[1].src_kind is RKBufferKind.ARG and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert decode_image(encode_image(image)) == image
+
+
+def test_cmac_storage_epilogue_does_not_clobber_an_inplace_input():
+  out, lhs, rhs = UOp.param(0,dtypes.half,(1,)),UOp.param(1,dtypes.half,(4,)),UOp.param(2,dtypes.half,(4,))
+  products = [(lhs.index(i).load()*rhs.index(i).load()).cast(dtypes.float) for i in range(4)]
+  reduced = functools.reduce(lambda total,term:total+term,products).cast(dtypes.half)
+  image = _lower_uop_program(_program(dtypes.half,lambda _i:reduced+out.index(0).load(),count=1))
+  assert image is None
 
 
 def test_independent_fp32_reductions_are_committed_before_outer_half_division():
@@ -1578,7 +1619,8 @@ def test_independent_fp32_reductions_are_committed_before_outer_half_division():
   for product,weight in zip(products[1:], weights[1:]): numerator, denominator = numerator+product, denominator+weight
   ratio = UOp(Ops.FDIV, dtypes.half, src=(numerator.cast(dtypes.half), denominator.cast(dtypes.half)))
   image = _lower_uop_program(_program(dtypes.half, lambda _i:ratio, count=1))
-  assert image is not None and len(image.ew_ops) > 40 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert image is not None and image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (1,1,4)
+  assert len(image.ew_ops) == 55 and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
 def test_fp32_math_uop_converts_at_half_storage_boundary():
@@ -1637,7 +1679,8 @@ def test_terminal_minimum_is_not_misclassified_as_cmac_relu():
   reduced = products[0].alu(Ops.ADD, products[1]).cast(dtypes.half)
   value = (reduced < zero).where(reduced, zero)
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
-  assert image is not None and image.cmac is None and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
+  assert image is not None and image.cmac is not None and not image.cmac.relu
+  assert (image.cmac.m,image.cmac.n,image.cmac.k) == (2,2,2) and image.ew_ops[-1].dst.kind is RKBufferKind.ARG
 
 
 def test_static_local_accumulator_is_structurally_executed():
