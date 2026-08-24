@@ -1168,6 +1168,25 @@ def test_batched_zero_gated_convolution_reorders_one_production_cmac():
   assert decode_image(encode_image(image)) == image and image.execution_class is RKExecutionClass.NATIVE
 
 
+def test_biased_eight_channel_convolutions_restore_proven_kahan_images():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",200,dtypes.half,num=13001)).reshape(1,8,5,5)
+    weight = Tensor(UOp.new_buffer("ROCKCHIP",64,dtypes.half,num=13002)).reshape(8,8,1,1)
+    bias = Tensor(UOp.new_buffer("ROCKCHIP",8,dtypes.half,num=13003))
+    schedule = source.conv2d(weight,bias).relu().conv2d(weight,bias).schedule_linear()
+    calls = [u for u in schedule.toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    records = []
+    for call in calls:
+      to_program_cache.clear()
+      program = to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP")))
+      blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
+      image = decode_image(blob)
+      records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(image.ew_ops),len(image.gathers),len(image.mid_gathers),image.cmac))
+  assert records == [
+    ("2a2363213d2e86522c45f9523b75f8f6efcf21c9452fd20d2127093c0e630f6f",5539,98,16,17,None),
+    ("7d4ea7789747715e7efc1fe4d6f275b4afae4f2d0631a42c8a7efb4f56ec4802",5441,96,16,17,None)]
+
+
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     lhs = Tensor(UOp.new_buffer("ROCKCHIP",6,dtypes.half,num=1007)).reshape(2,3)
