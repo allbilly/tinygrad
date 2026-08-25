@@ -363,10 +363,11 @@ def _try(o,d,f,*a,v=True)->RKImage|None: return None if not v or (o:=_admit(o,d)
 
 def _iter_range_env(ranges:list[UOp], max_envs:int|None=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> list[dict[UOp, int]]:
   if dependencies:
-    ranges = list(dict.fromkeys(node for root in ranges for node in root.toposort() if node.op is Ops.RANGE or node is root))
+    def dependency_order(r:UOp)->tuple[UOp,...]: return (*itertools.chain.from_iterable(dependency_order(src) for src in r.src[1:] if src.op is Ops.RANGE),r)  # noqa: E501
+    ranges=list(dict.fromkeys(node for root in ranges for node in dependency_order(root)))
   if any(r.src[0].op is not Ops.CONST for r in ranges): raise RuntimeError("RKPLAN_REJECT:unsupported_index")
-  bounds = tuple(int(r.src[0].arg) for r in ranges)
-  if any(bound < 0 for bound in bounds) or max_envs is not None and math.prod(bounds) > max_envs: raise RuntimeError("RKPLAN_REJECT:static_index_budget")  # noqa: E501
+  bounds=tuple(int(r.src[0].arg) for r in ranges)
+  if any(bound<0 for bound in bounds) or max_envs is not None and math.prod(bounds)>max_envs: raise RuntimeError("RKPLAN_REJECT:static_index_budget")  # noqa: E501
   return [dict(zip(ranges, values)) for values in itertools.product(*(range(bound) for bound in bounds))]
 
 @functools.lru_cache(maxsize=8)
@@ -409,8 +410,7 @@ def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, i
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   vector_env, dst = _static_vector_env(out_index, load_index, *((gate,) if gate is not None else ()), reject="gather_index")
-  cache:dict[UOp,int|float|bool|np.ndarray]={}
-  src=np.broadcast_to(_eval_expr(load_index,vector_env,cache,vector=True),len(dst)).astype(np.int64)
+  src=np.broadcast_to(_eval_expr(load_index,vector_env,cache:=typing_cast(dict[UOp,int|float|bool|np.ndarray],{}),vector=True),len(dst)).astype(np.int64)  # noqa: E501
   values = src if gate is None else np.where(active:=np.broadcast_to(_eval_expr(gate, vector_env, cache, True), len(dst)), src, -1)
   if np.any((src<0)&(gate is None or active)) or np.any((dst<0)|(dst>=count)): raise RuntimeError("RKPLAN_REJECT:gather_index")
   offsets = np.full(count, -2, dtype=np.int64); offsets[dst] = values
