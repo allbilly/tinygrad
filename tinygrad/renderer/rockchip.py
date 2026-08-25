@@ -651,13 +651,6 @@ def _ordered_byte_less(ops:list[RKEWOp], allocate:Callable[[], RKArg], zero:RKAr
     ops.extend(_ew_ops(((maximum,lhs,rhs,Ops.MAX),(lhs_delta,maximum,lhs,Ops.SUB),(rhs_delta,maximum,rhs,Ops.SUB),(lhs_less,lhs_delta,one,_EW_CFG_MIN),(rhs_less,rhs_delta,one,_EW_CFG_MIN),(unequal,lhs_less,rhs_less,Ops.MAX),(same,one,unequal,Ops.SUB),(selected,equal,lhs_less,Ops.MUL),(next_less,less,selected,Ops.MAX),(next_equal,equal,same,Ops.MUL)),lanes,**_INT16_EW)); less,equal=next_less,next_equal  # noqa: E501
   return less
 
-def _candidate_gather(src:int, dst:int, rows:tuple[tuple[int, ...], ...], lanes:int) -> RKGather:
-  """Gather candidate rows compactly when their active rectangle is affine."""
-  n, base = len(rows[0]), rows[0][0]; dx, dy = (rows[0][1]-base if n > 1 else 0), (rows[1][0]-base if len(rows) > 1 else 0)
-  return RKGather(src, dst, len(rows)*lanes, base, ((1, n, dx), (lanes, len(rows), dy)), dst_stride=2, itemsize=1) if lanes%n == 0 and \
-    all(value == base+r*dy+c*dx for r,row in enumerate(rows) for c,value in enumerate(row)) else \
-    RKGather(src, dst, len(rows)*lanes, offsets=tuple(x for row in rows for x in (*row, *(-1,)*(lanes-n))), dst_stride=2, itemsize=1)
-
 def _bounded_index_gate(gate:UOp, bounded:UOp, limit:int|None=None) -> int|None:
   """Return the exact positive bound proved by the canonical conjunction, or None."""
   if gate.op is not Ops.AND: return None
@@ -670,10 +663,10 @@ def _bounded_index_gate(gate:UOp, bounded:UOp, limit:int|None=None) -> int|None:
     comparison.src[0].key == bounded.key and comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg) == 0 for u in nodes) else None
 
 def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
-  """Materialize a bounded dynamic typed LOAD through the shared typed UOp byte comparator."""
-  _,out_param,count,out_index,root=output; total_gate:tuple[UOp,UOp]|None=None; load=root
+  """Rewrite a bounded dynamic typed LOAD as ordinary exact candidate-selection UOps."""
+  store,out_param,count,out_index,root=output; total_gate:tuple[UOp,UOp]|None=None; source_load=load=root
   if root.op is Ops.WHERE and len(root.src) == 3:
-    condition,load,fill=root.src
+    condition,source_load,fill=root.src; load=source_load
     if dtype is dtypes.half:
       if load.op is not Ops.LOAD or fill.op is not Ops.CONST or len(load.src) <= 2 or load.src[1].op is not Ops.CONST: return None
       load_gate,same_default=load.src[2],float(load.src[1].arg)==float(fill.arg)
@@ -713,98 +706,35 @@ def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKIma
   if any(not 0 <= param.arg.slot <= _RKIMAGE_U16_MAX for param in (out_param,data_param,*params,*((bool_param,) if bool_param is not None else ()),*((total_gate[0],) if total_gate is not None else ()))): return None  # noqa: E501
   candidates,data_count=math.prod(extent for _,_,extent,_ in axes),int(data_param.src[0].arg)
   if total_gate is not None and (data_count!=int(total_gate[0].src[0].arg) or candidates!=data_count or int(params[0].src[0].arg)!=count): return None  # noqa: E501
-  alternative_count,external_count,pre_repeat=sum(1+wrapped for *_,wrapped in axes),int(bool_load is not None),min(8,count)
-  total_scratch,total_gathers=(0,0) if total_gate is None else (5+3*dtype.itemsize,data_count+3+dtype.itemsize)
-  if (pre_vl:=_stripe_layout(count,2)[1] if candidates>1 else count)>_MAX_EW_ELEMS_FP16: return None
-  pre_blocks=ceildiv(candidates,_MAX_EW_ELEMS_FP16//pre_vl)
-  if candidates>min(_MAX_STATIC_RANGE_ENVS,_MAX_DYNAMIC_SELECTOR_CELLS//count) or any(size>_RKIMAGE_U16_MAX for size in (pre_blocks*(3*len(axes)+16*alternative_count+2*pre_repeat*dtype.itemsize)+external_count+total_scratch,pre_blocks*(len(axes)+8*alternative_count+pre_repeat*dtype.itemsize)+external_count+pre_repeat*dtype.itemsize+total_gathers)): return None  # noqa: E501
-  combinations=tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes))); external:tuple[int,tuple[int,...]]|None=None
+  if candidates>min(_MAX_STATIC_RANGE_ENVS,_MAX_DYNAMIC_SELECTOR_CELLS//count): return None
+  combinations=tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes)))
   if bool_load is not None and bool_param is not None:
     try: bool_offsets=_gather_offsets(out_index,bool_load.src[0].src[1],None,count)
     except RuntimeError: return None
     if any(not 0 <= offset < int(bool_param.src[0].arg) for offset in bool_offsets): return None
-    external=bool_param.arg.slot,bool_offsets
+  static_gate={} if bool_load is None else {bool_load:bool_load.const_like(True)}
+  mappings=tuple({dynamic:dynamic.const_like(value) for dynamic,value in zip(loads,values)} for values in combinations)
+  candidate_loads=tuple(load.substitute(mapping|static_gate) for mapping in mappings)
   try:
     index_offsets=tuple(_gather_offsets(out_index,dynamic.src[0].src[1],None,count) for dynamic in loads)
-    plans=tuple(_gather_plan(data_param.arg.slot,0,out_index,data_index.substitute(mapping),gate.substitute(mapping|({bool_load:bool_load.const_like(True)} if bool_load is not None else {})),count) for values in combinations for mapping in ({dynamic:dynamic.const_like(value) for dynamic,value in zip(loads,values)},))  # noqa: E501
-    plan_offsets=tuple(plan.offsets or tuple(plan.base+sum((lane//d%n)*s for d,n,s in plan.axes) for lane in range(plan.count)) for plan in plans)  # noqa: E501
+    plans=tuple(_typed_load_plan(candidate,dtype,out_index,count,require_offsets=True) for candidate in candidate_loads)
   except RuntimeError: return None
-  if any(not 0 <= offset < int(param.src[0].arg) or offset*4+3>dtypes.int.max for offsets,param in zip(index_offsets,params) for offset in offsets) or any(not 0 <= offset < data_count or offset*dtype.itemsize+dtype.itemsize-1>dtypes.int.max for row in plan_offsets for offset in row) or external is not None and any(offset>dtypes.int.max for offset in external[1]): return None  # noqa: E501
+  if None in plans or any(not 0 <= offset < int(param.src[0].arg) or offset*4+3>dtypes.int.max for offsets,param in zip(index_offsets,params) for offset in offsets) or any(offset >= 0 and offset*dtype.itemsize+dtype.itemsize-1>dtypes.int.max for plan in plans if plan is not None for offset in plan.gather.offsets): return None  # noqa: E501
   if total_gate is not None and index_offsets[0]!=tuple(range(count)): return None
-  repeat=next((width for width in range(min(8,count),0,-1) if count%width==0 and all(all(row[start:start+width]==(row[start],)*width for start in range(0,count,width)) for row in (*index_offsets,*((external[1],) if external else ())))),1)  # noqa: E501
-  group_count=count//repeat; grouped_indices=tuple((param.arg.slot,offsets[::repeat]) for param,offsets in zip(params,index_offsets)); grouped_gate=None if external is None else (external[0],external[1][::repeat])  # noqa: E501
-  if (vector_lanes:=_stripe_layout(group_count,2)[1] if candidates>1 else group_count)>_MAX_EW_ELEMS_FP16: return None
-  block_rows=_MAX_EW_ELEMS_FP16//vector_lanes
-
-  def block_image(start:int,stop:int) -> tuple[RKImage,list[list[RKArg]]]:
-    rows,matrix_lanes,slot=stop-start,(stop-start)*vector_lanes,1; lane=UOp.range(matrix_lanes,63)
-    specs:dict[int,tuple[int,tuple[int,...],tuple[int,...]|None]]={}; axis_masks:list[UOp]=[]
-    # Express exact INT32 equality through ordinary INT16 byte UOps, then replace only the fake inputs' static gathers.
-    for axis_index,((index_slot,offsets),values) in enumerate(zip(grouped_indices,zip(*combinations))):
-      dynamic_bytes:list[UOp]=[]
-      for byte in range(4):
-        fake=UOp.param(slot,dtypes.int16,(matrix_lanes+1,)); specs[slot]=(index_slot,tuple(offset*4+byte if col<group_count else -1 for _ in range(rows) for col,offset in enumerate((*offsets,*((0,)*(vector_lanes-group_count))))),None); slot+=1  # noqa: E501
-        dynamic_bytes.append(fake.index(lane+1).load())
-      alternative_masks:list[UOp]=[]
-      for alternative in (values,*((tuple(value-axes[axis_index][2] for value in values),) if axes[axis_index][3] else ())):
-        byte_masks:list[UOp]=[]
-        for byte,dynamic in enumerate(dynamic_bytes):
-          fake=UOp.param(slot,dtypes.int16,(matrix_lanes+1,)); vals=tuple((value>>(byte*8))&255 if col<group_count else 0 for value in alternative[start:stop] for col in range(vector_lanes)); specs[slot]=(out_param.arg.slot,(),vals); slot+=1  # noqa: E501
-          byte_masks.append(UOp(Ops.CMPEQ,dtypes.bool,src=(dynamic,fake.index(lane+1).load())))
-        alternative_masks.append(functools.reduce(lambda x,y:x&y,byte_masks))
-      axis_masks.append(functools.reduce(lambda x,y:x|y,alternative_masks))
-    mask=functools.reduce(lambda x,y:x&y,axis_masks)
-    if grouped_gate is not None:
-      fake=UOp.param(slot,dtypes.bool,(matrix_lanes+1,)); specs[slot]=(grouped_gate[0],tuple(offset if col<group_count else -1 for _ in range(rows) for col,offset in enumerate((*grouped_gate[1],*((0,)*(vector_lanes-group_count))))),None)  # noqa: E501
-      mask=mask&fake.index(lane+1).load()
-    fake_out=UOp.param(0,dtypes.bool,(matrix_lanes,)); image=_lower_uop_program(list(fake_out.index(lane).store(mask).end(lane).sink().toposort()),vectorize_reductions=False,recipes_ready=True)  # noqa: E501
-    if image is None or image.host_gathers or image.host_scatters or len(image.post_gathers)!=1: raise RuntimeError("dynamic mask")
-    patched:list[RKGather]=[]
-    for gather in image.gathers:
-      src,offsets,spec_values=specs[gather.src_index]; patched.append(replace(gather,src_index=src,base=0,axes=(),offsets=offsets,values=spec_values or (),itemsize=2 if spec_values else 1,dst_stride=1 if spec_values else 2))  # noqa: E501
-    terminal=image.post_gathers[0]; mask_arg=RKArg(terminal.src_kind,terminal.src_index,terminal.base)
-    scratch,gathers,ops=list(image.scratch),patched,list(image.ew_ops)
-    def allocate(lanes:int=matrix_lanes) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1)
-    results:list[list[RKArg]]=[]
-    for channel in range(repeat):
-      result:list[RKArg]=[]
-      for byte in range(dtype.itemsize):
-        raw,selected=allocate(),allocate(); raw_rows=tuple(tuple(x*dtype.itemsize+byte for x in row[channel::repeat]) for row in plan_offsets[start:stop])  # noqa: E501
-        gathers.append(_candidate_gather(data_param.arg.slot,raw.index,raw_rows,vector_lanes)); ops.append(RKEWOp(selected,raw,mask_arg,matrix_lanes,_EW_CFG[Ops.MUL],**_INT16_EW))  # noqa: E501
-        result.append(_reduce_rows(ops,[replace(selected,addend=row*vector_lanes*2) for row in range(rows)],group_count,_EW_CFG[Ops.ADD],int16=True))  # noqa: E501
-      results.append(result)
-    return replace(image,scratch=tuple(scratch),gathers=tuple(gathers),ew_ops=tuple(ops),post_gathers=()),results
-
-  try: blocks=[block_image(start,min(candidates,start+block_rows)) for start in range(0,candidates,block_rows)]
-  except (KeyError,RuntimeError): return None
-  image,results=blocks[0]
-  for child,other in blocks[1:]:
-    fc,sc,fs=len(image.constants)//2,len(child.constants)//2,len(image.scratch)
-    # _append_inplace_image inserts the child's constants between the parent's constant and ordinary scratch slots.
-    def first(arg:RKArg) -> RKArg: return replace(arg,index=arg.index+sc) if arg.kind is RKBufferKind.SCRATCH and arg.index>=fc else arg
-    def second(arg:RKArg) -> RKArg: return replace(arg,index=fc+arg.index if arg.index<sc else fs+arg.index) if arg.kind is RKBufferKind.SCRATCH else arg  # noqa: E501
-    if (combined:=_append_inplace_image(image,child)) is None: return None
-    results,other=[[first(value) for value in row] for row in results],[[second(value) for value in row] for row in other]; ops=list(combined.ew_ops)  # noqa: E501
-    for row,additions in zip(results,other):
-      for value,part in zip(row,additions): ops.append(RKEWOp(value,value,part,group_count,_EW_CFG[Ops.ADD],**_INT16_EW))
-    image=replace(combined,ew_ops=tuple(ops))
-  scratch,gathers,ops,mid=list(image.scratch),list(image.gathers),list(image.ew_ops),list(image.mid_gathers)
-  def allocate(lanes:int=count) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1)
-  if total_gate is not None:
-    mask_param,fill=total_gate; bool_values=allocate(data_count*32)
-    gathers.extend(RKGather(mask_param.arg.slot,bool_values.index,1,offsets=(lane,),dst_addend=lane*64,dst_stride=2,itemsize=1) for lane in range(data_count))  # noqa: E501
-    total=_reduce_rows(ops,[replace(bool_values,addend=lane*64) for lane in range(data_count)],1,_EW_CFG[Ops.ADD],int16=True)
-    total_vector,coordinate,zero,one=(allocate() for _ in range(4)); mid.append(RKGather(total.index,total_vector.index,count,offsets=(total.addend//2,)*count,src_kind=RKBufferKind.SCRATCH,after=len(ops)))  # noqa: E501
-    gathers.extend((RKGather(mask_param.arg.slot,coordinate.index,count,values=tuple(range(count))),RKGather(mask_param.arg.slot,zero.index,count,values=(0,)*count),RKGather(mask_param.arg.slot,one.index,count,values=(1,)*count)))  # noqa: E501
-    delta,positive,valid=(allocate() for _ in range(3)); ops.extend(_ew_ops(((delta,total_vector,coordinate,Ops.SUB),(positive,delta,zero,Ops.MAX),(valid,positive,one,_EW_CFG_MIN)),count,**_INT16_EW))  # noqa: E501
-    fill_bits=int(fill.arg)&((1<<(dtype.itemsize*8))-1)
-    for byte,value in enumerate(results[0]):
-      fill_value,selected=allocate(),allocate(); gathers.append(RKGather(mask_param.arg.slot,fill_value.index,count,values=((fill_bits>>(byte*8))&255,)*count))  # noqa: E501
-      ops.extend(_ew_ops(((selected,value,fill_value,Ops.SUB),(selected,selected,valid,Ops.MUL),(value,fill_value,selected,Ops.ADD)),count,**_INT16_EW))  # noqa: E501
-  terminal=tuple(_raw_gather(value,out_param.arg.slot,group_count,dst_stride=repeat*dtype.itemsize,dst_addend=channel*dtype.itemsize+byte,offsets=tuple(range(value.addend,value.addend+group_count*2,2))) for channel,result in enumerate(results) for byte,value in enumerate(result))  # noqa: E501
-  image=replace(image,scratch=tuple(scratch),gathers=tuple(gathers),ew_ops=tuple(ops),mid_gathers=tuple(mid),post_gathers=terminal); all_gathers=image.gathers+image.mid_gathers+image.post_gathers  # noqa: E501
-  if any(size>_RKIMAGE_U16_MAX for size in (len(image.scratch),len(all_gathers))) or any(not 0<=index<=_RKIMAGE_U16_MAX for gather in all_gathers for index in (gather.src_index,gather.dst_index)) or any(not 0<=arg.index<=_RKIMAGE_U16_MAX for op in image.ew_ops for arg in (op.dst,op.lhs,op.rhs)): return None  # noqa: E501
-  return image
+  selected=UOp.const(0,dtype)
+  for values,mapping,candidate in zip(combinations,mappings,candidate_loads):
+    masks=[]
+    for (_,dynamic,extent,wrapped),value in zip(axes,values):
+      alternatives=(value,value-extent) if wrapped else (value,)
+      masks.append(functools.reduce(lambda x,y:x|y,(UOp(Ops.CMPEQ,dtypes.bool,src=(dynamic,dynamic.const_like(alternative))) for alternative in alternatives)))  # noqa: E501
+    mask=functools.reduce(lambda x,y:x&y,masks)
+    if bool_load is not None: mask=mask&bool_load
+    selected=mask.where(candidate,selected)
+  semantic=selected if source_load is root else root.substitute({source_load:selected})
+  physical=semantic.bitcast(dtypes.int16) if dtype is dtypes.half else semantic
+  target=UOp.param(out_param.arg.slot,physical.dtype,(count,)).index(out_index).store(physical)
+  image=_lower_uop_program(list(UOp(Ops.SINK,src=(target,)).toposort()),vectorize_reductions=False,recipes_ready=True)
+  return image if image is not None and image.execution_class is RKExecutionClass.NATIVE else None
 
 def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
   term = _unwrap_condition(term)

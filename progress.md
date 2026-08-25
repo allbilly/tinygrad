@@ -8307,6 +8307,51 @@ immediately before and after the census with `reset_npu ret=0`, `SUBMIT ret=0`,
 and exact output `[8 8 8 8 8 8 8 8]`.  No reset outside that health script,
 reboot, retry, test edit, runtime/core edit, or push was used.
 
+## 2026-08-25 — dynamic selector semantics join typed lowering at 1,997 lines
+
+This hardware-accepted milestone follows `828ca2108`.  Its predeclared
+authoritative `sz.py` budget was exactly **-132 old executable renderer lines**
+(`_lower_dynamic_typed_load` 126 plus `_candidate_gather` 6), with at most
+**+70 executable lines** in the replacement `_lower_dynamic_typed_load`, for
+net at most **-62**.  The observed result is renderer **2,061 -> 1,997**
+(**-64**), runtime remains **443**, and repository total **27,572 -> 27,508**.
+The raw renderer diff is **+24/-94 physical lines**.  The tested renderer
+SHA-256 is
+`714303bc9c8bfd417c8aefab37589132fdf91ff15a0471ef892ff50546f95bee`.
+
+The bounded selector owner now stops after proving its candidate domain and
+constructing ordinary typed `CMPEQ`/`WHERE` UOps.  Existing
+`_lower_uop_program` and `RKContext` own candidate loads, raw selection,
+reduction, and block composition, making the private `_candidate_gather` and
+the remaining manual physical image builder obsolete.  HALF results are
+bitcast to their INT16 physical carrier before lowering so selection is exact
+over all 16-bit payloads, including signed zero, infinities, and NaN payloads;
+INT16 and INT32 remain native typed values.  Admission still fails closed on
+slot and byte-offset bounds and still caps preallocated candidate cells.  This
+adds no generic IR, runtime phase, host computation, CPU/GPU numeric fallback,
+or runtime/core change.
+
+An intermediate FP16-root prototype was rejected by the raw hardware probe
+because a terminal floating MAX canonicalized NaN exponent bits.  The physical
+INT16 carrier repair then passed the exact production Tensor probe for words
+`0000,8000,7e01,7fff,7c01,fc01,3555,bc00,0400,7e01,8000,fc01`.  A raw oracle
+also passed **800 randomized cases** across HALF, INT16, INT32, normalized and
+multi-axis indices, repeated channels, external gates, and total-count fill.
+The focused selector gate reports **9 passed**, the complete Rockchip UOp
+module reports **155 passed** under `-n12`, and the production Tensor
+`to_program` hardware gate for gather, masked select, and fancy indexing
+reports **13 passed in 350.71 seconds**.  Mypy succeeds in **216 source files**,
+repository-wide Ruff succeeds, and diff checks are clean.
+
+The required uninterrupted serial hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and `-n0`; pytest exited zero
+with **433 passed, 12 suite-declared skips, and 154 subtests passed in 2259.14
+seconds**, exactly accounting for all **445** cases with zero failures.  The
+authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed
+immediately before and after the census with `reset_npu ret=0`, `SUBMIT ret=0`,
+and exact output `[8 8 8 8 8 8 8 8]`.  No reset outside that health script,
+reboot, census retry, runtime/core edit, or push was used.
+
 ---
 
 ## 2026-08-25 — bounded coordinates join generic native lowering at 2,137 lines

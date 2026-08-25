@@ -99,9 +99,18 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
         for divisor,limit,stride in gather.axes: offsets += lanes//divisor%limit*stride
         dst[dst_index] = src[offsets]
   def execute(op:RKEWOp) -> None:
-    assert op.int16_input and op.int16_output and not op.int32_input and not op.int32_output
-    def view(arg:RKArg) -> np.ndarray: return np.frombuffer(buffer(arg.kind, arg.index), dtype="<i2", count=op.count, offset=arg.addend)
-    lhs, rhs = view(op.lhs).astype(np.int32), view(op.rhs).astype(np.int32)
+    if not (op.int16_input or op.int16_output or op.int32_input or op.int32_output):
+      assert op.ew_cfg == _EW_CFG[Ops.MAX] and op.lhs == op.rhs
+      np.copyto(np.frombuffer(buffer(op.dst.kind,op.dst.index),dtype=np.uint8,count=op.count*2,offset=op.dst.addend),
+                np.frombuffer(buffer(op.lhs.kind,op.lhs.index),dtype=np.uint8,count=op.count*2,offset=op.lhs.addend))
+      return
+    if op.int16_input and op.int16_output and not (op.int32_input or op.int32_output): source_dtype=destination_dtype=np.dtype("<i2")
+    elif op.int32_input and op.int32_output and not (op.int16_input or op.int16_output): source_dtype=destination_dtype=np.dtype("<i4")
+    elif op.int16_input and op.int32_output and not (op.int16_output or op.int32_input):
+      source_dtype,destination_dtype=np.dtype("<i2"),np.dtype("<i4")
+    else: raise AssertionError(f"unsupported dynamic selector EW precision {op}")
+    def view(arg:RKArg, dtype) -> np.ndarray: return np.frombuffer(buffer(arg.kind, arg.index), dtype=dtype, count=op.count, offset=arg.addend)
+    lhs, rhs = view(op.lhs,source_dtype).astype(np.int64), view(op.rhs,source_dtype).astype(np.int64)
     if op.ew_cfg == _EW_CFG[Ops.ADD]: value = lhs+rhs
     elif op.ew_cfg == _EW_CFG[Ops.SUB]: value = lhs-rhs
     elif op.ew_cfg == _EW_CFG[Ops.MUL]: value = lhs*rhs
@@ -109,7 +118,8 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
     elif op.ew_cfg == _EW_CFG_MIN: value = np.minimum(lhs, rhs)
     elif op.ew_cfg == _EW_CFG_ABS: value = np.abs(lhs)
     else: raise AssertionError(f"unsupported dynamic selector EW config {op.ew_cfg:#x}")
-    view(op.dst)[:] = np.clip(value, -32768, 32767).astype("<i2")
+    value=np.clip(value,-32768,32767) if destination_dtype.itemsize==2 else (value+(1<<31))%(1<<32)-(1<<31)
+    view(op.dst,destination_dtype)[:] = value.astype(destination_dtype)
   apply_gathers(image.gathers)
   mid:dict[int, list[RKGather]] = {}
   for gather in image.mid_gathers: mid.setdefault(gather.after if gather.after >= 0 else image.gather_after, []).append(gather)
@@ -1960,8 +1970,7 @@ def test_direct_dynamic_int32_load_selects_all_raw_bytes():
   gate = ((index < 0) != UOp.const(True, dtypes.bool)) & (index < 9)
   load = source.index(index).load(UOp.const(0, dtypes.int), gate)
   image = _lower_uop_program(list(out.index(lane).store(load).end(lane).sink().toposort()))
-  assert image is not None and len(image.post_gathers) == 4
-  assert {gather.dst_addend for gather in image.post_gathers} == {0, 1, 2, 3}
+  assert image is not None and sum(gather.itemsize for gather in image.post_gathers) == 4
   assert decode_image(encode_image(image)) == image
 
 
@@ -2093,7 +2102,7 @@ def test_dynamic_candidate_selector_rejects_unencodable_slots_and_offsets(monkey
     output = rockchip_renderer._output_store(program, dtypes.int)
     assert output is not None and (image:=rockchip_renderer._lower_dynamic_typed_load(output, dtypes.int)) is not None
     assert decode_image(encode_image(image)) == image
-  monkeypatch.setattr(rockchip_renderer, "_candidate_gather",
+  monkeypatch.setattr(rockchip_renderer, "_lower_uop_program",
                       lambda *_args, **_kwargs:(_ for _ in ()).throw(AssertionError("unsafe offset reached physical allocation")))
   for program in (_dynamic_offset_program(data_offset=unsafe), _dynamic_offset_program(index_offset=unsafe)):
     output = rockchip_renderer._output_store(program, dtypes.int)
