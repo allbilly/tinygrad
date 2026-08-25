@@ -1930,16 +1930,9 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
         assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst_index].size//gather.itemsize
 
   coordinate = images[-1]
-  coordinate_rows = [g for g in coordinate.gathers if g.dst_kind is RKBufferKind.SCRATCH and g.itemsize == 2 and
-                    g.count == result.numel() and len(g.values) == result.numel()]
-  row_slots = {g.dst_index for g in coordinate_rows}
-  assert len(coordinate_rows) == 10 and len(row_slots) == 3
-  matrix_slot = next(slot for slot in row_slots if sum(g.dst_index == slot for g in coordinate_rows) == 8)
-  matrix_rows = [g for g in coordinate_rows if g.dst_index == matrix_slot]
-  assert coordinate.scratch[matrix_slot].size == 512
-  assert tuple(g.dst_addend for g in matrix_rows) == tuple(range(0, 256, 32))
-  assert tuple(g.values for g in matrix_rows) == ((0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (1, 1, 1, 1),
-                                                  (1, 1, 1, 1), (0, 0, 0, 0), (1, 1, 1, 1), (1, 1, 1, 1))
+  assert (len(coordinate.scratch),len(coordinate.gathers),len(coordinate.ew_ops),len(coordinate.mid_gathers),
+          len(coordinate.post_gathers),coordinate.gather_after) == (169,10,10979,120,1,1)
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest() == "e345944f37b06a416b124388c78257a55744c722924083ae5e39d00dc427b6eb"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))

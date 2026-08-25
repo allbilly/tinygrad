@@ -8254,6 +8254,51 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — bounded coordinates join generic native lowering at 2,137 lines
+
+This hardware-accepted milestone follows `30cec0b54`.  The predeclared
+authoritative `sz.py` budget was **+0 / at least -49 executable renderer
+lines**, replacing `_lower_bounded_integer_predicate_coordinates` and its
+dispatch with the existing `_unroll_static_local`, `_unroll_static_reduces`,
+bounded integer carrier logic in `RKContext`, and generic native output path.
+The observed result is larger: renderer **2,193 -> 2,137** (**-56**), runtime
+remains **443**, and repository total **27,704 -> 27,648**.  The raw renderer
+diff deletes 59 physical lines and adds none; the deleted planner's docstring
+disappears only because its complete owner is obsolete, not to affect `sz.py`.
+
+The fixed-rank nonzero coordinate image remains production `to_program`,
+fully native, and free of host gathers/scatters.  It now uses the shared
+semantic unroller and typed context instead of a second physical INT16-byte
+predicate planner.  Its generic image has **169 scratch slots / 10 initial
+gathers / 10,979 EW stages / 120 mid-gathers / one post-gather**, encodes to
+78,668 bytes, and has SHA-256
+`e345944f37b06a416b124388c78257a55744c722924083ae5e39d00dc427b6eb`.
+The permanent unit keeps the complete scratch-bound scan, native execution
+class, codec round trip, exact raw numeric result, and now pins that resource
+tuple and image hash rather than asserting the deleted planner's private
+coordinate-matrix layout.  No assertion or tolerance was weakened.
+
+The first isolated focused gate actually ran masked-select and nonzero on the
+NPU: **4 passed in 70.62 seconds**.  Host verification then reported **155
+passed** for `test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in
+**216 source files**, repository-wide Ruff success, and clean diff checks.
+The required uninterrupted serial hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and `-n0`; pytest exited zero
+with **433 passed, 12 suite-declared skips, and 154 subtests passed in 2067.61
+seconds**, exactly accounting for all **445** cases with zero failures.  The
+authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed
+immediately before and after that census with `reset_npu ret=0`, `SUBMIT
+ret=0`, and exact output `[8 8 8 8 8 8 8 8]`.
+
+The promoted renderer and focused-test SHA-256 values are respectively
+`b44f3cf1a6e2d10029c5bad50f4348ab5a1c492872b6beb82a8817e16fcb7e57`
+and `7d2bf50e01fbbe422381e952f5fe8bf69f1f662c32c10ba5fab1779fe3d2fb85`,
+byte-identical to the fully tested isolated worktree.  No runtime/core code,
+CPU/GPU/host numeric fallback, CMAC/LUT/PPU route, retry, reset outside the
+authoritative health script, reboot, or push was used.
+
+---
+
 ## 2026-08-25 — finite-threshold WHERE owns exact unordered selection at 2,193 lines
 
 This hardware-accepted milestone follows `376807da50`.  Its predeclared
