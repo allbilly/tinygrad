@@ -8254,6 +8254,62 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — CMAC planning has explicit reviewable phases at 2,088 lines
+
+This hardware-accepted cleanup follows `ad10a3824`.  The first private draft's
+renderer ceiling of **2,058** was rejected before promotion because a clean
+phase split measured larger.  The revised declared hard ceiling was **2,097**:
+at least 39 old executable lines replaced by at most 139 executable lines in
+`_RKCMACLinearTerm`, `_RKCMACShape`, `_cmac_source_offset`,
+`_parse_cmac_terms`, `_align_cmac_terms`, `_cmac_shapes`,
+`_pack_cmac_image`, and the rewritten `_lower_cmac_reduction`.  The measured
+token-aware spans are **46 -> 137 executable lines, net +91**.  Authoritative
+`sz.py` therefore moves renderer **1,997 -> 2,088** and repository total
+**27,508 -> 27,599**; runtime remains **443**.  The raw renderer diff is
+**+139/-39 physical lines**, and the tested renderer SHA-256 is
+`2a9987e0786ae7522bd72f2f202f7418feb7c542e1dce3078d2d5fe129e75996`.
+
+The former single CMAC owner compressed semantic term admission, typed source
+offsets, row/column stability, affine matrix-view enumeration, candidate
+ranking, physical A/B packing, partial gathers, and output unswizzling into
+nested comprehensions.  Those responsibilities now have named records and
+phase functions; `_lower_cmac_reduction` only unwraps the arithmetic boundary,
+invokes the phases, and selects the existing resource score.  Comments and
+docstrings are retained.  CMAC admission, scoring, limits, packing order,
+wire/runtime fields, numerical rounding, production `to_program` dispatch,
+and fail-closed fallback are unchanged.
+
+A committed-parent/candidate oracle ran the complete Rockchip UOp module
+serially.  Both sides made **148 CMAC attempts**, accepted the same **44**,
+passed all **155 tests**, and produced byte-identical ordered admission/image
+records at SHA-256
+`eb2f2909057f4c1c319f6bb762ec445ca730f4f3e932a2299ca9ac70ac5a8988`.
+The focused 34-case CMAC/matmul/convolution/weighted-term gate likewise made
+59 attempts, accepted the same 37, and matched at SHA-256
+`044de709d55c6f5492d8c230657e31cad68b42eb7f00a27ee87e32e699851985`.
+The parallel full module reports **155 passed** under `-n12`; mypy succeeds in
+**216 source files**, repository-wide Ruff succeeds, and diff checks are
+clean.
+
+The required uninterrupted serial hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and `-n0`; pytest exited zero
+with **433 passed, 12 suite-declared skips, and 154 subtests passed in 2220.68
+seconds**, exactly accounting for all **445** cases with zero failures.  The
+authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed
+before promotion, immediately before the census, and after the census with
+`reset_npu ret=0`, `SUBMIT ret=0`, and exact output
+`[8 8 8 8 8 8 8 8]`.  No test, runtime/core file, tolerance, CPU/GPU numeric
+fallback, reboot, census retry, or push was used.
+
+`Ops.WMMA` was audited but deliberately not added here.  Generic WMMA can be a
+future logical boundary for dense M/N/K contractions, but today's Tinygrad ABI
+is thread/lane based and does not carry RK3588's padded surfaces, CBUF limits,
+FP16 output swizzle, weighted terms, or sum-only contracts.  The historical
+Rockchip WMMA demos also host-packed/decoded NumPy buffers and did not prove
+the 445 census.  A future WMMA experiment is acceptable only if production
+scheduling emits it and thereby makes existing CMAC parser/shape code
+obsolete; an additive second input path is not a cleanup.
+
 ## 2026-08-25 — dynamic selectors reuse typed UOp byte comparison at 2,061 lines
 
 This hardware-accepted milestone follows `8b5dac598`.  Its predeclared
