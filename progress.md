@@ -8254,6 +8254,68 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — finite-threshold WHERE owns exact unordered selection at 2,193 lines
+
+This hardware-accepted milestone follows `376807da50`.  Its predeclared
+authoritative `sz.py` budget deleted the **19-line** `_mask_expr` and the
+**12-line** `_fold_threshold_where`, added a **12-line**
+`RKContext._threshold_where`, and made one-for-one `_raw_where` signature and
+dispatch replacements: net **-19 executable lines**.  The target is met
+exactly: renderer **2212 -> 2193**, repository total **27723 -> 27704**, and
+runtime remains **443**.  The renderer's raw diff is **+18/-38** because the
+replacement retains the obsolete helpers' semantic warning in its docstring.
+The tested/promoted renderer SHA-256 is
+`f7f83ab449bf541428607fd7fe056e34d35b400af0b24ef8e79dcc87d0c1e835`.
+
+`_mask_expr` had one production owner and its recursive CMPNE, boolean
+constant, AND, and OR branches were unreachable from that owner's required
+plain finite CMPLT gate.  `RKContext._threshold_where` now owns that narrow
+admission directly, reusing `_positive_mask`, `_fp16_component_values`,
+`_coerce_bool`, and `_raw_where` instead of maintaining a second recursive
+predicate language and arithmetic WHERE recipe.  It excludes lanes classified
+as NaN from the cheap positive mask, then delegates typed arm selection to the
+existing exact raw-byte path.  No generic IR, new image or runtime field,
+CPU/GPU numeric fallback, hand-built renderer shortcut, or tolerance change
+was introduced; every probe and census case used the production `to_program`
+path.
+
+This cleanup exposed a pre-existing correctness defect in the deleted fold:
+`(x < threshold).where(x, constant)` propagated NaN from the inactive source
+arm even though IEEE CMPLT is false for NaN.  The committed parent and the
+first byte-identical cleanup draft both returned NaN instead of the finite
+constant.  A second draft still trusted the DPU positive mask for unordered
+lanes and failed the same probe.  The final classifier-guarded design passed
+all **8/8** focused hardware cases across both source-arm orientations and
+four finite thresholds.  An existing hardware test now also executes
+`where(x < 0, x, 1)` over NaN, both infinities, signed zero, and a finite lane;
+the test census stays exactly **445** rather than adding a 446th case.
+
+Correct selection costs **18 scratch slots / 37 EW stages / 8 mid-gathers /
+628 encoded bytes** for the four-lane threshold fixture.  That is more than
+the incorrect shortcut's **4 / 10 / 0 / 237**, but substantially below the
+rejected fully generic fallback's **25 / 104 / 10 / 1181**.  The existing
+hardware regression records **12** total UOps submits for its three
+permutation calls, making this physical cost explicit rather than hiding it.
+A twin audit of every Rockchip `_masked_where`, `_raw_where`, `_mask_mul`, and
+`_fold_*where` owner found no other FP16 inactive-arm mask blend:
+`_masked_where` is confined to BOOL/INT16, generic FP16 uses raw bytes, and the
+remaining FP16 folds are dedicated ABS or ordered MIN/MAX paths already
+covered by nonfinite hardware cases.
+
+Host verification reports **155 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The focused
+permanent hardware regression passed separately.  The required uninterrupted
+serial census actually ran twice with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`: the isolated candidate passed
+in **2048.31 seconds**, and its byte-identical promoted shared tree passed in
+**2072.81 seconds**.  Each run exited zero with **433 passed, 12 suite-declared
+skips, and 154 subtests passed**, exactly accounting for all **445** cases with
+zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before and after
+the census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact output
+`[8 8 8 8 8 8 8 8]`.
+
 ## 2026-08-25 — bounded integer carriers share one semantic recipe at 2,212 lines
 
 This hardware-accepted milestone follows `d0f907fe3` in the isolated worktree

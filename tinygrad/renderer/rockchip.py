@@ -1660,10 +1660,24 @@ class RKContext:
                             (selected_no, inverse, no, _EW_CFG[Ops.MUL])): self._emit(dst, lhs, rhs, cfg)
     return self._emit(self._scratch(dtype, layout, u=u), selected_yes, selected_no, _EW_CFG[Ops.ADD])
 
-  def _raw_where(self, u:UOp) -> RKValue:
+  def _threshold_where(self, u:UOp) -> RKValue|None:
+    """Build a cheap FP16 0/1 predicate for a finite-threshold mask while excluding unordered lanes.
+    Select a compared value or finite constant without multiplying an inactive nonfinite value."""
+    gate = _unwrap_condition(u.src[0])
+    if gate.op is not Ops.CMPLT or gate.src[1].op is not Ops.CONST or not math.isfinite(float(gate.src[1].arg)) or any(src.dtype.scalar() not in (dtypes.half,dtypes.float) for src in gate.src): return None  # noqa: E501
+    lhs, yes, no = gate.src[0], *(_unwrap_condition(src) for src in u.src[1:])
+    if not (yes.key == lhs.key and no.op is Ops.CONST and math.isfinite(float(no.arg)) and float(no.arg) != float(gate.src[1].arg) or no.key == lhs.key and yes.op is Ops.CONST and math.isfinite(float(yes.arg)) and float(yes.arg) != float(gate.src[1].arg)): return None  # noqa: E501
+    value = self.lower(lhs.cast(dtypes.half))
+    if value.layout is not RKLayout.FP16: raise _RKGenericReject
+    selector = self.lower(_positive_mask(gate.src[1].cast(dtypes.half).alu(Ops.SUB, lhs.cast(dtypes.half))))
+    if selector.layout is not RKLayout.FP16 or selector.dtype is not dtypes.bool: raise _RKGenericReject
+    nan = self._fp16_component_values(value)[2]
+    mask = self._i16(self._coerce_bool(selector, RKLayout.INT16).arg, self._i16(self._i16_const(1), nan, _EW_CFG[Ops.SUB]), _EW_CFG[Ops.MUL])  # noqa: E501
+    return self._raw_where(u, RKValue(mask, dtypes.bool, self.count, RKLayout.INT16))
+
+  def _raw_where(self, u:UOp, selector:RKValue|None=None) -> RKValue:
     """Select typed values exactly, keeping nonfinite arms lazy until the selector layout is known."""
     specials = [i for i,arm in enumerate(u.src[1:]) if arm.op is Ops.CONST and arm.dtype is dtypes.half and not math.isfinite(float(arm.arg))]
-    selector:RKValue|None = None
     if len(specials) == 1:
       special, finite = specials[0], self.lower(u.src[2-specials[0]])
       if finite.layout is not RKLayout.FP16: raise _RKGenericReject
@@ -1739,7 +1753,8 @@ class RKContext:
         self.post_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count, offsets=offsets,
           partial=bool(partial), dst_kind=RKBufferKind.ARG, src_kind=value.arg.kind, itemsize=itemsize))
       return RKValue(self.out, dtype, self.count, expected)
-    for fold in (_fold_where_abs, _fold_ordered_where, _fold_threshold_where):
+    if (threshold:=self._threshold_where(u)) is not None: return threshold
+    for fold in (_fold_where_abs, _fold_ordered_where):
       if (recipe:=fold(u)) is not None: return self.lower(recipe)
     return self._raw_where(u)
 
@@ -2226,41 +2241,6 @@ def _finite_positive_mask(u:UOp) -> UOp:
   """Map finite binary16 values to `u > 0` without the stateful DPU compare path."""
   magnitude = u.alu(Ops.MAX, UOp.const(0.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half))
   return UOp(Ops.MAX, magnitude.dtype, src=(magnitude, UOp.const(1.0, dtypes.half)), arg=_NATIVE_MIN)
-
-def _mask_expr(u:UOp) -> UOp|None:
-  """Build an FP16 0/1 predicate using DPU positive-mask stages."""
-  u = _unwrap_condition(u)
-  if u.op in (Ops.CMPLT, Ops.CMPNE):
-    lhs, rhs = (_unwrap_condition(x) for x in u.src)
-    for value, other in ((lhs, rhs), (rhs, lhs)):
-      if value.op is Ops.CONST and value.dtype.scalar() is dtypes.bool:
-        mask = _mask_expr(other)
-        if mask is None: return None
-        return UOp.const(1.0, dtypes.half).alu(Ops.SUB, mask) if bool(value.arg) else mask
-    if lhs.dtype.scalar() not in (dtypes.half, dtypes.float) or rhs.dtype.scalar() not in (dtypes.half, dtypes.float): return None
-    lhs, rhs = lhs.cast(dtypes.half), rhs.cast(dtypes.half)
-    positive = _positive_mask(rhs.alu(Ops.SUB, lhs))
-    if u.op is Ops.CMPLT: return positive
-    return positive.alu(Ops.MAX, _positive_mask(lhs.alu(Ops.SUB, rhs)))
-  if u.op in (Ops.OR, Ops.AND):
-    mask_lhs, mask_rhs = (_mask_expr(x) for x in u.src)
-    if mask_lhs is None or mask_rhs is None: return None
-    return mask_lhs.alu(Ops.MAX, mask_rhs) if u.op is Ops.OR else _mask_mul(mask_lhs, mask_rhs)
-  return None
-
-def _fold_threshold_where(x:UOp) -> UOp|None:
-  """Select a compared value or finite constant without multiplying an inactive nonfinite value."""
-  gate = _unwrap_condition(x.src[0])
-  if gate.op is not Ops.CMPLT or gate.src[1].op is not Ops.CONST or not math.isfinite(float(gate.src[1].arg)): return None
-  lhs, threshold, yes, no = gate.src[0], float(gate.src[1].arg), *(_unwrap_condition(u) for u in x.src[1:])
-  if (mask:=_mask_expr(x.src[0])) is None: return None
-  if yes.key == lhs.key and no.op is Ops.CONST and math.isfinite(float(no.arg)) and float(no.arg) != threshold:
-    return _native_min(lhs.cast(dtypes.half), _half(threshold), dtype=lhs.dtype).alu(
-      Ops.ADD, _mask_mul(UOp.const(1.0, dtypes.half).alu(Ops.SUB, mask), _half(float(no.arg)-threshold)))
-  if no.key == lhs.key and yes.op is Ops.CONST and math.isfinite(float(yes.arg)) and float(yes.arg) != threshold:
-    return lhs.cast(dtypes.half).alu(Ops.MAX, _half(threshold)).alu(
-      Ops.ADD, _mask_mul(mask, _half(float(yes.arg)-threshold)))
-  return None
 
 def _fold_relu_cap(x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
