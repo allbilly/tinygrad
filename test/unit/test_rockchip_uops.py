@@ -2085,7 +2085,7 @@ def test_dynamic_candidate_selector_rejects_before_table_allocation(monkeypatch)
            (4096, rockchip_renderer._MAX_DYNAMIC_SELECTOR_CELLS//4096+1))
   for count,extent in cases:
     output = rockchip_renderer._output_store(_dynamic_load_program(count=count, extents=(extent,)), dtypes.half)
-    assert output is not None and rockchip_renderer._lower_dynamic_typed_load(output, dtypes.half) is None
+    assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is None
 
 
 def test_dynamic_candidate_selector_rejects_unencodable_slots_and_offsets(monkeypatch):
@@ -2095,18 +2095,19 @@ def test_dynamic_candidate_selector_rejects_unencodable_slots_and_offsets(monkey
   dynamic = indices.index(lane).load()
   gate = ((dynamic < 0) != UOp.const(True, dtypes.bool)) & (dynamic < 1)
   program = list(out.index(lane).store(source.index(dynamic).load(UOp.const(0.0, dtypes.half), gate)).end(lane).sink().toposort())
-  output = rockchip_renderer._output_store(program, dtypes.half)
-  assert output is not None and rockchip_renderer._lower_dynamic_typed_load(output, dtypes.half) is None
+  with monkeypatch.context() as scoped:
+    scoped.setattr(rockchip_renderer, "_dynamic_load_recipe",
+                   lambda *_args:(_ for _ in ()).throw(AssertionError("unencodable slot reached candidate planning")))
+    assert _lower_uop_program(program) is None
   safe, unsafe = (1 << 29)-1, 1 << 29
   for program in (_dynamic_offset_program(data_offset=safe), _dynamic_offset_program(index_offset=safe)):
     output = rockchip_renderer._output_store(program, dtypes.int)
-    assert output is not None and (image:=rockchip_renderer._lower_dynamic_typed_load(output, dtypes.int)) is not None
+    assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is not None and \
+      (image:=_lower_uop_program(program)) is not None
     assert decode_image(encode_image(image)) == image
-  monkeypatch.setattr(rockchip_renderer, "_lower_uop_program",
-                      lambda *_args, **_kwargs:(_ for _ in ()).throw(AssertionError("unsafe offset reached physical allocation")))
   for program in (_dynamic_offset_program(data_offset=unsafe), _dynamic_offset_program(index_offset=unsafe)):
     output = rockchip_renderer._output_store(program, dtypes.int)
-    assert output is not None and rockchip_renderer._lower_dynamic_typed_load(output, dtypes.int) is None
+    assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is None
 
 
 def test_dynamic_candidate_selector_composes_exact_bool_total_fill_gate():

@@ -8254,6 +8254,54 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — dynamic selection joins ordinary typed lowering at 2,066 lines
+
+This hardware-accepted cleanup follows `e838e41ca`.  Its predeclared `sz.py`
+budget deleted 75 executable lines—the 71-line `_lower_dynamic_typed_load`,
+the two-line `_same_condition`, and the two-line preemptive dispatcher—and
+allowed at most 53 replacement lines in `_dynamic_load_recipe` plus its
+`RKContext._load` hook, for net at most **-22**.  The measured result meets the
+ceiling exactly: renderer **2,088 -> 2,066**, repository total **27,599 ->
+27,577**, and runtime remains **443**.  The raw renderer diff is **+47/-71
+physical lines**; its tested SHA-256 is
+`19d36d898b4e7a80f8d1fc52e3f214fb4d86ee076e949854e11872996e0fe29c`.
+
+The old specializer intercepted a whole output, rebuilt an equality/WHERE
+graph, recursively invoked `_lower_uop_program`, and returned a complete
+`RKImage`.  `_dynamic_load_recipe` now proves the same HALF/INT16/INT32 source,
+negative-index normalization, external BOOL mask, finite candidate-space,
+parameter extent, and byte-address bounds, but returns only the semantic UOp.
+The normal `RKContext.lower` recursion lowers that recipe in place.  Root
+WHERE composition, typed physical carriers, output storage, resource
+selection, and native-image construction therefore each have one owner.  The
+global parameter-slot rejection still precedes recipe planning, and all
+unproved shapes fail closed into the existing path; no CPU/GPU numeric
+fallback or renderer-side data read was added.
+
+A nine-program committed-parent/candidate resource audit covered HALF,
+normalized and repeated indices, multiple dynamic axes, large tables,
+INT16/INT32, and prefix-total fills.  Every candidate remains
+`RKExecutionClass.NATIVE` with zero host-gather records.  The rewrite removes
+the specializer's postprocess record; affected images use one ordinary final
+EW record instead, while scratch, gather, and intermediate-EW counts remain
+unchanged.  Raw-focused bounds and carrier tests pass, including rejection
+before oversized table allocation and before unencodable parameter slots.
+
+The real production `Tensor -> schedule -> to_program` hardware gate for the
+complete gather, masked-select, and fancy-index classes ran serially and
+reported **13 passed in 296.59 seconds**.  The parallel unit module reports
+**155 passed in 32.34 seconds**; mypy succeeds in **216 source files**,
+repository-wide Ruff succeeds, and diff checks are clean.
+
+The required uninterrupted full hardware command then actually ran all 445
+census cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and `-n0`.
+It exited zero with **433 passed, 12 suite-declared skips, and 154 subtests
+passed in 2163.69 seconds**.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before the
+change, immediately before the census, and after it with `reset_npu ret=0`,
+`SUBMIT ret=0`, and exact output `[8 8 8 8 8 8 8 8]`.  No test count,
+tolerance, runtime/core file, reboot, retry, fallback, or push was used.
+
 ## 2026-08-25 — CMAC planning has explicit reviewable phases at 2,088 lines
 
 This hardware-accepted cleanup follows `ad10a3824`.  The first private draft's

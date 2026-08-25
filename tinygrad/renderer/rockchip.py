@@ -762,79 +762,58 @@ def _bounded_index_gate(gate:UOp, bounded:UOp, limit:int|None=None) -> int|None:
   return limit if any((comparison:=_inverted_condition(u, typed=True)) is not None and comparison.op is Ops.CMPLT and
     comparison.src[0].key == bounded.key and comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg) == 0 for u in nodes) else None
 
-def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
-  """Rewrite a bounded dynamic typed LOAD as ordinary exact candidate-selection UOps."""
-  store,out_param,count,out_index,root=output; total_gate:tuple[UOp,UOp]|None=None; source_load=load=root
-  if root.op is Ops.WHERE and len(root.src) == 3:
-    condition,source_load,fill=root.src; load=source_load
-    if dtype is dtypes.half:
-      if load.op is not Ops.LOAD or fill.op is not Ops.CONST or len(load.src) <= 2 or load.src[1].op is not Ops.CONST: return None
-      load_gate,same_default=load.src[2],float(load.src[1].arg)==float(fill.arg)
-      if not same_default and not (_same_condition(condition,load_gate) or condition.op is Ops.AND and any(_same_condition(x,load_gate) for x in condition.src)): return None  # noqa: E501
-      load=load.replace(src=(load.src[0],fill,condition.alu(Ops.AND,load_gate) if same_default else condition))
-    else:
-      if dtype not in (dtypes.int16,dtypes.int) or not 1 <= count <= _FP16_EXACT_INTEGER or condition.op is not Ops.CMPLT or \
-         _strip_cast(condition.src[0]).key != out_index.key or fill.op is not Ops.CONST or fill.dtype.scalar() is not dtype: return None
-      # Prove the prefix length counts every element of one BOOL parameter exactly once.
-      terms,mask_plans=list(_iter_binary(condition.src[1],Ops.ADD)),typing_cast(list[RKTypedLoadPlan],[])
-      try:
-        for term in terms:
-          if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or (source:=term.src[0]).op is not Ops.LOAD or source.dtype.scalar() is not dtypes.bool or source.src[0].op is not Ops.INDEX or [u for u in term.toposort() if u.op is Ops.LOAD] != [source] or (plan:=_typed_load_plan(source,dtypes.bool,out_index,count,require_offsets=True)) is None or len(set(plan.gather.offsets)) != 1: return None  # noqa: E501
-          mask_plans.append(plan)
-      except RuntimeError: return None
-      if not mask_plans or any(plan.param.arg.slot != mask_plans[0].param.arg.slot for plan in mask_plans) or int(mask_plans[0].param.src[0].arg) != len(mask_plans) or sorted(plan.gather.offsets[0] for plan in mask_plans) != list(range(len(mask_plans))): return None  # noqa: E501
-      total_gate=mask_plans[0].param,fill
-  if count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0: return None  # noqa: E501
-  data_param,data_index,gate,gate_nodes=_root_param(load.src[0]),load.src[0].src[1],load.src[2],load.src[2].toposort()
-  bool_loads=tuple(u for u in gate_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool); address_nodes=data_index.toposort()
-  normalized=tuple((u,index,int(addition[1].arg)) for u in address_nodes if u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT and u.src[0].src[1].op is Ops.CONST and int(u.src[0].src[1].arg)==0 and (index:=u.src[0].src[0]).op is Ops.LOAD and index.dtype.scalar() is dtypes.int and u.src[2].key==index.key and (addition:=_const_operand(u.src[1],Ops.ADD)) is not None and addition[0].key==index.key and int(addition[1].arg)>0)  # noqa: E501
-  normalized_by_load={dynamic.key:(base,extent) for base,dynamic,extent in normalized}
-  dynamic_loads=tuple({u.key:u for u in address_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
-  if not dynamic_loads or len(normalized_by_load) != len(normalized): return None
-  dynamic_axes:list[tuple[UOp,UOp,int,bool]]=[]
+def _dynamic_load_recipe(load:UOp, out_index:UOp, count:int) -> UOp|None:
+  """Express one bounded runtime-address LOAD as exact candidate-selection semantics."""
+  dtype = load.dtype.scalar()
+  if count <= 0 or dtype not in (dtypes.half,dtypes.int16,dtypes.int) or load.op is not Ops.LOAD or len(load.src) != 3 or \
+     load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0: return None
+  data_param,data_index,gate = _root_param(load.src[0]),load.src[0].src[1],load.src[2]
+  address_nodes = data_index.toposort()
+  normalized = tuple((node,index,int(addition[1].arg)) for node in address_nodes if node.op is Ops.WHERE and
+    node.src[0].op is Ops.CMPLT and node.src[0].src[1].op is Ops.CONST and int(node.src[0].src[1].arg) == 0 and
+    (index:=node.src[0].src[0]).op is Ops.LOAD and index.dtype.scalar() is dtypes.int and node.src[2].key == index.key and
+    (addition:=_const_operand(node.src[1],Ops.ADD)) is not None and addition[0].key == index.key and int(addition[1].arg) > 0)
+  normalized_by_load = {dynamic.key:(base,extent) for base,dynamic,extent in normalized}
+  dynamic_loads = tuple({node.key:node for node in address_nodes if node.op is Ops.LOAD and node.dtype.scalar() is dtypes.int}.values())
+  if data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or \
+     not dynamic_loads or len(normalized_by_load) != len(normalized): return None
+  axes:list[tuple[UOp, UOp, int, bool]] = []
   for dynamic in dynamic_loads:
-    axis,extent,wrapped=(*normalized_by_load[dynamic.key],True) if dynamic.key in normalized_by_load else \
+    axis,extent,wrapped = (*normalized_by_load[dynamic.key],True) if dynamic.key in normalized_by_load else \
       (dynamic,_bounded_index_gate(gate,dynamic),False)
     if extent is None or wrapped and _bounded_index_gate(gate,axis,extent) is None: return None
-    dynamic_axes.append((axis,dynamic,extent,wrapped))
-  axes=tuple(dynamic_axes); loads=tuple(axis[1] for axis in axes); params=typing_cast(tuple[UOp,...],tuple(_root_param(u.src[0]) if u.src and u.src[0].op is Ops.INDEX else None for u in loads))  # noqa: E501
-  if data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or len(bool_loads)>1 or any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params) or {u.key for u in gate_nodes if u.op is Ops.LOAD}!={u.key for u in (*loads,*bool_loads)}: return None  # noqa: E501
-  bool_load=bool_loads[0] if bool_loads else None
-  bool_param=_root_param(bool_load.src[0]) if bool_load is not None and len(bool_load.src)==1 and bool_load.src[0].op is Ops.INDEX else None
-  if bool_load is not None and (bool_load not in _iter_binary(gate,Ops.AND) or bool_param is None or bool_param.dtype.scalar() is not dtypes.bool or bool_param.src[0].op is not Ops.CONST): return None  # noqa: E501
-  if total_gate is not None and (bool_load is not None or len(axes)!=1 or data_index.key!=loads[0].key or axes[0][3]): return None
-  if any(not 0 <= param.arg.slot <= _RKIMAGE_U16_MAX for param in (out_param,data_param,*params,*((bool_param,) if bool_param is not None else ()),*((total_gate[0],) if total_gate is not None else ()))): return None  # noqa: E501
-  candidates,data_count=math.prod(extent for _,_,extent,_ in axes),int(data_param.src[0].arg)
-  if total_gate is not None and (data_count!=int(total_gate[0].src[0].arg) or candidates!=data_count or int(params[0].src[0].arg)!=count): return None  # noqa: E501
-  if candidates>min(_MAX_STATIC_RANGE_ENVS,_MAX_DYNAMIC_SELECTOR_CELLS//count): return None
-  combinations=tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes)))
-  if bool_load is not None and bool_param is not None:
-    try: bool_offsets=_gather_offsets(out_index,bool_load.src[0].src[1],None,count)
+    axes.append((axis,dynamic,extent,wrapped))
+  gate_loads = tuple(node for node in gate.toposort() if node.op is Ops.LOAD)
+  bool_loads = tuple(node for node in gate_loads if node.dtype.scalar() is dtypes.bool)
+  raw_params = tuple(_root_param(dynamic.src[0]) if dynamic.src and dynamic.src[0].op is Ops.INDEX else None for dynamic in dynamic_loads)
+  invalid_params = any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in raw_params)
+  if len(bool_loads) > 1 or invalid_params or \
+     {node.key for node in gate_loads} != {node.key for node in (*dynamic_loads,*bool_loads)}: return None
+  params = typing_cast(tuple[UOp, ...],raw_params); bool_load = bool_loads[0] if bool_loads else None
+  if bool_load is not None:
+    bool_param = _root_param(bool_load.src[0]) if len(bool_load.src) == 1 and bool_load.src[0].op is Ops.INDEX else None
+    if bool_load not in _iter_binary(gate,Ops.AND) or bool_param is None or bool_param.dtype.scalar() is not dtypes.bool or bool_param.src[0].op is not Ops.CONST: return None  # noqa: E501
+    try: bool_offsets = _gather_offsets(out_index,bool_load.src[0].src[1],None,count)
     except RuntimeError: return None
     if any(not 0 <= offset < int(bool_param.src[0].arg) for offset in bool_offsets): return None
-  static_gate={} if bool_load is None else {bool_load:bool_load.const_like(True)}
-  mappings=tuple({dynamic:dynamic.const_like(value) for dynamic,value in zip(loads,values)} for values in combinations)
-  candidate_loads=tuple(load.substitute(mapping|static_gate) for mapping in mappings)
+  candidates = math.prod(extent for _,_,extent,_ in axes)
+  if candidates > min(_MAX_STATIC_RANGE_ENVS,_MAX_DYNAMIC_SELECTOR_CELLS//count): return None
+  combinations = tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes)))
+  mappings = tuple({dynamic:dynamic.const_like(value) for (_,dynamic,_,_),value in zip(axes,values)} for values in combinations)
+  static_gate = {} if bool_load is None else {bool_load:bool_load.const_like(True)}
+  candidate_loads = tuple(load.substitute(mapping|static_gate) for mapping in mappings)
   try:
-    index_offsets=tuple(_gather_offsets(out_index,dynamic.src[0].src[1],None,count) for dynamic in loads)
-    plans=tuple(_typed_load_plan(candidate,dtype,out_index,count,require_offsets=True) for candidate in candidate_loads)
+    index_offsets = tuple(_gather_offsets(out_index,dynamic.src[0].src[1],None,count) for dynamic in dynamic_loads)
+    plans = tuple(_typed_load_plan(candidate,dtype,out_index,count,require_offsets=True) for candidate in candidate_loads)
   except RuntimeError: return None
-  if None in plans or any(not 0 <= offset < int(param.src[0].arg) or offset*4+3>dtypes.int.max for offsets,param in zip(index_offsets,params) for offset in offsets) or any(offset >= 0 and offset*dtype.itemsize+dtype.itemsize-1>dtypes.int.max for plan in plans if plan is not None for offset in plan.gather.offsets): return None  # noqa: E501
-  if total_gate is not None and index_offsets[0]!=tuple(range(count)): return None
-  selected=UOp.const(0,dtype)
-  for values,mapping,candidate in zip(combinations,mappings,candidate_loads):
-    masks=[]
-    for (_,dynamic,extent,wrapped),value in zip(axes,values):
-      alternatives=(value,value-extent) if wrapped else (value,)
-      masks.append(functools.reduce(lambda x,y:x|y,(UOp(Ops.CMPEQ,dtypes.bool,src=(dynamic,dynamic.const_like(alternative))) for alternative in alternatives)))  # noqa: E501
-    mask=functools.reduce(lambda x,y:x&y,masks)
-    if bool_load is not None: mask=mask&bool_load
-    selected=mask.where(candidate,selected)
-  semantic=selected if source_load is root else root.substitute({source_load:selected})
-  physical=semantic.bitcast(dtypes.int16) if dtype is dtypes.half else semantic
-  target=UOp.param(out_param.arg.slot,physical.dtype,(count,)).index(out_index).store(physical)
-  image=_lower_uop_program(list(UOp(Ops.SINK,src=(target,)).toposort()),vectorize_reductions=False,recipes_ready=True)
-  return image if image is not None and image.execution_class is RKExecutionClass.NATIVE else None
+  if any(plan is None for plan in plans) or any(not 0 <= offset < int(param.src[0].arg) or offset*4+3 > dtypes.int.max for offsets,param in zip(index_offsets,params) for offset in offsets) or any(offset >= 0 and offset*dtype.itemsize+dtype.itemsize-1 > dtypes.int.max for plan in plans if plan is not None for offset in plan.gather.offsets): return None  # noqa: E501
+  selected = UOp.const(0,dtype)
+  for values,candidate in zip(combinations,candidate_loads):
+    masks = [functools.reduce(lambda x,y:x|y,(UOp(Ops.CMPEQ,dtypes.bool,src=(dynamic,dynamic.const_like(alternative)))
+      for alternative in ((value,value-extent) if wrapped else (value,)))) for (_,dynamic,extent,wrapped),value in zip(axes,values)]
+    mask = functools.reduce(lambda x,y:x&y,masks)
+    selected = (mask if bool_load is None else mask&bool_load).where(candidate,selected)
+  return selected
 
 def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:
   term = _unwrap_condition(term)
@@ -1073,6 +1052,8 @@ class RKContext:
       fill_override if fill_override is not None else _fp16_bits(0 if default is None else default.arg) if dtype is dtypes.half else \
       _int16_bits(0 if default is None else default.arg) if dtype is dtypes.int16 else int(0 if default is None else default.arg) & 0xffffffff
     if address_loads:
+      if (u is self.root or self.root.op is Ops.WHERE) and (recipe:=_dynamic_load_recipe(u,self.out_index,self.count)) is not None:
+        return self.lower(recipe)
       if os.getenv("ROCKCHIP_HOST_GATHER","1") != "1": raise _RKGenericReject
       # Resolve an affine or table-addressed runtime index without reading it on the renderer.
       infos = tuple(info for node in index.toposort() if (info:=_runtime_index(node)) is not None); affine = False; index_offset:int|None = None
@@ -2010,9 +1991,6 @@ def _lower_host_scatter(output:RKOutput) -> RKImage|None:
     itemsize=out_param.dtype.scalar().itemsize, index_itemsize=index_itemsize)
   return RKImage(RKTarget.RK3588, host_scatters=(address,))
 
-def _same_condition(a:UOp, b:UOp) -> bool: return a.key == b.key or a.op is b.op is Ops.AND and len(a.src) == len(b.src) == 2 and any(
-  all(_same_condition(x, y) for x,y in zip(a.src, order)) for order in (b.src, b.src[::-1]))
-
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipes_ready:bool=False) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return None
@@ -2030,8 +2008,6 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if (mixed:=_try(strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops,v=vectorize_reductions)) is not None: return mixed
   if (scatter:=_try(strict_output, (dtypes.half, dtypes.int16), _lower_host_scatter)) is not None: return scatter
   if (image:=_try(strict_output,dtypes.int,_lower_raw_fp16_bitcast)) is not None: return image
-  for dtype in (dtypes.half, dtypes.int16, dtypes.int):
-    if (image:=_try(strict_output, dtype, _lower_dynamic_typed_load, dtype)) is not None: return image
   if (extrema:=_try(local_output, dtypes.int, _lower_vectorized_scalar_local_extrema, uops, v=vectorize_reductions)) is not None: return extrema
   storage_uops, storage_product_adds = typing_cast(list[UOp]|None, None), False
   if any(u.dtype.scalar() is dtypes.float for u in uops):
