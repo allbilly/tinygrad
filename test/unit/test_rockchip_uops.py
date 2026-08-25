@@ -1147,7 +1147,14 @@ def test_large_affine_matmul_keeps_cmac_planning_compact(m:int, k:int, n:int):
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
   assert image.cmac is not None and (image.cmac.m,image.cmac.n,image.cmac.k) == (m,n,k)
   assert len(image.gathers) == 2 and not image.ew_ops and decode_image(encode_image(image)) == image
-  lhs_offsets, rhs_offsets = (np.asarray(gather.offsets) for gather in image.gathers)
+  def offsets(gather:RKGather) -> np.ndarray:
+    lanes = np.arange(gather.count,dtype=np.int64)
+    indices = np.full(gather.count,gather.base,dtype=np.int64)
+    for divisor,limit,stride in gather.axes: indices += lanes//divisor%limit*stride
+    return indices
+  assert len(encode_image(image)) < 512
+  assert all(gather.axes and not gather.offsets for gather in (*image.gathers,*image.post_gathers))
+  lhs_offsets,rhs_offsets = map(offsets,image.gathers)
   np.testing.assert_array_equal(lhs_offsets,np.arange(m*k))
   expected_rhs = np.asarray([(ib*32+ki)*n+ob*16+ni for ob in range(n//16) for ib in range(k//32) for ni in range(16) for ki in range(32)])
   np.testing.assert_array_equal(rhs_offsets,expected_rhs)
@@ -1156,6 +1163,8 @@ def test_large_affine_matmul_keeps_cmac_planning_compact(m:int, k:int, n:int):
   packed_rhs = rhs_values.reshape(-1)[rhs_offsets].reshape(n//16,k//32,16,32).transpose(0,2,1,3).reshape(n,k)
   np.testing.assert_array_equal(lhs_values.astype(np.float32)@packed_rhs.T.astype(np.float32),
                                 lhs_values.astype(np.float32)@rhs_values.astype(np.float32))
+  expected_output = np.asarray([row*n*2+col//16*32+col%16 for row in range(m) for col in range(n)])
+  np.testing.assert_array_equal(offsets(image.post_gathers[0]),expected_output)
 
 
 def test_real_matmul_relu_routes_one_production_cmac_stage():

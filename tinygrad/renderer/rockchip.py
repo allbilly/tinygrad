@@ -647,42 +647,59 @@ def _cmac_shapes(parsed:tuple[_RKCMACLinearTerm, ...], out_index:UOp, rows:int, 
     if valid_shape and normalized and not trivial_fp32: candidates.append(_RKCMACShape(is_diagonal,m,n,lanes,outputs,normalized,ai,ao))
   return tuple(candidates)
 
+def _dense_cmac_gathers(shape:_RKCMACShape) -> tuple[RKGather, RKGather]|None:
+  """Prove and encode an aligned dense contraction without materializing its physical offset arrays."""
+  groups = len(shape.terms)
+  if shape.diagonal or shape.lanes or shape.outputs or shape.ai != groups or shape.ao != shape.n: return None
+  lhs0,rhs0,_ = shape.terms[0]
+  if lhs0 is None or rhs0 is None: return None
+  for k,(lhs,rhs,weight) in enumerate(shape.terms):
+    if lhs is None or rhs is None or weight != 1.0 or lhs.param is not lhs0.param or rhs.param is not rhs0.param: return None
+    if lhs.gather.offsets or lhs.gather.base != lhs0.gather.base+k or lhs.gather.axes != ((shape.n,shape.m,groups),): return None
+    if rhs.gather.offsets or rhs.gather.base != rhs0.gather.base+k*shape.n or rhs.gather.axes != ((1,shape.n,1),): return None
+  return RKGather(lhs0.param.arg.slot,0,shape.m*groups,base=lhs0.gather.base,axes=((1,shape.m*groups,1),)), \
+    RKGather(rhs0.param.arg.slot,1,shape.n*groups,base=rhs0.gather.base,axes=((groups*16,shape.n//16,16),(512,groups//32,32*shape.n),(32,16,1),(1,32,shape.n)))  # noqa: E501
+
 def _pack_cmac_image(shape:_RKCMACShape, parsed:tuple[_RKCMACLinearTerm, ...], out:UOp,
                      rows:int, relu:bool) -> RKImage|None:
   """Pack selected logical sources into fixed A/B surfaces and restore output order."""
   groups,fp16 = len(parsed),out.dtype.scalar() is dtypes.half
-  a_cells:list[tuple[int|None, int]] = []
-  for row in range(shape.m):
-    for k in range(shape.ai):
-      if k >= groups: a_cells.append((None,0)); continue
-      lhs,rhs,weight = shape.terms[k]
-      if lhs is None: a_cells.append((None,_fp16_bits(1.0 if rhs is None else weight))); continue
-      logical = row if shape.diagonal else row*shape.n; lane = shape.lanes[logical] if shape.lanes else logical
-      a_cells.append((lhs.param.arg.slot,_cmac_source_offset(lhs,lane)))
-  b_cells:list[tuple[int|None, int]] = []
-  for ob in range(shape.ao//16):
-    for ib in range(shape.ai//32):
-      for ni in range(16):
-        for ki in range(32):
-          lane,k = ob*16+ni,ib*32+ki
-          if lane >= shape.n or k >= groups: b_cells.append((None,0)); continue
-          _,rhs,weight = shape.terms[k]
-          if rhs is None: b_cells.append((None,_fp16_bits(weight))); continue
-          logical = shape.lanes[lane] if shape.lanes else lane
-          b_cells.append((rhs.param.arg.slot,_cmac_source_offset(rhs,logical)))
-  gathers:list[RKGather] = []
-  for dst,packed in enumerate((a_cells,b_cells)):
-    sources = tuple(dict.fromkeys(source for source,_ in packed if source is not None))
-    values = tuple(value if source is None else 0 for source,value in packed); seeded = not sources or any(values)
-    if seeded: gathers.append(RKGather(out.arg.slot,dst,len(packed),values=values))
-    for i,source in enumerate(sources):
-      offsets = tuple(value if owner == source else -1 for owner,value in packed)
-      gathers.append(RKGather(source,dst,len(packed),offsets=offsets,partial=seeded or bool(i)))
+  dense_gathers = _dense_cmac_gathers(shape)
+  gathers:list[RKGather] = list(dense_gathers) if dense_gathers is not None else []
+  if dense_gathers is None:
+    a_cells:list[tuple[int|None, int]] = []
+    for row in range(shape.m):
+      for k in range(shape.ai):
+        if k >= groups: a_cells.append((None,0)); continue
+        lhs,rhs,weight = shape.terms[k]
+        if lhs is None: a_cells.append((None,_fp16_bits(1.0 if rhs is None else weight))); continue
+        logical = row if shape.diagonal else row*shape.n; lane = shape.lanes[logical] if shape.lanes else logical
+        a_cells.append((lhs.param.arg.slot,_cmac_source_offset(lhs,lane)))
+    b_cells:list[tuple[int|None, int]] = []
+    for ob in range(shape.ao//16):
+      for ib in range(shape.ai//32):
+        for ni in range(16):
+          for ki in range(32):
+            lane,k = ob*16+ni,ib*32+ki
+            if lane >= shape.n or k >= groups: b_cells.append((None,0)); continue
+            _,rhs,weight = shape.terms[k]
+            if rhs is None: b_cells.append((None,_fp16_bits(weight))); continue
+            logical = shape.lanes[lane] if shape.lanes else lane
+            b_cells.append((rhs.param.arg.slot,_cmac_source_offset(rhs,logical)))
+    for dst,packed in enumerate((a_cells,b_cells)):
+      sources = tuple(dict.fromkeys(source for source,_ in packed if source is not None))
+      values = tuple(value if source is None else 0 for source,value in packed); seeded = not sources or any(values)
+      if seeded: gathers.append(RKGather(out.arg.slot,dst,len(packed),values=values))
+      for i,source in enumerate(sources):
+        offsets = tuple(value if owner == source else -1 for owner,value in packed)
+        gathers.append(RKGather(source,dst,len(packed),offsets=offsets,partial=seeded or bool(i)))
   if sum(gather.count for gather in gathers)+rows > _MAX_DYNAMIC_SELECTOR_CELLS: return None
-  output_offsets = tuple(row*shape.ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col)
-                         for i in (shape.outputs or range(rows)) for row,col in (divmod(i,shape.n),))
+  output_axes = ((shape.n,shape.m,shape.ao*2),(16,shape.n//16,32),(1,16,1)) if dense_gathers is not None and fp16 else \
+    ((1,rows,1),) if dense_gathers is not None else ()
+  output_offsets = () if dense_gathers is not None else tuple(row*shape.ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col)
+    for i in (shape.outputs or range(rows)) for row,col in (divmod(i,shape.n),))
   return RKImage(RKTarget.RK3588,(RKScratch(shape.m*shape.ai*2),RKScratch(shape.ao*shape.ai*2),RKScratch(shape.m*shape.ao*4)),
-    gathers=tuple(gathers),post_gathers=(RKGather(2,out.arg.slot,rows,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,
+    gathers=tuple(gathers),post_gathers=(RKGather(2,out.arg.slot,rows,axes=output_axes,offsets=output_offsets,dst_kind=RKBufferKind.ARG,itemsize=2 if fp16 else 4,  # noqa: E501
     src_kind=RKBufferKind.SCRATCH),),cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),
     shape.m,shape.n,groups,fp16,relu))
 

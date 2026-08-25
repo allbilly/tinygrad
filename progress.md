@@ -8254,6 +8254,52 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-26 — aligned dense CMAC packing is affine at 2,105 lines
+
+This hardware-accepted architecture cleanup follows `8cd42e1ed`.  Its
+predeclared `sz.py` budget deleted the 37 executable lines in the old
+`_pack_cmac_image` and allowed at most 52 replacement lines across
+`_dense_cmac_gathers` and the rewritten `_pack_cmac_image`, for net at most
+**+15**.  The measured result meets that ceiling exactly: renderer **2,090 ->
+2,105**, repository total **27,601 -> 27,616**, and runtime remains **443**.
+The raw renderer diff is **+47/-30 physical lines**; its tested SHA-256 is
+`cb75f302d73473f5e97ea9525dcad4b1f32b5ad920f6bcbefa248f13ca66f56f`.
+
+Large aligned dense contractions no longer materialize two physical offset
+arrays with tens of thousands of entries.  `_dense_cmac_gathers` proves that
+every K term has unit weight, the same two source parameters, consecutive
+bases, the exact row-stable/column-stable affine axes, no lane permutation,
+and no CMAC padding.  It then represents the A surface, tiled B surface, and
+physical output order directly with existing `RKGather.axes`.  The ordinary
+packer remains the sole fallback owner for padding, constants, multiple
+sources, diagonal layouts, lane permutations, and non-affine offsets.  UOps
+remain the only semantic IR; this adds no WMMA rewrite, wire field, runtime
+stage, host arithmetic, CPU/GPU numeric fallback, or relaxed admission.
+
+Four actual production `Tensor.schedule_linear -> to_program` matmuls with
+`(M,K,N)` equal to `(256,256,256)`, `(192,256,160)`, `(64,384,384)`, and
+`(512,128,128)` retain exact expanded A/B packing and FP32 matrix-product
+semantics.  Their encoded images shrink respectively from **309,336,
+200,393, 354,327, and 220,817 bytes** to **204, 223, 223, and 216 bytes**.
+Cold production compilation in the same order moved from **1.793, 1.431,
+2.616, and 1.090 seconds** to **1.274, 1.173, 2.100, and 0.697 seconds**.
+The regression retains its prior numeric packing oracle, adds exact affine
+output-layout expansion, requires every relevant gather to omit offsets, and
+caps each encoded image below 512 bytes.  The small unaligned `3x5 @ 5x4`
+test continues to exercise the explicit-offset path.
+
+Host verification reports **155 passed** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 files**,
+repository-wide Ruff success, and clean diff checks.  Two production-path
+hardware matmuls, `(2,32,16)` and `(3,64,32)`, hit the affine path and matched
+their exact FP16 references.  The authoritative uninterrupted command
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest
+test/backend/test_rockchip.py -q -n0` accounts for the complete 445-case
+census with **433 passed, 12 skipped, 154 subtests passed in 2,198.31 seconds
+(36:38)**.  Pre-promotion, post-feature, pre-census, and post-census
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health gates all report
+`reset_npu ret=0`, `SUBMIT ret=0`, and exact `[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-25 — typed load phases are explicit at 2,090 lines
 
 This hardware-accepted cleanliness milestone follows `7c3106954`.  Its
