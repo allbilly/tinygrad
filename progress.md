@@ -8254,6 +8254,56 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — typed load phases are explicit at 2,090 lines
+
+This hardware-accepted cleanliness milestone follows `7c3106954`.  Its
+predeclared `sz.py` budget deleted all 76 executable lines in the old
+`RKContext._load` and allowed at most 100 replacement lines in
+`_RKRuntimeAddress`, `_runtime_load_address`, `_masked_load_default`,
+`_host_address_load`, `_fp32_load`, and the rewritten `_load`, for net at most
+**+24**.  The measured result meets that ceiling exactly: renderer **2,066 ->
+2,090**, repository total **27,577 -> 27,601**, and runtime remains **443**.
+The raw renderer diff is **+103/-70 physical lines**; its tested SHA-256 is
+`c4494e7caf536f10bb35dacbbad819e6bae1772ba19678254758e0e065f7f35b`.
+
+The former 76-line method mixed typed admission, nonconstant masked defaults,
+native dynamic-selection recipes, affine/table runtime-address proof, explicit
+host-address materialization, FP32 physical conversion, BOOL packing, and
+direct-buffer reuse.  Runtime-address proof is now a pure 15-line function;
+the three materializers are 12, 24, and 14 lines; and the remaining dispatcher
+is 33 lines.  Each helper owns a physical invariant rather than forwarding a
+single call.  `_RKRuntimeAddress` is private proof metadata only: UOps remain
+the sole semantic IR.  Admission, execution class, host/raw ownership,
+resource ordering, and encoded command bytes are unchanged.
+
+A committed-parent/candidate oracle ran the complete Rockchip UOp module
+serially in both trees.  Both report **155 passed** and exactly the same JSON
+over **292 lowering outcomes / 274 RKImages**.  The complete oracle files are
+byte-identical at SHA-256
+`593d1906bd0454a8e2d880273dac455bd903d2a389396d04fddaf366beb0fec2`;
+their ordered outcome/image record hash is
+`0f38482dd1fc6c40a68a5cacc43e5b473ac2d1b0097b192bed91e55125113ff9`.
+The retained oracle and both records are under
+`/home/orangepi/rk-artifacts-clean-load-20260825/`.
+
+Focused load/gather verification reports **23 passed** and the complete unit
+module reports **155 passed in 32.18 seconds**, both under `-n12`.  Mypy
+succeeds in **216 source files**, repository-wide Ruff succeeds, and diff
+checks are clean.  The required uninterrupted serial production census then
+actually ran with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` through
+`test/backend/test_rockchip.py -q -n0`; pytest exited zero with **433 passed,
+12 suite-declared skips, and 154 subtests passed in 2158.15 seconds**, exactly
+accounting for all **445** cases with zero failures.  A stale external
+`~/rk3588/test/test_rockchip.py` invocation failed during import before
+collection because it references removed upstream helpers; it executed no
+test and is not counted as the census.
+
+The authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` health
+gate passed before promotion, immediately before the census, and after it with
+`reset_npu ret=0`, `SUBMIT ret=0`, and exact output
+`[8 8 8 8 8 8 8 8]`.  No runtime/core/test file, tolerance, CPU/GPU numeric
+fallback, reboot, hardware retry, census retry, or push was used.
+
 ## 2026-08-25 — dynamic selection joins ordinary typed lowering at 2,066 lines
 
 This hardware-accepted cleanup follows `e838e41ca`.  Its predeclared `sz.py`
