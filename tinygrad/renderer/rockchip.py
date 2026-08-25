@@ -4,7 +4,7 @@ import base64, functools, heapq, io, itertools, marshal, math, os, struct, zlib
 import numpy as np
 from dataclasses import astuple, dataclass, replace
 from enum import IntEnum
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, cast, cast as typing_cast
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16
 from tinygrad.helpers import ceildiv, round_up
@@ -617,22 +617,6 @@ def _lower_cmac_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64; return vector_bytes, vector_bytes//2, rows*vector_bytes//2
 
-class _RKBuilder:
-  """Allocate physical scratch and append native stages without owning semantic lowering."""
-  def __init__(self, minimum:int=0):
-    self.minimum = minimum; self.sizes,self.gathers,self.ops = typing_cast(tuple[list[int], list[RKGather], list[RKEWOp]], ([], [], []))
-  def scratch(self, size:int, addend:int=0) -> RKArg:
-    self.sizes.append(max(self.minimum, size)); return RKArg(RKBufferKind.SCRATCH, len(self.sizes)-1, addend)
-  def constant(self, source:int, count:int, value:int, itemsize:int=2, dst:RKArg|None=None) -> RKArg:
-    if dst is None: dst = self.scratch(count*itemsize)
-    self.gathers.append(RKGather(source, dst.index, count, values=(value,)*count, itemsize=itemsize)); return dst
-  def i16(self, lhs:RKArg, rhs:RKArg, count:int, cfg:int, dst:RKArg|None=None) -> RKArg:
-    if dst is None: dst = self.scratch(count*2)
-    self.ops.append(RKEWOp(dst, lhs, rhs, count, cfg, **_INT16_EW)); return dst
-  def image(self, constants:bytes=b"", **kwargs) -> RKImage:
-    return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in self.sizes), constants,
-                   gathers=tuple(self.gathers), ew_ops=tuple(self.ops), **kwargs)
-
 def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
   first = not int16
@@ -641,10 +625,6 @@ def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16
       ops.append(RKEWOp(lhs, lhs, rhs, count, cfg, submit_barrier=first, stateful=first, int16_input=int16, int16_output=int16)); first = False  # noqa: E501
     active = active[::2]
   return active[0]
-
-def _masked_rows(builder:_RKBuilder, value:RKArg, mask:RKArg, rows:int, lanes:int, count:int) -> RKArg:
-  selected = builder.i16(value, mask, rows*lanes, _EW_CFG[Ops.MUL])
-  return _reduce_rows(builder.ops, [replace(selected, addend=row*lanes*2) for row in range(rows)], count, _EW_CFG[Ops.ADD], int16=True)
 
 def _int16_byte_bits(ops:list[RKEWOp], alloc:Callable[[], RKArg], const:dict[int, RKArg], value:RKArg, lanes:int, weighted=False)->tuple[RKArg, ...]:
   """Split unsigned byte lanes into exact native planes, optionally retaining each bit's scale."""
@@ -689,201 +669,141 @@ def _bounded_index_gate(gate:UOp, bounded:UOp, limit:int|None=None) -> int|None:
   return limit if any((comparison:=_inverted_condition(u, typed=True)) is not None and comparison.op is Ops.CMPLT and
     comparison.src[0].key == bounded.key and comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg) == 0 for u in nodes) else None
 
-def _native_int16_byte_mask(builder:_RKBuilder, index_slot:int, index_offsets:tuple[int, ...]|tuple[tuple[int, ...], ...],
-                            coordinate_sets:tuple[tuple[tuple[int, ...], ...], ...], count:int, vector_lanes:int) -> RKArg|None:
-  """Compare arbitrary INT32 values exactly as four unsigned bytes using native INT16 DPU EW."""
-  rows = len(coordinate_sets[0]) if coordinate_sets else 0
-  if not rows or any(len(group) != rows or any(len(row) != count for row in group) for group in coordinate_sets): return None
-  matrix_lanes = rows*vector_lanes
-  offset_rows = (index_offsets,)*rows if index_offsets and isinstance(index_offsets[0], int) else cast(tuple[tuple[int, ...], ...], index_offsets)
-  if len(offset_rows) != rows or any(len(offsets) != count for offsets in offset_rows): return None
-  one, diff, magnitude, unequal = builder.constant(index_slot, matrix_lanes, 1), *(builder.scratch(matrix_lanes*2) for _ in range(3))
-  masks:list[RKArg] = []
-  for coordinates in coordinate_sets:
-    byte_masks:list[RKArg] = []
-    for byte in range(4):
-      dynamic, static, equal = (builder.scratch(matrix_lanes*2) for _ in range(3))
-      builder.gathers.append(_candidate_gather(index_slot, dynamic.index,
-        tuple(tuple(offset*4+byte for offset in offsets) for offsets in offset_rows), vector_lanes))
-      builder.gathers.append(RKGather(index_slot, static.index, matrix_lanes,
-        values=tuple((value >> (byte*8)) & 0xff for row in coordinates for value in (*row, *((0,)*(vector_lanes-count)))), itemsize=2))
-      for lhs,rhs,cfg,dst in ((dynamic, static, _EW_CFG[Ops.SUB], diff), (diff, diff, _EW_CFG_ABS, magnitude),
-                              (magnitude, one, _EW_CFG_MIN, unequal)): builder.i16(lhs, rhs, matrix_lanes, cfg, dst)
-      byte_masks.append(builder.i16(one, unequal, matrix_lanes, _EW_CFG[Ops.SUB], equal))
-    masks.append(_reduce_byte_masks(builder, byte_masks, matrix_lanes, _EW_CFG[Ops.MUL]))
-  return _reduce_byte_masks(builder, masks, matrix_lanes, _EW_CFG[Ops.MAX])
-
-def _reduce_byte_masks(builder:_RKBuilder, masks:list[RKArg]|tuple[RKArg, ...], count:int, cfg:int, *, in_place:bool=False) -> RKArg:
-  return functools.reduce(lambda result,value: builder.i16(result, value, count, cfg, result if in_place else None), masks[1:], masks[0])
-
-def _prefix_valid(builder:_RKBuilder, total:RKArg, coordinate:RKArg, zero:RKArg, one:RKArg, count:int) -> tuple[RKArg, RKArg]:
-  delta, positive, valid, remaining = (builder.scratch(count*2) for _ in range(4))
-  for lhs,rhs,cfg,dst in ((total, coordinate, _EW_CFG[Ops.SUB], delta), (delta, zero, _EW_CFG[Ops.MAX], positive),
-                          (positive, one, _EW_CFG_MIN, valid), (one, valid, _EW_CFG[Ops.SUB], remaining)):
-    builder.i16(lhs, rhs, count, cfg, dst)
-  return valid, remaining
-
-def _full_predicate_count(expr:UOp, out_index:UOp, count:int, dtype:DType, predicate:Callable[[UOp], UOp|None],
-                          max_scale:int=1) -> tuple[UOp, int]|None:
-  """Prove an unrolled sum covers every typed source predicate uniformly, possibly repeated or scaled."""
-  terms, source, offsets, scales = list(_iter_binary(expr, Ops.ADD)), None, [], []
-  try:
-    for term in terms:
-      scale = 1
-      if max_scale > 1 and term.op is Ops.MUL:
-        constants = [u for u in term.src if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int]
-        if len(constants) != 1 or len(term.src)-len(constants) != 1: return None
-        scale, term = int(constants[0].arg), next(u for u in term.src if u not in constants)
-      if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or \
-         (load:=predicate(term.src[0])) is None or [u for u in term.toposort() if u.op is Ops.LOAD] != [load]: return None
-      if (parsed:=_typed_load_plan(load, dtype, out_index, count, require_offsets=True)) is None or len(set(parsed.gather.offsets)) != 1: return None
-      if source is not None and parsed.param.arg.slot != source.arg.slot: return None
-      source = parsed.param
-      offsets.append(parsed.gather.offsets[0])
-      scales.append(scale)
-  except RuntimeError: return None
-  if source is None or not scales or len(set(scales)) != 1: return None
-  if (source_count:=int(source.src[0].arg)) <= 0 or len(terms)%source_count or any(offsets.count(i) != len(terms)//source_count for i in range(source_count)): return None  # noqa: E501
-  return (source, scales[0]*(len(terms)//source_count)) if 1 <= scales[0]*(len(terms)//source_count) <= max_scale else None
-
 def _lower_dynamic_typed_load(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
-  """Parse and materialize one bounded dynamic typed LOAD as exact candidate-major raw bytes."""
-  _, out_param, count, out_index, root = output
-  total_gate:tuple[UOp, UOp]|None = None
-  load = root
+  """Materialize a bounded dynamic typed LOAD through the shared typed UOp byte comparator."""
+  _,out_param,count,out_index,root=output; total_gate:tuple[UOp,UOp]|None=None; load=root
   if root.op is Ops.WHERE and len(root.src) == 3:
-    condition, load, fill = root.src
+    condition,load,fill=root.src
     if dtype is dtypes.half:
       if load.op is not Ops.LOAD or fill.op is not Ops.CONST or len(load.src) <= 2 or load.src[1].op is not Ops.CONST: return None
-      load_gate, same_default = load.src[2], float(load.src[1].arg) == float(fill.arg)
-      if not same_default and not (_same_condition(condition, load_gate) or
-         condition.op is Ops.AND and any(_same_condition(x, load_gate) for x in condition.src)): return None
-      load = load.replace(src=(load.src[0], fill, condition.alu(Ops.AND, load_gate) if same_default else condition))
+      load_gate,same_default=load.src[2],float(load.src[1].arg)==float(fill.arg)
+      if not same_default and not (_same_condition(condition,load_gate) or condition.op is Ops.AND and any(_same_condition(x,load_gate) for x in condition.src)): return None  # noqa: E501
+      load=load.replace(src=(load.src[0],fill,condition.alu(Ops.AND,load_gate) if same_default else condition))
     else:
-      if (dtype not in (dtypes.int16, dtypes.int) or not 1 <= count <= _FP16_EXACT_INTEGER or condition.op is not Ops.CMPLT or
-          _strip_cast(condition.src[0]).key != out_index.key or fill.op is not Ops.CONST or fill.dtype.scalar() is not dtype or
-          (mask_info:=_full_predicate_count(condition.src[1], out_index, count, dtypes.bool, lambda u:u if u.op is Ops.LOAD and
-            u.dtype.scalar() is dtypes.bool and u.src[0].op is Ops.INDEX else None)) is None or mask_info[1] != 1): return None
-      total_gate = mask_info[0], fill
-  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or load.src[0].op is not Ops.INDEX or
-      load.src[1].op is not Ops.CONST or load.src[1].arg != 0): return None
-  data_param, data_index, gate, gate_nodes = _root_param(load.src[0]), load.src[0].src[1], load.src[2], load.src[2].toposort()
-  bool_loads = tuple(u for u in gate_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool)
-  address_nodes = data_index.toposort()
-  normalized = tuple((u, index, int(addition[1].arg)) for u in address_nodes
-    if u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT and u.src[0].src[1].op is Ops.CONST and int(u.src[0].src[1].arg) == 0
-    and (index:=u.src[0].src[0]).op is Ops.LOAD and index.dtype.scalar() is dtypes.int and u.src[2].key == index.key
-    and (addition:=_const_operand(u.src[1], Ops.ADD)) is not None and addition[0].key == index.key and int(addition[1].arg) > 0)
-  normalized_by_load = {dynamic.key:(root, extent) for root,dynamic,extent in normalized}
-  dynamic_loads = tuple({u.key:u for u in address_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
+      if dtype not in (dtypes.int16,dtypes.int) or not 1 <= count <= _FP16_EXACT_INTEGER or condition.op is not Ops.CMPLT or \
+         _strip_cast(condition.src[0]).key != out_index.key or fill.op is not Ops.CONST or fill.dtype.scalar() is not dtype: return None
+      # Prove the prefix length counts every element of one BOOL parameter exactly once.
+      terms,mask_plans=list(_iter_binary(condition.src[1],Ops.ADD)),typing_cast(list[RKTypedLoadPlan],[])
+      try:
+        for term in terms:
+          if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or (source:=term.src[0]).op is not Ops.LOAD or source.dtype.scalar() is not dtypes.bool or source.src[0].op is not Ops.INDEX or [u for u in term.toposort() if u.op is Ops.LOAD] != [source] or (plan:=_typed_load_plan(source,dtypes.bool,out_index,count,require_offsets=True)) is None or len(set(plan.gather.offsets)) != 1: return None  # noqa: E501
+          mask_plans.append(plan)
+      except RuntimeError: return None
+      if not mask_plans or any(plan.param.arg.slot != mask_plans[0].param.arg.slot for plan in mask_plans) or int(mask_plans[0].param.src[0].arg) != len(mask_plans) or sorted(plan.gather.offsets[0] for plan in mask_plans) != list(range(len(mask_plans))): return None  # noqa: E501
+      total_gate=mask_plans[0].param,fill
+  if count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or load.src[1].arg != 0: return None  # noqa: E501
+  data_param,data_index,gate,gate_nodes=_root_param(load.src[0]),load.src[0].src[1],load.src[2],load.src[2].toposort()
+  bool_loads=tuple(u for u in gate_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.bool); address_nodes=data_index.toposort()
+  normalized=tuple((u,index,int(addition[1].arg)) for u in address_nodes if u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT and u.src[0].src[1].op is Ops.CONST and int(u.src[0].src[1].arg)==0 and (index:=u.src[0].src[0]).op is Ops.LOAD and index.dtype.scalar() is dtypes.int and u.src[2].key==index.key and (addition:=_const_operand(u.src[1],Ops.ADD)) is not None and addition[0].key==index.key and int(addition[1].arg)>0)  # noqa: E501
+  normalized_by_load={dynamic.key:(base,extent) for base,dynamic,extent in normalized}
+  dynamic_loads=tuple({u.key:u for u in address_nodes if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
   if not dynamic_loads or len(normalized_by_load) != len(normalized): return None
-  dynamic_axes:list[tuple[UOp, UOp, int, bool]] = []
+  dynamic_axes:list[tuple[UOp,UOp,int,bool]]=[]
   for dynamic in dynamic_loads:
-    axis, extent, wrapped = (*normalized_by_load[dynamic.key], True) if dynamic.key in normalized_by_load else \
-      (dynamic, _bounded_index_gate(gate, dynamic), False)
-    if extent is None or wrapped and _bounded_index_gate(gate, axis, extent) is None: return None
-    dynamic_axes.append((axis, dynamic, extent, wrapped))
-  axes = tuple(dynamic_axes)
-  loads = tuple(axis[1] for axis in axes); params = typing_cast(tuple[UOp, ...], tuple(_root_param(u.src[0]) if u.src and u.src[0].op is Ops.INDEX else None for u in loads))  # noqa: E501
-  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or len(bool_loads) > 1 or
-      any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params) or
-      {u.key for u in gate_nodes if u.op is Ops.LOAD} != {u.key for u in (*loads, *bool_loads)}): return None
-  bool_load = bool_loads[0] if bool_loads else None
-  bool_param = _root_param(bool_load.src[0]) if bool_load is not None and len(bool_load.src) == 1 and bool_load.src[0].op is Ops.INDEX else None
-  if bool_load is not None and (bool_load not in _iter_binary(gate, Ops.AND) or bool_param is None or bool_param.dtype.scalar() is not
-                                dtypes.bool or bool_param.src[0].op is not Ops.CONST): return None
-  if total_gate is not None and (bool_load is not None or len(axes) != 1 or data_index.key != loads[0].key or axes[0][3]): return None
-  if any(not 0 <= param.arg.slot <= _RKIMAGE_U16_MAX for param in (out_param, data_param, *params,
-         *((bool_param,) if bool_param is not None else ()), *((total_gate[0],) if total_gate is not None else ()))): return None
-  candidates, data_count = math.prod(extent for _,_,extent,_ in axes), int(data_param.src[0].arg)
-  if total_gate is not None and (data_count != int(total_gate[0].src[0].arg) or candidates != data_count or int(params[0].src[0].arg) != count):
-    return None
-  alternative_count, external_count, pre_repeat = sum(1+wrapped for *_,wrapped in axes), int(bool_load is not None), min(8, count)
-  total_scratch, total_gathers = (0, 0) if total_gate is None else (5+3*dtype.itemsize, data_count+3+dtype.itemsize)
-  if (pre_vl:=_stripe_layout(count, 2)[1] if candidates > 1 else count) > _MAX_EW_ELEMS_FP16: return None
-  pre_blocks = ceildiv(candidates, _MAX_EW_ELEMS_FP16//pre_vl)
-  if candidates > min(_MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS//count) or any(size > _RKIMAGE_U16_MAX for size in (
-     pre_blocks*(3*len(axes)+16*alternative_count+2*pre_repeat*dtype.itemsize)+external_count+total_scratch,
-     pre_blocks*(len(axes)+8*alternative_count+pre_repeat*dtype.itemsize)+external_count+pre_repeat*dtype.itemsize+total_gathers)): return None
-  combinations = tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes)))
-  external:tuple[int, tuple[int, ...]]|None = None
+    axis,extent,wrapped=(*normalized_by_load[dynamic.key],True) if dynamic.key in normalized_by_load else \
+      (dynamic,_bounded_index_gate(gate,dynamic),False)
+    if extent is None or wrapped and _bounded_index_gate(gate,axis,extent) is None: return None
+    dynamic_axes.append((axis,dynamic,extent,wrapped))
+  axes=tuple(dynamic_axes); loads=tuple(axis[1] for axis in axes); params=typing_cast(tuple[UOp,...],tuple(_root_param(u.src[0]) if u.src and u.src[0].op is Ops.INDEX else None for u in loads))  # noqa: E501
+  if data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or len(bool_loads)>1 or any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params) or {u.key for u in gate_nodes if u.op is Ops.LOAD}!={u.key for u in (*loads,*bool_loads)}: return None  # noqa: E501
+  bool_load=bool_loads[0] if bool_loads else None
+  bool_param=_root_param(bool_load.src[0]) if bool_load is not None and len(bool_load.src)==1 and bool_load.src[0].op is Ops.INDEX else None
+  if bool_load is not None and (bool_load not in _iter_binary(gate,Ops.AND) or bool_param is None or bool_param.dtype.scalar() is not dtypes.bool or bool_param.src[0].op is not Ops.CONST): return None  # noqa: E501
+  if total_gate is not None and (bool_load is not None or len(axes)!=1 or data_index.key!=loads[0].key or axes[0][3]): return None
+  if any(not 0 <= param.arg.slot <= _RKIMAGE_U16_MAX for param in (out_param,data_param,*params,*((bool_param,) if bool_param is not None else ()),*((total_gate[0],) if total_gate is not None else ()))): return None  # noqa: E501
+  candidates,data_count=math.prod(extent for _,_,extent,_ in axes),int(data_param.src[0].arg)
+  if total_gate is not None and (data_count!=int(total_gate[0].src[0].arg) or candidates!=data_count or int(params[0].src[0].arg)!=count): return None  # noqa: E501
+  alternative_count,external_count,pre_repeat=sum(1+wrapped for *_,wrapped in axes),int(bool_load is not None),min(8,count)
+  total_scratch,total_gathers=(0,0) if total_gate is None else (5+3*dtype.itemsize,data_count+3+dtype.itemsize)
+  if (pre_vl:=_stripe_layout(count,2)[1] if candidates>1 else count)>_MAX_EW_ELEMS_FP16: return None
+  pre_blocks=ceildiv(candidates,_MAX_EW_ELEMS_FP16//pre_vl)
+  if candidates>min(_MAX_STATIC_RANGE_ENVS,_MAX_DYNAMIC_SELECTOR_CELLS//count) or any(size>_RKIMAGE_U16_MAX for size in (pre_blocks*(3*len(axes)+16*alternative_count+2*pre_repeat*dtype.itemsize)+external_count+total_scratch,pre_blocks*(len(axes)+8*alternative_count+pre_repeat*dtype.itemsize)+external_count+pre_repeat*dtype.itemsize+total_gathers)): return None  # noqa: E501
+  combinations=tuple(itertools.product(*(range(extent) for _,_,extent,_ in axes))); external:tuple[int,tuple[int,...]]|None=None
   if bool_load is not None and bool_param is not None:
-    try: bool_offsets = _gather_offsets(out_index, bool_load.src[0].src[1], None, count)
+    try: bool_offsets=_gather_offsets(out_index,bool_load.src[0].src[1],None,count)
     except RuntimeError: return None
     if any(not 0 <= offset < int(bool_param.src[0].arg) for offset in bool_offsets): return None
-    external = bool_param.arg.slot, bool_offsets
+    external=bool_param.arg.slot,bool_offsets
   try:
-    index_offsets = tuple(_gather_offsets(out_index, dynamic.src[0].src[1], None, count) for dynamic in loads)
-    plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index, data_index.substitute(mapping), gate.substitute(mapping |
-      ({bool_load:bool_load.const_like(True)} if bool_load is not None else {})), count) for values in combinations
-      for mapping in ({dynamic:dynamic.const_like(value) for dynamic,value in zip(loads, values)},))
-    plan_offsets = tuple(plan.offsets or tuple(plan.base+sum((lane//d%n)*s for d,n,s in plan.axes) for lane in range(plan.count)) for plan in plans)
+    index_offsets=tuple(_gather_offsets(out_index,dynamic.src[0].src[1],None,count) for dynamic in loads)
+    plans=tuple(_gather_plan(data_param.arg.slot,0,out_index,data_index.substitute(mapping),gate.substitute(mapping|({bool_load:bool_load.const_like(True)} if bool_load is not None else {})),count) for values in combinations for mapping in ({dynamic:dynamic.const_like(value) for dynamic,value in zip(loads,values)},))  # noqa: E501
+    plan_offsets=tuple(plan.offsets or tuple(plan.base+sum((lane//d%n)*s for d,n,s in plan.axes) for lane in range(plan.count)) for plan in plans)  # noqa: E501
   except RuntimeError: return None
-  if (any(not 0 <= offset < int(param.src[0].arg) or offset*4+3 > dtypes.int.max for offsets,param in zip(index_offsets, params)
-          for offset in offsets) or any(not 0 <= offset < data_count or offset*dtype.itemsize+dtype.itemsize-1 > dtypes.int.max
-          for row in plan_offsets for offset in row) or external is not None and any(offset > dtypes.int.max for offset in external[1])): return None
-  if total_gate is not None and index_offsets[0] != tuple(range(count)): return None
-  repeat = next((width for width in range(min(8, count), 0, -1) if count%width == 0 and all(all(
-    row[start:start+width] == (row[start],)*width for start in range(0, count, width)) for row in (*index_offsets,
-    *((external[1],) if external else ())))), 1)
-  group_count, grouped_indices = count//repeat, tuple((param.arg.slot, offsets[::repeat]) for param,offsets in zip(params, index_offsets))
-  grouped_gate = None if external is None else (external[0], external[1][::repeat])
-  if (vector_lanes:=_stripe_layout(group_count, 2)[1] if candidates > 1 else group_count) > _MAX_EW_ELEMS_FP16: return None
-  block_count = ceildiv(candidates, block_rows:=_MAX_EW_ELEMS_FP16//vector_lanes)
-  if any(size > _RKIMAGE_U16_MAX for size in (block_count*(3*len(axes)+16*alternative_count+2*repeat*dtype.itemsize)+external_count+total_scratch,
-     block_count*(len(axes)+8*alternative_count+repeat*dtype.itemsize)+external_count+repeat*dtype.itemsize+total_gathers)): return None
-  builder, blocks = _RKBuilder(), []
-  for start,stop in ((start,min(candidates,start+block_rows)) for start in range(0,candidates,block_rows)):
-    rows, matrix_lanes, axis_masks = stop-start, (stop-start)*vector_lanes, typing_cast(list[RKArg], [])
-    for axis_index,((index_slot, offsets), values) in enumerate(zip(grouped_indices, zip(*combinations))):
-      alternatives = (values, *((tuple(value-axes[axis_index][2] for value in values),) if axes[axis_index][3] else ()))
-      coordinate_sets = tuple(tuple((value,)*group_count for value in alternative[start:stop]) for alternative in alternatives)
-      if (mask:=_native_int16_byte_mask(builder, index_slot, offsets, coordinate_sets, group_count, vector_lanes)) is None: return None
-      axis_masks.append(mask)
-    mask = _reduce_rows(builder.ops, axis_masks, matrix_lanes, _EW_CFG[Ops.MUL], int16=True)
-    block:list[list[RKArg]] = []
+  if any(not 0 <= offset < int(param.src[0].arg) or offset*4+3>dtypes.int.max for offsets,param in zip(index_offsets,params) for offset in offsets) or any(not 0 <= offset < data_count or offset*dtype.itemsize+dtype.itemsize-1>dtypes.int.max for row in plan_offsets for offset in row) or external is not None and any(offset>dtypes.int.max for offset in external[1]): return None  # noqa: E501
+  if total_gate is not None and index_offsets[0]!=tuple(range(count)): return None
+  repeat=next((width for width in range(min(8,count),0,-1) if count%width==0 and all(all(row[start:start+width]==(row[start],)*width for start in range(0,count,width)) for row in (*index_offsets,*((external[1],) if external else ())))),1)  # noqa: E501
+  group_count=count//repeat; grouped_indices=tuple((param.arg.slot,offsets[::repeat]) for param,offsets in zip(params,index_offsets)); grouped_gate=None if external is None else (external[0],external[1][::repeat])  # noqa: E501
+  if (vector_lanes:=_stripe_layout(group_count,2)[1] if candidates>1 else group_count)>_MAX_EW_ELEMS_FP16: return None
+  block_rows=_MAX_EW_ELEMS_FP16//vector_lanes
+
+  def block_image(start:int,stop:int) -> tuple[RKImage,list[list[RKArg]]]:
+    rows,matrix_lanes,slot=stop-start,(stop-start)*vector_lanes,1; lane=UOp.range(matrix_lanes,63)
+    specs:dict[int,tuple[int,tuple[int,...],tuple[int,...]|None]]={}; axis_masks:list[UOp]=[]
+    # Express exact INT32 equality through ordinary INT16 byte UOps, then replace only the fake inputs' static gathers.
+    for axis_index,((index_slot,offsets),values) in enumerate(zip(grouped_indices,zip(*combinations))):
+      dynamic_bytes:list[UOp]=[]
+      for byte in range(4):
+        fake=UOp.param(slot,dtypes.int16,(matrix_lanes+1,)); specs[slot]=(index_slot,tuple(offset*4+byte if col<group_count else -1 for _ in range(rows) for col,offset in enumerate((*offsets,*((0,)*(vector_lanes-group_count))))),None); slot+=1  # noqa: E501
+        dynamic_bytes.append(fake.index(lane+1).load())
+      alternative_masks:list[UOp]=[]
+      for alternative in (values,*((tuple(value-axes[axis_index][2] for value in values),) if axes[axis_index][3] else ())):
+        byte_masks:list[UOp]=[]
+        for byte,dynamic in enumerate(dynamic_bytes):
+          fake=UOp.param(slot,dtypes.int16,(matrix_lanes+1,)); vals=tuple((value>>(byte*8))&255 if col<group_count else 0 for value in alternative[start:stop] for col in range(vector_lanes)); specs[slot]=(out_param.arg.slot,(),vals); slot+=1  # noqa: E501
+          byte_masks.append(UOp(Ops.CMPEQ,dtypes.bool,src=(dynamic,fake.index(lane+1).load())))
+        alternative_masks.append(functools.reduce(lambda x,y:x&y,byte_masks))
+      axis_masks.append(functools.reduce(lambda x,y:x|y,alternative_masks))
+    mask=functools.reduce(lambda x,y:x&y,axis_masks)
+    if grouped_gate is not None:
+      fake=UOp.param(slot,dtypes.bool,(matrix_lanes+1,)); specs[slot]=(grouped_gate[0],tuple(offset if col<group_count else -1 for _ in range(rows) for col,offset in enumerate((*grouped_gate[1],*((0,)*(vector_lanes-group_count))))),None)  # noqa: E501
+      mask=mask&fake.index(lane+1).load()
+    fake_out=UOp.param(0,dtypes.bool,(matrix_lanes,)); image=_lower_uop_program(list(fake_out.index(lane).store(mask).end(lane).sink().toposort()),vectorize_reductions=False,recipes_ready=True)  # noqa: E501
+    if image is None or image.host_gathers or image.host_scatters or len(image.post_gathers)!=1: raise RuntimeError("dynamic mask")
+    patched:list[RKGather]=[]
+    for gather in image.gathers:
+      src,offsets,spec_values=specs[gather.src_index]; patched.append(replace(gather,src_index=src,base=0,axes=(),offsets=offsets,values=spec_values or (),itemsize=2 if spec_values else 1,dst_stride=1 if spec_values else 2))  # noqa: E501
+    terminal=image.post_gathers[0]; mask_arg=RKArg(terminal.src_kind,terminal.src_index,terminal.base)
+    scratch,gathers,ops=list(image.scratch),patched,list(image.ew_ops)
+    def allocate(lanes:int=matrix_lanes) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1)
+    results:list[list[RKArg]]=[]
     for channel in range(repeat):
-      result:list[RKArg] = []
+      result:list[RKArg]=[]
       for byte in range(dtype.itemsize):
-        raw, raw_rows = builder.scratch(matrix_lanes*2), tuple(tuple(x*dtype.itemsize+byte for x in row[channel::repeat]) for row in plan_offsets[start:stop])  # noqa: E501
-        builder.gathers.append(_candidate_gather(data_param.arg.slot, raw.index, raw_rows, vector_lanes))
-        result.append(_masked_rows(builder, raw, mask, rows, vector_lanes, group_count))
-      block.append(result)
-    blocks.append(block)
-  results = blocks[0]
-  for block in blocks[1:]:
-    for result,other in zip(results, block):
-      for value,part in zip(result, other): builder.i16(value, part, group_count, _EW_CFG[Ops.ADD], value)
-  if grouped_gate is not None:
-    gate_value = builder.scratch(group_count*2)
-    builder.gathers.append(RKGather(grouped_gate[0], gate_value.index, group_count, offsets=grouped_gate[1], dst_stride=2, itemsize=1))
-    for result in results:
-      for value in result: builder.i16(value, gate_value, group_count, _EW_CFG[Ops.MUL], value)
-  mid, gather_after = typing_cast(tuple[RKGather, ...], ()), 0
+        raw,selected=allocate(),allocate(); raw_rows=tuple(tuple(x*dtype.itemsize+byte for x in row[channel::repeat]) for row in plan_offsets[start:stop])  # noqa: E501
+        gathers.append(_candidate_gather(data_param.arg.slot,raw.index,raw_rows,vector_lanes)); ops.append(RKEWOp(selected,raw,mask_arg,matrix_lanes,_EW_CFG[Ops.MUL],**_INT16_EW))  # noqa: E501
+        result.append(_reduce_rows(ops,[replace(selected,addend=row*vector_lanes*2) for row in range(rows)],group_count,_EW_CFG[Ops.ADD],int16=True))  # noqa: E501
+      results.append(result)
+    return replace(image,scratch=tuple(scratch),gathers=tuple(gathers),ew_ops=tuple(ops),post_gathers=()),results
+
+  try: blocks=[block_image(start,min(candidates,start+block_rows)) for start in range(0,candidates,block_rows)]
+  except (KeyError,RuntimeError): return None
+  image,results=blocks[0]
+  for child,other in blocks[1:]:
+    fc,sc,fs=len(image.constants)//2,len(child.constants)//2,len(image.scratch)
+    # _append_inplace_image inserts the child's constants between the parent's constant and ordinary scratch slots.
+    def first(arg:RKArg) -> RKArg: return replace(arg,index=arg.index+sc) if arg.kind is RKBufferKind.SCRATCH and arg.index>=fc else arg
+    def second(arg:RKArg) -> RKArg: return replace(arg,index=fc+arg.index if arg.index<sc else fs+arg.index) if arg.kind is RKBufferKind.SCRATCH else arg  # noqa: E501
+    if (combined:=_append_inplace_image(image,child)) is None: return None
+    results,other=[[first(value) for value in row] for row in results],[[second(value) for value in row] for row in other]; ops=list(combined.ew_ops)  # noqa: E501
+    for row,additions in zip(results,other):
+      for value,part in zip(row,additions): ops.append(RKEWOp(value,value,part,group_count,_EW_CFG[Ops.ADD],**_INT16_EW))
+    image=replace(combined,ew_ops=tuple(ops))
+  scratch,gathers,ops,mid=list(image.scratch),list(image.gathers),list(image.ew_ops),list(image.mid_gathers)
+  def allocate(lanes:int=count) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1)
   if total_gate is not None:
-    mask_param, fill = total_gate
-    bool_values = builder.scratch(data_count*64)
-    builder.gathers.extend(RKGather(mask_param.arg.slot, bool_values.index, 1, offsets=(lane,), dst_addend=lane*64, dst_stride=2, itemsize=1)
-                           for lane in range(data_count))
-    total = _reduce_rows(builder.ops, [replace(bool_values, addend=lane*64) for lane in range(data_count)], 1, _EW_CFG[Ops.ADD], int16=True)
-    gather_after, total_vector, coordinate, zero, one = len(builder.ops), *(builder.scratch(count*2) for _ in range(4))
-    mid = (RKGather(total.index, total_vector.index, count, offsets=(total.addend//2,)*count, src_kind=RKBufferKind.SCRATCH),)
-    builder.gathers.append(RKGather(mask_param.arg.slot, coordinate.index, count, values=tuple(range(count))))
-    for dst,constant in ((zero,0),(one,1)): builder.constant(mask_param.arg.slot, count, constant, dst=dst)
-    valid, _ = _prefix_valid(builder, total_vector, coordinate, zero, one, count)
-    fill_bits = int(fill.arg) & ((1 << (dtype.itemsize*8))-1)
+    mask_param,fill=total_gate; bool_values=allocate(data_count*32)
+    gathers.extend(RKGather(mask_param.arg.slot,bool_values.index,1,offsets=(lane,),dst_addend=lane*64,dst_stride=2,itemsize=1) for lane in range(data_count))  # noqa: E501
+    total=_reduce_rows(ops,[replace(bool_values,addend=lane*64) for lane in range(data_count)],1,_EW_CFG[Ops.ADD],int16=True)
+    total_vector,coordinate,zero,one=(allocate() for _ in range(4)); mid.append(RKGather(total.index,total_vector.index,count,offsets=(total.addend//2,)*count,src_kind=RKBufferKind.SCRATCH,after=len(ops)))  # noqa: E501
+    gathers.extend((RKGather(mask_param.arg.slot,coordinate.index,count,values=tuple(range(count))),RKGather(mask_param.arg.slot,zero.index,count,values=(0,)*count),RKGather(mask_param.arg.slot,one.index,count,values=(1,)*count)))  # noqa: E501
+    delta,positive,valid=(allocate() for _ in range(3)); ops.extend(_ew_ops(((delta,total_vector,coordinate,Ops.SUB),(positive,delta,zero,Ops.MAX),(valid,positive,one,_EW_CFG_MIN)),count,**_INT16_EW))  # noqa: E501
+    fill_bits=int(fill.arg)&((1<<(dtype.itemsize*8))-1)
     for byte,value in enumerate(results[0]):
-      fill_value = builder.constant(mask_param.arg.slot, count, (fill_bits >> (byte*8)) & 0xff)
-      selected = builder.i16(builder.i16(value, fill_value, count, _EW_CFG[Ops.SUB]), valid, count, _EW_CFG[Ops.MUL])
-      builder.i16(fill_value, selected, count, _EW_CFG[Ops.ADD], value)
-  terminal = tuple(_raw_gather(RKArg(RKBufferKind.SCRATCH, value.index, value.addend), out_param.arg.slot, group_count,
-    dst_stride=repeat*dtype.itemsize, dst_addend=channel*dtype.itemsize+byte, offsets=tuple(range(value.addend, value.addend+group_count*2, 2)))
-    for channel,result in enumerate(results) for byte,value in enumerate(result))
-  image = builder.image(mid_gathers=mid, gather_after=gather_after, post_gathers=terminal)
-  gathers = image.gathers+image.mid_gathers+image.post_gathers
-  if any(size > _RKIMAGE_U16_MAX for size in (len(image.scratch), len(gathers))) or \
-     any(not 0 <= index <= _RKIMAGE_U16_MAX for gather in gathers for index in (gather.src_index, gather.dst_index)) or \
-     any(not 0 <= arg.index <= _RKIMAGE_U16_MAX for op in image.ew_ops for arg in (op.dst, op.lhs, op.rhs)): return None
+      fill_value,selected=allocate(),allocate(); gathers.append(RKGather(mask_param.arg.slot,fill_value.index,count,values=((fill_bits>>(byte*8))&255,)*count))  # noqa: E501
+      ops.extend(_ew_ops(((selected,value,fill_value,Ops.SUB),(selected,selected,valid,Ops.MUL),(value,fill_value,selected,Ops.ADD)),count,**_INT16_EW))  # noqa: E501
+  terminal=tuple(_raw_gather(value,out_param.arg.slot,group_count,dst_stride=repeat*dtype.itemsize,dst_addend=channel*dtype.itemsize+byte,offsets=tuple(range(value.addend,value.addend+group_count*2,2))) for channel,result in enumerate(results) for byte,value in enumerate(result))  # noqa: E501
+  image=replace(image,scratch=tuple(scratch),gathers=tuple(gathers),ew_ops=tuple(ops),mid_gathers=tuple(mid),post_gathers=terminal); all_gathers=image.gathers+image.mid_gathers+image.post_gathers  # noqa: E501
+  if any(size>_RKIMAGE_U16_MAX for size in (len(image.scratch),len(all_gathers))) or any(not 0<=index<=_RKIMAGE_U16_MAX for gather in all_gathers for index in (gather.src_index,gather.dst_index)) or any(not 0<=arg.index<=_RKIMAGE_U16_MAX for op in image.ew_ops for arg in (op.dst,op.lhs,op.rhs)): return None  # noqa: E501
   return image
 
 def _nonzero_load(term:UOp, dtype:DType=dtypes.half) -> UOp|None:

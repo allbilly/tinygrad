@@ -8254,6 +8254,61 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-25 — dynamic selectors reuse typed UOp byte comparison at 2,061 lines
+
+This hardware-accepted milestone follows `8b5dac598`.  Its predeclared
+authoritative `sz.py` budget was at most **+164/-206 executable renderer
+lines, net at most -42**.  The replacement function is
+`_lower_dynamic_typed_load`; the obsolete owners are `_RKBuilder`,
+`_masked_rows`, `_native_int16_byte_mask`, `_reduce_byte_masks`,
+`_prefix_valid`, and `_full_predicate_count`.  The observed result is larger:
+renderer **2,137 -> 2,061** (**-76**), runtime remains **443**, and repository
+total **27,648 -> 27,572**.  The raw renderer diff is **+120/-200 physical
+lines**.  The tested renderer SHA-256 is
+`43e2494ed963f4a7c9707f8195f6d3146261f894a3c6b2b34644843dee75b92c`.
+
+The bounded dynamic-load owner now describes its exact INT32 equality masks
+as ordinary INT16 byte UOps and lowers those masks through the existing
+`_lower_uop_program` / `RKContext` path.  It replaces only the fake semantic
+inputs' proven static gathers with the real index bytes and candidate
+constants, then retains the existing raw candidate gathers, balanced row
+reduction, and `_append_inplace_image` block composition.  This deletes the
+second physical builder, byte comparator, mask reducer, prefix helper, and
+general predicate-count helper.  The prefix case keeps an inline proof that
+one BOOL parameter is counted exactly once.  There is no new IR, runtime
+phase, host-address execution, CPU/GPU numeric fallback, or tolerance change.
+
+All selector images remain `NATIVE` and preserve raw payload bits, including
+FP16 NaN payloads and signed INT16/INT32 representations.  The ordinary
+one-axis selector keeps **37 EW stages** while scratch falls **23 -> 14**.
+The normalized selector keeps **57 EW stages** while scratch falls **39 ->
+18**.  The two-axis selector moves **243 -> 242 EW stages** and **75 -> 31
+scratch slots**; repeated-channel selection moves **67 -> 62 EW stages** and
+**32 -> 23 scratch slots**.  The 1,001-candidate block case keeps **2,042 EW
+stages**, falls **46 -> 28 scratch slots**, and grows from **31,650 -> 42,837
+encoded bytes** because the second semantic block carries explicit phased
+gathers; it remains within every wire/resource bound and its host test passed.
+The production candidate then passed full hardware acceptance.
+
+The focused selector gate reports **9 passed**, and the complete Rockchip UOp
+module reports **155 passed** under `-n12`.  A raw-bit oracle passed **800
+randomized cases** over HALF, INT16, INT32, normalized indices, repeated
+channels, external masks, and total-count fill.  Mypy succeeds in **216 source
+files**, repository-wide Ruff succeeds, and diff checks are clean.  The
+production Tensor `to_program` hardware gate for gather, masked select, and
+fancy indexing reports **13 passed in 224.05 seconds**.
+
+The required uninterrupted serial hardware census actually ran with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and `-n0`; pytest exited zero
+with **433 passed, 12 suite-declared skips, and 154 subtests passed in 2069.83
+seconds**, exactly accounting for all **445** cases with zero failures.  The
+authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed
+immediately before and after the census with `reset_npu ret=0`, `SUBMIT ret=0`,
+and exact output `[8 8 8 8 8 8 8 8]`.  No reset outside that health script,
+reboot, retry, test edit, runtime/core edit, or push was used.
+
+---
+
 ## 2026-08-25 — bounded coordinates join generic native lowering at 2,137 lines
 
 This hardware-accepted milestone follows `30cec0b54`.  The predeclared
