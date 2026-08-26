@@ -1836,83 +1836,56 @@ def _static_local_defs(uops:list[UOp], buffers:set[UOp]) -> dict[UOp, _RKStaticL
     definitions[buffer] = _RKStaticLocalDef(initializers[0], *updates[0])
   return definitions
 
-def _lower_vectorized_scalar_local_extrema(output:RKOutput, uops:list[UOp]) -> RKImage|None:
-  """Vectorize two dependent scalar local MAX accumulators without assigning meaning to their tensor source."""
-  _, out_param, count, _, root = output
-  if count != 1 or out_param.dtype.scalar() is not dtypes.int: return None
-  try: definitions = _static_local_defs(uops, {buffer for u in uops if u.op is Ops.BUFFER and (buffer:=_local_buffer(u)) is not None})
-  except _RKGenericReject: return None
-  limit = min(32767, _MAX_EW_ELEMS_FP16)
-  descriptors = {dtype:(buffer, definition, tuple(int(loop.src[0].arg) for loop in definition.loops))
-    for dtype,initial in ((dtypes.half,-math.inf),(dtypes.int,dtypes.int.min)) for buffer,definition in definitions.items()
-    if buffer.dtype.scalar() is dtype and definition.update_op is Ops.MAX and definition.initial.op is Ops.CONST and
-    float(definition.initial.arg) == initial and definition.loops and all(loop.src[0].op is Ops.CONST and 1 <= int(loop.src[0].arg) <= limit for loop in definition.loops)}  # noqa: E501
-  if (len(definitions) != 2 or set(descriptors) != {dtypes.half, dtypes.int} or
-      descriptors[dtypes.half][2] != descriptors[dtypes.int][2]): return None
-  (value_buffer,value_def,extents), (index_buffer,index_def,_) = descriptors[dtypes.half], descriptors[dtypes.int]
-  if not 2 <= (total:=math.prod(extents)) <= limit: return None
-  weighted_terms = list(_iter_binary(index_def.term, Ops.MUL))
-  casts = [term for term in weighted_terms if term.op is Ops.CAST and term.dtype.scalar() is dtypes.int and term.src[0].dtype.scalar() is dtypes.bool]  # noqa: E501
-  if len(casts) != 1 or len(weighted_terms) != 2: return None
-  coordinate, predicate = weighted_terms[1 if weighted_terms[0] is casts[0] else 0], _inverted_condition(casts[0].src[0], True)
-  if predicate is None or predicate.op is not Ops.CMPNE or len(predicate.src) != 2 or \
-     any(src.dtype.scalar() is not dtypes.half for src in predicate.src): return None
-  if ((current:=next((src for src in predicate.src if (load:=_local_load(src)) is not None and _local_buffer(load) is value_buffer), None)) is None or
-      (candidate:=next((src for src in predicate.src if src is not current), None)) is None): return None
-  if _strip_cast(candidate.substitute(dict(zip(index_def.loops, value_def.loops)), walk=True)).key != _strip_cast(value_def.term).key: return None  # noqa: E501
-  try: coordinates = tuple(int(_eval_expr(coordinate, env, {})) for env in _iter_range_env(list(index_def.loops), None, False))
-  except RuntimeError: return None
-  if len(coordinates) != total or any(not 0 <= value <= 32767 for value in coordinates): return None
-  if len(final_loads:=[load for load in _semantic_loads(root, local=True) if _local_buffer(load) is index_buffer]) != 1: return None
-  try: mapped_outputs = tuple(int(_eval_expr(root.substitute({final_loads[0]:final_loads[0].const_like(value)}), {}, {})) for value in coordinates)
-  except RuntimeError: return None
-  if (second:=next((i for i in range(1, len(coordinates)) if coordinates[i] != coordinates[0]), None)) is None: return None
-  coordinate_delta, output_delta = coordinates[second]-coordinates[0], mapped_outputs[second]-mapped_outputs[0]
-  if (slope:=output_delta//coordinate_delta)*coordinate_delta != output_delta: return None
-  baseline = mapped_outputs[0]-slope*coordinates[0]
-  if any(result != baseline+slope*value for value,result in zip(coordinates, mapped_outputs)) or not all(-32768 <= value <= 32767 for value in (*mapped_outputs, slope, baseline)): return None  # noqa: E501
-  flat = UOp.const(0, dtypes.int)
-  for index,axis in reversed(tuple(enumerate(value_def.loops))):
-    flat = flat.alu(Ops.ADD, axis.alu(Ops.MUL, axis.const_like(math.prod(extents[index+1:]))))
-  fake_param = UOp.param(1+max((u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None), default=out_param.arg.slot), dtypes.half, (total,))  # noqa: E501
-  child_store = fake_param.index(flat).store(value_def.term).end(*value_def.loops)
-  child = _lower_uop_program(list(child_store.sink().toposort()), vectorize_reductions=False)
-  if child is None or child.host_gathers or child.host_scatters: return None
-  target = RKArg(RKBufferKind.SCRATCH, len(child.scratch)); child = replace(_alias_image_args(child, {fake_param.arg.slot:target}), scratch=child.scratch+(RKScratch(_scratch_bytes(total)),))  # noqa: E501
-  scratch = list(child.scratch); values = RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
-  def allocate(lanes:int=total) -> RKArg: scratch.append(RKScratch(_scratch_bytes(lanes))); return RKArg(RKBufferKind.SCRATCH, len(scratch)-1)
-  ops, gathers, mid = list(child.ew_ops), list(child.gathers), list(child.mid_gathers); mid.extend(replace(gather, after=len(ops)) for gather in child.post_gathers)  # noqa: E501
-  spaced = allocate(total*32)
-  mid.append(RKGather(values.index, spaced.index, total, axes=((1,total,1),), dst_stride=32, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
-  best = _reduce_rows(ops, [replace(spaced, addend=lane*64) for lane in range(total)], 1, _EW_CFG[Ops.MAX])
-  best_values = allocate(); mid.append(RKGather(best.index, best_values.index, total, offsets=(best.addend//2,)*total, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
-  fake_out, fake_values, fake_best, fake_coordinates = range(fake_param.arg.slot, fake_param.arg.slot+4)
-  lane = UOp.range(total, max((u.arg[0] for u in (*value_def.loops, *index_def.loops) if isinstance(u.arg, tuple)), default=-1)+1)
-  lhs, rhs = UOp.param(fake_values, dtypes.half, (total,)).index(lane).load(), UOp.param(fake_best, dtypes.half, (total,)).index(lane).load()
-  equal = UOp(Ops.CMPEQ, dtypes.bool, src=(lhs, rhs)).cast(dtypes.int16)*UOp.param(fake_coordinates, dtypes.int16, (total,)).index(lane).load()
-  selected = UOp.param(fake_out, dtypes.int16, (total,)).index(lane).store(equal).end(lane)
-  if (selected_image:=_lower_uop_program(list(selected.sink().toposort()), vectorize_reductions=False)) is None: return None
-  coordinate_arg = allocate(); gathers.append(RKGather(out_param.arg.slot, coordinate_arg.index, total, values=coordinates))
-  prefix = RKImage(RKTarget.RK3588, tuple(scratch), child.constants, gathers=tuple(gathers), ew_ops=tuple(ops),
-                   mid_gathers=tuple(mid), gather_after=child.gather_after)
-  if (combined:=_append_inplace_image(prefix, selected_image)) is None: return None
-  def retained(arg:RKArg) -> RKArg: return replace(arg, index=arg.index+len(selected_image.constants)//2) \
-    if arg.kind is RKBufferKind.SCRATCH and arg.index >= len(prefix.constants)//2 else arg
-  weighted = RKArg(RKBufferKind.SCRATCH, len(combined.scratch))
-  combined = _alias_image_args(combined, {fake_values:retained(values), fake_best:retained(best_values),
-                                          fake_coordinates:retained(coordinate_arg), fake_out:weighted})
-  scratch, gathers, ops, mid = list(combined.scratch), list(combined.gathers), list(combined.ew_ops), list(combined.mid_gathers)
-  scratch.append(RKScratch(_scratch_bytes(total)))
-  mid.append(RKGather(weighted.index, retained(spaced).index, total, axes=((1,total,1),), dst_stride=32, src_kind=RKBufferKind.SCRATCH, after=len(ops)))  # noqa: E501
-  result = _reduce_rows(ops, [replace(retained(spaced), addend=lane*64) for lane in range(total)], 1, _EW_CFG[Ops.MAX], int16=True)
-  for value,op in ((v,o) for v,o,n in ((slope,Ops.MUL,1), (baseline,Ops.ADD,0)) if v != n):
-    source, previous, result = allocate(1), result, allocate(1)
-    gathers.append(RKGather(out_param.arg.slot, source.index, 1, values=(_int16_bits(value),)))
-    ops.append(RKEWOp(result, previous, source, 1, _EW_CFG[op], **_INT16_EW))
-  zero = allocate(1); gathers.append(RKGather(out_param.arg.slot, zero.index, 1, values=(0,)))
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, zero, 1, _EW_CFG[Ops.ADD], int16_input=True, int32_output=True))
-  image = RKImage(RKTarget.RK3588, tuple(scratch), combined.constants, gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid), gather_after=child.gather_after)  # noqa: E501
-  return image if all(len(items) <= _RKIMAGE_U16_MAX for items in (image.scratch, image.gathers, image.ew_ops, image.mid_gathers)) else None
+def _match_scalar_extrema(output:RKOutput, uops:list[UOp]) -> tuple[UOp,int,_RKStaticLocalDef,tuple[int,...],int,int]|None:
+  """Recognize paired scalar MAX accumulators as a value vector and affine output coordinate."""
+  _,out,count,_,root=output
+  if count != 1 or out.dtype.scalar() is not dtypes.int: return None
+  try:
+    definitions=_static_local_defs(uops,{buffer for u in uops if u.op is Ops.BUFFER and (buffer:=_local_buffer(u)) is not None}); limit=min(32767,_MAX_EW_ELEMS_FP16)  # noqa: E501
+    descriptors={dtype:(buffer,definition,tuple(int(loop.src[0].arg) for loop in definition.loops)) for dtype,initial in ((dtypes.half,-math.inf),(dtypes.int,dtypes.int.min)) for buffer,definition in definitions.items()  # noqa: E501
+      if buffer.dtype.scalar() is dtype and definition.update_op is Ops.MAX and definition.initial.op is Ops.CONST and float(definition.initial.arg)==initial and definition.loops and all(loop.src[0].op is Ops.CONST and 1<=int(loop.src[0].arg)<=limit for loop in definition.loops)}  # noqa: E501
+    (value_buffer,value_def,extents),(index_buffer,index_def,index_extents)=descriptors[dtypes.half],descriptors[dtypes.int]
+    if len(definitions)!=2 or extents!=index_extents or not 2<=(total:=math.prod(extents))<=limit: return None
+    terms=tuple(_iter_binary(index_def.term,Ops.MUL)); cast=next(term for term in terms if term.op is Ops.CAST and term.dtype.scalar() is dtypes.int and term.src[0].dtype.scalar() is dtypes.bool)  # noqa: E501
+    if len(terms)!=2: return None
+    coordinate=next(term for term in terms if term is not cast); predicate=_inverted_condition(cast.src[0],True)
+    if predicate is None or predicate.op is not Ops.CMPNE or len(predicate.src)!=2 or any(src.dtype.scalar() is not dtypes.half for src in predicate.src): return None  # noqa: E501
+    current=next(src for src in predicate.src if (load:=_local_load(src)) is not None and _local_buffer(load) is value_buffer); candidate=next(src for src in predicate.src if src is not current)  # noqa: E501
+    if _strip_cast(candidate.substitute(dict(zip(index_def.loops,value_def.loops)),walk=True)).key != _strip_cast(value_def.term).key: return None  # noqa: E501
+    coordinates=tuple(int(_eval_expr(coordinate,env,{})) for env in _iter_range_env(list(index_def.loops),None,False))
+    if len(coordinates)!=total or any(not 0<=value<=32767 for value in coordinates): return None
+    if len(final_loads:=tuple(load for load in _semantic_loads(root,local=True) if _local_buffer(load) is index_buffer))!=1: return None
+    mapped=tuple(int(_eval_expr(root.substitute({final_loads[0]:final_loads[0].const_like(value)}),{},{})) for value in coordinates)
+    second=next(i for i in range(1,total) if coordinates[i]!=coordinates[0]); dx,dy=coordinates[second]-coordinates[0],mapped[second]-mapped[0]; slope=dy//dx; baseline=mapped[0]-slope*coordinates[0]  # noqa: E501
+    if slope*dx!=dy: return None
+    if any(result!=baseline+slope*value for value,result in zip(coordinates,mapped)) or not all(-32768<=value<=32767 for value in (*mapped,slope,baseline)): return None  # noqa: E501
+    return out,total,value_def,coordinates,slope,baseline
+  except (_RKGenericReject,RuntimeError,KeyError,StopIteration,ZeroDivisionError): return None
+
+def _lower_scalar_extrema(output:RKOutput, uops:list[UOp]) -> RKImage|None:
+  """Lower a matched scalar extrema pair without recursively compiling its typed comparison phase."""
+  if (plan:=_match_scalar_extrema(output,uops)) is None: return None
+  out,total,value_def,coordinates,slope,baseline=plan
+  flat=functools.reduce(lambda value,item:value.alu(Ops.ADD,item[1].alu(Ops.MUL,item[1].const_like(math.prod(tuple(int(loop.src[0].arg) for loop in value_def.loops[item[0]+1:]))))),reversed(tuple(enumerate(value_def.loops))),UOp.const(0,dtypes.int))  # noqa: E501
+  fake_slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM and u.arg is not None),default=out.arg.slot); fake=UOp.param(fake_slot,dtypes.half,(total,)); child_store=fake.index(flat).store(value_def.term).end(*value_def.loops)  # noqa: E501
+  if (child:=_lower_uop_program(list(child_store.sink().toposort()),vectorize_reductions=False)) is None or child.host_gathers or child.host_scatters: return None  # noqa: E501
+  target=RKArg(RKBufferKind.SCRATCH,len(child.scratch)); child=replace(_alias_image_args(child,{fake_slot:target}),scratch=child.scratch+(RKScratch(_scratch_bytes(total)),))  # noqa: E501
+  lane=UOp.range(total,max((u.arg[0] for u in uops if u.op is Ops.RANGE and isinstance(u.arg,tuple)),default=-1)+1); loads=tuple(UOp.param(fake_slot+i,dtype,(total,)).index(lane).load() for i,dtype in enumerate((dtypes.half,dtypes.half,dtypes.int16),1))  # noqa: E501
+  weighted=UOp(Ops.CMPEQ,dtypes.bool,src=loads[:2]).cast(dtypes.int16)*loads[2]; fake_out=UOp.param(fake_slot+4,dtypes.int16,(total,)); context=RKContext((fake_out.index(lane).store(weighted),fake_out,total,lane,weighted),accurate_adds=False)  # noqa: E501
+  # Continue the typed comparison in the child image's physical state; this keeps one allocator and one dependency schedule.
+  context.scratch,context.gathers,context.ew_ops,context.mid_gathers=list(child.scratch),list(child.gathers),list(child.ew_ops),list(child.mid_gathers)
+  context.constants={child.constants[i:i+2]:i//2 for i in range(0,len(child.constants),2)}; context.mid_gathers.extend(replace(gather,after=len(context.ew_ops)) for gather in child.post_gathers)  # noqa: E501
+  def allocate(lanes:int=total)->RKArg: return context._scratch(dtypes.int16,RKLayout.INT16,_scratch_bytes(lanes)).arg
+  values,spaced=target,allocate(total*32); context.mid_gathers.append(RKGather(values.index,spaced.index,total,axes=((1,total,1),),dst_stride=32,src_kind=RKBufferKind.SCRATCH,after=len(context.ew_ops)))  # noqa: E501
+  best=_reduce_rows(context.ew_ops,[replace(spaced,addend=i*64) for i in range(total)],1,_EW_CFG[Ops.MAX]); best_values,coordinate_arg=allocate(),allocate(); context.mid_gathers.append(RKGather(best.index,best_values.index,total,offsets=(best.addend//2,)*total,src_kind=RKBufferKind.SCRATCH,after=len(context.ew_ops)))  # noqa: E501
+  context.gathers.append(RKGather(out.arg.slot,coordinate_arg.index,total,values=coordinates)); context.values.update(dict(zip(loads,(RKValue(values,dtypes.half,total,RKLayout.FP16),RKValue(best_values,dtypes.half,total,RKLayout.FP16),RKValue(coordinate_arg,dtypes.int16,total,RKLayout.INT16)))))  # noqa: E501
+  split=len(context.ew_ops); context.out=allocate(); selected=context.lower(weighted).arg; context.ew_ops[split]=replace(context.ew_ops[split],submit_barrier=True,stateful=True)  # noqa: E501
+  context.mid_gathers.append(RKGather(selected.index,spaced.index,total,axes=((1,total,1),),dst_stride=32,src_kind=RKBufferKind.SCRATCH,after=len(context.ew_ops))); result=_reduce_rows(context.ew_ops,[replace(spaced,addend=i*64) for i in range(total)],1,_EW_CFG[Ops.MAX],int16=True)  # noqa: E501
+  for value,op in ((v,o) for v,o,n in ((slope,Ops.MUL,1),(baseline,Ops.ADD,0)) if v!=n):
+    source,previous,result=allocate(1),result,allocate(1); context.gathers.append(RKGather(out.arg.slot,source.index,1,values=(_int16_bits(value),))); context.ew_ops.append(RKEWOp(result,previous,source,1,_EW_CFG[op],**_INT16_EW))  # noqa: E501
+  zero=allocate(1); context.gathers.append(RKGather(out.arg.slot,zero.index,1,values=(0,))); context.ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG,out.arg.slot),result,zero,1,_EW_CFG[Ops.ADD],int16_input=True,int32_output=True))  # noqa: E501
+  constants=b"" if not context.constants else b"".join({slot:bits for bits,slot in context.constants.items()}.get(i,b"\0\0") for i in range(max(context.constants.values())+1)); image=_reuse_linear_scratch(RKImage(RKTarget.RK3588,tuple(context.scratch),constants,gathers=tuple(context.gathers),ew_ops=tuple(context.ew_ops),mid_gathers=tuple(context.mid_gathers),gather_after=child.gather_after),context.constants)  # noqa: E501
+  return image if all(len(items)<=_RKIMAGE_U16_MAX for items in (image.scratch,image.gathers,image.ew_ops,image.mid_gathers)) else None
 
 def _lower_host_scatter(output:RKOutput) -> RKImage|None:
   """Lower a direct dynamic STORE as raw last-writer host address materialization."""
@@ -1946,7 +1919,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True, recipe
   if (mixed:=_try(strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops,v=vectorize_reductions)) is not None: return mixed
   if (scatter:=_try(strict_output, (dtypes.half, dtypes.int16), _lower_host_scatter)) is not None: return scatter
   if (image:=_try(strict_output,dtypes.int,_lower_raw_fp16_bitcast)) is not None: return image
-  if (extrema:=_try(local_output, dtypes.int, _lower_vectorized_scalar_local_extrema, uops, v=vectorize_reductions)) is not None: return extrema
+  if (extrema:=_try(local_output,dtypes.int,_lower_scalar_extrema,uops,v=vectorize_reductions)) is not None: return extrema
   storage_uops, storage_product_adds = typing_cast(list[UOp]|None, None), False
   if any(u.dtype.scalar() is dtypes.float for u in uops):
     if (sink:=next((u for u in uops if u.op is Ops.SINK), None)) is not None:

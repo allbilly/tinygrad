@@ -8254,6 +8254,52 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-26 — scalar extrema share one lowering context at 1,970 lines
+
+This hardware-accepted architecture rewrite follows `304abd880`.  Its
+predeclared `sz.py` budget replaced the 76 executable lines in
+`_lower_vectorized_scalar_local_extrema` with at most 46 lines across
+`_match_scalar_extrema` and `_lower_scalar_extrema`, for net at most **-30**.
+The measured result meets that budget exactly: renderer **2,000 -> 1,970**,
+repository total **27,511 -> 27,481**, and runtime remains **443**.  The raw
+renderer diff is **+51/-78 physical lines**; its tested SHA-256 is
+`37f52b7c87cadb313a8a5a66cda4f5cb6948c9bc4b6ce7913510036245ffd290`.
+
+The recognizer now returns the proved value loop, coordinate vector, and
+affine output map as a small lowering plan.  The lowering still compiles the
+value-producing child through the production `_lower_uop_program` path, but
+it no longer builds and recursively compiles a second synthetic selected-index
+program, appends two independently allocated images, renumbers constants and
+scratch aliases, and then reconstructs their dependency schedule.  Instead,
+the typed equality and coordinate weighting continue in the child image's
+existing `RKContext`, so scratch allocation, constant ownership, gathers, and
+EW dependencies each have one owner.  No generic IR, new operation, relaxed
+admission, test change, runtime change, wire change, host arithmetic, or
+CPU/GPU numeric fallback was introduced.
+
+The complete Rockchip UOp module reports **156 passed** with
+`test/unit/test_rockchip_uops.py -x -q -n12`; mypy succeeds for **216 files**,
+repository-wide Ruff succeeds, and diff checks are clean.  Differential
+oracles retain byte-identical images for ordinary programs and equivalent
+selected-value provenance for the intentionally re-owned extrema images.
+The previously suspect TopK corpus retained all **115** encoded images
+byte-for-byte.  Fresh-boot production-path argmax, argmin, softmax-argmax,
+sort, argsort, and TopK tests each passed in separate serialized invocations.
+
+The authoritative uninterrupted census command was actually run, not merely
+collected:
+
+```sh
+FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -q -n12 --dist=loadfile --tb=short --durations=25
+```
+
+It completed in **2,020.69 seconds** with **433 passed, 12 skipped, and 154
+subtests passed**: every member of the exact **445-case** suite reached its
+terminal result.  `--dist=loadfile` kept the single hardware file on one
+worker while retaining the required `-n12` invocation.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health gate passed both
+before the ordered hardware tests and after the full census.
+
 ## 2026-08-26 — aligned dense CMAC packing is affine at 2,105 lines
 
 This hardware-accepted architecture cleanup follows `8cd42e1ed`.  Its
