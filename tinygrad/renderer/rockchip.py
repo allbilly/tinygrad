@@ -1660,12 +1660,12 @@ class RKContext:
     return self.values.setdefault(u, value)
 
   def finish(self) -> RKImage:
-    nodes = self.root.toposort()
-    # Static selectors materialize directly, so only dynamic predicates make iterative lowering unsafe.
-    if len(nodes) > 800 and not any(node.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ, Ops.WHERE) and node not in self.static_nodes for node in nodes):
+    nodes=self.root.toposort(); predicated=any(node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and node not in self.static_nodes for node in nodes); blocked:set[UOp]=set()  # noqa: E501
+    # A dynamic predicate taints only its consumers; independent FP16 arithmetic can form one physical prelude.
+    if len(nodes)>800:
       for node in nodes:
-        if node.dtype.scalar() in (dtypes.half, dtypes.int16, dtypes.bool, dtypes.uchar) and node.op in (Ops.CONST, Ops.LOAD, Ops.CAST, *GroupOp.ALU):
-          self.lower(node)
+        if node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and node not in self.static_nodes or any(src in blocked for src in node.src): blocked.add(node)  # noqa: E501
+        elif (not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and all(load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None for load in _semantic_loads(node))): self.lower(node)  # noqa: E501
     result, dtype = self.lower(self.root), self.out_param.dtype.scalar()
     if dtype is dtypes.half and result.layout is RKLayout.FP16 or dtype is dtypes.int16 and result.layout is RKLayout.INT16:
       layout = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16

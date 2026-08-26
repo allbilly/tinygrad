@@ -2347,6 +2347,17 @@ def test_large_static_local_add_balances_before_generic_post_uops():
   assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG, 0)
 
 
+def test_large_predicate_graph_keeps_fp16_prelude_before_typed_comparisons():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",96,dtypes.half,num=13010))
+    linear,_ = source.cummin(0)[1].linear_with_vars()
+    to_program_cache.clear()
+    renderer = RockchipRenderer(Target(device="ROCKCHIP"))
+    images = [decode_image(to_program(call.src[0],renderer).src[-1].arg) for call in linear.src if call.src[0].op is Ops.SINK]
+  def typed(op): return op.int16_input or op.int16_output or op.int32_input or op.int32_output
+  assert images and not any(typed(lhs) and not typed(rhs) for lhs,rhs in zip(images[-1].ew_ops,images[-1].ew_ops[1:]))
+
+
 def test_multiple_output_stores_execute_sequentially():
   first, second = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (4,))
   source, lane = UOp.param(2, dtypes.half, (4,)), UOp.range(4, 0)
