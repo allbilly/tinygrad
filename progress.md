@@ -8307,6 +8307,46 @@ zero failures.  The candidate-path
 before and after that census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
 `[8 8 8 8 8 8 8 8] PASS`.
 
+## 2026-08-26 — physical carrier transitions have one owner at 1,900 lines
+
+This hardware-accepted architecture rewrite follows `c83d47537`.  Its
+predeclared `sz.py` budget replaced the 126-line carrier-ownership closure
+across layout sizing, constants/statics, repeated load/ALU/bitwise layout
+selection, FP16 narrowing, INT16 widening, CAST lowering, and terminal output
+conversion with at most 92 executable lines owned by `RKLayout.itemsize`,
+`RKContext._layout`, `_convert`, `_cast`, and `_finish_value`: net at most
+**-34**.  The exact target was met: renderer **1,934 -> 1,900**, repository
+total **27,445 -> 27,411** (**-34**), and runtime remains **443**.  The raw
+renderer diff is **+91/-125 physical lines**.
+
+`_layout` now owns the dtype-to-physical-carrier policy, while `_convert` owns
+the four native boundaries FP16-to-INT16, FP16-to-INT32, INT32-to-FP16, and
+INT16-to-INT32.  `_cast` owns semantic BOOL, UCHAR, truncating integer, FP32,
+and bounded-integer recipes before crossing exactly one such boundary.
+`_finish_value` owns the output ABI conversion and raw gather.  This deletes
+the separate `_narrow_fp16` and `_widen_int16` transition owners together with
+the monolithic CAST and finish dispatches.  Allocation order and all native
+flags remain byte-identical.  No generic IR, new admission, CMAC change, wire
+or runtime path, CPU/GPU numeric fallback, test change, or comment/docstring
+deletion was introduced.
+
+Three committed-parent/candidate production-image oracles are exact: all 24
+general lowering images, all 298 cast cases (**214 images, 84 shared rejects,
+0 errors**), and all 16 BOOL/UCHAR output-boundary images match byte for byte.
+The complete Rockchip UOp module reports **156 passed in 31.28 seconds** under
+`-q -n12`; mypy succeeds for **216 files**, repository-wide Ruff succeeds,
+and diff checks are clean.  A focused NPU cast/classification/comparison pass
+reports **10 passed in 13.49 seconds**.
+
+The authoritative production-path census executed all **445** top-level
+cases and completed in **2,020.82 seconds** with **433 passed, 12 skipped, and
+154 subtests passed**, zero failures.  The candidate-path
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after that census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.  Its slowest case was
+`test_cross_entropy_smoothing` at **144.91 seconds**; the carrier rewrite's
+focused cast cases stayed at or below **1.68 seconds** each.
+
 ## 2026-08-26 — RKImage serialization takes one topology-preserving walk at 1,970 lines
 
 This hardware-accepted performance cleanup follows `566244f3b`.  Its revised
