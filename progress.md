@@ -8254,6 +8254,58 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-26 — RKImage serialization takes one topology-preserving walk at 1,970 lines
+
+This hardware-accepted performance cleanup follows `566244f3b`.  Its revised
+predeclared `sz.py` budget replaced the one executable `_plain_image` line
+with one executable `_plain_image` line and changed the `encode_image` call
+one-for-one: exact **net 0**.  The measured renderer therefore remains
+**1,970**, repository total remains **27,481**, and runtime remains **443**.
+The raw renderer diff is **+2/-2 physical lines**; its tested SHA-256 is
+`215d2bd681edf8826929f119018341ef48264117ad63f599f968e4ccad4260e5`.
+
+`encode_image` previously called `dataclasses.astuple`, which recursively
+deep-copied the complete image, and then `_plain_image`, which recursively
+walked the resulting tuple tree a second time to normalize enums.  The new
+`_plain_image` walks each RK dataclass and tuple exactly once, directly
+constructing the same primitive tuple topology.  `astuple` remains imported
+for `_gather_cache_key`; no unrelated caller changed.  A first private draft
+that reused nested tuple objects was rejected when the byte oracle showed
+that marshal reference encoding changed on complex images, even though they
+decoded equivalently.  None of that rejected draft entered the shared tree.
+
+A 30,000-EW-operation synthetic image retained exact tuple, marshal, and
+compressed bytes.  Tuple construction moved from **0.768092 s to 0.305067
+s** (**2.52x faster**) and complete encoding from **0.911810 s to 0.445318
+s** (**2.05x faster**).  A legacy serializer wrapped every encoding in the
+complete Rockchip UOp module: all **212/212** observed encoded images were
+byte-identical, and the module reports **156 passed** under `-x -q -n12`.
+Mypy succeeds for **216 files**, repository-wide Ruff succeeds, and diff
+checks are clean.
+
+The uninstrumented production-path `cross_entropy_smoothing` test passed in
+both candidate trials at **145.66 s** and **138.17 s** call time, versus two
+same-boot committed-parent trials at **167.46 s** and **147.23 s**.  Because
+the full-census comparison is less dramatic—**124.84 s** here versus
+**126.30 s** in the preceding census—the change is recorded as a proven
+codec optimization, not as a complete solution to the end-to-end slow test.
+
+The authoritative uninterrupted candidate census actually ran through the
+production `to_program` path:
+
+```sh
+FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -q -n12 --dist=loadfile --tb=short --durations=25
+```
+
+It completed in **1,976.21 seconds** with **433 passed, 12 skipped, and 154
+subtests passed**, exactly accounting for all **445** cases with zero
+failures.  The candidate-path
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before the
+hardware timing runs and after the census with `reset_npu ret=0`, `SUBMIT
+ret=0`, and exact `[8 8 8 8 8 8 8 8] PASS`.  No test, runtime/core file,
+tolerance, retry, reboot, wire byte, CPU/GPU numeric fallback, or hardware
+arithmetic path changed.
+
 ## 2026-08-26 — scalar extrema share one lowering context at 1,970 lines
 
 This hardware-accepted architecture rewrite follows `304abd880`.  Its

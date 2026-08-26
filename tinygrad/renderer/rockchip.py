@@ -129,7 +129,7 @@ def _reuse_linear_scratch(image:RKImage, constant_slots:dict[bytes, int]) -> RKI
 
 class RKStage(NamedTuple): commands: tuple[int, ...]; relocs: tuple[tuple[int, RKArg], ...]
 
-def _plain_image(value): return tuple(map(_plain_image, value)) if isinstance(value, tuple) else int(value) if isinstance(value, IntEnum) else value
+def _plain_image(value): return tuple(map(_plain_image,vars(value).values() if hasattr(value,"__dataclass_fields__") else value)) if isinstance(value,tuple) or hasattr(value,"__dataclass_fields__") else int(value) if isinstance(value,IntEnum) else value  # noqa: E501
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool: return all(isinstance(x,int) and -(1<<(bits-1)) <= x < 1<<(bits-1) if signed else isinstance(x,int) and 0 <= x < 1<<bits for x in values)  # noqa: E501
 
 def _validate_image(image:RKImage) -> None:
@@ -147,7 +147,7 @@ def _validate_image(image:RKImage) -> None:
     if not _fits((op.dst.index,),16) or not _fits((op.lhs.index,op.rhs.index,op.count,op.ew_cfg)) or not _fits((op.dst.addend,op.lhs.addend,op.rhs.addend),signed=True) or op.bool_output and not op.int32_output or (op.int16_output or op.int16_input) and (op.int32_output or op.int32_input) and not int16_to_int32: raise ValueError("invalid RKEWOp flags")  # noqa: E501
 
 def encode_image(image:RKImage) -> bytes:
-  _validate_image(image); return RKIMAGE_MAGIC+struct.pack("<H", image.version)+zlib.compress(marshal.dumps(_plain_image(astuple(image)), 4), 1)
+  _validate_image(image); return RKIMAGE_MAGIC+struct.pack("<H", image.version)+zlib.compress(marshal.dumps(_plain_image(image), 4), 1)
 
 def decode_image(blob:bytes) -> RKImage:
   def arg(x): return RKArg(RKBufferKind(x[0]), *x[1:])
