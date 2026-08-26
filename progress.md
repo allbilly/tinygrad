@@ -8254,6 +8254,67 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — semantic recipes and physical records have one owner at 1,698 lines
+
+This hardware-accepted milestone follows `143c46a4b` and is an architecture
+rewrite rather than line packing.  Three isolated cuts moved authoritative
+renderer size **1795 -> 1760 -> 1729 -> 1698**: **-35**, **-31**, and **-31**
+executable lines.  The combined raw renderer diff is **+182/-283 physical
+lines**, while token-aware `sz.py` reports renderer **1795 -> 1698** (**-97**),
+runtime **443 -> 442** (**-1**), and repository total **27306 -> 27208**
+(**-98**).  Comments and docstrings remain.
+
+Tinygrad UOps are now the sole semantic recipe representation.  `RKContext`
+binds physical carriers through `_physical` and `_lower_recipe`, with
+`recipe_owners` retaining the semantic output owner across generated recipe
+nodes.  BOOL comparison/selection, integer bit planes, FP16 classification,
+and INT32 division therefore share ordinary UOp interning instead of parallel
+`bit_components`, FP16 component/order, INT32 division, and INT16-mask recipe
+caches.  The obsolete `_narrow_compare`, `_masked_where`, `_int16_cmod`, and
+test-only `_output_store` forwarding owners are deleted.  Root static
+ownership is explicitly limited to `semantic_nodes`, so physical recipe UOps
+cannot be mistaken for compile-time expressions.
+
+The immutable image ABI records (`RKArg`, `RKValue`, `RKScratch`, `RKGather`,
+`RKHostAddress`, `RKEWOp`, `RKCMAC`, and `RKImage`) now use typed tuple records.
+Native `_replace` and tuple traversal delete dataclass reflection, conversion,
+and replacement plumbing in both renderer and runtime without changing the
+encoded image topology.  Existing ABI field names `index` and `count` are
+retained; their mypy annotations document the intentional tuple-method name
+collision rather than renaming the wire-facing API.
+
+Finally, FP32-to-FP16 storage preparation has one graph owner.
+`_expand_math_uops` performs storage-boundary conversion and precise-ADD
+recipe expansion before physical allocation, while `_lower_uop_program` only
+sequences the semantic expansion and common storage rewrite.  The second lazy
+accurate-ADD pass and state in `RKContext`, the parallel nested-boundary
+substitution loop, and its duplicate SIN/root handling are gone.  The ratio
+path, product-add timing, runtime-address exclusion, and compensated-prefix
+performance behavior retain their pinned physical programs.  A rejected
+draft that expanded accuracy before storage normalization doubled the biased
+eight-channel convolution program; it was not promoted.
+
+The complete Rockchip UOp module passes **156/156 in 28.56 seconds** with
+`-q -n12`; repository-wide Ruff passes, mypy reports no issues in **216 source
+files**, and diff checks are clean.  The shared promotion was verified
+byte-for-byte against the isolated candidate for all three changed production
+and test files.  No generic IR, WMMA detour, new wire/runtime field, relaxed
+test, tolerance change, scheduler shortcut, or CPU/GPU numeric fallback was
+introduced; all arithmetic still reaches the existing production
+`Tensor.schedule_linear -> to_program -> RKImage` path.
+
+The authoritative candidate-pinned `.venv/bin/python
+~/rk3588/examples/simple_add.py` health gate passed immediately before and
+after the census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.  The uninterrupted production-path census was
+actually executed with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and
+pytest `-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed**
+in **1872.43 seconds (31:12)**, exactly accounting for all **445** top-level
+cases with zero failures.  Its slowest case was
+`test_binary_crossentropy_reductions` at **99.82 seconds**, followed by
+`test_binary_crossentropy` at **93.87 seconds** and
+`test_simple_conv_transpose3d` at **89.02 seconds**.
+
 ## 2026-08-26 — lower integer byte circuits through UOps at 1,795 lines
 
 This milestone replaces the duplicated, hand-scheduled integer byte circuits

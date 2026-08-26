@@ -1,6 +1,5 @@
 from __future__ import annotations
 import collections, ctypes, mmap, os, time, weakref as wr
-from dataclasses import replace as copy_dataclass
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
@@ -241,7 +240,7 @@ class RockchipProgram(Program['RockchipDevice']):
           if split:
             for chunk_start in range(0, len(group), _MAX_EW_GROUP_OPS):
               chunk = list(group[chunk_start:chunk_start+_MAX_EW_GROUP_OPS])
-              chunk[0] = copy_dataclass(chunk[0], submit_barrier=False, stateful=True)
+              chunk[0] = chunk[0]._replace(submit_barrier=False, stateful=True)
               self._run_ew_ops(address, buffer, tuple(chunk), tile_groups=False)
           elif not tiled:
             self._run_ew_ops(address, buffer, group, tile_groups=False)

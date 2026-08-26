@@ -2,7 +2,6 @@ import ctypes, functools, hashlib, itertools, math, struct
 import numpy as np
 import pytest
 from collections.abc import Callable
-from dataclasses import replace
 from types import SimpleNamespace
 from tinygrad import Tensor
 from tinygrad.codegen import to_program, to_program_cache
@@ -274,29 +273,29 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
     RKArg(RKBufferKind.SCRATCH, 1), 3, 4, 5)
   image = RKImage(RKTarget.RK3588, (RKScratch(192), RKScratch(2048), RKScratch(384)), cmac=cmac)
   assert decode_image(encode_image(image)) == image
-  for invalid in (replace(image, cmac=replace(cmac, lhs=RKArg(RKBufferKind.ARG, 0))),
-                  replace(image, scratch=(RKScratch(191), *image.scratch[1:]))):
+  for invalid in (image._replace(cmac=cmac._replace(lhs=RKArg(RKBufferKind.ARG, 0))),
+                  image._replace(scratch=(RKScratch(191), *image.scratch[1:]))):
     try: encode_image(invalid)
     except ValueError: pass
     else: raise AssertionError("invalid CMAC image was encoded")
-  try: emit_cmac_stage(replace(cmac, m=2, k=385))
+  try: emit_cmac_stage(cmac._replace(m=2, k=385))
   except ValueError: pass
   else: raise AssertionError("multi-row CMAC exceeded the donor CBUF contract")
-  try: emit_cmac_stage(replace(cmac, m=1, k=417))
+  try: emit_cmac_stage(cmac._replace(m=1, k=417))
   except ValueError: pass
   else: raise AssertionError("CMAC exceeded the thirteen encoded K blocks")
   stage = emit_cmac_stage(cmac)
   assert len(stage.commands) == 45 and tuple(index for index,_ in stage.relocs) == (18, 24, 31)
   body = patch_stage(stage, lambda _kind,index:(0x100000,0x200000,0x300000)[index])
   assert hashlib.sha256(struct.pack("<45Q", *body)).hexdigest() == "d754ae668b210999c7d568131c0387e46be9c934ad3812b51fb956c789e3db22"
-  relu_image = replace(image, cmac=replace(cmac, relu=True))
+  relu_image = image._replace(cmac=cmac._replace(relu=True))
   assert decode_image(encode_image(relu_image)) == relu_image
   relu_stage = emit_cmac_stage(relu_image.cmac)
   changed = [(old,new) for old,new in zip(stage.commands,relu_stage.commands) if old != new]
   assert len(relu_stage.commands) == 45 and len(changed) == 1
   assert changed[0][0]&0xffff == changed[0][1]&0xffff == rockchip_renderer.rk.REG_DPU_BS_CFG
   assert ((changed[0][0]>>16)&0xffffffff,(changed[0][1]>>16)&0xffffffff) == (0x53,0x12)
-  mixed = replace(image, ew_ops=(RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD]),),
+  mixed = image._replace(ew_ops=(RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD]),),
                   mid_gathers=(RKGather(2,0,1,src_kind=RKBufferKind.SCRATCH,after=0),))
   assert decode_image(encode_image(mixed)) == mixed
 
@@ -692,7 +691,7 @@ def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
   image = _lower_uop_program(_program(dtypes.half, lambda i:
     ((magnitude.index(i).load().bitcast(dtypes.int16) & UOp.const(dtypes.int16.max, dtypes.int16)) |
      (sign.index(i).load().bitcast(dtypes.int16) & UOp.const(dtypes.int16.min, dtypes.int16))).bitcast(dtypes.half)))
-  assert image is not None and len(image.ew_ops) == 11 and len(image.mid_gathers) == 10
+  assert image is not None and len(image.ew_ops) == 10 and len(image.mid_gathers) == 6
   assert len(image.post_gathers) == 1 and image.post_gathers[0].itemsize == 2
   assert decode_image(encode_image(image)) == image
 
@@ -2094,7 +2093,7 @@ def test_dynamic_candidate_selector_rejects_before_table_allocation(monkeypatch)
   cases = ((1, rockchip_renderer._MAX_STATIC_RANGE_ENVS+1),
            (4096, rockchip_renderer._MAX_DYNAMIC_SELECTOR_CELLS//4096+1))
   for count,extent in cases:
-    output = rockchip_renderer._output_store(_dynamic_load_program(count=count, extents=(extent,)), dtypes.half)
+    output = rockchip_renderer._admit(rockchip_renderer._outs(_dynamic_load_program(count=count, extents=(extent,)))[0], dtypes.half)
     assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is None
 
 
@@ -2111,12 +2110,12 @@ def test_dynamic_candidate_selector_rejects_unencodable_slots_and_offsets(monkey
     assert _lower_uop_program(program) is None
   safe, unsafe = (1 << 29)-1, 1 << 29
   for program in (_dynamic_offset_program(data_offset=safe), _dynamic_offset_program(index_offset=safe)):
-    output = rockchip_renderer._output_store(program, dtypes.int)
+    output = rockchip_renderer._admit(rockchip_renderer._outs(program)[0], dtypes.int)
     assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is not None and \
       (image:=_lower_uop_program(program)) is not None
     assert decode_image(encode_image(image)) == image
   for program in (_dynamic_offset_program(data_offset=unsafe), _dynamic_offset_program(index_offset=unsafe)):
-    output = rockchip_renderer._output_store(program, dtypes.int)
+    output = rockchip_renderer._admit(rockchip_renderer._outs(program)[0], dtypes.int)
     assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is None
 
 
