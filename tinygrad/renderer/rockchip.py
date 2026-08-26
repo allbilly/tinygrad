@@ -645,14 +645,35 @@ def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16
     active = active[::2]
   return active[0]
 
-def _int16_byte_bits(ops:list[RKEWOp], alloc:Callable[[], RKArg], const:dict[int, RKArg], value:RKArg, lanes:int, weighted=False)->tuple[RKArg, ...]:
-  """Split unsigned byte lanes into exact native planes, optionally retaining each bit's scale."""
-  result, remainder = typing_cast(list[RKArg|None], [None]*8), value
-  for bit in range(7, 0, -1):
-    delta, positive, flag, scaled, next_remainder = (alloc() for _ in range(5))
-    ops.extend(_ew_ops(((delta,remainder,const[(1<<bit)-1],Ops.SUB),(positive,delta,const[0],Ops.MAX),(flag,positive,const[1],_EW_CFG_MIN),(scaled,flag,const[1<<bit],Ops.MUL),(next_remainder,remainder,scaled,Ops.SUB)),lanes,**_INT16_EW))  # noqa: E501
-    result[bit], remainder = scaled if weighted else flag, next_remainder
-  result[0]=remainder; return typing_cast(tuple[RKArg, ...],tuple(result))
+def _i16_min(lhs:UOp, rhs:UOp) -> UOp: return UOp(Ops.MAX,dtypes.int16,src=(lhs,rhs),arg=_NATIVE_MIN)
+def _i16_abs(value:UOp) -> UOp: return UOp(Ops.MAX,dtypes.int16,src=(value,value),arg=_NATIVE_ABS)
+def _i16_bit(value:UOp) -> UOp: return _i16_min(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
+def _i16_equal(lhs:UOp, rhs:UOp) -> UOp: return lhs.const_like(1).alu(Ops.SUB,_i16_min(_i16_abs(lhs.alu(Ops.SUB,rhs)),lhs.const_like(1)))
+def _sign_bias(value:UOp) -> UOp: return value.alu(Ops.ADD,value.const_like(128)).alu(Ops.SUB,_i16_bit(value.alu(Ops.SUB,value.const_like(127))).alu(Ops.MUL,value.const_like(256)))  # noqa: E501
+
+def _byte_bits(value:UOp) -> tuple[UOp, ...]:
+  """Split one unsigned byte expression into exact least-significant-first INT16 bit planes."""
+  result, remainder = typing_cast(list[UOp|None],[None]*8),value
+  for bit in range(7,0,-1):
+    result[bit]=flag=_i16_bit(remainder.alu(Ops.SUB,value.const_like((1<<bit)-1)))
+    remainder=remainder.alu(Ops.SUB,flag.alu(Ops.MUL,value.const_like(1<<bit)))
+  result[0]=remainder; return typing_cast(tuple[UOp,...],tuple(result))
+
+def _ordered_bits(lhs:Iterable[UOp], rhs:Iterable[UOp]) -> UOp:
+  """Compare equal-width unsigned components from most to least significant."""
+  left=tuple(lhs); less,equal=left[0].const_like(0),left[0].const_like(1)
+  for a,b in zip(left,rhs):
+    maximum=a.alu(Ops.MAX,b); a_less,b_less=(_i16_bit(maximum.alu(Ops.SUB,value)) for value in (a,b))
+    less=less.alu(Ops.MAX,equal.alu(Ops.MUL,a_less)); equal=equal.alu(Ops.MUL,equal.const_like(1).alu(Ops.SUB,a_less.alu(Ops.MAX,b_less)))
+  return less
+
+def _twos_complement(raw:Iterable[UOp], sign:UOp) -> tuple[UOp, ...]:
+  carry,result=sign,[]
+  for byte in raw:
+    inverted=byte.const_like(255).alu(Ops.SUB,byte.alu(Ops.MUL,byte.const_like(2))).alu(Ops.MUL,sign)
+    total=byte.alu(Ops.ADD,inverted).alu(Ops.ADD,carry); carry=_i16_bit(total.alu(Ops.SUB,total.const_like(255)))
+    result.append(total.alu(Ops.SUB,carry.alu(Ops.MUL,total.const_like(256))))
+  return tuple(result)
 
 def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
   """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
@@ -661,14 +682,6 @@ def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
   lanes:dict[int,RKTypedLoadPlan|None]={int(term.src[1].arg):_typed_load_plan(bitcast.src[0],dtypes.half,index,n,require_offsets=True) for term in packed.src if term.op is Ops.SHL and len(term.src)==2 and term.src[1].op is Ops.CONST and int(term.src[1].arg) in (0,16) for bitcast in (_typed_cast_source(term.src[0],dtypes.uint,dtypes.ushort),) if bitcast is not None and bitcast.op is Ops.BITCAST and len(bitcast.src)==1 and len(bitcast.src[0].src)==1}  # noqa: E501
   if len(packed.src)!=2 or set(lanes)!={0,16} or (low:=lanes[0]) is None or (high:=lanes[16]) is None or low.param.arg!=high.param.arg or any(a&1 or b!=a+1 for a,b in zip(low.gather.offsets,high.gather.offsets)): return None  # noqa: E501
   return RKImage(RKTarget.RK3588,gathers=(replace(_raw_gather(RKArg(RKBufferKind.ARG,low.param.arg.slot),out.arg.slot,n,itemsize=4,src_kind=RKBufferKind.ARG),axes=(),offsets=tuple(offset//2 for offset in low.gather.offsets)),))  # noqa: E501
-
-def _ordered_byte_less(ops:list[RKEWOp], allocate:Callable[[], RKArg], zero:RKArg, one:RKArg,
-                       lhs_components:Iterable[RKArg], rhs_components:Iterable[RKArg], lanes:int) -> RKArg:
-  less, equal = zero, one
-  for lhs,rhs in zip(lhs_components, rhs_components):
-    maximum, lhs_delta, rhs_delta, lhs_less, rhs_less, unequal, same, selected, next_less, next_equal = (allocate() for _ in range(10))
-    ops.extend(_ew_ops(((maximum,lhs,rhs,Ops.MAX),(lhs_delta,maximum,lhs,Ops.SUB),(rhs_delta,maximum,rhs,Ops.SUB),(lhs_less,lhs_delta,one,_EW_CFG_MIN),(rhs_less,rhs_delta,one,_EW_CFG_MIN),(unequal,lhs_less,rhs_less,Ops.MAX),(same,one,unequal,Ops.SUB),(selected,equal,lhs_less,Ops.MUL),(next_less,less,selected,Ops.MAX),(next_equal,equal,same,Ops.MUL)),lanes,**_INT16_EW)); less,equal=next_less,next_equal  # noqa: E501
-  return less
 
 def _bounded_index_gate(gate:UOp, bounded:UOp, limit:int|None=None) -> int|None:
   """Return the exact positive bound proved by the canonical conjunction, or None."""
@@ -885,8 +898,9 @@ class RKContext:
     self.store,self.out_param,self.count,self.out_index,self.root=output; self.out=RKArg(RKBufferKind.ARG,self.out_param.arg.slot)
     # Initialize per-context state before checking the root-derived layout.
     self.values:dict[UOp,RKValue]={}; self.scratch:list[RKScratch]=[]; self.constants:dict[bytes,int]={}; self.materialized_slots:dict[tuple,int]={}  # noqa: E501
-    self.raw_components:dict[RKArg,tuple[RKValue,...]]={}; self.int32_divmod:dict[tuple[UOp,UOp],tuple[tuple[RKArg,...],tuple[RKArg,...],RKArg,RKArg]]={}; self.int16_masks:dict[RKArg,int]={}  # noqa: E501
-    self.fp16_components:dict[RKArg,tuple[RKValue,RKArg,RKArg]]={}; self.fp16_ordered:dict[RKArg,tuple[RKArg,RKArg]]={}
+    self.raw_components:dict[RKArg,tuple[RKValue,...]]={}; self.bit_components:dict[RKArg,tuple[UOp,...]]={}
+    self.int32_divmod:dict[tuple[UOp,UOp],tuple[tuple[UOp,...],tuple[UOp,...],UOp,UOp]]={}; self.int16_masks:dict[RKArg,int]={}  # noqa: E501
+    self.fp16_components:dict[RKArg,tuple[RKValue,UOp,UOp]]={}; self.fp16_ordered:dict[RKArg,tuple[UOp,UOp]]={}
     self.gathers:list[RKGather]=[]; self.host_gathers:list[RKHostAddress]=[]; self.mid_gathers:list[RKGather]=[]; self.post_gathers:list[RKGather]=[]  # noqa: E501
     self.ew_ops:list[RKEWOp] = []
     nodes=self.root.toposort(); self.mask_program=any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)
@@ -1074,6 +1088,27 @@ class RKContext:
     if mask is not None: self.int16_masks[result.arg] = mask
     return result
 
+  def _physical_i16(self, value:RKValue|RKArg|UOp) -> UOp:
+    """Bind an existing physical INT16 row into an ordinary semantic UOp recipe."""
+    if isinstance(value,UOp): return value
+    arg=value.arg if isinstance(value,RKValue) else value; node=UOp(Ops.NOOP,dtypes.int16,src=(UOp.const(0,dtypes.int16),),arg=arg)
+    self.values.setdefault(node,RKValue(arg,dtypes.int16,self.count,RKLayout.INT16)); return node
+
+  def _bitplanes(self, value:RKValue) -> tuple[UOp, ...]:
+    if value.arg not in self.bit_components:
+      self.bit_components[value.arg]=tuple(itertools.chain.from_iterable(
+        _byte_bits(self._physical_i16(part)) for part in self._raw(value,copy_wide=False)))
+    return self.bit_components[value.arg]
+
+  def _pack_bits(self, bits:Iterable[UOp], layout:RKLayout, u:UOp) -> RKValue:
+    planes=tuple(bits)
+    if len(planes)!=layout.itemsize()*8: raise _RKGenericReject
+    raw=tuple(functools.reduce(lambda x,y:x.alu(Ops.ADD,y),
+      (planes[byte*8+bit].alu(Ops.MUL,planes[byte*8+bit].const_like(1<<bit)) for bit in range(1,8)),planes[byte*8])
+      for byte in range(layout.itemsize()))
+    result=self._raw(tuple(self.lower(part) for part in raw),layout,u=u); self.bit_components[result.arg]=planes
+    return result
+
   def _alu(self, u:UOp) -> RKValue:
     if u.op in (Ops.RECIPROCAL, Ops.NEG):
       src = self.lower(u.src[0])
@@ -1109,7 +1144,7 @@ class RKContext:
       self._emit(positive_mask, lhs, lhs, _EW_CFG[Ops.MAX], compare=True)
       return self._emit(self._scratch(dtypes.half, RKLayout.FP16, u=u), positive_mask, negative_mask, _EW_CFG[Ops.SUB])
     if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
-      if expected is not RKLayout.FP16: return self._emit(self._scratch(dtype, RKLayout.INT16, u=u), lhs, rhs, _EW_CFG_MIN)
+      if expected is not RKLayout.FP16: return self._emit(self._scratch(dtype,RKLayout.INT16,u=u),lhs,rhs,_EW_CFG_MIN)
       zero = self.lower(UOp.const(0.0, dtypes.half))
       neg_lhs, neg_rhs = (self._scratch(dtypes.half, RKLayout.FP16) for _ in range(2))
       self._emit(neg_lhs, zero, lhs, _EW_CFG[Ops.SUB])
@@ -1119,7 +1154,7 @@ class RKContext:
     cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else \
       _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
-    return self._emit(self._scratch(dtype, expected, u=u), lhs, rhs, cfg, compare=compare)
+    return self._emit(self._scratch(dtype,expected,u=u),lhs,rhs,cfg,compare=compare)
 
   def _convert(self, u:UOp|None, source:RKValue, dtype:DType, layout:RKLayout) -> RKValue:
     """Cross one physical carrier boundary using the native DPU conversion stage."""
@@ -1129,40 +1164,34 @@ class RKContext:
     if pair == (RKLayout.FP16,RKLayout.INT16): rhs,flags=source.arg,dict(stateful=True,int16_output=True,submit_barrier=dtype in (dtypes.bool,dtypes.uchar))  # noqa: E501
     elif pair == (RKLayout.FP16,RKLayout.INT32): rhs,flags=self._scratch(dtypes.int,RKLayout.INT32,(self.count+3)//4<<6).arg,dict(stateful=True,int32_output=True)  # noqa: E501
     elif pair == (RKLayout.INT32,RKLayout.FP16): rhs,flags=self._scratch(dtypes.int,RKLayout.INT32,(self.count+3)//4<<6).arg,dict(int32_input=True)  # noqa: E501
-    elif pair == (RKLayout.INT16,RKLayout.INT32): rhs,flags,cfg=self._i16_const(0),dict(int16_input=True,int32_output=True),_EW_CFG[Ops.ADD]
+    elif pair == (RKLayout.INT16,RKLayout.INT32): rhs,flags,cfg=self._constant(UOp.const(0,dtypes.int16)).arg,dict(int16_input=True,int32_output=True),_EW_CFG[Ops.ADD]  # noqa: E501
     else: raise _RKGenericReject(f"convert {source.layout.name}->{layout.name}")
     if result is None: result=self._scratch(dtype,layout,u=u)
     self.ew_ops.append(RKEWOp(result.arg,source.arg,rhs,self.count,cfg,**flags)); return result
 
   def _bool_binary(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
-    if u.op is Ops.CMPNE:
-      for expression,marker in (u.src, u.src[::-1]):
-        if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and expression.op is Ops.CMPLT:
-          sources = tuple(_half_backed_value(src) for src in expression.src)
-          if any(src is None for src in sources): continue
-          less = self.lower(expression)
-          if less.layout is not RKLayout.INT16: raise _RKGenericReject
-          operands = tuple(self._operand(src, dtypes.half) for src in typing_cast(tuple[UOp, UOp], sources))
-          nan = tuple(self._fp16_component_values(value)[2] for value in operands)
-          one_arg = self._i16_const(1)
-          inverse = self._i16(one_arg, less.arg, _EW_CFG[Ops.SUB])
-          numeric = self._i16(one_arg, self._i16(nan[0], nan[1], _EW_CFG[Ops.MAX]), _EW_CFG[Ops.SUB])
-          result = self._i16(inverse, numeric, _EW_CFG[Ops.MUL], self._scratch(dtypes.bool, RKLayout.INT16, u=u).arg)
-          return RKValue(result, dtypes.bool, self.count, RKLayout.INT16)
+    ordered=next(((expression,typing_cast(tuple[UOp,UOp],sources)) for expression,marker in (u.src,u.src[::-1])
+      if u.op is Ops.CMPNE and marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and expression.op is Ops.CMPLT
+      for sources in (tuple(_half_backed_value(src) for src in expression.src),) if all(src is not None for src in sources)),None)
+    if ordered is not None:
+      expression,sources=ordered; less=self.lower(expression)
+      if less.layout is not RKLayout.INT16: raise _RKGenericReject
+      nan=tuple(self._fp16_component_values(self._operand(src,dtypes.half))[2] for src in sources); one=self._physical_i16(less).const_like(1)
+      return replace(self.lower(one.alu(Ops.SUB,self._physical_i16(less)).alu(Ops.MUL,
+        one.alu(Ops.SUB,nan[0].alu(Ops.MAX,nan[1])))),dtype=dtypes.bool)
     lhs, rhs = (self.lower(src) for src in u.src)
     if any(value.dtype is not dtypes.bool or value.layout is not RKLayout.INT16 for value in (lhs,rhs)): raise _RKGenericReject
     dst = self._scratch(dtypes.bool, RKLayout.INT16, u=u)
-    if u.op is Ops.AND: return self._emit(dst, lhs, rhs, _EW_CFG[Ops.MUL])
-    if u.op is Ops.OR: return self._emit(dst, lhs, rhs, _EW_CFG[Ops.MAX])
+    if u.op in (Ops.AND,Ops.OR): return self._emit(dst,lhs,rhs,_EW_CFG[Ops.MUL if u.op is Ops.AND else Ops.MAX])
     if u.op in (Ops.XOR, Ops.CMPNE):
       for source,one,other in ((u.src[0], lhs, rhs), (u.src[1], rhs, lhs)):
         if source.op is Ops.CONST and source.dtype.scalar() is dtypes.bool and bool(source.arg): return self._emit(dst, one, other, _EW_CFG[Ops.SUB])
     delta = self._emit(self._scratch(dtypes.int16, RKLayout.INT16), lhs, rhs, _EW_CFG[Ops.SUB])
     if u.op in (Ops.XOR, Ops.CMPNE): return self._emit(dst, delta, delta, _EW_CFG_ABS)
     if u.op is Ops.CMPEQ:
-      unequal = self._emit(self._scratch(dtypes.bool, RKLayout.INT16), delta, delta, _EW_CFG_ABS)
-      return self._emit(dst, self._constant(UOp.const(1,dtypes.int16)), unequal, _EW_CFG[Ops.SUB])
+      return self._emit(dst,self._constant(UOp.const(1,dtypes.int16)),
+        self._emit(self._scratch(dtypes.bool,RKLayout.INT16),delta,delta,_EW_CFG_ABS),_EW_CFG[Ops.SUB])
     raise _RKGenericReject
 
   def _integer_bitwise(self, u:UOp) -> RKValue:
@@ -1172,120 +1201,55 @@ class RKContext:
         if marker.op is not Ops.CONST or (mask:=int(marker.arg)&0xffff) not in (0x7fff, 0x8000): continue
         value = self.lower(source)
         if value.layout is not RKLayout.INT16: raise _RKGenericReject
-        low, high = self._raw(value)
-        zero, _, _, const128 = (self._constant(UOp.const(number, dtypes.int16)) for number in (0, 1, 127, 128))
-        sign = self._i16_clamp_one(self._i16(high.arg, self._constant(UOp.const(127, dtypes.int16)).arg, _EW_CFG[Ops.SUB]))
-        sign_scale = self._i16(sign, const128.arg, _EW_CFG[Ops.MUL])
-        if mask == 0x7fff:
-          return self._raw((low, self._i16(high.arg, sign_scale, _EW_CFG[Ops.SUB])), RKLayout.INT16, u=u, mask=mask)
-        return self._raw((zero, sign_scale), RKLayout.INT16, u=u, mask=mask)
+        low,high=self._raw(value); high_uop=self._physical_i16(high)
+        sign=_i16_bit(high_uop.alu(Ops.SUB,high_uop.const_like(127))); sign_scale=sign.alu(Ops.MUL,sign.const_like(128))
+        parts=(self._physical_i16(low),high_uop.alu(Ops.SUB,sign_scale)) if mask==0x7fff else (high_uop.const_like(0),sign_scale)
+        return self._raw(tuple(self.lower(part) for part in parts),RKLayout.INT16,u=u,mask=mask)
     if u.dtype.scalar() is dtypes.int16 and u.op is Ops.OR:
       values = tuple(self.lower(source) for source in u.src)
       masks = tuple(self.int16_masks.get(value.arg) for value in values)
       if all(mask is not None for mask in masks) and typing_cast(int, masks[0]) & typing_cast(int, masks[1]) == 0:
-        summed_parts = tuple(self._i16(lhs.arg, rhs.arg, _EW_CFG[Ops.ADD]) for lhs,rhs in zip(*(tuple(self._raw(value) for value in values))))
-        return self._raw(summed_parts, RKLayout.INT16, u=u, mask=typing_cast(int, masks[0]) | typing_cast(int, masks[1]))
+        summed=tuple(self.lower(self._physical_i16(lhs).alu(Ops.ADD,self._physical_i16(rhs)))
+                     for lhs,rhs in zip(*(self._raw(value) for value in values)))
+        return self._raw(summed,RKLayout.INT16,u=u,mask=typing_cast(int,masks[0])|typing_cast(int,masks[1]))
     if u.op is Ops.XOR:
       for marker, source in (u.src, u.src[::-1]):
         if marker.op is not Ops.CONST or int(marker.arg) != -1: continue
-        dtype = u.dtype.scalar()
-        layout = self._layout(dtype)
-        if layout is RKLayout.INT32 and u is self.root and 1 <= self.count*4 <= _MAX_EW_ELEMS_FP16 and \
-           (parsed:=_typed_load_plan(source, dtypes.int, self.out_index, self.count, require_offsets=True)) is not None:
-          param, offsets = parsed.param, parsed.gather.offsets
-          lanes, stride, slot = self.count*4, round_up(self.count*4*2, 64), len(self.scratch)
-          self.scratch.append(RKScratch(stride*3))
-          raw_arg, constant_arg, inverted_arg = (RKArg(RKBufferKind.SCRATCH, slot, row*stride) for row in range(3))
-          self.gathers.extend((RKGather(param.arg.slot, raw_arg.index, lanes,
-            offsets=tuple(offset*4+byte if offset >= 0 else -1 for offset in offsets for byte in range(4)), dst_stride=2, itemsize=1),
-            RKGather(param.arg.slot, constant_arg.index, lanes, values=(255,)*lanes, dst_addend=constant_arg.addend//2)))
-          self.ew_ops.append(RKEWOp(inverted_arg, constant_arg, raw_arg, lanes, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True))
-          self.post_gathers.append(_raw_gather(inverted_arg, self.out_param.arg.slot, lanes))
-          return RKValue(self.out, dtype, self.count, layout)
-        rhs = self.lower(source)
+        dtype,layout,rhs=u.dtype.scalar(),self._layout(u.dtype.scalar()),self.lower(source)
         if rhs.layout is not layout: raise _RKGenericReject
         if layout is RKLayout.INT32:
-          components, const255 = self._raw(rhs), self._constant(UOp.const(255, dtypes.int16))
-          return self._raw(tuple(self._i16(const255.arg, component.arg, _EW_CFG[Ops.SUB]) for component in components), RKLayout.INT32, u=u)
+          inverted=tuple(self.lower(part.const_like(255).alu(Ops.SUB,part)) for component in self._raw(rhs)
+            for part in (self._physical_i16(component),))
+          return self._raw(inverted,RKLayout.INT32,u=u)
         lhs = self._constant(UOp.const(-1, dtype))
         return self._emit(self._scratch(dtype, layout, u=u), lhs, rhs, _EW_CFG[Ops.SUB])
-    dtype = u.dtype.scalar()
-    layout = self._layout(dtype)
+    dtype,layout=u.dtype.scalar(),self._layout(u.dtype.scalar())
     if dtype is dtypes.int and layout is not RKLayout.INT32 or u.op not in (Ops.AND,Ops.OR,Ops.XOR): raise _RKGenericReject
     values = tuple(self.lower(source) for source in u.src)
     if any(value.layout is not layout for value in values): raise _RKGenericReject
-    lanes = self.count*layout.itemsize()
-    if not 1 <= lanes <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16, _scratch_bytes(lanes)).arg
-    raw = tuple(self._byte_gather(v.arg, allocate(), lanes, base=v.arg.addend, dst_stride=2, itemsize=1, after=len(self.ew_ops)) for v in values)
-    constants = {number:allocate() for number in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128)}; self.gathers.extend(
-      RKGather(self.out_param.arg.slot, constant.index, lanes, values=(number,)*lanes) for number,constant in constants.items())
-    lhs_bits, rhs_bits = (_int16_byte_bits(self.ew_ops, allocate, constants, value, lanes, weighted=True) for value in raw)
-    weighted = [allocate() for _ in lhs_bits]
-    for combined,left,right in zip(weighted, lhs_bits, rhs_bits):
-      self.ew_ops.extend(_ew_ops(((combined, left, right, Ops.SUB), (combined, combined, combined, _EW_CFG_ABS)) if u.op is Ops.XOR else
-        ((combined, left, right, _EW_CFG_MIN if u.op is Ops.AND else _EW_CFG[Ops.MAX]),), lanes, **_INT16_EW))
-    combined, result = _reduce_rows(self.ew_ops, weighted, lanes, _EW_CFG[Ops.ADD], int16=True), self._scratch(dtype, layout, u=u)
-    self._byte_gather(combined, result.arg, lanes, base=combined.addend, source_stride=2, itemsize=1, after=len(self.ew_ops))
-    return result
+    if not 1 <= self.count*layout.itemsize() <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
+    lhs_bits,rhs_bits=(self._bitplanes(value) for value in values)
+    combined=tuple(left.alu(Ops.MUL,right) if u.op is Ops.AND else left.alu(Ops.MAX,right) if u.op is Ops.OR else
+                   _i16_abs(left.alu(Ops.SUB,right))
+                   for left,right in zip(lhs_bits,rhs_bits))
+    return self._pack_bits(combined,layout,u)
 
   def _int32_shift(self, u:UOp) -> RKValue:
     if len(u.src) != 2 or u.dtype.scalar() not in (dtypes.int, dtypes.uint) or \
        u.src[1].dtype.scalar() not in (dtypes.int, dtypes.uint) or self.int_layout is not RKLayout.INT32:
       raise _RKGenericReject
     if (value:=self.lower(u.src[0])).layout is not RKLayout.INT32: raise _RKGenericReject
-    vector_bytes=(self.count*2+63)&-64
-    vector_lanes,matrix_lanes=vector_bytes//2,16*vector_bytes
-    pre_lanes = vector_lanes*5
-    if self.count < 1 or matrix_lanes > _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    pre_arena = self._scratch(dtypes.int16, RKLayout.INT16, 51*pre_lanes*2).arg
-    pre_allocate = iter(replace(pre_arena, addend=row*pre_lanes*2) for row in range(51)).__next__
-    raw, value_parts, shift = pre_allocate(), self._raw(value), None if u.src[1].op is Ops.CONST else self.lower(u.src[1])
-    if shift is not None and shift.layout is not RKLayout.INT32: raise _RKGenericReject
-    shift_part = None if shift is None else self._raw(shift)[0]
-    for byte,part in enumerate(value_parts): self._byte_gather(part.arg, raw, self.count, base=part.arg.addend//2,
-                                                               dst_addend=byte*vector_lanes, after=len(self.ew_ops))
-    if shift_part is None:
-      self.mid_gathers.append(RKGather(self.out_param.arg.slot, raw.index, self.count,
-        values=(int(u.src[1].arg)&0xff,)*self.count, dst_addend=4*vector_lanes, after=len(self.ew_ops)))
-    else: self._byte_gather(shift_part.arg, raw, self.count, base=shift_part.arg.addend//2,
-                            dst_addend=4*vector_lanes, after=len(self.ew_ops))
-    constants = {number:pre_allocate() for number in (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128)}
-    self.gathers.extend(RKGather(self.out_param.arg.slot, dst.index, pre_lanes, values=(number,)*pre_lanes, dst_addend=dst.addend//2)
-                        for number,dst in constants.items())
-    planes = _int16_byte_bits(self.ew_ops, pre_allocate, constants, raw, pre_lanes)
-
-    post_arena = self._scratch(dtypes.int16, RKLayout.INT16, 20*matrix_lanes*2).arg
-    post_allocate = iter(replace(post_arena, addend=row*matrix_lanes*2) for row in range(20)).__next__
-    bits, masks, sign, zero, weights = post_allocate(), tuple(post_allocate() for _ in range(5)), post_allocate(), post_allocate(), post_allocate()
-    def gather_plane(plane:RKArg, destination:RKArg, count:int, byte:int, source_limit:int|None=None,
-                     dst_addend:int|None=None) -> None:
-      self._byte_gather(plane, destination, count, base=plane.addend//2+byte*vector_lanes, source_limit=source_limit,
-                        dst_addend=destination.addend//2 if dst_addend is None else dst_addend, after=len(self.ew_ops))
-    for absolute_bit in range(32):
-      gather_plane(planes[absolute_bit&7], bits, self.count, absolute_bit>>3, dst_addend=absolute_bit*vector_lanes)
-    for bit,mask in enumerate(masks): gather_plane(planes[bit], mask, matrix_lanes, 4, vector_lanes)
-    gather_plane(planes[7], sign, matrix_lanes, 3, vector_lanes)
-    self.mid_gathers.append(RKGather(self.out_param.arg.slot, weights.index, matrix_lanes,
-      values=tuple(1 << (row&7) if lane < self.count else 0 for row in range(32) for lane in range(vector_lanes)),
-      dst_addend=weights.addend//2, after=len(self.ew_ops)))
-    current = bits
-    for bit,amount in enumerate((1, 2, 4, 8, 16)):
-      temp, result = post_allocate(), post_allocate()
-      normal_rows,normal_dst,shifted_src,boundary_rows,boundary_dst = (32-amount, amount, 0, amount, 0) if u.op is Ops.SHL else \
-        (32-amount, 0, amount, amount, 32-amount)
-      for rows,dst_row,src,fill in ((normal_rows, normal_dst, current, shifted_src),
-                                    (boundary_rows, boundary_dst, sign if u.op is Ops.SHR and u.dtype.scalar() is dtypes.int else zero, 0)):
-        dst,old,selected = (replace(arg, addend=arg.addend+dst_row*vector_bytes) for arg in (temp, current, result))
-        source = replace(src, addend=src.addend+(fill*vector_bytes if src is current else dst_row*vector_bytes))
-        mask = replace(masks[bit], addend=masks[bit].addend+dst_row*vector_bytes)
-        self.ew_ops.extend(_ew_ops(((dst, source, old, Ops.SUB), (dst, dst, mask, Ops.MUL),
-          (selected, old, dst, Ops.ADD)), rows*vector_lanes, **_INT16_EW))
-      current = result
-    weighted = post_allocate()
-    self.ew_ops.append(RKEWOp(weighted, current, weights, matrix_lanes, _EW_CFG[Ops.MUL], **_INT16_EW))
-    return self._raw(tuple(_reduce_rows(self.ew_ops, [replace(weighted, addend=weighted.addend+(byte*8+bit)*vector_bytes) for bit in range(8)],
-      vector_lanes, _EW_CFG[Ops.ADD], int16=True) for byte in range(4)), RKLayout.INT32, u=u)
+    if self.count<1 or 16*((self.count*2+63)&-64)>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
+    current=self._bitplanes(value); signed=u.op is Ops.SHR and u.dtype.scalar() is dtypes.int
+    masks=() if u.src[1].op is Ops.CONST else self._bitplanes(self.lower(u.src[1]))[:5]
+    for bit,amount in enumerate((1,2,4,8,16)):
+      if not masks and not (int(u.src[1].arg)&amount): continue
+      fill=current[31] if signed else current[0].const_like(0)
+      shifted=tuple(current[index-amount] if u.op is Ops.SHL and index>=amount else
+        current[index+amount] if u.op is Ops.SHR and index+amount<32 else fill for index in range(32))
+      current=shifted if not masks else tuple(old.alu(Ops.ADD,masks[bit].alu(Ops.MUL,new.alu(Ops.SUB,old)))
+        for old,new in zip(current,shifted))
+    return self._pack_bits(current,RKLayout.INT32,u)
 
   def _compare(self, u:UOp) -> RKValue:
     if len(u.src) != 2: raise _RKGenericReject
@@ -1294,60 +1258,30 @@ class RKContext:
       value = self.lower(nonzero)
       if value.layout is not RKLayout.FP16: raise _RKGenericReject
       return self._convert(u,value,dtypes.bool,RKLayout.INT16)
-    if all(src.dtype.scalar() is dtypes.half for src in u.src): pass
-    elif all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
+    nan:tuple[UOp,...]=()
+    if all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
       int_sources = typing_cast(tuple[UOp, UOp], tuple(UOp.const(int(src.arg), dtypes.int) if src.dtype.scalar() is dtypes.weakint else src for src in u.src))  # noqa: E501
       half_sources=tuple(_half_int_expr(src) for src in int_sources)
       if self.int_layout is RKLayout.INT16 and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
       if self.int_layout is RKLayout.INT16: return self._narrow_compare(u, int_sources, dtypes.int)
-      u = u.replace(src=int_sources)
-      def operand(src:UOp) -> RKValue:
-        value = self._slot(self.materialized_slots, tuple(x & 0xffffffff for x in _static_values(self.out_index, src, self.count, int)),
-                           dtypes.int, RKLayout.INT32) if src in self.static_nodes else self.lower(src)
-        if value.layout is not RKLayout.INT32: raise _RKGenericReject
-        return value
-      lhs_value, rhs_value = (operand(src) for src in u.src)
-      lhs_bytes, rhs_bytes = self._raw(lhs_value), self._raw(rhs_value)
-      def allocate() -> RKArg: return self._scratch(dtypes.int16, RKLayout.INT16).arg
-      constants = {value:self._constant(UOp.const(value, dtypes.int16)).arg for value in (0, 1, 127, 128, 256)}
-      if u.op is Ops.CMPLT:
-        lhs_components, rhs_components = [value.arg for value in lhs_bytes[::-1]], [value.arg for value in rhs_bytes[::-1]]
-        def biased_sign(value:RKArg) -> RKArg:
-          delta, positive, high, scaled, biased = (allocate() for _ in range(5))
-          self.ew_ops.extend(_ew_ops(((delta, value, constants[127], Ops.SUB), (positive, delta, constants[0], Ops.MAX),
-            (high, positive, constants[1], _EW_CFG_MIN), (scaled, high, constants[256], Ops.MUL),
-            (biased, value, constants[128], Ops.ADD), (biased, biased, scaled, Ops.SUB)), self.count, **_INT16_EW))
-          return biased
-        lhs_components[0], rhs_components[0] = biased_sign(lhs_components[0]), biased_sign(rhs_components[0])
-        mask = _ordered_byte_less(self.ew_ops, allocate, constants[0], constants[1], lhs_components, rhs_components, self.count)
-      else:
-        equal = constants[1]
-        for left,right in zip(lhs_bytes, rhs_bytes):
-          equal = self._i16(equal, self._i16_equal(left.arg, right.arg), _EW_CFG[Ops.MUL])
-        if u.op is Ops.CMPEQ: mask = equal
-        elif u.op is Ops.CMPNE: mask = self._i16(constants[1], equal, _EW_CFG[Ops.SUB])
-        else: raise _RKGenericReject
-      return RKValue(mask, dtypes.bool, self.count, RKLayout.INT16)
+      values=tuple(self._operand(src,dtypes.int) for src in int_sources)
+      if any(value.layout is not RKLayout.INT32 for value in values): raise _RKGenericReject
+      components=tuple(tuple(self._physical_i16(part) for part in self._raw(value)) for value in values)
+      if u.op is Ops.CMPLT: components=tuple((_sign_bias(parts[3]),*parts[2::-1]) for parts in components)
     elif all(src.dtype.scalar() is dtypes.int16 for src in u.src): return self._narrow_compare(u, u.src, dtypes.int16)
     else:
-      half_sources = tuple(_half_backed_value(src) for src in u.src)
+      half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
-      u = u.replace(src=typing_cast(tuple[UOp, UOp], half_sources))
-    # Evaluate IEEE FP16 equality through raw bytes and native INT16 arithmetic, without reset-heavy compare stages.
-    # Evaluate IEEE FP16 less-than as an ordered raw-byte comparison without reset-heavy compare stages.
-    values = tuple(self._operand(src, dtypes.half) for src in u.src)
-    if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
-    zero, one = (self._constant(UOp.const(number, dtypes.int16)).arg for number in (0, 1))
-    if u.op is Ops.CMPLT:
-      ordered, nan = tuple(self._fp16_ordered_values(value) for value in values), tuple(self._fp16_component_values(value)[2] for value in values)
-      result = _ordered_byte_less(self.ew_ops, lambda: self._scratch(dtypes.int16, RKLayout.INT16).arg, zero, one, ordered[0], ordered[1], self.count)
-      result = self._i16(result, self._i16(one, self._i16(nan[0], nan[1], _EW_CFG[Ops.MAX]), _EW_CFG[Ops.SUB]), _EW_CFG[Ops.MUL])
-    else:
-      lhs_low,lhs_high,lhs_nan,rhs_low,rhs_high,rhs_nan = (*self._fp16_component_values(values[0]), *self._fp16_component_values(values[1]))
-      low_equal,high_equal,numeric = self._i16_equal(lhs_low.arg,rhs_low.arg),self._i16_equal(lhs_high,rhs_high),self._i16(one,self._i16(lhs_nan,rhs_nan,_EW_CFG[Ops.MAX]),_EW_CFG[Ops.SUB])  # noqa: E501
-      result = self._i16(self._i16(low_equal,high_equal,_EW_CFG[Ops.MUL]),numeric,_EW_CFG[Ops.MUL])
-      if u.op is Ops.CMPNE: result = self._i16(one, result, _EW_CFG[Ops.SUB])
-    return RKValue(result, dtypes.bool, self.count, RKLayout.INT16)
+      values=tuple(self._operand(src,dtypes.half) for src in typing_cast(tuple[UOp,UOp],half_sources))
+      if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
+      nan=tuple(self._fp16_component_values(value)[2] for value in values)
+      components=tuple(self._fp16_ordered_values(value) if u.op is Ops.CMPLT else
+        (self._physical_i16(parts[0]),parts[1]) for value in values for parts in (self._fp16_component_values(value),))
+    result=_ordered_bits(*components) if u.op is Ops.CMPLT else functools.reduce(
+      lambda equal,pair:equal.alu(Ops.MUL,_i16_equal(*pair)),zip(*components),components[0][0].const_like(1))
+    if nan: result=result.alu(Ops.MUL,result.const_like(1).alu(Ops.SUB,nan[0].alu(Ops.MAX,nan[1])))
+    if u.op is Ops.CMPNE: result=result.const_like(1).alu(Ops.SUB,result)
+    return replace(self.lower(result),dtype=dtypes.bool)
 
   def _narrow_compare(self, u:UOp, sources:tuple[UOp,...], dtype:DType) -> RKValue:
     if u.op not in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ): raise _RKGenericReject
@@ -1358,99 +1292,58 @@ class RKContext:
     result=self._emit(self._scratch(dtypes.bool,RKLayout.INT16,u=u),magnitude,self._constant(UOp.const(1,dtype)),_EW_CFG_MIN)
     return result if u.op is not Ops.CMPEQ else self._emit(result,self._constant(UOp.const(1,dtype)),result,_EW_CFG[Ops.SUB])
 
-  def _i16(self, lhs:RKArg, rhs:RKArg, cfg:int, dst:RKArg|None=None) -> RKArg:
-    result = RKValue(dst or self._scratch(dtypes.int16, RKLayout.INT16).arg, dtypes.int16, self.count, RKLayout.INT16)
-    return self._emit(result, RKValue(lhs, dtypes.int16, self.count, RKLayout.INT16), RKValue(rhs, dtypes.int16, self.count, RKLayout.INT16), cfg).arg
-
-  def _i16_equal(self, lhs:RKArg, rhs:RKArg, diff:RKArg|None=None) -> RKArg:
-    magnitude = self._i16(diff:=self._i16(lhs, rhs, _EW_CFG[Ops.SUB]) if diff is None else diff, diff, _EW_CFG_ABS)
-    return self._i16(self._i16_const(1), self._i16(magnitude, self._i16_const(1), _EW_CFG_MIN), _EW_CFG[Ops.SUB])
-
-  def _i16_const(self, value:int) -> RKArg: return self._constant(UOp.const(value, dtypes.int16)).arg
-
-  def _i16_clamp_one(self, value:RKArg) -> RKArg:
-    return self._i16(self._i16(value, self._i16_const(0), _EW_CFG[Ops.MAX]), self._i16_const(1), _EW_CFG_MIN)
-
-  def _i16_twos_complement(self, raw:tuple[RKArg, ...], sign:RKArg) -> tuple[RKArg, ...]:
-    carry, result = sign, []
-    for byte in raw:
-      inverted = self._i16(
-        self._i16(self._i16_const(255), self._i16(byte, byte, _EW_CFG[Ops.ADD]), _EW_CFG[Ops.SUB]),
-        sign, _EW_CFG[Ops.MUL])
-      total = self._i16(self._i16(byte, inverted, _EW_CFG[Ops.ADD]), carry, _EW_CFG[Ops.ADD])
-      carry = self._i16_clamp_one(self._i16(total, self._i16_const(255), _EW_CFG[Ops.SUB]))
-      result.append(self._i16(total, self._i16(carry, self._i16_const(256), _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB]))
-    return tuple(result)
-
   def _int32_divmod(self, u:UOp) -> RKValue:
     if len(u.src) != 2 or not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    key = u.src
-    if key not in self.int32_divmod:
+    if (key:=u.src) not in self.int32_divmod:
       values = tuple(self._operand(src, dtypes.int) for src in key)
       if any(value.layout is not RKLayout.INT32 for value in values): raise _RKGenericReject
-      raw = tuple(tuple(part.arg for part in self._raw(value)) for value in values)
-      constants = {value:self._i16_const(value) for value in
-                   (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256)}
-      signs = tuple(self._i16_clamp_one(self._i16(value[3], self._i16_const(127), _EW_CFG[Ops.SUB])) for value in raw)
-      numerator, denominator = (self._i16_twos_complement(value, sign) for value,sign in zip(raw, signs))
-      denominator_nonzero = _reduce_rows(self.ew_ops, [self._i16_clamp_one(value) for value in denominator], self.count, _EW_CFG[Ops.MAX], int16=True)
-      numerator_bits = tuple(itertools.chain.from_iterable(_int16_byte_bits(self.ew_ops, lambda:self._scratch(dtypes.int16, RKLayout.INT16).arg,
-                                                                            constants, byte, self.count) for byte in numerator))
-      remainder, quotient = [constants[0]]*4, [constants[0]]*4
+      raw=tuple(tuple(self._physical_i16(part) for part in self._raw(value)) for value in values)
+      signs=tuple(_i16_bit(value[3].alu(Ops.SUB,value[3].const_like(127))) for value in raw)
+      numerator,denominator=(_twos_complement(value,sign) for value,sign in zip(raw,signs))
+      denominator_nonzero=functools.reduce(lambda x,y:x.alu(Ops.MAX,y),map(_i16_bit,denominator))
+      numerator_bits=tuple(itertools.chain.from_iterable(map(_byte_bits,numerator)))
+      zero=numerator[0].const_like(0); remainder,quotient=[zero]*4,[zero]*4
       for bit_index in range(31, -1, -1):
-        shifted:list[RKArg] = []
-        incoming = numerator_bits[bit_index]
+        shifted,incoming=[],numerator_bits[bit_index]
         for byte in remainder:
-          carry = self._i16_clamp_one(self._i16(byte, self._constant(UOp.const(127, dtypes.int16)).arg, _EW_CFG[Ops.SUB]))
-          wrapped = self._i16(self._i16(byte, byte, _EW_CFG[Ops.ADD]), self._i16(carry, constants[256], _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB])
-          shifted.append(self._i16(wrapped, incoming, _EW_CFG[Ops.ADD])); incoming = carry
-        remainder, greater, equal = shifted, constants[0], constants[1]
-        for left,right in zip(reversed(remainder), reversed(denominator)):
-          diff = self._i16(left, right, _EW_CFG[Ops.SUB])
-          positive = self._i16(self._i16(diff, constants[0], _EW_CFG[Ops.MAX]), constants[1], _EW_CFG_MIN)
-          greater = self._i16(greater, self._i16(equal, positive, _EW_CFG_MIN), _EW_CFG[Ops.MAX])
-          equal = self._i16(equal, self._i16_equal(left, right, diff), _EW_CFG_MIN)
-        ge = self._i16(self._i16(greater, equal, _EW_CFG[Ops.MAX]), denominator_nonzero, _EW_CFG_MIN)
-        borrow, reduced = constants[0], []
+          carry=_i16_bit(byte.alu(Ops.SUB,byte.const_like(127)))
+          wrapped=byte.alu(Ops.ADD,byte).alu(Ops.SUB,carry.alu(Ops.MUL,byte.const_like(256)))
+          shifted.append(wrapped.alu(Ops.ADD,incoming)); incoming=carry
+        remainder=shifted
+        ge=denominator_nonzero.alu(Ops.MUL,denominator_nonzero.const_like(1).alu(Ops.SUB,
+          _ordered_bits(reversed(remainder),reversed(denominator)))); borrow,reduced=zero,[]
         for left,right in zip(remainder, denominator):
-          delta = self._i16(self._i16(left, self._i16(right, ge, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB]), borrow, _EW_CFG[Ops.SUB])
-          borrow = self._i16_clamp_one(self._i16(constants[0], delta, _EW_CFG[Ops.SUB]))
-          reduced.append(self._i16(delta, self._i16(borrow, constants[256], _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD]))
-        remainder, byte_index, weight = reduced, bit_index >> 3, 1 << (bit_index&7)
-        quotient[byte_index] = self._i16(quotient[byte_index], self._i16(ge, constants[weight], _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD])
-      sign_delta = self._i16(signs[0], signs[1], _EW_CFG[Ops.SUB])
-      self.int32_divmod[key] = tuple(quotient), tuple(remainder), signs[0], self._i16(sign_delta, sign_delta, _EW_CFG_ABS)
+          delta=left.alu(Ops.SUB,right.alu(Ops.MUL,ge)).alu(Ops.SUB,borrow)
+          borrow=_i16_bit(zero.alu(Ops.SUB,delta)); reduced.append(delta.alu(Ops.ADD,borrow.alu(Ops.MUL,zero.const_like(256))))
+        remainder=reduced; byte_index,weight=bit_index>>3,1<<(bit_index&7)
+        quotient[byte_index]=quotient[byte_index].alu(Ops.ADD,ge.alu(Ops.MUL,zero.const_like(weight)))
+      self.int32_divmod[key]=tuple(quotient),tuple(remainder),signs[0],_i16_abs(signs[0].alu(Ops.SUB,signs[1]))
     quotient_raw, remainder_raw, remainder_sign, quotient_sign = self.int32_divmod[key]
     packed_raw, sign = (quotient_raw, quotient_sign) if u.op is Ops.CDIV else (remainder_raw, remainder_sign)
-    return self._raw(self._i16_twos_complement(packed_raw, sign), RKLayout.INT32, u=u)
+    return self._raw(tuple(self.lower(value) for value in _twos_complement(packed_raw,sign)),RKLayout.INT32,u=u)
 
   def _int16_cmod(self, u:UOp) -> RKValue:
     if (recipe:=_half_int_expr(u)) is None: raise _RKGenericReject
     return self.lower(recipe.cast(dtypes.int))
 
-  def _fp16_component_values(self, value:RKValue) -> tuple[RKValue, RKArg, RKArg]:
+  def _fp16_component_values(self, value:RKValue) -> tuple[RKValue, UOp, UOp]:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
     if value.layout is not RKLayout.FP16: raise _RKGenericReject
     if value.arg in self.fp16_components: return self.fp16_components[value.arg]
-    (low, high), (zero, one, const123, const124, const127, const128) = self._raw(value), tuple(map(self._i16_const,(0,1,123,124,127,128)))
-    sign_scale = self._i16(self._i16_clamp_one(self._i16(high.arg, const127, _EW_CFG[Ops.SUB])), const128, _EW_CFG[Ops.MUL])
-    magnitude = self._i16(high.arg, sign_scale, _EW_CFG[Ops.SUB])
-    high_zero, low_zero = self._i16_equal(magnitude, zero), self._i16_equal(low.arg, zero)
-    clean_high = self._i16(high.arg, self._i16(sign_scale, self._i16(high_zero, low_zero, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.MUL]), _EW_CFG[Ops.SUB])
-    exponent = self._i16_clamp_one(self._i16(magnitude, const123, _EW_CFG[Ops.SUB]))
-    mantissa = self._i16(self._i16_clamp_one(self._i16(magnitude, const124, _EW_CFG[Ops.SUB])),
-      self._i16(low.arg, one, _EW_CFG_MIN), _EW_CFG[Ops.MAX])
-    return self.fp16_components.setdefault(value.arg, (low, clean_high, self._i16(exponent, mantissa, _EW_CFG[Ops.MUL])))
+    low,high=self._raw(value); lo,hi=self._physical_i16(low),self._physical_i16(high)
+    sign_scale=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))).alu(Ops.MUL,hi.const_like(128)); magnitude=hi.alu(Ops.SUB,sign_scale)
+    clean=hi.alu(Ops.SUB,sign_scale.alu(Ops.MUL,_i16_equal(magnitude,magnitude.const_like(0)).alu(Ops.MUL,_i16_equal(lo,lo.const_like(0)))))
+    exponent=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(123)))
+    mantissa=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(124))).alu(Ops.MAX,_i16_min(lo,lo.const_like(1)))
+    return self.fp16_components.setdefault(value.arg,(low,clean,exponent.alu(Ops.MUL,mantissa)))
 
-  def _fp16_ordered_values(self, value:RKValue) -> tuple[RKArg, RKArg]:
+  def _fp16_ordered_values(self, value:RKValue) -> tuple[UOp, UOp]:
     """Map a classified FP16 lane to two unsigned bytes whose lexical order is IEEE numeric order."""
     if value.arg in self.fp16_ordered: return self.fp16_ordered[value.arg]
-    (low,clean_high,_),(_,_,const127,const128,const255) = self._fp16_component_values(value), (*map(self._i16_const,(0,1,127,128,255)),)
-    sign, positive_high = self._i16_clamp_one(self._i16(clean_high, const127, _EW_CFG[Ops.SUB])), self._i16(clean_high, const128, _EW_CFG[Ops.ADD])
-    high_delta = self._i16(self._i16(const255, clean_high, _EW_CFG[Ops.SUB]), positive_high, _EW_CFG[Ops.SUB])
-    ordered_high = self._i16(positive_high, self._i16(sign, high_delta, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD])
-    low_delta = self._i16(self._i16(const255, low.arg, _EW_CFG[Ops.SUB]), low.arg, _EW_CFG[Ops.SUB])
-    return self.fp16_ordered.setdefault(value.arg, (ordered_high, self._i16(low.arg, self._i16(sign, low_delta, _EW_CFG[Ops.MUL]), _EW_CFG[Ops.ADD])))
+    low,hi,_=self._fp16_component_values(value); lo=self._physical_i16(low)
+    sign=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))); positive=hi.alu(Ops.ADD,hi.const_like(128))
+    high_delta=hi.const_like(255).alu(Ops.SUB,hi).alu(Ops.SUB,positive); low_delta=lo.const_like(255).alu(Ops.SUB,lo).alu(Ops.SUB,lo)
+    return self.fp16_ordered.setdefault(value.arg,(positive.alu(Ops.ADD,sign.alu(Ops.MUL,high_delta)),lo.alu(Ops.ADD,sign.alu(Ops.MUL,low_delta))))
 
   def _masked_where(self, u:UOp, dtype:DType, layout:RKLayout, selector:RKValue,
                     yes:RKValue, no:RKValue, one:RKValue) -> RKValue:
@@ -1471,8 +1364,8 @@ class RKContext:
     selector = self.lower(_positive_mask(gate.src[1].cast(dtypes.half).alu(Ops.SUB, lhs.cast(dtypes.half))))
     if selector.layout is not RKLayout.FP16 or selector.dtype is not dtypes.half: raise _RKGenericReject
     nan = self._fp16_component_values(value)[2]
-    mask = self._i16(self._convert(None,selector,dtypes.bool,RKLayout.INT16).arg, self._i16(self._i16_const(1), nan, _EW_CFG[Ops.SUB]), _EW_CFG[Ops.MUL])  # noqa: E501
-    return self._raw_where(u, RKValue(mask, dtypes.bool, self.count, RKLayout.INT16))
+    selector_uop=self._physical_i16(self._convert(None,selector,dtypes.bool,RKLayout.INT16)); nan_uop=self._physical_i16(nan)
+    return self._raw_where(u,replace(self.lower(selector_uop.alu(Ops.MUL,nan_uop.const_like(1).alu(Ops.SUB,nan_uop))),dtype=dtypes.bool))
 
   def _raw_where(self, u:UOp, selector:RKValue|None=None) -> RKValue:
     """Select typed values through one canonical INT16 mask, preserving nonfinite arms as raw bytes."""
