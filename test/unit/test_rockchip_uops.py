@@ -1536,12 +1536,13 @@ def test_remapped_integer_and_bool_to_float_casts_use_generic_typed_values():
     assert image is not None and len(image.ew_ops) == stages and decode_image(encode_image(image)) == image
 
 
-def test_terminal_half_casts_use_typed_integer_and_bool_output_abis():
+def test_terminal_half_casts_use_typed_integer_and_canonical_bool_abis():
   source = UOp.param(1, dtypes.half, (9,))
   integer = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load().cast(dtypes.int), count=9))
   boolean = _lower_uop_program(_program(dtypes.bool, lambda i:source.index(i).load().cast(dtypes.bool), count=9))
   assert integer is not None and integer.ew_ops[-1].int32_output
-  assert boolean is not None and boolean.ew_ops[-1].bool_output
+  assert boolean is not None and boolean.ew_ops[-1].int16_output and boolean.ew_ops[-1].dst.kind is RKBufferKind.SCRATCH
+  assert len(boolean.post_gathers) == 1 and boolean.post_gathers[0].itemsize == 1
   assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
 
 

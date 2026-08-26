@@ -948,7 +948,7 @@ class TestRockchipBitcastOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipClassificationOps(unittest.TestCase):
-  """FP16 IEEE predicates computed as DPU masks and packed through the typed bool-output ABI."""
+  """FP16 IEEE predicates use a canonical INT16 carrier and one-byte output boundary."""
 
   @classmethod
   def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op

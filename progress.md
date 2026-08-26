@@ -8254,6 +8254,59 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-26 — semantic BOOL has one INT16 carrier at 1,934 lines
+
+This hardware-accepted architecture rewrite follows `8342d020a`.  Its
+predeclared `sz.py` budget replaced the 76-line semantic-BOOL ownership
+closure with at most 46 executable lines across `_narrow_fp16`, rewritten
+`_bool_binary` and `_raw_where` owners, and their direct callers: net at most
+**-30**.  The measured result exceeds that target: renderer **1,970 -> 1,934**,
+repository total **27,481 -> 27,445** (**-36**), and runtime remains **443**.
+The raw renderer diff is **+38/-73 physical lines**.
+
+Semantic BOOL values now have exactly one physical representation: INT16
+lanes containing zero or one.  `_constant`, `_static`, typed loads,
+comparisons, BOOL algebra, BOOL WHERE, integer WHERE selectors, casts, and the
+terminal byte gather all share that carrier.  `_coerce_bool`, its selectable
+BOOL layout, the FP16 BOOL output branch, and the nonfinite FP16-mask WHERE
+special case are obsolete and deleted.  `_narrow_fp16` owns the genuine
+FP16-to-INT16 boundary shared by BOOL and UCHAR.  `_NATIVE_POSITIVE_MASK`
+remains correctly typed as FP16 arithmetic for EXP2, LOG2, SIN, and related
+recipes; it is narrowed only when it becomes a semantic predicate.
+
+The terminal cast unit assertion was strengthened to require an INT16 scratch
+predicate plus exactly one one-byte output gather.  The complete Rockchip UOp
+module reports **156 passed** under `-q -n12`; mypy succeeds for **216 files**,
+repository-wide Ruff succeeds, source ownership and diff checks are clean,
+and the focused NPU suite covering casts, IEEE classification, comparisons,
+logical predicates, ANY/ALL, nonfinite WHERE, integer WHERE, and masked select
+reports **27 passed in 65.25 seconds**.  No generic IR, new wire field, runtime
+path, scheduler hook, CPU/GPU numeric fallback, or relaxed admission was added.
+
+The first uninterrupted census executed all cases but reported one isolated
+`test_cross_entropy_reductions` NaN: **432 passed, 1 failed, 12 skipped, and
+154 subtests passed**.  The deterministic node then passed alone, after its
+three local predecessor tests, and ten times inside a same-process stress
+wrapper; the complete loss class plus that wrapper reported **15 passed in
+357.46 seconds**.  Most decisively, committed parent and candidate each
+generated the same five actual production `to_program` images for that
+workload: every encoded byte and size matched, with aggregate ordered hash
+`11c1cffd50bcaa2991c9d898f8bb6ee6de888d8eb1dd0e41208db174517abb3c`.
+The failure was therefore not caused by a changed program from this rewrite.
+
+The authoritative fresh retry used the production path:
+
+```sh
+FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest test/backend/test_rockchip.py -q -n12 --dist=loadfile --tb=short --durations=25
+```
+
+It completed in **2,013.64 seconds** with **433 passed, 12 skipped, and 154
+subtests passed**, exactly accounting for all **445** top-level cases with
+zero failures.  The candidate-path
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after that census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-26 — RKImage serialization takes one topology-preserving walk at 1,970 lines
 
 This hardware-accepted performance cleanup follows `566244f3b`.  Its revised
