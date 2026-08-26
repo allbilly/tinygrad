@@ -1514,7 +1514,9 @@ class RKContext:
     if len(nodes)>800:
       for node in nodes:
         if node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and node not in self.static_nodes or any(src in blocked for src in node.src): blocked.add(node)  # noqa: E501
-        elif (not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and all(load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None for load in _semantic_loads(node))): self.lower(node)  # noqa: E501
+        # A maximal compensated ADD owns its prefixes; eagerly lowering each prefix only creates unused physical copies.
+        elif not (self.accurate_adds and node.dtype.scalar() is dtypes.half and node.op is Ops.ADD and node.arg is None) and \
+          ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and all(load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None for load in _semantic_loads(node)))): self.lower(node)  # noqa: E501
     result, dtype = self.lower(self.root), self.out_param.dtype.scalar(); self._finish_value(result,dtype)
     constants = b"" if not self.constants else b"".join(
       {slot:bits for bits,slot in self.constants.items()}.get(i, b"\0\0") for i in range(max(self.constants.values())+1))
