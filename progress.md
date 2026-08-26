@@ -8254,6 +8254,56 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-26 — lower integer byte circuits through UOps at 1,795 lines
+
+This milestone replaces the duplicated, hand-scheduled integer byte circuits
+instead of compressing them cosmetically.  Its architectural rewrite has 149
+physical insertions and 256 deletions in the renderer and moves authoritative
+`sz.py` size **1900 -> 1794** (**-106 executable lines**).  The subsequent
+one-line compensated-ADD performance guard leaves the accepted renderer at
+**1795**, repository total **27411 -> 27306** (**-105**), and runtime at
+**443**.
+
+The deleted owners include `_int16_byte_bits`, `_ordered_byte_less`, the old
+physical `_integer_bitwise`, padded-matrix `_int32_shift`, `_compare`,
+`_int32_divmod`, and the duplicated floating-point component/order circuits.
+Their replacements are semantic Tinygrad UOps shared through `_i16_min`,
+`_i16_abs`, `_i16_bit`, `_i16_equal`, `_sign_bias`, `_byte_bits`,
+`_ordered_bits`, and `_twos_complement`, with `RKContext._physical_i16`,
+`_bitplanes`, and `_pack_bits` owning the physical boundary.  The existing
+`RKContext.lower` and production `Tensor.schedule_linear -> to_program` path
+perform the lowering; there is no CPU/GPU numeric fallback, compatibility
+stage, new generic IR, or hand-built render shortcut.
+
+The exact program updates are structural improvements rather than relaxed
+tests.  ABS falls from **123 -> 120 operations** with SHA-256
+`948805a1f21cdf9b2280dcb5dd9aa198bf2bc71365588919b115171f61a85060`.
+The nonzero-coordinate image passes simulator, round-trip, and bounds checks
+at `(200,10,11131,120,1,1)`, SHA-256
+`c75b1a0d9f5ede56e9747fabf033e889ac07189a67df6d37c23c0767896a3002`.
+The real `where_permute` path falls from **12 -> 9 submissions** while keeping
+the same eight gathers and passing its numeric hardware assertion.
+
+Profiling then identified eager lowering of every intermediate compensated
+FP16 ADD prefix as the compile bottleneck.  `RKContext.finish` now defers those
+prefixes to their maximal recipe owner.  A representative compile falls from
+**28.12s -> 7.49s**, and focused
+`TestRockchipLossOps::test_cross_entropy_smoothing` hardware time falls from
+**119.73s -> 54.30s**.  The next observed full-suite slowest case is
+`simple_conv_transpose3d` at **93.06s**.
+
+Fresh-board acceptance used candidate-pinned pre/post
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health checks; both returned
+the exact expected vector of eights.  The complete 445-item hardware census
+was actually executed with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**1924.03s (32:04)**.  `--dist=loadfile` retains 12 pytest workers while
+serializing this single hardware file; unconstrained workers race the one NPU
+and produce cascading DRM `EINVAL` failures.  Host verification additionally
+reports **156 passed** for `test/unit/test_rockchip_uops.py`, mypy success in
+**216 files**, repository-wide Ruff success, and clean diff checks.
+
 ## 2026-08-26 — semantic BOOL has one INT16 carrier at 1,934 lines
 
 This hardware-accepted architecture rewrite follows `8342d020a`.  Its
