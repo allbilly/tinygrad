@@ -8254,6 +8254,55 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — one NPU-owned dynamic address contract at 1,759 combined lines
+
+This hardware-accepted renderer/runtime rewrite follows `24ac785a4`.  After a
+no-write preflight, the declared token-aware budget was exactly **+35/-66
+executable lines, net -31**.  The final raw production diff is **+33/-66
+physical lines**; authoritative `sz.py` moves renderer **1520 -> 1498**,
+runtime **270 -> 261**, their combined size **1790 -> 1759**, and repository
+total **26854 -> 26823** (**-31**).
+
+`RKContext._host_address_load` is now the sole interpreter of dynamic load
+addresses and predicates.  It always emits the complete signed physical lane
+through the existing typed NPU UOp path, using `-1` for an inactive lane.  The
+old second interpreter—which rediscovered affine dependencies, canonical
+bounds, base, index scale, and lane stride on the host—is deleted.  Consequently
+`RKGather` no longer carries `src_count`, `dst_count`, `index_limit`,
+`index_scale`, `lane_stride`, or `scatter`; RKIM is version 35.  Indexed-copy
+direction follows the physical destination (ARG is scatter, SCRATCH is gather),
+and `RockchipProgram.apply_gathers` performs one common bounds-checked raw-byte
+movement against the actual buffer views.  `_lower_host_scatter` retains its
+direct last-writer contract without duplicating the removed metadata.
+
+This is an ownership rewrite, not a syntax cut: dynamic arithmetic and boolean
+semantics stay on the NPU, while the host only validates physical bounds and
+moves opaque lanes.  There is no CPU/GPU numeric fallback, generic one-op IR,
+hand-built renderer shortcut, candidate table, or alternate production path.
+The affine `lane*10+index` unit fixture now proves that its address carrier is
+NPU scratch and executes raw payload bytes; the 1,001-element guard remains
+below 200 EW records, and multi-axis, normalization, external-gate, nonlinear,
+fill, scatter, and FP16/INT16/INT32 bit-pattern oracles remain covered.
+
+The complete Rockchip UOp module executes **160/160 passed** in **27.28
+seconds** with `-q -n12`.  Mypy reports success in **216 source files**,
+repository-wide Ruff passes, and diff checks are clean.  Final SHA-256 values
+are renderer
+`ad8d77ad335f4de5129f1c66bee9f4757d31d2ca7d6d3ca7a894a9b46b72e82d`,
+runtime
+`f3902610d5841bfb488c7c55175582dee434b950c772eed61649264a545ee172`,
+and unit module
+`c465df81bd9cd53183db5f5704d9e45d0428060e0373a0530cd77fc4a22ee026`.
+
+The uninterrupted production `Tensor -> schedule_linear -> to_program`
+hardware census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**1022.49 seconds (17:02)** with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before and after
+with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-28 — NPU-computed dynamic addresses retire candidate tables at 1,790 combined lines
 
 This hardware-accepted renderer rewrite follows `e28658759`.  Before editing,

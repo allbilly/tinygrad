@@ -196,36 +196,27 @@ class RockchipProgram(Program['RockchipDevice']):
       return np.frombuffer(to_mv(int(raw.va_addr),raw.size),dtype=dtype)[arg.addend//itemsize:]
     def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
       for gather in gathers:
-        lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
+        lane_dtype={1:np.uint8,2:np.uint16,4:np.uint32}[gather.itemsize]
         dst,lanes=view(gather.dst,lane_dtype,gather.itemsize),linear.setdefault(gather.count,np.arange(gather.count,dtype=np.intp))
+        if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: ctypes.memset(int((dest:=buffer(gather.dst.kind,gather.dst.index)).va_addr),0,dest.size)  # noqa: E501
+        dst_index=gather.dst_addend+lanes*gather.dst_stride
+        if gather.values:
+          dst[dst_index]=gather.values[0] if len(gather.values)==1 else gather.values
+          continue
+        assert gather.src is not None
+        src=view(gather.src,lane_dtype,gather.itemsize)
         if gather.index is not None:
-          assert gather.src is not None
-          src=view(gather.src,lane_dtype,gather.itemsize)
-          idx=view(gather.index,{2:np.int16,4:np.int32}[gather.index_itemsize],gather.index_itemsize)[:gather.count].astype(np.intp)
-          if len(idx)!=gather.count or len(src)<(gather.count if gather.scatter else gather.src_count) or len(dst)<(gather.dst_count if gather.scatter else gather.count): raise RuntimeError("runtime RKGather exceeds buffer")  # noqa: E501
-          valid=(idx>=0)&(idx<(gather.dst_count if gather.scatter else gather.index_limit or gather.src_count))
-          if gather.scatter:
-            dst[idx[valid]]=src[lanes[valid]]
-            continue
-          index=gather.base+lanes*gather.lane_stride+idx*gather.index_scale
-          valid&=(index>=0)&(index<gather.src_count)
-          dst_index=lanes
-          dst[dst_index]=gather.fill_bits
+          source_index=view(gather.index,{2:np.int16,4:np.int32}[gather.index_itemsize],gather.index_itemsize)[:gather.count].astype(np.intp)
+          scatter=gather.dst.kind is RKBufferKind.ARG
+          if len(source_index)!=gather.count or (len(src)<gather.count if scatter else len(dst)<gather.count): raise RuntimeError("runtime RKGather exceeds buffer")  # noqa: E501
+          source_index,dst_index=(lanes,source_index) if scatter else (source_index,lanes)
         else:
-          dest=buffer(gather.dst.kind,gather.dst.index)
-          if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: ctypes.memset(int(dest.va_addr),0,dest.size)  # noqa: E501
-          dst_index=gather.dst_addend+lanes*gather.dst_stride
-          if gather.values:
-            dst[dst_index]=gather.values[0] if len(gather.values)==1 else gather.values
-            continue
-          assert gather.src is not None
-          src=view(gather.src,lane_dtype,gather.itemsize)
-          index=np.asarray(gather.offsets,dtype=np.intp) if gather.offsets else np.full(gather.count,gather.base,dtype=np.intp)
-          valid=index>=0 if gather.offsets else np.ones(gather.count,dtype=np.bool_)
-          if gather.offsets and not gather.partial: dst[dst_index]=gather.fill_bits
-          for divisor,limit,stride in gather.axes: index+=(lanes//divisor%limit)*stride
-        dst[dst_index[valid]]=src[index[valid]]
-    cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather) or op.scatter),len(self.image.program))
+          source_index=np.asarray(gather.offsets,dtype=np.intp) if gather.offsets else np.full(gather.count,gather.base,dtype=np.intp)
+          for divisor,limit,stride in gather.axes: source_index+=(lanes//divisor%limit)*stride
+        valid=(source_index>=0)&(source_index<len(src))&(dst_index>=0)&(dst_index<len(dst))
+        if not gather.partial and (gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH): dst[dst_index]=gather.fill_bits  # noqa: E501
+        dst[dst_index[valid]]=src[source_index[valid]]
+    cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather) or op.index is not None and op.dst.kind is RKBufferKind.ARG),len(self.image.program))  # noqa: E501
     apply_gathers(self.image.program[:cursor])  # type: ignore[arg-type]
     self.dev._sync_buffers((*bufs,*((arena,) if (arena:=self._buffers.get("scratch")) is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind,index:int) -> int: return self._dma(buffer(kind,index))

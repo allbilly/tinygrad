@@ -32,7 +32,8 @@ def _constant_gathers(image:RKImage) -> tuple[RKGather, ...]:
 def _constant_bytes(image:RKImage) -> bytes:
   return b"".join(int(op.values[0]).to_bytes(op.itemsize,"little") for op in _constant_gathers(image))
 def _runtime_gathers(image:RKImage, scatter:bool|None=None) -> tuple[RKGather, ...]:
-  return tuple(op for op in image.program if isinstance(op,RKGather) and op.index is not None and (scatter is None or op.scatter is scatter))
+  return tuple(op for op in image.program if isinstance(op,RKGather) and op.index is not None and
+               (scatter is None or (op.dst.kind is RKBufferKind.ARG) is scatter))
 def _address_gather(image:RKImage) -> RKGather:
   gathers=_runtime_gathers(image,False)
   assert len(gathers)==1 and gathers[0].index is not None
@@ -120,14 +121,13 @@ def _apply_test_gather(gather:RKGather, buffer, linear:dict[int,np.ndarray]) -> 
     assert gather.src is not None
     src=view(gather.src)
     indices=view(gather.index,{2:np.int16,4:np.int32}[gather.index_itemsize],gather.index_itemsize)[:gather.count].astype(np.intp)
-    selected=gather.base+indices*gather.index_scale+lanes*gather.lane_stride
-    valid=(indices>=0)&(indices<(gather.dst_count if gather.scatter else gather.index_limit or gather.src_count))
-    if gather.scatter:
+    valid=(indices>=0)&(indices<len(dst) if gather.dst.kind is RKBufferKind.ARG else indices<len(src))
+    if gather.dst.kind is RKBufferKind.ARG:
       for lane in range(gather.count):
-        if valid[lane]: dst[selected[lane]]=src[lane]
+        if valid[lane]: dst[indices[lane]]=src[lane]
     else:
       dst[:gather.count]=gather.fill_bits
-      dst[np.nonzero(valid)[0]]=src[selected[valid]]
+      dst[np.nonzero(valid)[0]]=src[indices[valid]]
     return
   if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: dst[:]=0
   dst_index=gather.dst_addend+lanes*gather.dst_stride
@@ -712,8 +712,8 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("75c5bdd1307010e49b3c49af0e763eea2a08eb898d322fe023854fe9e0d3aa64",1445,120,6),
-                     ("5b75024dbf3dd502c597ddae4e122ea19add5c3292ed2c13ab2aef269ba619dd",173,4,0)]
+  assert records == [("052b81ea5947bf111c6c14458393b8133dc194e1b4617a53f2f696ecac70df83",1423,120,6),
+                     ("e4581018b478fc55a9365481809ecdbf0b939b9a4e24d9d25f56d8bec2460e74",168,4,0)]
 
 
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
@@ -1332,8 +1332,8 @@ def test_biased_eight_channel_convolutions_use_shared_kahan_recipe():
       inputs=sum(g.src is not None and g.src.kind is RKBufferKind.ARG for g in _static_gathers(image))
       records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(_ew_ops(image)),inputs,_cmac(image)))
   assert records == [
-    ("b97c01eee74476d5cec653bd52c70ef8e7c1a7c7455f9aafb081c94ac84fe41f",2147,253,17,None),
-    ("93fe8eece006a0ca5b6849ab3f5b44ed508e65b70dc48ce9d74f45ead1c0746f",2130,251,17,None)]
+    ("7a4d7ed9731c83ba532133d8c6541ab7d01f26690d0cdd985befda92b95a66fc",2133,253,17,None),
+    ("661197510a693da9cf566587ae4588c3378c61ec845003bbe81404e51fdf1892",2117,251,17,None)]
 
 
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
@@ -1961,7 +1961,7 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (130,148,11132,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="02642850e2ecaa766a8bc1b6775e1f5ce1b1f92776eb455dffe1163b28dc9f48"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="1a08872f03274e933131822263999b93bc6463cefe2b327040ec414d65a9e0f1"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -2003,7 +2003,7 @@ def test_dynamic_address_gather_preserves_plain_raw_payloads():
   }
   for dtype,source in sources.items():
     image = _lower_uop_program(_dynamic_load_program(dtype=dtype))
-    assert image is not None and _address_gather(image).index_limit == len(source)
+    assert image is not None and _address_gather(image).index is not None and _address_gather(image).index.kind is RKBufferKind.SCRATCH
     assert _execute_raw_dynamic_image(image, 4*dtype.itemsize, source.tobytes(), indices.tobytes()) == source[indices].tobytes()
     assert decode_image(encode_image(image)) == image
 
@@ -2112,7 +2112,7 @@ def test_dynamic_npu_address_repeats_raw_channels():
 def test_dynamic_address_avoids_1001_candidate_expansion():
   source = (np.arange(1001, dtype=np.uint32)+0x8000).astype("<u2")
   image = _lower_uop_program(_dynamic_load_program(count=64, extents=(1001,)))
-  assert image is not None and _address_gather(image).index_limit == len(source) and len(_ew_ops(image)) < 200
+  assert image is not None and _address_gather(image).index is not None and _address_gather(image).index.kind is RKBufferKind.SCRATCH and len(_ew_ops(image)) < 200  # noqa: E501
   for start in range(0, 1024, 64):
     indices = np.arange(start, start+64, dtype="<i4")
     expected = np.zeros(64, dtype="<u2")
@@ -2127,7 +2127,7 @@ def test_dynamic_address_has_no_candidate_domain_allocation():
            (4096, rockchip_renderer._MAX_DYNAMIC_SELECTOR_CELLS//4096+1))
   for count,extent in cases:
     image=_lower_uop_program(_dynamic_load_program(count=count, extents=(extent,)))
-    assert image is not None and _address_gather(image).src_count==extent and len(encode_image(image)) < 1 << 20
+    assert image is not None and _address_gather(image).index is not None and _address_gather(image).index.kind is RKBufferKind.SCRATCH and len(encode_image(image)) < 1 << 20  # noqa: E501
 
 
 def test_dynamic_address_rejects_unencodable_slots_and_offsets():
@@ -2482,7 +2482,7 @@ def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_out(monkeypatch):
   assert _lower_uop_program(gather_uops) is None and _lower_uop_program(scatter_uops) is None
 
 
-def test_dynamic_host_gather_carries_affine_lane_address_abi(monkeypatch):
+def test_dynamic_host_gather_materializes_affine_lane_address_on_npu(monkeypatch):
   monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "1")
   count = 4
   out, source = UOp.param(0, dtypes.half, (count,)), UOp.param(1, dtypes.half, (count*10,))
@@ -2491,7 +2491,10 @@ def test_dynamic_host_gather_carries_affine_lane_address_abi(monkeypatch):
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and len(_runtime_gathers(image,False)) == 1
   address = _runtime_gathers(image,False)[0]
-  assert (address.base, address.index_scale, address.lane_stride, address.index_limit) == (0, 1, 10, count*10)
+  assert address.index is not None and address.index.kind is RKBufferKind.SCRATCH and _gather_point(image,address)>0
+  source_values=np.arange(count*10,dtype="<u2")
+  index_values=np.arange(1,count+1,dtype="<i4")
+  assert _execute_raw_dynamic_image(image,count*2,source_values.tobytes(),index_values.tobytes()) == source_values[[1,12,23,34]].tobytes()
   assert decode_image(encode_image(image)) == image
 
 
@@ -2508,7 +2511,7 @@ def test_dynamic_host_gather_materializes_nonaffine_static_lane_bases(monkeypatc
   assert image is not None and len(_runtime_gathers(image,False)) == 1
   host = _runtime_gathers(image,False)[0]
   assert host.src.kind is RKBufferKind.ARG and host.index is not None and host.index.kind is RKBufferKind.SCRATCH
-  assert (host.src_count, host.index_scale, host.lane_stride, host.index_limit) == (8, 1, 0, 8) and _gather_point(image,host)>0
+  assert _gather_point(image,host)>0
   assert decode_image(encode_image(image)) == image
 
 

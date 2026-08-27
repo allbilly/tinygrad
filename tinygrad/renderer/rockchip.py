@@ -13,7 +13,7 @@ from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, 
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 34, (1 << 16) - 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 35, (1 << 16) - 1
 
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 
@@ -36,8 +36,7 @@ class RKGather(NamedTuple):
   dst_stride: int = 1; dst_addend: int = 0
   itemsize: int = 2
   # A runtime index makes this raw movement host-addressed; numeric semantics remain on the NPU.
-  index: RKArg|None = None; src_count: int = 0; dst_count: int = 0; index_itemsize: int = 4; index_limit: int = 0  # type: ignore[assignment]
-  index_scale: int = 1; lane_stride: int = 0; scatter: bool = False
+  index: RKArg|None = None; index_itemsize: int = 4  # type: ignore[assignment]
 
 class RKEWOp(NamedTuple):
   """One contiguous DPU elementwise operation."""
@@ -101,7 +100,7 @@ def _validate_image(image:RKImage) -> None:
   if cmacs: _validate_cmac(cmacs[0],image.scratch)
   if any(not _fits((s.size,s.alignment)) for s in image.scratch): raise ValueError("invalid RKScratch")
   if any(g.itemsize not in (1,2,4) or (g.src is None) != bool(g.values) or not _fits((g.count,g.fill_bits,g.dst_stride)) or not _fits((g.base,g.dst_addend),signed=True) or g.dst_stride < 1 or g.dst_addend < 0 or len(g.axes) > 255 or bool(g.values)+bool(g.offsets)+bool(g.axes) > 1 or g.values and (len(g.values) not in (1,g.count) or not _fits(g.values,g.itemsize*8)) or g.offsets and (len(g.offsets) != g.count or not _fits(g.offsets,signed=True)) or any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes) for g in static): raise ValueError("invalid RKGather")  # noqa: E501
-  if any(h.src is None or h.index is None or h.values or h.offsets or h.axes or h.partial or h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.count,h.src_count,h.dst_count,h.fill_bits,h.index_limit)) or not _fits((h.src.addend,h.index.addend,h.dst.addend,h.base,h.index_scale,h.lane_stride),signed=True) for h in hosts): raise ValueError("invalid runtime RKGather")  # noqa: E501
+  if any(h.src is None or h.index is None or h.values or h.offsets or h.axes or h.partial or h.base or h.dst_stride!=1 or h.dst_addend or h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.count,h.fill_bits)) or not _fits((h.src.addend,h.index.addend,h.dst.addend),signed=True) for h in hosts): raise ValueError("invalid runtime RKGather")  # noqa: E501
   if any(not _fits((arg.index,),16) for op in image.program for arg in _op_args(op)): raise ValueError("invalid RKArg")
   if any(op.mode==RKEWMode.HALF_TO_FLOAT and nxt.mode!=RKEWMode.HALF_TO_FLOAT or op.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT16_TO_INT32) and op.dst.kind is RKBufferKind.ARG for op,nxt in zip(ew_ops,ew_ops[1:])): raise ValueError("invalid RKEWOp sequence")  # noqa: E501
   if any(not _fits((op.count,op.ew_cfg,op.mode)) or op.mode >= len(RKEWMode) or not _fits((op.dst.addend,op.lhs.addend,op.rhs.addend),signed=True) or op.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT32_TO_HALF) and (op.count>4 or op.dst!=op.lhs or op.lhs!=op.rhs or op.dst.kind is not RKBufferKind.SCRATCH) for op in ew_ops): raise ValueError("invalid RKEWOp flags")  # noqa: E501
@@ -693,7 +692,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=out.arg.slot); fake=UOp.param(slot,mapped_dtype,(lanes,))
   mapped_sink=fake.index(lane).store(mapped_body).end(lane).sink()
   mapped=_lower_uop_program(list(graph_rewrite(mapped_sink,pm_lower_index_dtype,ctx={}).toposort() if integer else mapped_sink.toposort()),vectorize_reductions=False)  # noqa: E501
-  if mapped is None or any(isinstance(op,RKCMAC) or isinstance(op,RKGather) and op.scatter for op in mapped.program): return None
+  if mapped is None or any(isinstance(op,RKCMAC) or isinstance(op,RKGather) and op.index is not None and op.dst.kind is RKBufferKind.ARG for op in mapped.program): return None  # noqa: E501
   direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and len(mapped.scratch)==1 and len(mapped.program)==2 and isinstance(mapped.program[0],RKGather) and isinstance(mapped.program[1],RKEWOp) and mapped.program[1].dst==RKArg(RKBufferKind.ARG,slot) and mapped.program[1].lhs==mapped.program[1].rhs  # noqa: E501
   if direct:
     scratch=[RKScratch(lanes*64)]; prefix_program:tuple[RKGather|RKEWOp|RKCMAC,...]=(typing_cast(RKGather,mapped.program[0])._replace(dst=RKArg(RKBufferKind.SCRATCH,0),dst_stride=32),); spaced=RKArg(RKBufferKind.SCRATCH,0)  # noqa: E501
@@ -819,9 +818,7 @@ def _runtime_index(u:UOp) -> tuple[UOp, UOp, UOp, int]|None:
 
 def _has_runtime_address(root:UOp) -> bool:
   """True when a value LOAD obtains its address or gate from another runtime LOAD."""
-  return any(_runtime_index(node) is not None for load in root.toposort()
-             if load.op is Ops.LOAD and load.src and load.src[0].op is Ops.INDEX
-             for node in (*load.src[0].src[1].toposort(), *(load.src[2].toposort() if len(load.src) > 2 else ())))
+  return any(_semantic_loads(load.src[0].src[1]) or len(load.src)>2 and _semantic_loads(load.src[2]) for load in _semantic_loads(root) if load.src and load.src[0].op is Ops.INDEX)  # noqa: E501
 
 def _fp32_expr_to_half(u:UOp) -> UOp:
   """Represent a float ADD/MUL expression with a three-half expansion at its FP16 storage boundary."""
@@ -954,32 +951,14 @@ class RKContext:
     ordinary typed UOp path. This replaces candidate-domain value selection with one exact physical address carrier.
     """
     if os.getenv("ROCKCHIP_HOST_GATHER","1") != "1" or not address_loads: raise _RKGenericReject
-    source_count=int(param.src[0].arg)
-    runtime=tuple({info[0].key:info for node in address_loads if (info:=_runtime_index(node)) is not None}.values())
-    if not runtime or any((int(info[1].src[0].arg)-1)*info[3]+info[3]-1>dtypes.int.max for info in runtime) or \
-       (source_count-1)*dtype.itemsize+dtype.itemsize-1>dtypes.int.max: raise _RKGenericReject
-    # Keep a one-axis affine address as raw layout metadata. More general predicates stay on the NPU and encode
-    # rejected lanes as -1, including normalized, multi-axis, and external-BOOL selection.
-    direct=None
-    dynamic=runtime[0][0] if len(runtime)==1 else None; dependent:set[UOp]=set()
-    for node in index.toposort():
-      if node is dynamic or any(src in dependent for src in node.src): dependent.add(node)
-    if dynamic is not None and all(node is dynamic or node.op in (Ops.CAST,Ops.ADD,Ops.SUB) or node.op is Ops.MUL and sum(src in dependent for src in node.src)==1 for node in dependent):  # noqa: E501
-      nodes=() if gate is None else gate.toposort(); terms=() if gate is None else tuple(_iter_binary(gate,Ops.AND))
-      limits={int(node.src[1].arg) for node in nodes if node.op is Ops.CMPLT and node.src[0].key==dynamic.key and node.src[1].op is Ops.CONST and int(node.src[1].arg)>0}  # noqa: E501
-      limit=source_count if gate is None else next(iter(limits)) if len(terms)==2 and len(limits)==1 and {node.key for node in nodes if node.op is Ops.LOAD}=={dynamic.key} and any((comparison:=_inverted_condition(node,typed=True)) is not None and comparison.op is Ops.CMPLT and comparison.src[0].key==dynamic.key and comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg)==0 for node in terms) else None  # noqa: E501
-      try: zero,one=(_static_values(self.out_index,index.substitute({dynamic:dynamic.const_like(value)}),self.count,int) for value in (0,1))  # noqa: E501
-      except RuntimeError: pass
-      else:
-        stride=zero[1]-zero[0] if self.count>1 else 0
-        if limit is not None and len({a-b for a,b in zip(one,zero)})==1 and zero==tuple(zero[0]+lane*stride for lane in range(self.count)): direct=(self.lower(dynamic),zero[0],one[0]-zero[0],stride,limit)  # noqa: E501
-    if direct is not None: physical,base,index_scale,lane_stride,index_limit=direct
-    else: physical,base,index_scale,lane_stride,index_limit=self.lower(index if gate is None else gate.where(index,index.const_like(-1))),0,1,0,source_count  # noqa: E501
+    if any((info:=_runtime_index(node)) is not None and
+           (int(info[1].src[0].arg)-1)*info[3]+info[3]-1>dtypes.int.max for node in address_loads) or \
+       (int(param.src[0].arg)-1)*dtype.itemsize+dtype.itemsize-1>dtypes.int.max: raise _RKGenericReject
+    physical=self.lower(index if gate is None else gate.where(index,index.const_like(-1)))
     if physical.dtype not in (dtypes.int16,dtypes.int): raise _RKGenericReject
     value=self._scratch(layout,self.count*dtype.itemsize)
-    self.program.append(RKGather(RKArg(RKBufferKind.ARG,param.arg.slot),value.arg,self.count,base=base,fill_bits=fill_bits,
-      itemsize=dtype.itemsize,index=physical.arg,src_count=source_count,dst_count=self.count,
-      index_itemsize=physical.dtype.itemsize,index_limit=index_limit,index_scale=index_scale,lane_stride=lane_stride))
+    self.program.append(RKGather(RKArg(RKBufferKind.ARG,param.arg.slot),value.arg,self.count,fill_bits=fill_bits,
+      itemsize=dtype.itemsize,index=physical.arg,index_itemsize=physical.dtype.itemsize))
     return value
 
   def _fp32_load(self, plan:RKTypedLoadPlan) -> UOp:
@@ -1461,18 +1440,15 @@ def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
 
 def _lower_host_scatter(output:RKOutput) -> RKImage|None:
   """Lower a direct dynamic STORE as raw last-writer host address materialization."""
-  if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1" or len(output[0].src) != 2: return None
-  _, out_param, out_count, dynamic_index, value = output
-  if (index_info:=_runtime_index(dynamic_index)) is None: return None
+  _, out_param, _, dynamic_index, value = output
+  if os.getenv("ROCKCHIP_HOST_GATHER", "1") != "1" or len(output[0].src) != 2 or (index_info:=_runtime_index(dynamic_index)) is None: return None
   (_, index_param, lane_index, index_itemsize), value = index_info, _strip_cast(value)
   if (value.op is not Ops.LOAD or len(value.src) != 1 or value.src[0].op is not Ops.INDEX or
       (source:=_root_param(value.src[0])) is None or source.src[0].op is not Ops.CONST or
       value.src[0].src[1].key != lane_index.key or source.dtype.scalar() is not out_param.dtype.scalar()): return None
-  count = int(index_param.src[0].arg)
-  if int(source.src[0].arg) < count: return None
+  if int(source.src[0].arg) < (count:=int(index_param.src[0].arg)): return None
   return RKImage(program=(RKGather(RKArg(RKBufferKind.ARG,source.arg.slot),RKArg(RKBufferKind.ARG,out_param.arg.slot),count,  # noqa: E501
-    itemsize=out_param.dtype.scalar().itemsize,index=RKArg(RKBufferKind.ARG,index_param.arg.slot),
-    src_count=int(source.src[0].arg),dst_count=out_count,index_itemsize=index_itemsize,scatter=True),))
+    itemsize=out_param.dtype.scalar().itemsize,index=RKArg(RKBufferKind.ARG,index_param.arg.slot),index_itemsize=index_itemsize),))
 
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKImage|None:
   """Lower a composable typed UOp program; return None for the legacy correctness oracle."""
