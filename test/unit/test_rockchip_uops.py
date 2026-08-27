@@ -1409,6 +1409,18 @@ def test_tensor_mean_routes_scaled_production_cmac_weights():
   assert not _runtime_gathers(image) and not _runtime_gathers(image,False) and not _runtime_gathers(image,True)
 
 
+def test_avg_pool3d_static_denominator_stays_compile_time_data():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source = Tensor(UOp.new_buffer("ROCKCHIP",4096,dtypes.half,num=1005)).reshape(1,1,16,16,16)
+    output = source.avg_pool2d(kernel_size=(8,8,8),stride=5,padding=1,count_include_pad=False)
+    to_program_cache.clear()
+    program = to_program(output.schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
+  image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
+  assert len(_ew_ops(image)) == 4088 and len(_static_gathers(image)) == 574 and len(image.scratch) == 37
+  assert not any(op.int16_input or op.int16_output or op.int32_input or op.int32_output for op in _ew_ops(image))
+  assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
+
+
 def test_arange_weighted_tensor_sum_routes_binary_outer_scale_cmac():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP",5,dtypes.half,num=1006))

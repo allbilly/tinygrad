@@ -8254,6 +8254,60 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — precise-add ownership removes 511 AvgPool resets
+
+This hardware-accepted performance correction follows `03295b641`.  Before
+implementation its exact production `sz.py` budget was **+1/-1, net 0** and
+the sole replacement owner was `_tag_precise_adds`: mark physical FP16 ADDs,
+not every dtype of ADD nested beneath the compensated expression.  The final
+raw renderer diff is exactly **+1/-1** and production size is unchanged at
+renderer **1599**, runtime **385**, combined **1984**, and repository total
+**27048**.
+
+Profiling the previous census's slowest case reproduced `test_avg_pool3d` at
+**63.21 seconds** in isolation.  A phase-split production run measured
+schedule **0.186 s**, `to_program` compilation **7.187 s**, and device
+execution **56.128 s**, with **1,143 submits / 7,127 tasks**.  Offline replay
+accounted for exactly **511 resets**.  The accurate FP32-ratio recipe had
+tagged integer address ADDs inside 512 compile-time padding masks as
+`rockchip_precise_add`; the static folder correctly refuses physical recipe
+markers, so those otherwise-static masks expanded into native INT16 work and
+an INT16-to-FP16 reset at each transition.
+
+Restricting that existing marker to HALF ADDs restores the intended semantic
+boundary without an AvgPool matcher, reset bypass, new IR, or new runtime
+path.  The same production image moves from **7,127 to 4,088 EW stages**,
+**763 to 574 gathers**, **83 to 37 scratch slots**, **1,143 to 87 submits**,
+and **511 to zero resets**.  Measured schedule/compile/execute becomes
+**0.144 / 7.154 / 0.253 seconds**; the unchanged pytest call passes in
+**8.14 seconds**, about **7.8x** faster end to end and over **220x** faster in
+device execution.  The numerical output sample and the existing FP16 golden
+comparison remain unchanged.
+
+A new actual `Tensor.schedule_linear -> to_program` unit regression pins the
+compact `(1,1,16,16,16)` three-dimensional AvgPool image and proves that its
+static denominator contributes no native INT16 or INT32 stages.  Final host
+verification reports **159/159 passed** with `-q -n12`, repository-wide Ruff
+success, mypy success in **216 source files**, and a clean diff check.  The
+renderer SHA-256 is
+`3cd4b7ce367a0bbab123f9432898a61ff9d51c1158052ee8f969d4b5db1290fd`;
+the unit module SHA-256 is
+`1715c23ded73799afb721b30788cfaf4ae90c99d5fe907a737e101e2f468dc37`.
+
+The uninterrupted production census actually executed all **445** top-level
+cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**954.18 seconds (15:54)** with zero failures, down from the parent run's
+**994.48 seconds**.  AvgPool leaves the slowest-20 list.  The apparent
+full-suite `cross_entropy_smoothing` high of **42.63 seconds** was separately
+checked: isolated candidate call time was **23.37 seconds** versus the
+parent's **29.86 seconds**, so it is suite-state variance rather than a
+regression.  The authoritative health gate passed immediately before and
+after the census and again after profiling with `reset_npu ret=0`,
+`SUBMIT ret=0`, and exact `[8 8 8 8 8 8 8 8] PASS`.  No host tensor
+arithmetic, CPU/GPU fallback, tolerance, skip, retry, or census contract
+changed.
+
 ## 2026-08-27 — one nonrecursive EW scheduler at 1,984 combined lines
 
 This hardware-accepted runtime rewrite follows `9f932dbf8`, whose tree is

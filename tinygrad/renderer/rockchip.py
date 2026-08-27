@@ -461,7 +461,7 @@ def _tag_precise_adds(root:UOp) -> UOp:
   """Mark physical ADDs so the generic accuracy pass does not expand an already compensated recipe."""
   tagged:dict[UOp, UOp] = {}
   return root.topovisit(lambda node: node.replace(src=tuple(tagged[src] for src in node.src),
-    arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD else node.arg), tagged)
+    arg=_NATIVE_PRECISE_ADD if node.op is Ops.ADD and node.dtype.scalar() is dtypes.half else node.arg), tagged)
 
 def _physical_recipe(recipe:UOp, opaque:tuple[UOp, ...]=()) -> UOp: return _tag_precise_adds(recipe.substitute(placeholders:={source:UOp.param(-index-1,source.dtype,()) for index,source in enumerate(opaque)})).substitute({placeholder:source for source,placeholder in placeholders.items()})  # noqa: E501
 
