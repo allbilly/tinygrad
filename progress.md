@@ -8254,6 +8254,62 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — NPU-computed dynamic addresses retire candidate tables at 1,790 combined lines
+
+This hardware-accepted renderer rewrite follows `e28658759`.  Before editing,
+the declared budget was to replace the **106-line** dynamic-address closure
+with at most **36 executable lines**, for **net -70 or better**.  The named
+replacement owner was `RKContext._host_address_load` plus the existing
+`RKGather` runtime primitive; the obsolete owners were
+`_bounded_index_gate`, `_dynamic_load_recipe`, `_runtime_lane_offset`,
+`_RKRuntimeAddress`, and `_runtime_load_address`.  The final raw production
+diff is **+32/-115 lines**.  Authoritative `sz.py` moves renderer **1600 ->
+1520**, keeps runtime byte-identical at **270**, moves their combined size
+**1870 -> 1790**, and moves repository total **26934 -> 26854** (**-80**).
+
+The replacement removes candidate-domain-wide value selection.  General
+dynamic indices, normalization, multi-axis composition, and semantic/external
+predicates are computed by the existing typed NPU UOp path; a rejected lane is
+encoded as index `-1`.  The existing runtime gather then performs only the
+final raw lane movement and exact fill.  A narrowly proved one-axis affine
+case keeps the raw index plus base, scale, stride, and canonical bounds as
+address metadata.  Its admission requires one runtime index load, affine
+dependency propagation, exactly the canonical lower/upper bound leaves, no
+extra loaded predicate, and statically proved lane stride.  Nonlinear address
+expressions and any additional predicate therefore remain on the NPU.  The
+32-bit address/slot safety checks remain explicit.  There is no CPU/GPU
+numeric fallback, generic IR, hand-built render shortcut, candidate table, or
+change to the production `to_program` path.
+
+Raw-bit unit oracles cover FP16, INT16, and INT32 payloads, negative-index
+normalization, multiple axes plus an external BOOL gate, repeated channels,
+total/fill selection, nonlinear addresses, and extra non-address predicates.
+The 1,001-element domain now uses one runtime address gather and fewer than
+200 EW records instead of expanding 2,042 candidate-selector records.  Large
+domains no longer allocate a candidate table, and the encoded image stays
+below 1 MiB.  The focused dynamic/gather set executes **26/26 passed**; the
+complete Rockchip UOp module executes **160/160 passed** in **23.39 seconds**
+with `-q -n12`.  Repository-wide Ruff passes, mypy reports success in **216
+source files**, and diff checks are clean.  Final SHA-256 values are renderer
+`11b8d60f2ff641cd528bc531d14570753369e2de2ac327c30d0addf17c5ab289`,
+unchanged runtime
+`32fd7b84656ad681f0dc31ffb68e6936ca7af523d4c777f3ca60980a87fcec64`,
+and unit module
+`10669e70e9ea8097e19786f42c09ade5bd2967cd11d87ac86e05422eb4f72760`.
+
+The affected production hardware slice executes **15/15 passed** in **71.57
+seconds**.  One initial full attempt stopped at top-level case 253 after a
+transient FP16 NaN in `test_cross_entropy_reductions`; that kernel does not
+require the rewritten address bridge, passed alone, passed with the bridge
+disabled, and passed after its exact two predecessors.  The subsequent
+uninterrupted, non-`-x` production census actually executed all **445**
+top-level cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and
+pytest `-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed**
+in **976.64 seconds (16:16)** with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-28 — one physical submission and buffer owner at 1,870 combined lines
 
 This hardware-accepted runtime rewrite follows `ae3c0a54b`.  The first honest

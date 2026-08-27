@@ -33,6 +33,10 @@ def _constant_bytes(image:RKImage) -> bytes:
   return b"".join(int(op.values[0]).to_bytes(op.itemsize,"little") for op in _constant_gathers(image))
 def _runtime_gathers(image:RKImage, scatter:bool|None=None) -> tuple[RKGather, ...]:
   return tuple(op for op in image.program if isinstance(op,RKGather) and op.index is not None and (scatter is None or op.scatter is scatter))
+def _address_gather(image:RKImage) -> RKGather:
+  gathers=_runtime_gathers(image,False)
+  assert len(gathers)==1 and gathers[0].index is not None
+  return gathers[0]
 def _initial_gathers(image:RKImage) -> tuple[RKGather, ...]:
   boundary=next((i for i,op in enumerate(image.program) if isinstance(op,(RKEWOp,RKCMAC))),len(image.program))
   return tuple(op for op in image.program[:boundary] if isinstance(op,RKGather) and op.index is None and op not in _constant_gathers(image))
@@ -1989,7 +1993,7 @@ def test_direct_dynamic_int32_load_selects_all_raw_bytes():
   assert decode_image(encode_image(image)) == image
 
 
-def test_dynamic_candidate_selector_preserves_plain_raw_payloads():
+def test_dynamic_address_gather_preserves_plain_raw_payloads():
   indices = np.asarray((0, 1, 2, 8), dtype="<i4")
   sources = {
     dtypes.half:np.asarray((0x0000, 0x8000, 0x7e01, 0x7fff, 0x7c01, 0xfc01, 0x3555, 0xbc00, 0x0400), dtype="<u2"),
@@ -1999,16 +2003,18 @@ def test_dynamic_candidate_selector_preserves_plain_raw_payloads():
   }
   for dtype,source in sources.items():
     image = _lower_uop_program(_dynamic_load_program(dtype=dtype))
-    assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
+    assert image is not None and _address_gather(image).index_limit == len(source)
     assert _execute_raw_dynamic_image(image, 4*dtype.itemsize, source.tobytes(), indices.tobytes()) == source[indices].tobytes()
     assert decode_image(encode_image(image)) == image
 
 
-def test_dynamic_candidate_selector_normalizes_negative_indices_exactly():
+def test_dynamic_npu_address_normalizes_negative_indices_exactly():
   source = np.asarray((0x0000, 0x8000, 0x7e01, 0x7fff, 0x7c01, 0xfc01, 0x3555, 0xbc00, 0x0400), dtype="<u2")
   indices = np.asarray((-1, -9, -5, -10), dtype="<i4")
   image = _lower_uop_program(_dynamic_load_program(normalized=True))
-  assert image is not None and not _runtime_gathers(image,False)
+  assert image is not None
+  gather=_address_gather(image)
+  assert gather.index is not None and gather.index.kind is RKBufferKind.SCRATCH and _gather_point(image,gather)>0
   expected = np.asarray((source[8], source[0], source[4], 0), dtype="<u2")
   assert _execute_raw_dynamic_image(image, 8, source.tobytes(), indices.tobytes()) == expected.tobytes()
 
@@ -2061,31 +2067,52 @@ def test_gather_offsets_normalize_inactive_raw_negative_to_fill():
     assert any(gather.offsets==(-1,-1,-1,-1) for gather in _static_gathers(image))
 
 
-def test_dynamic_candidate_selector_composes_multiple_axes_and_external_gate():
+def test_dynamic_npu_address_composes_multiple_axes_and_external_gate():
   source = (np.arange(81, dtype=np.uint32)*257+0x8000).astype("<u2")
   first, second = np.asarray((-1, 0, 2, -10), dtype="<i4"), np.asarray((0, -1, 3, 4), dtype="<i4")
   gate = np.asarray((1, 1, 0, 1), dtype=np.uint8)
   image = _lower_uop_program(_dynamic_load_program(extents=(9, 9), normalized=True, external_gate=True))
-  assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
+  assert image is not None
+  gather=_address_gather(image)
+  assert gather.index is not None and gather.index.kind is RKBufferKind.SCRATCH and _gather_point(image,gather)>0
   expected = np.asarray((source[72], source[8], 0, 0), dtype="<u2")
   assert _execute_raw_dynamic_image(image, 8, source.tobytes(), first.tobytes(), second.tobytes(), gate.tobytes()) == expected.tobytes()
   assert decode_image(encode_image(image)) == image
 
 
-def test_dynamic_candidate_selector_repeats_raw_channels():
+def test_dynamic_address_keeps_non_address_predicates_on_npu():
+  out,source,indices=UOp.param(0,dtypes.half,(4,)),UOp.param(1,dtypes.half,(9,)),UOp.param(2,dtypes.int,(4,))
+  lane=UOp.range(4,0)
+  dynamic=indices.index(lane).load()
+  bounds=((dynamic < 0) != UOp.const(True,dtypes.bool)) & (dynamic < 3)
+  values=np.asarray((0x100,0x101,0x102,0x103,0x104,0x105,0x106,0x107,0x108),dtype="<u2")
+  cases=((dynamic,bounds & (lane < 2),np.asarray((0,1,2,2),dtype="<i4"),np.asarray((values[0],values[1],0,0),dtype="<u2")),
+         (dynamic*dynamic,bounds,np.asarray((-1,0,2,3),dtype="<i4"),np.asarray((0,values[0],values[4],0),dtype="<u2")))
+  for index,gate,raw_indices,expected in cases:
+    load=source.index(index).load(UOp.const(0.0,dtypes.half),gate)
+    image=_lower_uop_program(list(out.index(lane).store(load).end(lane).sink().toposort()))
+    assert image is not None
+    gather=_address_gather(image)
+    assert gather.index is not None and gather.index.kind is RKBufferKind.SCRATCH and _gather_point(image,gather)>0
+    assert _execute_raw_dynamic_image(image,8,values.tobytes(),raw_indices.tobytes())==expected.tobytes()
+
+
+def test_dynamic_npu_address_repeats_raw_channels():
   source = (np.arange(21, dtype=np.uint32)*131+0x8000).astype("<u2")
   indices, gate = np.asarray((6, 0, 3, 7), dtype="<i4"), np.asarray((1, 0, 1, 1), dtype=np.uint8)
   image = _lower_uop_program(_dynamic_load_program(count=12, extents=(7,), external_gate=True, repeat=3))
-  assert image is not None and not _runtime_gathers(image,False)
+  assert image is not None
+  gather=_address_gather(image)
+  assert gather.index is not None and gather.index.kind is RKBufferKind.SCRATCH and _gather_point(image,gather)>0
   expected = np.zeros(12, dtype="<u2")
   expected[:3], expected[6:9] = source[18:21], source[9:12]
   assert _execute_raw_dynamic_image(image, 24, source.tobytes(), indices.tobytes(), gate.tobytes()) == expected.tobytes()
 
 
-def test_dynamic_candidate_selector_blocks_1001_candidates():
+def test_dynamic_address_avoids_1001_candidate_expansion():
   source = (np.arange(1001, dtype=np.uint32)+0x8000).astype("<u2")
   image = _lower_uop_program(_dynamic_load_program(count=64, extents=(1001,)))
-  assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
+  assert image is not None and _address_gather(image).index_limit == len(source) and len(_ew_ops(image)) < 200
   for start in range(0, 1024, 64):
     indices = np.arange(start, start+64, dtype="<i4")
     expected = np.zeros(64, dtype="<u2")
@@ -2095,44 +2122,38 @@ def test_dynamic_candidate_selector_blocks_1001_candidates():
   assert decode_image(encode_image(image)) == image
 
 
-def test_dynamic_candidate_selector_rejects_before_table_allocation(monkeypatch):
-  def unexpected(*_args, **_kwargs): raise AssertionError("candidate table escaped pre-allocation admission")
-  monkeypatch.setattr(rockchip_renderer, "_gather_offsets", unexpected)
+def test_dynamic_address_has_no_candidate_domain_allocation():
   cases = ((1, rockchip_renderer._MAX_STATIC_RANGE_ENVS+1),
            (4096, rockchip_renderer._MAX_DYNAMIC_SELECTOR_CELLS//4096+1))
   for count,extent in cases:
-    output = rockchip_renderer._admit(rockchip_renderer._outs(_dynamic_load_program(count=count, extents=(extent,)))[0], dtypes.half)
-    assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is None
+    image=_lower_uop_program(_dynamic_load_program(count=count, extents=(extent,)))
+    assert image is not None and _address_gather(image).src_count==extent and len(encode_image(image)) < 1 << 20
 
 
-def test_dynamic_candidate_selector_rejects_unencodable_slots_and_offsets(monkeypatch):
+def test_dynamic_address_rejects_unencodable_slots_and_offsets():
   out, source, indices = UOp.param(0, dtypes.half, (1,)), UOp.param(rockchip_renderer._RKIMAGE_U16_MAX+1, dtypes.half, (1,)), \
     UOp.param(2, dtypes.int, (1,))
   lane = UOp.range(1, 0)
   dynamic = indices.index(lane).load()
   gate = ((dynamic < 0) != UOp.const(True, dtypes.bool)) & (dynamic < 1)
   program = list(out.index(lane).store(source.index(dynamic).load(UOp.const(0.0, dtypes.half), gate)).end(lane).sink().toposort())
-  with monkeypatch.context() as scoped:
-    scoped.setattr(rockchip_renderer, "_dynamic_load_recipe",
-                   lambda *_args:(_ for _ in ()).throw(AssertionError("unencodable slot reached candidate planning")))
-    assert _lower_uop_program(program) is None
+  assert _lower_uop_program(program) is None
   safe, unsafe = (1 << 29)-1, 1 << 29
   for program in (_dynamic_offset_program(data_offset=safe), _dynamic_offset_program(index_offset=safe)):
-    output = rockchip_renderer._admit(rockchip_renderer._outs(program)[0], dtypes.int)
-    assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is not None and \
-      (image:=_lower_uop_program(program)) is not None
+    assert (image:=_lower_uop_program(program)) is not None
     assert decode_image(encode_image(image)) == image
   for program in (_dynamic_offset_program(data_offset=unsafe), _dynamic_offset_program(index_offset=unsafe)):
-    output = rockchip_renderer._admit(rockchip_renderer._outs(program)[0], dtypes.int)
-    assert output is not None and rockchip_renderer._dynamic_load_recipe(output[4],output[3],output[2]) is None
+    assert _lower_uop_program(program) is None
 
 
-def test_dynamic_candidate_selector_composes_exact_bool_total_fill_gate():
+def test_dynamic_npu_address_composes_exact_bool_total_fill_gate():
   indices, mask = np.asarray((4, 1, -1, 8), dtype="<i4"), np.asarray((1, 0, 1, 0, 0), dtype=np.uint8)
   for dtype,source in ((dtypes.int16, np.asarray((0x8000, 0xffff, 0x7fff, 0x1234, 0xabcd), dtype="<u2")),
                        (dtypes.int, np.asarray((0x80000000, 0xffffffff, 0x7fffffff, 0x12345678, 0xabcdef01), dtype="<u4"))):
     image = _lower_uop_program(_dynamic_total_load_program(dtype))
-    assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
+    assert image is not None
+    gather=_address_gather(image)
+    assert gather.index is not None and any(op.mode in _TYPED_EW_MODES for op in _ew_ops(image))
     expected = np.asarray((source[4], source[1], (1 << (dtype.itemsize*8))-7, (1 << (dtype.itemsize*8))-7), dtype=source.dtype)
     assert _execute_raw_dynamic_image(image, 4*dtype.itemsize, source.tobytes(), indices.tobytes(), mask.tobytes()) == expected.tobytes()
     assert decode_image(encode_image(image)) == image
@@ -2486,8 +2507,8 @@ def test_dynamic_host_gather_materializes_nonaffine_static_lane_bases(monkeypatc
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and len(_runtime_gathers(image,False)) == 1
   host = _runtime_gathers(image,False)[0]
-  assert host.src.kind is RKBufferKind.SCRATCH and (host.src_count, host.index_scale, host.lane_stride, host.index_limit) == (8, 1, 2, 2)
-  assert any(gather.offsets == (0, 2, 1, 3, 4, 6, 5, 7) for gather in _initial_gathers(image))
+  assert host.src.kind is RKBufferKind.ARG and host.index is not None and host.index.kind is RKBufferKind.SCRATCH
+  assert (host.src_count, host.index_scale, host.lane_stride, host.index_limit) == (8, 1, 0, 8) and _gather_point(image,host)>0
   assert decode_image(encode_image(image)) == image
 
 
