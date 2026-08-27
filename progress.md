@@ -8254,6 +8254,75 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — exclusive EW modes make conversion physical at 1,900 combined lines
+
+This hardware-accepted architecture rewrite follows `bef5c0a77`.  It began as
+two bounded replacements.  Ordered FP16/INT32 conversion was budgeted at
+most **+20/-50 executable lines, net -30 or better** and first landed at
+**+6/-45, net -39**.  The exclusive-mode scheduler was budgeted at most
+**+50/-95, net -45 or better**; its first draft saved only 16 lines, so that
+draft was not accepted as the milestone and the same ownership cut was
+extended through tiling, validation, and gather execution.  A final declared
+**+0/-9** ownership cleanup moved the candidate from 1,909 to exactly 1,900.
+The cumulative raw production diff is **+121/-206 lines**; authoritative
+`sz.py` moves renderer **1599 -> 1600**, runtime **385 -> 300**, their combined
+size **1984 -> 1900**, and repository total **27048 -> 26964** (**-84**).
+
+`RKEWMode` replaces eight overlapping `RKEWOp` booleans and the two FP32 bits
+formerly hidden in `ew_cfg` with eleven mutually exclusive physical DPU
+modes.  Image version 34 serializes that mode directly, `_validate_image`
+owns mode and terminal-sequence validity, and `_stage_template` maps a mode to
+one data format and register recipe.  `emit_ew_stage` now accepts the physical
+operation itself.  The runtime scheduler therefore consumes renderer-owned
+facts instead of reconstructing compare, stateful, integer, and FP32 state
+from combinations of flags.
+
+FP16-to-INT32 and INT32-to-FP16 conversion now appears in the actual encoded
+program as ordered **`RKGather -> native DPU RKEWOp -> RKGather`** atoms of at
+most four lanes.  This makes the 47-line runtime `_run_int32_conversion`
+routine obsolete, including its host-side tile packing, result unpacking,
+buffer-bound reconstruction, and special submission loop.  Host gathers move
+raw lane representations only; numeric conversion remains on the Rockchip
+DPU.  The production `Tensor.schedule_linear -> to_program` path is used, and
+no CPU/GPU device or NumPy numeric fallback was added.
+
+The remaining runtime has one mode-driven EW grouping and tiling owner.
+`_ew_groups`, `_offset_stage`, `_task_command_bytes`, precision-specific flag
+dictionaries, duplicate terminal validation, and separate static-offset,
+affine, and dynamic-index gather tails are obsolete.  Prefix gathers execute
+as one ordered batch, while the shared final assignment retains fill,
+partial, indexed gather, and scatter semantics.  Existing CMAC submission and
+the scratch INT16 body cache remain intact.
+
+The cache was challenged rather than retained by assumption.  A 256-lane
+INT32 AND TinyJit profile measured the accepted parent at **3.477 ms** warm
+median, the cache-deletion candidate at **8.895 ms**, and the final restored
+implementation at **2.094 ms**.  All three performed the same eight submits;
+the final run executed **2,944 NPU tasks** and produced exact INT32 output.
+The attempted deletion was rejected on this evidence.
+
+The adversarial diff audit found **156 test definitions before and after**,
+no added skip, widened tolerance, deleted assertion, CPU/GPU fallback, or
+debug debris.  Existing physical-field assertions were migrated to modes,
+exact body/image hashes were updated for RKImage v34, and malformed aligned
+conversion atoms gained explicit codec rejection coverage.  Final hashes are
+renderer
+`c32213103e7d50c8cec4362d55346401b838193ffa7e213a56350f414c9ab7d9`,
+runtime
+`97a47214490e4a1d3f4a2ce79da2f778cc365a35aa1da30f4545f7ac5d11dc0e`,
+and unit module
+`a11e12dcd7cfdc1f126cf25207cb809ce5cf9929b96a13cbebbd382cbde4b90a`.
+
+Final host verification actually executed **159/159 passed** with `-q -n12`;
+repository-wide Ruff passes and mypy reports success in **216 source files**.
+The uninterrupted production census actually executed all **445** top-level
+cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**1022.45 seconds (17:02)** with zero failures.  The authoritative
+`simple_add.py` health gate passed immediately before and after with
+`reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-27 — precise-add ownership removes 511 AvgPool resets
 
 This hardware-accepted performance correction follows `03295b641`.  Before

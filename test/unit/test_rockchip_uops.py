@@ -7,9 +7,9 @@ from tinygrad import Tensor
 from tinygrad.codegen import expand_horizontal_reduce, to_program, to_program_cache
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Context, Target
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWOp,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather, RKScratch,
-  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
   _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image, patch_stage)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
@@ -18,6 +18,9 @@ from tinygrad.uop.ops import AxisType, Ops, UOp
 
 def _typed_ops(image:RKImage, cls): return tuple(op for op in image.program if isinstance(op,cls))
 def _ew_ops(image:RKImage) -> tuple[RKEWOp, ...]: return _typed_ops(image,RKEWOp)
+_TYPED_EW_MODES=(RKEWMode.INT16,RKEWMode.INT32,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32,
+                 RKEWMode.HALF_TO_INT16,RKEWMode.INT32_TO_HALF)
+_INT32_OUTPUT_MODES=(RKEWMode.INT32,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32)
 def _cmac(image:RKImage) -> RKCMAC|None:
   cmacs=_typed_ops(image,RKCMAC)
   assert len(cmacs)<=1
@@ -144,7 +147,7 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
   args, scratch = [bytearray(output_bytes), *(bytearray(value) for value in inputs)], [bytearray(spec.size) for spec in image.scratch]
   def buffer(kind:RKBufferKind, index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
   def execute(op:RKEWOp) -> None:
-    if not (op.int16_input or op.int16_output or op.int32_input or op.int32_output):
+    if op.mode in (RKEWMode.HALF,RKEWMode.STATEFUL,RKEWMode.COMPARE):
       def fp16(arg:RKArg) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype="<f2",count=op.count,offset=arg.addend)
       lhs,rhs=fp16(op.lhs).copy(),fp16(op.rhs).copy()
       value=(lhs+rhs if op.ew_cfg==_EW_CFG[Ops.ADD] else lhs-rhs if op.ew_cfg==_EW_CFG[Ops.SUB] else lhs*rhs if op.ew_cfg==_EW_CFG[Ops.MUL]
@@ -152,11 +155,11 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
       assert value is not None, hex(op.ew_cfg)
       fp16(op.dst)[:]=value.astype("<f2")
       return
-    if op.int16_input and op.int16_output and not (op.int32_input or op.int32_output): source_dtype=destination_dtype=np.dtype("<i2")
-    elif op.int32_input and op.int32_output and not (op.int16_input or op.int16_output): source_dtype=destination_dtype=np.dtype("<i4")
-    elif op.int16_input and op.int32_output and not (op.int16_output or op.int32_input):
+    if op.mode==RKEWMode.INT16: source_dtype=destination_dtype=np.dtype("<i2")
+    elif op.mode==RKEWMode.INT32: source_dtype=destination_dtype=np.dtype("<i4")
+    elif op.mode==RKEWMode.INT16_TO_INT32:
       source_dtype,destination_dtype=np.dtype("<i2"),np.dtype("<i4")
-    elif op.int16_output and not (op.int16_input or op.int32_input or op.int32_output):
+    elif op.mode==RKEWMode.HALF_TO_INT16:
       def view_fp(arg:RKArg,dtype) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype=dtype,count=op.count,offset=arg.addend)
       assert op.ew_cfg == _EW_CFG[Ops.MAX]
       view_fp(op.dst,"<i2")[:] = np.maximum(view_fp(op.lhs,"<f2"),view_fp(op.rhs,"<f2")).astype("<i2")
@@ -189,11 +192,11 @@ def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
   def view(arg:RKArg, dtype, lanes:int) -> np.ndarray:
     return np.frombuffer(buffer(arg.kind, arg.index), dtype=dtype, count=lanes, offset=arg.addend)
   def execute(op:RKEWOp) -> None:
-    if op.int16_input and op.int16_output and not (op.int32_input or op.int32_output):
+    if op.mode==RKEWMode.INT16:
       source_dtype = destination_dtype = np.dtype("<i2")
-    elif op.int32_input and op.int32_output and not (op.int16_input or op.int16_output):
+    elif op.mode==RKEWMode.INT32:
       source_dtype = destination_dtype = np.dtype("<i4")
-    elif op.int16_input and op.int32_output and not (op.int16_output or op.int32_input):
+    elif op.mode==RKEWMode.INT16_TO_INT32:
       source_dtype, destination_dtype = np.dtype("<i2"), np.dtype("<i4")
     else: raise AssertionError(f"unsupported integer EW precision {op}")
     lhs = view(op.lhs, source_dtype, op.count).astype(np.int64)
@@ -232,8 +235,9 @@ def _assert_decoded_image_bounds(image:RKImage) -> RKImage:
       indices = gather_indices(gather)
       if indices: _assert_scratch_extent(decoded, gather.src, (max(indices)+1)*gather.itemsize)
   for op in _ew_ops(decoded):
-    source_width = 4 if op.int32_input or op.ew_cfg & _EW_STAGE_FP32_IN else 2
-    destination_width = (1 if op.bool_output else 4) if op.int32_output else 4 if op.ew_cfg & _EW_STAGE_FP32_OUT else 2
+    source_width = 4 if op.mode in (RKEWMode.INT32,RKEWMode.INT32_TO_HALF,RKEWMode.FLOAT_TO_HALF) else 2
+    destination_width = 4 if op.mode in (RKEWMode.INT32,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32,
+                                         RKEWMode.HALF_TO_FLOAT) else 2
     _assert_scratch_extent(decoded, op.lhs, op.lhs.addend+op.count*source_width)
     _assert_scratch_extent(decoded, op.rhs, op.rhs.addend+op.count*source_width)
     _assert_scratch_extent(decoded, op.dst, op.dst.addend+op.count*destination_width)
@@ -283,11 +287,11 @@ def _execute_scalar_reduction_image(image:RKImage, values:np.ndarray) -> float:
       _apply_test_gather(op,raw_buffer,linear)
       continue
     assert isinstance(op,RKEWOp)
-    input_dtype = np.dtype("<f4") if op.ew_cfg & _EW_STAGE_FP32_IN else np.dtype("<f2")
-    output_dtype = np.dtype("<f4") if op.ew_cfg & _EW_STAGE_FP32_OUT else np.dtype("<f2")
+    input_dtype = np.dtype("<f4") if op.mode==RKEWMode.FLOAT_TO_HALF else np.dtype("<f2")
+    output_dtype = np.dtype("<f4") if op.mode==RKEWMode.HALF_TO_FLOAT else np.dtype("<f2")
     lhs, rhs = read(op.lhs, input_dtype, op.count), read(op.rhs, input_dtype, op.count)
     if output_dtype == np.dtype("<f4"): lhs, rhs = lhs.astype(np.float32), rhs.astype(np.float32)
-    cfg=op.ew_cfg & ~(_EW_STAGE_FP32_IN | _EW_STAGE_FP32_OUT)
+    cfg=op.ew_cfg
     assert cfg in (_EW_CFG[Ops.ADD],_EW_CFG[Ops.MAX])
     write(op.dst, output_dtype, lhs+rhs if cfg == _EW_CFG[Ops.ADD] else np.maximum(lhs,rhs))
   return float(np.frombuffer(args[0], dtype="<f4")[0])
@@ -325,6 +329,9 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
 
 def test_image_codec_rejects_malformed_and_trailing_payloads():
   blob = encode_image(RKImage((RKScratch(64),)))
+  scratch = RKArg(RKBufferKind.SCRATCH,0)
+  with pytest.raises(ValueError,match="invalid RKEWOp flags"):
+    encode_image(RKImage((RKScratch(64),),(RKEWOp(scratch,scratch,scratch,5,_EW_CFG[Ops.MAX],mode=RKEWMode.HALF_TO_INT32),)))
   payload = rockchip_renderer.zlib.decompress(blob[6:])
   malformed = (b"", blob[:4]+b"\0\0"+blob[6:], blob[:-1], blob+b"\0",
     blob[:6]+rockchip_renderer.zlib.compress(payload+b"\0", 1),
@@ -451,7 +458,7 @@ def test_numeric_output_program_resets_before_its_first_dpu_stage():
     def _sync_buffers(self, _buffers, _flags): pass
     def reset_npu(self): self.resets += 1
   op = RKEWOp(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,0),1,
-              _EW_CFG[Ops.ADD] | _EW_STAGE_FP32_OUT)
+              _EW_CFG[Ops.ADD],mode=RKEWMode.HALF_TO_FLOAT)
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev,program.image,program.scratch,program._scratch_arena = FakeDevice(),RKImage(program=(op,)),(),None
   program._ensure_scratch=lambda:None
@@ -531,26 +538,26 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
   add, large = _EW_CFG[Ops.ADD], _MAX_EW_ELEMS_FP16+3
   cases = (
     ("6fef992e01c99f01880ddd0363b4f4472c05097528700dc4f4c1748c695e6056", ((31,31),),
-      RKEWOp(scratch[0],scratch[1],scratch[2],large,add,int16_input=True,int16_output=True)),
+      RKEWOp(scratch[0],scratch[1],scratch[2],large,add,mode=RKEWMode.INT16)),
     ("d8269792e064feb474483980a269a3df704b71fde4dd366b58afed686da58db2", ((32,32),),
-      RKEWOp(scratch[0],scratch[1],scratch[2],11,add,int16_input=True,int32_output=True)),
+      RKEWOp(scratch[0],scratch[1],scratch[2],11,add,mode=RKEWMode.INT16_TO_INT32)),
     ("f7d8fb289a5ee91ebb11e059ebab0ee16d46ad93094d6937e56a4bb83060c270", ((31,31),),
-      RKEWOp(scratch[0],external[1],scratch[2],large,add,int16_input=True,int16_output=True)),
+      RKEWOp(scratch[0],external[1],scratch[2],large,add,mode=RKEWMode.INT16)),
     ("a8dffe2406a897e0d7f225ac7b4fba7879ca8d476dc410ba15b552d9e733145f", ((31,31),),
-      RKEWOp(scratch[0],scratch[1],scratch[2],_MAX_EW_ELEMS_FP16//2+3,add,int32_input=True,int32_output=True)),
+      RKEWOp(scratch[0],scratch[1],scratch[2],_MAX_EW_ELEMS_FP16//2+3,add,mode=RKEWMode.INT32)),
     ("b16caeded014eca42e067c91c6e7b07094bafa4fb5eb4b0a62a1239b82aee7d5", ((18,18),),
       RKEWOp(external[0],external[1],external[2],large,add)),
     ("bb30c192a115976317e2ed0341666192a4d3bcf758e0910f5f1ec09a1d44b215", ((31,),),
-      RKEWOp(external[0],external[1],external[2],17,add,stateful=True)),
+      RKEWOp(external[0],external[1],external[2],17,add,mode=RKEWMode.STATEFUL)),
     ("2f075321eab33020cf9ae176f91235110c26e2e01e3d4790070c5f6e85f00d88", ((31,31),),
-      RKEWOp(external[0],external[1],external[2],large,add,int16_output=True)),)
+      RKEWOp(external[0],external[1],external[2],large,add,mode=RKEWMode.HALF_TO_INT16)),)
   def address(kind:RKBufferKind, index:int) -> int: return 0x10000000+int(kind)*0x01000000+index*0x00100000
   for expected_hash,expected_shape,op in cases:
     program = object.__new__(rockchip_runtime.RockchipProgram)
     program.dev, program.image, program._scratch_ew_bodies = FakeDevice(), SimpleNamespace(ew_ops=(op,)), {}
     submissions = []
     program._submit_pcchain = lambda bodies:submissions.append(tuple(bodies))
-    program._run_ew_ops(address,lambda _kind,_index:None,(op,))
+    program._run_ew_ops(address,(op,))
     assert tuple(tuple(map(len, submission)) for submission in submissions) == expected_shape and program.dev.resets == 0
     packed = b"".join(struct.pack(f"<{len(body)}Q", *body) for submission in submissions for body in submission)
     assert hashlib.sha256(packed).hexdigest() == expected_hash
@@ -560,28 +567,25 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
   scratch = tuple(RKArg(RKBufferKind.SCRATCH,index,index*64) for index in range(3))
   external = tuple(RKArg(RKBufferKind.ARG,index,index*64) for index in range(3))
   add, large = _EW_CFG[Ops.ADD], _MAX_EW_ELEMS_FP16+3
-  def op(*,count=17,barrier=False,compare=False,stateful=False,int16_in=False,int16_out=False,int32_in=False,int32_out=False,
-         numeric=False,scratch_args=False):
+  def op(*,count=17,barrier=False,mode=RKEWMode.HALF,scratch_args=False):
     args = scratch if scratch_args else external
-    return RKEWOp(args[0],args[1],args[2],count,add|(rockchip_renderer._EW_STAGE_FP32_OUT if numeric else 0),
-      submit_barrier=barrier,compare=compare,stateful=stateful,int16_input=int16_in,int16_output=int16_out,
-      int32_input=int32_in,int32_output=int32_out)
+    return RKEWOp(args[0],args[1],args[2],count,add,submit_barrier=barrier,mode=mode)
   cases = (
     ((op(),op(barrier=True),op()), (("submit",(18,)),("submit",(18,18)))),
-    ((op(int16_in=True,int16_out=True,scratch_args=True),op(int32_in=True,int32_out=True,scratch_args=True),
-      op(int16_in=True,int32_out=True,scratch_args=True),op()),
+    ((op(mode=RKEWMode.INT16,scratch_args=True),op(mode=RKEWMode.INT32,scratch_args=True),
+      op(mode=RKEWMode.INT16_TO_INT32,scratch_args=True),op()),
      (("submit",(31,)),("submit",(31,)),("submit",(32,32,32,18)))),
-    ((op(int16_in=True,int16_out=True,scratch_args=True),op()),
+    ((op(mode=RKEWMode.INT16,scratch_args=True),op()),
      (("submit",(31,)),("reset",), ("submit",(18,)))),
-    ((op(),op(int32_in=True,scratch_args=True),op()),
-     (("submit",(18,)),("conversion",17,True,False),("submit",(18,)))),
-    ((op(),op(compare=True),op()),
+    ((op(),op(count=4,mode=RKEWMode.INT32_TO_HALF,scratch_args=True),op()),
+     (("submit",(18,)),("submit",(31,)),("reset",),("submit",(18,)))),
+    ((op(),op(mode=RKEWMode.COMPARE),op()),
      (("submit",(18,)),("reset",),("standalone",37),("reset",),("submit",(18,)))),
-    ((op(),*(op(count=1,numeric=True) for _ in range(17))),
+    ((op(),*(op(count=1,mode=RKEWMode.HALF_TO_FLOAT) for _ in range(17))),
      (("submit",(18,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
-    ((op(),op(count=large,barrier=True,stateful=True),op(count=large),op(barrier=True)),
+    ((op(),op(count=large,barrier=True,mode=RKEWMode.STATEFUL),op(count=large),op(barrier=True)),
      (("submit",(18,)),("submit",(31,18)),("submit",(31,18)),("submit",(18,)))),
-    ((op(stateful=True),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
+    ((op(mode=RKEWMode.STATEFUL),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
      (("submit",(31,)+(18,)*(rockchip_runtime._MAX_EW_GROUP_OPS-1)),("submit",(31,)))),
   )
   def address(kind:RKBufferKind,index:int) -> int: return 0x10000000+int(kind)*0x100000+index*0x10000
@@ -595,14 +599,12 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
     program.dev,program.image,program._scratch_ew_bodies = FakeDevice(),SimpleNamespace(ew_ops=ops),{}
     program._submit_pcchain = lambda bodies:events.append(("submit",tuple(map(len,bodies))))
     program._submit_standalone = lambda body,*_args,**_kwargs:events.append(("standalone",len(body)))
-    program._run_int32_conversion = lambda value,*_args:events.append(
-      ("conversion",value.count,value.int32_input,value.int32_output))
-    program._run_ew_ops(address,lambda _kind,_index:None,ops)
+    program._run_ew_ops(address,ops)
     assert tuple(events) == expected
-  with pytest.raises(RuntimeError,match="FP32 EW output must be terminal"):
-    program._run_ew_ops(address,lambda _kind,_index:None,(op(numeric=True),op(barrier=True)))
-  with pytest.raises(RuntimeError,match="INT32 argument output must be terminal"):
-    program._run_ew_ops(address,lambda _kind,_index:None,(op(int16_in=True,int32_out=True),op(barrier=True)))
+  with pytest.raises(ValueError,match="invalid RKEWOp sequence"):
+    encode_image(RKImage(program=(op(mode=RKEWMode.HALF_TO_FLOAT),op(barrier=True))))
+  with pytest.raises(ValueError,match="invalid RKEWOp sequence"):
+    encode_image(RKImage(program=(op(mode=RKEWMode.INT16_TO_INT32),op(barrier=True))))
 
 
 def test_native_ew_configs_keep_their_exact_register_values():
@@ -662,7 +664,7 @@ def test_fp32_load_materializes_through_canonical_fp16_physical_abi():
   image = _lower_uop_program(_program(dtypes.half, lambda i:source.index(i).load().cast(dtypes.half), count=9))
   assert image is not None and len(_initial_gathers(image)) == 2
   assert any(gather.itemsize == 4 and gather.count == 9 and not gather.values for gather in _initial_gathers(image))
-  converters = [op for op in _ew_ops(image) if op.ew_cfg & _EW_STAGE_FP32_IN]
+  converters = [op for op in _ew_ops(image) if op.mode==RKEWMode.FLOAT_TO_HALF]
   assert [op.count for op in converters] == [4, 4, 1]
   assert any(gather.count == 9 and gather.itemsize == 2 for gather in _intermediate_gathers(image))
   assert decode_image(encode_image(image)) == image
@@ -672,7 +674,7 @@ def test_fp32_constant_uses_canonical_half_value_before_output_conversion():
   image = _lower_uop_program(_program(dtypes.float, lambda _i:UOp.const(4.0, dtypes.float), count=6))
   assert image is not None and _constant_bytes(image) == struct.pack("<e", 4.0)
   assert [op.count for op in _ew_ops(image)] == [4, 2]
-  assert all(op.ew_cfg & _EW_STAGE_FP32_OUT for op in _ew_ops(image))
+  assert all(op.mode==RKEWMode.HALF_TO_FLOAT for op in _ew_ops(image))
 
 
 def test_infinite_numerator_fdiv_preserves_dynamic_denominator_sign():
@@ -691,7 +693,7 @@ def test_generic_where_owns_ternary_arity():
     return (left < right).where(left, right)
   image = _lower_uop_program(_program(dtypes.half, select))
   assert image is not None
-  assert any(op.compare or op.ew_cfg == _EW_CFG[Ops.MAX] for op in _ew_ops(image))
+  assert any(op.mode==RKEWMode.COMPARE or op.ew_cfg == _EW_CFG[Ops.MAX] for op in _ew_ops(image))
   assert _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG and _ew_ops(image)[-1].dst.index == 0
 
 
@@ -706,8 +708,8 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("3d586f8b2fa403ec72c9a30a0b1c846b0d26e77de25def7d8e6618f8164d32d5",1457,120,6),
-                     ("424ea24d83390f8e5c401cf9ab6af39c3ead9ba92368e382ae2bbbd0c8346414",169,4,0)]
+  assert records == [("75c5bdd1307010e49b3c49af0e763eea2a08eb898d322fe023854fe9e0d3aa64",1445,120,6),
+                     ("5b75024dbf3dd502c597ddae4e122ea19add5c3292ed2c13ab2aef269ba619dd",173,4,0)]
 
 
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
@@ -763,7 +765,7 @@ def test_generic_bool_where_uses_canonical_int16_ternary():
     left, right = lhs.index(i).load(), rhs.index(i).load()
     return (left < right).where(left != UOp.const(0, dtypes.int), UOp.const(False, dtypes.bool))
   image = _lower_uop_program(_program(dtypes.bool, select))
-  assert image is not None and _ew_ops(image)[-1].int16_output
+  assert image is not None and _ew_ops(image)[-1].mode==RKEWMode.INT16
   assert len(_output_gathers(image)) == 1 and _output_gathers(image)[0].itemsize == 1
 
 
@@ -775,8 +777,8 @@ def test_inverted_fp16_comparison_keeps_ieee_unordered_semantics():
   image = _lower_uop_program(_program(dtypes.bool, greater_equal))
   assert image is not None and len(_ew_ops(image)) > 10
   assert _output_gathers(image) and _output_gathers(image)[-1].itemsize == 1
-  assert not any(op.compare for op in _ew_ops(image))
-  assert _ew_ops(image)[-1].ew_cfg == _EW_CFG[Ops.MUL] and _ew_ops(image)[-1].int16_output
+  assert not any(op.mode==RKEWMode.COMPARE for op in _ew_ops(image))
+  assert _ew_ops(image)[-1].ew_cfg == _EW_CFG[Ops.MUL] and _ew_ops(image)[-1].mode==RKEWMode.INT16
 
 
 def test_half_backed_fp32_inverted_comparison_reuses_exact_raw_path():
@@ -798,7 +800,7 @@ def test_fp16_equality_uses_exact_raw_bytes_without_compare_resets():
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() != rhs.index(i).load()))
   assert image is not None and len(_output_gathers(image))==1 and image.program[-1] is _output_gathers(image)[0]
   assert all(isinstance(op,RKGather) for op in image.program[:4])
-  assert not any(op.compare for op in _ew_ops(image)) and all(op.int16_input and op.int16_output for op in _ew_ops(image))
+  assert not any(op.mode==RKEWMode.COMPARE for op in _ew_ops(image)) and all(op.mode==RKEWMode.INT16 for op in _ew_ops(image))
 
 
 def test_generic_where_selects_infinity_without_mask_multiplication():
@@ -832,7 +834,7 @@ def test_generic_where_materializes_nan_only_on_selected_lanes():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:
     (source.index(i).load() < UOp.const(0.0, dtypes.half)).where(UOp.const(math.nan, dtypes.half), source.index(i).load())))
-  assert image is not None and _intermediate_gathers(image) and not any(op.compare or op.submit_barrier for op in _ew_ops(image))
+  assert image is not None and _intermediate_gathers(image) and not any(op.mode==RKEWMode.COMPARE or op.submit_barrier for op in _ew_ops(image))
 
 
 def test_nested_where_around_math_preserves_raw_uop_selection():
@@ -947,14 +949,14 @@ def test_generic_bool_store_has_explicit_boundary_conversion():
   image = _lower_uop_program(_program(dtypes.bool, lambda i:lhs.index(i).load() < rhs.index(i).load()))
   assert image is not None
   assert _output_gathers(image) and _output_gathers(image)[-1].itemsize == 1
-  assert not any(op.compare for op in _ew_ops(image))
+  assert not any(op.mode==RKEWMode.COMPARE for op in _ew_ops(image))
 
 
 def test_generic_int16_uses_canonical_native_layout():
   source = UOp.param(1, dtypes.int16, (4,))
   image = _lower_uop_program(_program(dtypes.int16, lambda i:source.index(i).load() + UOp.const(3, dtypes.int16)))
   assert image is not None and len(_ew_ops(image)) == 1
-  assert _ew_ops(image)[0].int16_input and _ew_ops(image)[0].int16_output
+  assert _ew_ops(image)[0].mode==RKEWMode.INT16
 
 
 def test_generic_int16_complement_recipe_composes_with_max():
@@ -966,7 +968,7 @@ def test_generic_int16_complement_recipe_composes_with_max():
     return UOp(Ops.XOR, dtypes.int16, src=(inverted_left.maximum(inverted_right), complement))
   image = _lower_uop_program(_program(dtypes.int16, minimum))
   assert image is not None and len(_ew_ops(image)) == 4
-  assert all(op.int16_input and op.int16_output for op in _ew_ops(image))
+  assert all(op.mode==RKEWMode.INT16 for op in _ew_ops(image))
 
 
 def test_generic_int16_where_avoids_saturating_difference():
@@ -977,7 +979,7 @@ def test_generic_int16_where_avoids_saturating_difference():
   image = _lower_uop_program(_program(dtypes.int16, clipped))
   assert image is not None
   assert len(_ew_ops(image)) == 7
-  assert all(op.int16_input and op.int16_output for op in _ew_ops(image))
+  assert all(op.mode==RKEWMode.INT16 for op in _ew_ops(image))
 
 
 def test_static_bool_materializes_in_int16_consumer_layout():
@@ -993,7 +995,7 @@ def test_int16_to_int32_is_an_explicit_output_boundary():
   image = _lower_uop_program(_program(dtypes.int,
     lambda i:(lhs.index(i).load() + rhs.index(i).load()).cast(dtypes.int)))
   assert image is not None and len(_ew_ops(image)) == 2
-  assert _ew_ops(image)[-1].int16_input and _ew_ops(image)[-1].int32_output
+  assert _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32
 
 
 def test_bounded_int_root_keeps_dynamic_int32_load_in_canonical_layout():
@@ -1003,14 +1005,14 @@ def test_bounded_int_root_keeps_dynamic_int32_load_in_canonical_layout():
   different = source.index(row).load() != cls
   value = different.where(UOp.const(0, dtypes.int), UOp.const(1, dtypes.int))
   image = _lower_uop_program(list(out.index(row*6+cls).store(value).end(cls, row).sink().toposort()))
-  assert image is not None and _intermediate_gathers(image) and _ew_ops(image)[-1].int32_output
+  assert image is not None and _intermediate_gathers(image) and _ew_ops(image)[-1].mode in (RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32)
 
 
 def test_bounded_semantic_int_does_not_alias_int32_output_before_widening():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:
     (UOp.const(100.0, dtypes.half) < source.index(i).load()).cast(dtypes.int) * UOp.const(2500, dtypes.int)))
-  assert image is not None and _ew_ops(image)[-1].int16_input and _ew_ops(image)[-1].int32_output
+  assert image is not None and _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32
   assert all(op.dst.kind is RKBufferKind.SCRATCH for op in _ew_ops(image)[:-1])
 
 
@@ -1025,7 +1027,7 @@ def test_native_int32_mul_uses_the_canonical_wide_layout():
   source = UOp.param(1, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load() * source.index(i).load()))
   assert image is not None and len(_ew_ops(image)) == 1
-  assert _ew_ops(image)[0].int32_input and _ew_ops(image)[0].int32_output
+  assert _ew_ops(image)[0].mode==RKEWMode.INT32
 
 
 def test_int32_where_constants_convert_at_the_output_boundary():
@@ -1033,7 +1035,7 @@ def test_int32_where_constants_convert_at_the_output_boundary():
   image = _lower_uop_program(_program(dtypes.int, lambda i:
     (UOp.const(0.5, dtypes.half) < source.index(i).load()).where(UOp.const(4, dtypes.int), UOp.const(2, dtypes.int))))
   assert image is not None and len(_ew_ops(image)) > 3
-  assert _ew_ops(image)[-1].int32_output and _ew_ops(image)[-1].int16_input
+  assert _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32
 
 
 def test_math_uops_own_multi_stage_recipes():
@@ -1051,7 +1053,7 @@ def test_generic_sign_recipe_owns_tagged_semantics():
     return UOp(Ops.SUB, dtypes.half, src=(value, value), arg=_NATIVE_SIGN)
   image = _lower_uop_program(_program(dtypes.half, sign))
   assert image is not None and len(_ew_ops(image)) == 4
-  assert sum(op.compare for op in _ew_ops(image)) == 2
+  assert sum(op.mode==RKEWMode.COMPARE for op in _ew_ops(image)) == 2
 
 
 def test_unrolled_math_reduction_vectorizes_periodic_indices():
@@ -1126,8 +1128,8 @@ def test_scalar_half_to_float_sum_preserves_two_stage_dpu_contract():
   sources=tuple(g for g in _static_gathers(image) if g.src is not None and g.src.kind is RKBufferKind.ARG)
   spread=next(g for g in reversed(_static_gathers(image)) if g.src is not None and g.src.kind is RKBufferKind.SCRATCH)
   assert len(sources)==values.size and _gather_point(image,spread)==values.size
-  assert sum(bool(op.ew_cfg & _EW_STAGE_FP32_OUT) for op in _ew_ops(image)) == 1
-  assert _ew_ops(image)[-1].dst == RKArg(RKBufferKind.ARG,0) and _ew_ops(image)[-1].ew_cfg & _EW_STAGE_FP32_OUT
+  assert sum(op.mode==RKEWMode.HALF_TO_FLOAT for op in _ew_ops(image)) == 1
+  assert _ew_ops(image)[-1].dst == RKArg(RKBufferKind.ARG,0) and _ew_ops(image)[-1].mode==RKEWMode.HALF_TO_FLOAT
   assert not _output_gathers(image) and decode_image(encode_image(image)) == image
   assert not _runtime_gathers(image) and not _runtime_gathers(image,False) and not _runtime_gathers(image,True)
 
@@ -1326,8 +1328,8 @@ def test_biased_eight_channel_convolutions_use_shared_kahan_recipe():
       inputs=sum(g.src is not None and g.src.kind is RKBufferKind.ARG for g in _static_gathers(image))
       records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(_ew_ops(image)),inputs,_cmac(image)))
   assert records == [
-    ("5fd502738d4e44f672bad9c59ad6345c86be8ed51ba82ad5f3a49a8dad2d32db",2162,253,17,None),
-    ("5731f2915fb330a28ff23209740e92d99fc474aa6eb62e9c72f9ccbff871a306",2140,251,17,None)]
+    ("b97c01eee74476d5cec653bd52c70ef8e7c1a7c7455f9aafb081c94ac84fe41f",2147,253,17,None),
+    ("93fe8eece006a0ca5b6849ab3f5b44ed508e65b70dc48ce9d74f45ead1c0746f",2130,251,17,None)]
 
 
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
@@ -1417,7 +1419,7 @@ def test_avg_pool3d_static_denominator_stays_compile_time_data():
     program = to_program(output.schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
   assert len(_ew_ops(image)) == 4088 and len(_static_gathers(image)) == 574 and len(image.scratch) == 37
-  assert not any(op.int16_input or op.int16_output or op.int32_input or op.int32_output for op in _ew_ops(image))
+  assert not any(op.mode in _TYPED_EW_MODES for op in _ew_ops(image))
   assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
 
 
@@ -1583,20 +1585,20 @@ def test_terminal_half_to_float_cast_uses_chunked_dpu_output_conversion():
   image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
   assert image is not None and len(_ew_ops(image))==3 and tuple(type(op) for op in image.program)==(RKGather,)*3+(RKEWOp,)*3
   assert tuple(gather.count for gather in _static_gathers(image))==(4,4,1)
-  assert all(op.ew_cfg & _EW_STAGE_FP32_OUT and op.dst.kind is RKBufferKind.ARG for op in _ew_ops(image))
+  assert all(op.mode==RKEWMode.HALF_TO_FLOAT and op.dst.kind is RKBufferKind.ARG for op in _ew_ops(image))
   assert decode_image(encode_image(image)) == image
 
 
 def test_terminal_int_to_float_cast_composes_integer_and_fp32_converters():
   source = UOp.param(1, dtypes.int, (9,))
   image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(i).load().cast(dtypes.float), count=9))
-  assert image is not None and len(_ew_ops(image)) == 4
-  assert sum(bool(op.ew_cfg & _EW_STAGE_FP32_OUT) for op in _ew_ops(image)) == 3
+  assert image is not None and len(_ew_ops(image)) == 6
+  assert sum(op.mode==RKEWMode.HALF_TO_FLOAT for op in _ew_ops(image)) == 3
   assert decode_image(encode_image(image)) == image
 
 
 def test_remapped_integer_and_bool_to_float_casts_use_generic_typed_values():
-  for dtype,stages in ((dtypes.int, 4), (dtypes.bool, 9)):
+  for dtype,stages in ((dtypes.int, 6), (dtypes.bool, 9)):
     source = UOp.param(1, dtype, (9,))
     image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(8-i).load().cast(dtypes.float), count=9))
     assert image is not None and len(_ew_ops(image)) == stages and decode_image(encode_image(image)) == image
@@ -1606,8 +1608,8 @@ def test_terminal_half_casts_use_typed_integer_and_canonical_bool_abis():
   source = UOp.param(1, dtypes.half, (9,))
   integer = _lower_uop_program(_program(dtypes.int, lambda i:source.index(i).load().cast(dtypes.int), count=9))
   boolean = _lower_uop_program(_program(dtypes.bool, lambda i:source.index(i).load().cast(dtypes.bool), count=9))
-  assert integer is not None and _ew_ops(integer)[-1].int32_output
-  assert boolean is not None and _ew_ops(boolean)[-1].int16_output and _ew_ops(boolean)[-1].dst.kind is RKBufferKind.SCRATCH
+  assert integer is not None and _ew_ops(integer)[-1].mode in _INT32_OUTPUT_MODES
+  assert boolean is not None and _ew_ops(boolean)[-1].mode==RKEWMode.HALF_TO_INT16 and _ew_ops(boolean)[-1].dst.kind is RKBufferKind.SCRATCH
   assert len(_output_gathers(boolean)) == 1 and _output_gathers(boolean)[0].itemsize == 1
   assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
 
@@ -1917,7 +1919,7 @@ def test_packed_bool_load_uses_canonical_int16_lanes():
   image = _lower_uop_program(list(out.index(lane).store(mask.index(lane).load().cast(dtypes.int)+1).end(lane).sink().toposort()))
   assert image is not None and len(_initial_gathers(image)) == 1
   assert _initial_gathers(image)[0].itemsize == 1 and _initial_gathers(image)[0].dst_stride == 2
-  assert _ew_ops(image)[-1].int16_input and _ew_ops(image)[-1].int32_output
+  assert _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32
 
 
 def test_fp16_predicate_prefix_executes_generic_uops():
@@ -1933,7 +1935,7 @@ def test_fp16_predicate_prefix_executes_generic_uops():
     return value
   image = _lower_uop_program(_program(dtypes.int, prefix))
   assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False) and not _runtime_gathers(image,True)
-  assert any(op.int32_output for op in _ew_ops(image)) and decode_image(encode_image(image)) == image
+  assert any(op.mode in _INT32_OUTPUT_MODES for op in _ew_ops(image)) and decode_image(encode_image(image)) == image
 
 
 def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds():
@@ -1955,7 +1957,7 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (130,148,11132,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="385d081d2cb2601f53826e976e11157b7a1fe1880dfbe00c7ead7323dc1d6570"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="02642850e2ecaa766a8bc1b6775e1f5ce1b1f92776eb455dffe1163b28dc9f48"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -1973,7 +1975,7 @@ def test_normalized_int_prefix_executes_generic_int32_uops():
     return (value < 0).where(value+4, value)
   image = _lower_uop_program(_program(dtypes.int, prefix))
   assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False) and not _runtime_gathers(image,True)
-  assert any(op.int32_output for op in _ew_ops(image)) and decode_image(encode_image(image)) == image
+  assert any(op.mode in _INT32_OUTPUT_MODES for op in _ew_ops(image)) and decode_image(encode_image(image)) == image
 
 
 def test_direct_dynamic_int32_load_selects_all_raw_bytes():
@@ -2144,7 +2146,7 @@ def test_bounded_int32_lookup_executes_as_ordinary_uops():
   value = valid.where(index+lane*4, UOp.const(0, dtypes.int))
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
-  assert any(op.int32_input and op.int32_output for op in _ew_ops(image))
+  assert any(op.mode==RKEWMode.INT32 for op in _ew_ops(image))
   assert decode_image(encode_image(image)) == image
   np.testing.assert_array_equal(_execute_integer_image(image, np.asarray((-1, 0, 2, 6), dtype=np.int32)),
                                 np.asarray((0, 4, 10, 0), dtype=np.int32))
@@ -2164,7 +2166,7 @@ def test_int32_bitwise_uop_executes_over_raw_byte_planes():
       (UOp(op, dtypes.int, src=(direct, third.index(lane).load())), samples, fn(fn(samples[0], samples[1]), samples[2]))):
       image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
       assert image is not None and not _runtime_gathers(image)
-      assert not _runtime_gathers(image,False) and not _runtime_gathers(image,True) and all(x.int16_input and x.int16_output for x in _ew_ops(image))
+      assert not _runtime_gathers(image,False) and not _runtime_gathers(image,True) and all(x.mode==RKEWMode.INT16 for x in _ew_ops(image))
       assert decode_image(encode_image(image)) == image
       np.testing.assert_array_equal(_execute_integer_image(image, *inputs), expected)
     for constant in (0, 1, -1, 0x00ff00ff, -1431655766):
@@ -2227,7 +2229,7 @@ def test_embedded_int32_not_preserves_all_raw_bytes_before_wide_arithmetic():
   image = _lower_uop_program(_program(dtypes.int, lambda i:
     UOp(Ops.XOR, dtypes.int, src=(source.index(i).load(), UOp.const(-1, dtypes.int)))+1))
   assert image is not None and len(_ew_ops(image)) == 6 and len(_intermediate_gathers(image)) == 8
-  assert sum(op.int32_input and op.int32_output for op in _ew_ops(image)) == 2
+  assert sum(op.mode==RKEWMode.INT32 for op in _ew_ops(image)) == 2
 
 
 def test_int32_shift_uops_compose_over_signed_and_unsigned_raw_bytes():
@@ -2279,7 +2281,7 @@ def test_cmod_range_keeps_expanded_parity_arithmetic_in_exact_fp16_lanes():
     negative = UOp(Ops.CMPLT, dtypes.bool, src=(remainder, UOp.const(0, dtypes.int)))
     return remainder + negative.where(UOp.const(2, dtypes.int), UOp.const(0, dtypes.int))
   image = _lower_uop_program(_program(dtypes.int, parity))
-  assert image is not None and any(op.int32_output for op in _ew_ops(image))
+  assert image is not None and any(op.mode in _INT32_OUTPUT_MODES for op in _ew_ops(image))
 
 
 def test_dependent_reduction_range_preserves_vector_output_axis():
@@ -2355,7 +2357,7 @@ def test_large_predicate_graph_keeps_fp16_prelude_before_typed_comparisons():
     to_program_cache.clear()
     renderer = RockchipRenderer(Target(device="ROCKCHIP"))
     images = [decode_image(to_program(call.src[0],renderer).src[-1].arg) for call in linear.src if call.src[0].op is Ops.SINK]
-  def typed(op): return op.int16_input or op.int16_output or op.int32_input or op.int32_output
+  def typed(op): return op.mode in _TYPED_EW_MODES
   assert images and not any(typed(lhs) and not typed(rhs) for lhs,rhs in zip(_ew_ops(images[-1]),_ew_ops(images[-1])[1:]))
 
 
@@ -2367,7 +2369,7 @@ def test_multiple_output_stores_execute_sequentially():
   image = _lower_uop_program(program)
   assert image is not None and len(_ew_ops(image)) == 2
   assert _ew_ops(image)[1].lhs == RKArg(RKBufferKind.ARG, 0)
-  assert _ew_ops(image)[1].submit_barrier and _ew_ops(image)[1].stateful
+  assert _ew_ops(image)[1].submit_barrier and _ew_ops(image)[1].mode==RKEWMode.STATEFUL
 
 
 def test_static_structural_expansion_is_bounded():

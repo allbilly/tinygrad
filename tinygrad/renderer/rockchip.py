@@ -13,9 +13,13 @@ from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, 
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 33, (1 << 16) - 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 34, (1 << 16) - 1
 
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
+
+class RKEWMode(IntEnum):
+  HALF_TO_FLOAT=0; FLOAT_TO_HALF=1; INT16=2; INT32=3; INT16_TO_INT32=4; HALF_TO_INT32=5
+  HALF_TO_INT16=6; INT32_TO_HALF=7; HALF=8; STATEFUL=9; COMPARE=10
 
 class RKArg(NamedTuple): kind: RKBufferKind; index: int; addend: int = 0  # type: ignore[assignment]
 
@@ -38,8 +42,7 @@ class RKGather(NamedTuple):
 class RKEWOp(NamedTuple):
   """One contiguous DPU elementwise operation."""
   dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int  # type: ignore[assignment]
-  submit_barrier: bool = False; compare: bool = False; stateful: bool = False
-  int32_output: bool = False; int32_input: bool = False; bool_output: bool = False; int16_output: bool = False; int16_input: bool = False
+  submit_barrier: bool = False; mode: RKEWMode = RKEWMode.HALF
 
 class RKCMAC(NamedTuple):
   """One fixed FP16 matrix contraction with an optional terminal BS ReLU; gathers own only its physical packing."""
@@ -100,9 +103,8 @@ def _validate_image(image:RKImage) -> None:
   if any(g.itemsize not in (1,2,4) or (g.src is None) != bool(g.values) or not _fits((g.count,g.fill_bits,g.dst_stride)) or not _fits((g.base,g.dst_addend),signed=True) or g.dst_stride < 1 or g.dst_addend < 0 or len(g.axes) > 255 or bool(g.values)+bool(g.offsets)+bool(g.axes) > 1 or g.values and (len(g.values) not in (1,g.count) or not _fits(g.values,g.itemsize*8)) or g.offsets and (len(g.offsets) != g.count or not _fits(g.offsets,signed=True)) or any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes) for g in static): raise ValueError("invalid RKGather")  # noqa: E501
   if any(h.src is None or h.index is None or h.values or h.offsets or h.axes or h.partial or h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.count,h.src_count,h.dst_count,h.fill_bits,h.index_limit)) or not _fits((h.src.addend,h.index.addend,h.dst.addend,h.base,h.index_scale,h.lane_stride),signed=True) for h in hosts): raise ValueError("invalid runtime RKGather")  # noqa: E501
   if any(not _fits((arg.index,),16) for op in image.program for arg in _op_args(op)): raise ValueError("invalid RKArg")
-  for op in ew_ops:
-    int16_to_int32 = op.int16_input and op.int32_output and not op.int16_output and not op.int32_input
-    if not _fits((op.dst.index,),16) or not _fits((op.lhs.index,op.rhs.index,op.count,op.ew_cfg)) or not _fits((op.dst.addend,op.lhs.addend,op.rhs.addend),signed=True) or op.bool_output and not op.int32_output or (op.int16_output or op.int16_input) and (op.int32_output or op.int32_input) and not int16_to_int32: raise ValueError("invalid RKEWOp flags")  # noqa: E501
+  if any(op.mode==RKEWMode.HALF_TO_FLOAT and nxt.mode!=RKEWMode.HALF_TO_FLOAT or op.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT16_TO_INT32) and op.dst.kind is RKBufferKind.ARG for op,nxt in zip(ew_ops,ew_ops[1:])): raise ValueError("invalid RKEWOp sequence")  # noqa: E501
+  if any(not _fits((op.count,op.ew_cfg,op.mode)) or op.mode >= len(RKEWMode) or not _fits((op.dst.addend,op.lhs.addend,op.rhs.addend),signed=True) or op.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT32_TO_HALF) and (op.count>4 or op.dst!=op.lhs or op.lhs!=op.rhs or op.dst.kind is not RKBufferKind.SCRATCH) for op in ew_ops): raise ValueError("invalid RKEWOp flags")  # noqa: E501
 
 def encode_image(image:RKImage) -> bytes:
   _validate_image(image); values=(image.scratch,tuple((_RK_OP_TYPES.index(type(op)),_plain_image(op)) for op in image.program)); return RKIMAGE_MAGIC+struct.pack("<H",RKIMAGE_VERSION)+zlib.compress(marshal.dumps(_plain_image(values),4),1)  # noqa: E501
@@ -138,16 +140,15 @@ _EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
 (_EW_CFG_RELU6, _EW_CFG_MIN, _EW_CFG_ABS, _EW_CFG_NEG, _EW_CFG_FLOOR, _EW_CFG_CEIL) = tuple(
   _EW_CFG_COMMON|flags for flags in (1<<10, _EW_RELU_BYPASS|(1<<16), _EW_RELU_BYPASS|(5<<16),
   _EW_RELU_BYPASS|(6<<16), _EW_RELU_BYPASS|(7<<16), _EW_RELU_BYPASS|(8<<16)))
-# Software stage tags and DPU data-format registers.
-_EW_STAGE_FP32_OUT, _EW_STAGE_FP32_IN = 1 << 29, 1 << 30
+# DPU data-format registers, indexed by RKEWMode.
 _DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4<<29)|(4<<26)|4,
-  (4<<29)|(1<<26)|1, (4<<29)|(2<<26)|2, (1<<29)|(2<<26)|2, (2<<29)|(4<<26)|4, (2<<29)|(2<<26)|2)
+  (4<<29)|(1<<26)|1, (4<<29)|(2<<26)|2, (1<<29)|(2<<26)|2, (2<<29)|(4<<26)|4)+(((2<<29)|(2<<26)|2),)*3
 # Batch-size and batch-normalization registers used by compare stages.
 (_BS_BN_BYPASS, _BS_OW_FP32_SCALAR, _BS_CFG_COMPARE, _BS_ALU_COMPARE, _BS_MUL_COMPARE, _BN_CFG_COMPARE, _BN_MUL_COMPARE,
  _BN_RELUX_COMPARE) = (1|(1<<1)|(1<<4)|(1<<6), (1<<8)|(1<<5)|(1<<2)|(1<<1), 0x40040, 0x33800000, 0x40000000, 0x40082, 0x7c000000, 0x3f800000)
 (_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD,
  _NATIVE_RELU6, _NATIVE_SIGN) = tuple("rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add relu6 sign".split())
-_EW_RELUX_CMP_RELU6, _INT16_EW = struct.unpack("<I", struct.pack("<f", 6.0))[0], dict(int16_input=True, int16_output=True)
+_EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,2<<16), (Ops.SUB,4<<16), (Ops.MUL,_EW_OP_CVT_BYPASS|1<<2), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|3<<16))}  # noqa: E501
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
@@ -194,20 +195,17 @@ def _raw_gather(source:RKArg, out_slot:int, count:int, stride:int=2, itemsize:in
                   dst_stride=dst_stride,dst_addend=dst_addend,itemsize=itemsize)
 
 @functools.lru_cache(maxsize=256)
-def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
-                    int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False, fp32_input:bool=False) \
-                    -> tuple[tuple[int, ...], tuple[int, ...]]:
+def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple[tuple[int, ...], tuple[int, ...]]:
   """Emit one DPU EW register template, sharing its physical prefix and RDMA tail across every precision."""
   D, R = _DPU, rk
-  special, native_int16, native_int32, c = (compare or stateful or int32_output or int32_input or int16_output or int16_input or
-    fp32_output or fp32_input), int16_input and int16_output, int32_input and int32_output, compare
-  int16_to_int32 = int16_input and int32_output and not int16_output and not int32_input
-  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if native_int32 else _EW_ELEMS_32BIT if \
+  native_int16,int16_to_int32,fp32_output,fp32_input = (mode == x for x in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_FLOAT,RKEWMode.FLOAT_TO_HALF))  # noqa: E501
+  int32_output,int32_input = mode in (RKEWMode.INT32,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32), mode in (RKEWMode.INT32,RKEWMode.INT32_TO_HALF)  # noqa: E501
+  special,compare = mode != RKEWMode.HALF, mode == RKEWMode.COMPARE
+  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if mode==RKEWMode.INT32 else _EW_ELEMS_32BIT if \
     int32_output or int32_input or fp32_output or fp32_input else _MAX_EW_ELEMS_FP16
   if not 0 < count <= limit: raise ValueError(f"{'stateful EW' if special else 'EW fp16'} count {count} out of range")
   lanes, is_div = (4 if int32_input or fp32_input else 8), ew_cfg == _EW_CFG[Ops.FDIV]
-  width, data_format = (count + lanes-1) // lanes - 1, next(format_ for flag,format_ in zip(
-    (fp32_output, fp32_input, native_int16, native_int32, int16_to_int32, int32_output, int16_output, int32_input, True), _DPU_DATA_FORMATS) if flag)
+  width, data_format = (count + lanes-1) // lanes - 1, _DPU_DATA_FORMATS[mode]
   regs:tuple[tuple[int, int, int], ...] = ((D,R.REG_DPU_S_POINTER,0xe),(D,R.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
     (D,R.REG_DPU_DATA_FORMAT,data_format)) + (((D,R.REG_DPU_DST_SURF_STRIDE,1<<4),) if int16_to_int32 or fp32_output else ()) + (
     (D,R.REG_DPU_DATA_CUBE_WIDTH,width),(D,R.REG_DPU_DATA_CUBE_HEIGHT,0),(D,R.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
@@ -219,11 +217,12 @@ def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=Fal
       (D,R.REG_DPU_WDMA_SIZE_0,0 if fp32_output and count == 1 else 3 if fp32_output else lanes-1),(D,R.REG_DPU_WDMA_SIZE_1,width),
       (D,R.REG_DPU_BN_MUL_CFG,0),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,0))
       + (((D,R.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(D,R.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),(D,R.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),
-      (D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE)) if c else ())
+      (D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),
+      (D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE)) if compare else ())
       + ((D,R.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else \
       ew_cfg & ~_EW_OP_CVT_BYPASS if native_int16 or int16_to_int32 else ew_cfg),
       (D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),
-      (D,R.REG_DPU_OUT_CVT_SCALE,0 if fp32_output else 1 if int32_output or int16_output or is_div else (1<<16)|1),
+      (D,R.REG_DPU_OUT_CVT_SCALE,0 if fp32_output else 1 if int32_output or mode in (RKEWMode.INT16,RKEWMode.HALF_TO_INT16) or is_div else (1<<16)|1),  # noqa: E501
       (D,R.REG_DPU_OUT_CVT_SHIFT,0),(D,R.REG_DPU_SURFACE_ADD,(2 if native_int16 or int16_to_int32 else 4)<<4)))
   else:
     pipeline = ((D,R.REG_DPU_EW_CFG,ew_cfg),) + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ()) + (
@@ -232,20 +231,16 @@ def _stage_template(count:int, ew_cfg:int, compare:bool=False, stateful:bool=Fal
   regs += pipeline + ((_RDMA,R.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
     (_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
     (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
-  rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if int16_input else 2
-  rdma_feature = (rdma_precision<<15)|(15<<11)|(rdma_precision<<5)|(0 if is_div or int16_input or fp32_input else 1<<3)|1
+  rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) else 2
+  rdma_feature = (rdma_precision<<15)|(15<<11)|(rdma_precision<<5)|(0 if is_div or mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) or fp32_input else 1<<3)|1  # noqa: E501
   bindings = ((_DPU, R.REG_DPU_DST_BASE_ADDR), (_RDMA, R.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR), (_RDMA, R.REG_DPU_RDMA_RDMA_EW_BASE_ADDR))
   commands = tuple(_cmd(*reg) for reg in regs)+tuple(_cmd(target, reg, 0) for target,reg in bindings)
   return commands+(_cmd(_RDMA, R.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature),), tuple(range(len(regs), len(commands)))
 
-def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
-                  stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
-                  int16_output:bool=False, int16_input:bool=False) -> RKStage:
+def emit_ew_stage(op:RKEWOp) -> RKStage:
   """Build one DPU EW command body without its PC-chain tail."""
-  fp32_output, fp32_input = bool(ew_cfg & _EW_STAGE_FP32_OUT), bool(ew_cfg & _EW_STAGE_FP32_IN)
-  ew_cfg &= ~(_EW_STAGE_FP32_OUT|_EW_STAGE_FP32_IN)
-  commands, words = _stage_template(count, ew_cfg, compare, stateful, int32_output, int32_input, int16_output, int16_input, fp32_output, fp32_input)
-  return RKStage(commands, tuple(zip(words, (dst, lhs, rhs))))
+  commands, words = _stage_template(op.count,op.ew_cfg,op.mode)
+  return RKStage(commands, tuple(zip(words, (op.dst,op.lhs,op.rhs))))
 
 def _root_param(u:UOp) -> UOp|None: return root if (root:=u.buf_uop).op is Ops.PARAM else None
 
@@ -487,8 +482,8 @@ def _append_inplace_image(first:RKImage, second:RKImage, chained:bool=False) -> 
   if chained and (any(not isinstance(second.program[i],RKEWOp) for i in range(second_ew[0],second_ew[-1]+1)) or
                   not any(isinstance(op,RKEWOp) for op in first.program)): return None
   fs=len(first.scratch); second=_map_image_args(second,lambda arg:arg._replace(index=fs+arg.index) if arg.kind is RKBufferKind.SCRATCH else arg)
-  program=list(second.program); first_ew=next(i for i,op in enumerate(program) if isinstance(op,RKEWOp))
-  program[first_ew]=typing_cast(RKEWOp,program[first_ew])._replace(submit_barrier=not chained,stateful=True)
+  program=list(second.program); first_ew=next(i for i,op in enumerate(program) if isinstance(op,RKEWOp)); op=typing_cast(RKEWOp,program[first_ew])
+  program[first_ew]=op._replace(submit_barrier=not chained,mode=RKEWMode.STATEFUL if op.mode==RKEWMode.HALF else op.mode)
   if chained:
     split=next(i for i,op in enumerate(first.program) if isinstance(op,RKEWOp)); program=program[:first_ew]+list(first.program[split:])+program[first_ew:]; prefix=first.program[:split]  # noqa: E501
   else: prefix=first.program
@@ -652,14 +647,16 @@ def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16
   first = barrier and not int16
   while len(active) > 1:
     for lhs,rhs in zip(active[::2], active[1::2]):
-      ops.append(RKEWOp(lhs, lhs, rhs, count, cfg, submit_barrier=first, stateful=first, int16_input=int16, int16_output=int16)); first = False  # noqa: E501
+      ops.append(RKEWOp(lhs,lhs,rhs,count,cfg,submit_barrier=first,
+        mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first = False
     active = active[::2]
   return active[0]
 
 def _kahan_rows(ops:list[RKEWOp], scratch:list[RKScratch], gathers:list[RKGather], active:list[RKArg], count:int, barrier:bool=True) -> RKArg:
   """Reduce mapped HALF rows with four reusable physical carriers."""
   total,updated,correction,adjusted=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(4)); scratch.extend((RKScratch(_scratch_bytes(count)),)*4)  # noqa: E501
-  gathers.append(RKGather(None,correction,count,values=(0,)*count)); ops.append(RKEWOp(total,active[0],active[0],count,_EW_CFG[Ops.MAX],submit_barrier=barrier,stateful=True))  # noqa: E501
+  gathers.append(RKGather(None,correction,count,values=(0,)*count)); ops.append(RKEWOp(total,active[0],active[0],count,
+    _EW_CFG[Ops.MAX],submit_barrier=barrier,mode=RKEWMode.STATEFUL))
   for value in active[1:]:
     ops.append(RKEWOp(adjusted,value,correction,count,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(updated,total,adjusted,count,_EW_CFG[Ops.ADD])); ops.append(RKEWOp(correction,updated,total,count,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(correction,correction,adjusted,count,_EW_CFG[Ops.SUB])); total,updated=updated,total  # noqa: E501
   return total
@@ -1075,7 +1072,7 @@ class RKContext:
     self.program.append(RKGather(None,zero.arg,_EW_ELEMS_32BIT,values=(0,)*_EW_ELEMS_32BIT,itemsize=4))
     for group,start in enumerate(groups): self.program.append(RKEWOp(aligned.arg._replace(addend=group*16),
       raw.arg._replace(addend=group*16),zero.arg,min(_EW_ELEMS_32BIT,self.count-start),
-      _EW_CFG[Ops.ADD]|_EW_STAGE_FP32_IN,stateful=True))
+      _EW_CFG[Ops.ADD],mode=RKEWMode.FLOAT_TO_HALF))
     compact = self._scratch(dtypes.half,self.count*2)
     self.program.append(RKGather(aligned.arg,compact.arg,self.count,
       offsets=tuple((lane//_EW_ELEMS_32BIT)*8+lane%_EW_ELEMS_32BIT for lane in range(self.count)),
@@ -1118,9 +1115,9 @@ class RKContext:
     integer16, integer32 = dst.dtype is dtypes.int16, dst.dtype is dtypes.int
     if lhs.dtype is not dst.dtype or rhs.dtype is not dst.dtype: raise _RKGenericReject
     barrier = not integer16 and not integer32 and cfg in (_EW_CFG_FLOOR, _EW_CFG[Ops.FDIV])
-    self.program.append(RKEWOp(dst.arg, lhs.arg, rhs.arg, self.count, cfg, submit_barrier=barrier,
-      compare=compare, stateful=integer32 or not integer16 and (self.mask_program and not compare or barrier),
-      int16_output=integer16, int16_input=integer16, int32_output=integer32, int32_input=integer32))
+    mode=RKEWMode.INT16 if integer16 else RKEWMode.INT32 if integer32 else RKEWMode.COMPARE if compare else \
+      RKEWMode.STATEFUL if self.mask_program or barrier else RKEWMode.HALF
+    self.program.append(RKEWOp(dst.arg,lhs.arg,rhs.arg,self.count,cfg,submit_barrier=barrier,mode=mode))
     self.mask_program |= compare; return dst
 
   def _byte_gather(self, source:RKArg, dest:RKArg, count:int, *, base:int=0, source_stride:int=1,
@@ -1203,15 +1200,20 @@ class RKContext:
   def _convert(self, u:UOp|None, source:UOp, target:DType, barrier:bool=False) -> UOp:
     """Cross one physical carrier boundary using the native DPU conversion stage."""
     if source.dtype is target: return source
-    pair, flags, cfg = (source.dtype,target), {}, _EW_CFG[Ops.MAX]
-    result=None if pair==(dtypes.int16,dtypes.int) else self._scratch(target,u=None if pair==(dtypes.int,dtypes.half) else u)
-    if pair == (dtypes.half,dtypes.int16): rhs,flags=source.arg,dict(stateful=True,int16_output=True,submit_barrier=barrier)
-    elif pair == (dtypes.half,dtypes.int): rhs,flags=self._scratch(dtypes.int,(self.count+3)//4<<6).arg,dict(stateful=True,int32_output=True)  # noqa: E501
-    elif pair == (dtypes.int,dtypes.half): rhs,flags=self._scratch(dtypes.int,(self.count+3)//4<<6).arg,dict(int32_input=True)
-    elif pair == (dtypes.int16,dtypes.int): rhs,flags,cfg=self._constant(UOp.const(0,dtypes.int16)).arg,dict(int16_input=True,int32_output=True),_EW_CFG[Ops.ADD]  # noqa: E501
+    pair, cfg = (source.dtype,target), _EW_CFG[Ops.MAX]
+    result=self._scratch(target,u=None if pair==(dtypes.int,dtypes.half) else u)
+    if pair in ((dtypes.half,dtypes.int),(dtypes.int,dtypes.half)):
+      atoms=tuple((start,min(4,self.count-start)) for start in range(0,self.count,4)); tile=self._scratch(dtypes.int,len(atoms)<<6)
+      src_size,dst_size=source.dtype.itemsize,target.itemsize
+      self.program.extend(RKGather(source.arg._replace(addend=source.arg.addend+start*src_size),tile.arg._replace(addend=start//4*64),count,axes=((1,count,1),),itemsize=src_size) for start,count in atoms)  # noqa: E501
+      mode=RKEWMode.HALF_TO_INT32 if target is dtypes.int else RKEWMode.INT32_TO_HALF
+      self.program.extend(RKEWOp((arg:=tile.arg._replace(addend=start//4*64)),arg,arg,count,cfg,mode=mode) for start,count in atoms)
+      self.program.extend(RKGather(tile.arg._replace(addend=start//4*64),result.arg._replace(addend=result.arg.addend+start*dst_size),count,axes=((1,count,1),),itemsize=dst_size) for start,count in atoms)  # noqa: E501
+      return result
+    if pair == (dtypes.half,dtypes.int16): rhs,mode=source.arg,RKEWMode.HALF_TO_INT16
+    elif pair == (dtypes.int16,dtypes.int): rhs,mode,cfg=self._constant(UOp.const(0,dtypes.int16)).arg,RKEWMode.INT16_TO_INT32,_EW_CFG[Ops.ADD]  # noqa: E501
     else: raise _RKGenericReject(f"convert {source.dtype}->{target}")
-    if result is None: result=self._scratch(target,u=u)
-    self.program.append(RKEWOp(result.arg,source.arg,rhs,self.count,cfg,**flags)); return result
+    self.program.append(RKEWOp(result.arg,source.arg,rhs,self.count,cfg,barrier and pair==(dtypes.half,dtypes.int16),mode)); return result
 
   def _integer_bitwise(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
@@ -1431,7 +1433,7 @@ class RKContext:
         lanes=min(_EW_ELEMS_32BIT,self.count-start); gathers.append(RKGather(result.arg._replace(addend=0),aligned.arg,lanes,
           offsets=tuple(result.arg.addend//2+lane for lane in range(start,start+lanes)),dst_addend=group*8,partial=bool(group)))
         source=aligned.arg._replace(addend=group*16); ops.append(RKEWOp(self.out._replace(addend=start*4),source,source,lanes,
-          _EW_CFG[Ops.MAX]|_EW_STAGE_FP32_OUT))
+          _EW_CFG[Ops.MAX],mode=RKEWMode.HALF_TO_FLOAT))
       self.program.extend((*gathers,*ops))
       return
     if result.arg == self.out: return

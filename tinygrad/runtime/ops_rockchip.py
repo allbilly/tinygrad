@@ -1,34 +1,22 @@
 from __future__ import annotations
-import collections, ctypes, itertools, mmap, os, time, weakref as wr
+import collections, ctypes, itertools, mmap, os, time, typing, weakref as wr
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
-from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
-  emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage,
+  emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
-_PC_DATA_AMOUNT_MAX = (1 << 16) - 1
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
 _SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
-_MAX_EW_GROUP_NUMERIC_OPS = _MAX_FP32_EW_GROUP_OPS = 16
-_EW_NUMERIC_OUT = _EW_STAGE_FP32_OUT
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
-_BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) & ~(alignment - 1)
-def _task_command_bytes(body_qwords:int) -> int: return _align_up(body_qwords + _PC_TAIL, 2) * 8
-def _offset_stage(op:RKEWOp, count:int, offset:int, *, dst_step:int=1, src_step:int=1, **flags):
-  dst, lhs, rhs = (RKArg(arg.kind, arg.index, arg.addend+offset*(dst_step if i == 0 else src_step))
-                   for i,arg in enumerate((op.dst, op.lhs, op.rhs)))
-  return emit_ew_stage(dst, lhs, rhs, count, op.ew_cfg, **flags)
-def _ew_groups(ops:tuple[RKEWOp, ...]) -> tuple[tuple[RKEWOp, ...], ...]:
-  cuts = (0, *(i for i,op in enumerate(ops) if i and op.submit_barrier), len(ops))
-  return tuple(ops[start:end] for start,end in zip(cuts,cuts[1:]))
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
   def _copyin(self, dest:HCQBuffer, src:memoryview):
@@ -55,10 +43,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self._scratch_arena:HCQBuffer|None = None
     self.scratch:tuple[HCQBuffer, ...] = ()
     self.submit_count = 0
-    self._cmd_buf:HCQBuffer|None = None
-    self._task_buf:HCQBuffer|None = None
-    self._standalone_cmd_buf:HCQBuffer|None = None
-    self._standalone_task_buf:HCQBuffer|None = None
+    self._cmd_buf = self._task_buf = self._standalone_cmd_buf = self._standalone_task_buf = typing.cast(HCQBuffer|None,None)
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
     dev._touch_program(self)
@@ -77,7 +62,7 @@ class RockchipProgram(Program['RockchipDevice']):
         setattr(self, attr, None)
         self.dev._gpu_free(buf)
     self._pcchain_bodies = None
-    getattr(self, "_scratch_ew_bodies", {}).clear()
+    getattr(self,"_scratch_ew_bodies",{}).clear()
 
   @suppress_finalizing
   def __del__(self):
@@ -121,8 +106,8 @@ class RockchipProgram(Program['RockchipDevice']):
       self._submit(self._cmd_buf, self._task_buf, n)
       return
     sizes = [len(body) for body in bodies]
-    if not sizes or not all(0 < s <= _PC_DATA_AMOUNT_MAX for s in sizes): raise ValueError("invalid EW PC-chain body")
-    cmd_size, task_need = sum(_task_command_bytes(s) for s in sizes)+_CMD_PREFETCH_GUARD, len(sizes)*_TASK_DESC_BYTES
+    if not sizes or not all(0 < s < 1<<16 for s in sizes): raise ValueError("invalid EW PC-chain body")
+    cmd_size, task_need = sum(_align_up(s+_PC_TAIL,2)*8 for s in sizes)+_CMD_PREFETCH_GUARD, len(sizes)*_TASK_DESC_BYTES
     offsets = [0]
     for body in bodies:
       offsets.append(offsets[-1] + _align_up(len(body) + _PC_TAIL, 2))
@@ -161,65 +146,12 @@ class RockchipProgram(Program['RockchipDevice']):
     finally:
       if cmac: self.dev.reset_npu()
 
-  def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
-    """Convert aligned four-lane atoms on DPU; host movement preserves raw lane representations."""
-    to_int32 = op.int32_output
-    if op.rhs.kind is not RKBufferKind.SCRATCH or (to_int32 and op.lhs.kind is not RKBufferKind.SCRATCH):
-      raise RuntimeError("INT32 EW conversion requires scratch input and tile arena")
-    source, tiles, dest = buffer(op.lhs.kind, op.lhs.index), buffer(op.rhs.kind, op.rhs.index), buffer(op.dst.kind, op.dst.index)
-    src_itemsize, dst_itemsize = (2, 1 if op.bool_output else 4) if to_int32 else (4, 2)
-    source_need = op.lhs.addend+op.count*src_itemsize
-    tile_need = op.rhs.addend+(op.count+3)//4*64
-    dest_need = op.dst.addend+op.count*dst_itemsize
-    if source_need > source.size or tile_need > tiles.size or dest_need > dest.size:
-      raise RuntimeError(f"INT32 conversion exceeds buffer: source {source_need}/{source.size}, "
-                         f"tiles {tile_need}/{tiles.size}, destination {dest_need}/{dest.size}; "
-                         f"slots lhs={op.lhs.index} rhs={op.rhs.index} dst={op.dst.index}, "
-                         f"scratch={tuple(spec.size for spec in self.image.scratch)}")
-    self.dev._sync_buffer(source, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-    ctypes.memset(int(tiles.va_addr), 0, tiles.size)
-    for tile,start in enumerate(range(0, op.count, 4)):
-      ctypes.memmove(int(tiles.va_addr)+op.rhs.addend+tile*64, int(source.va_addr)+op.lhs.addend+start*src_itemsize,
-                     min(4, op.count-start)*src_itemsize)
-    self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    bodies:list[tuple[int, ...]] = []
-    command_bytes = 0
-    for start in range(0, op.count, 4):
-      count = min(4, op.count-start)
-      tile_arg = RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+start//4*64)
-      stage = emit_ew_stage(tile_arg, tile_arg, tile_arg, count, op.ew_cfg, stateful=True,
-                            int32_output=to_int32, int32_input=not to_int32)
-      body = patch_stage(stage, address)
-      if bodies and command_bytes+_task_command_bytes(len(body)) > mmap.PAGESIZE:
-        self._submit_pcchain(bodies)
-        self.dev.reset_npu()
-        bodies.clear()
-        command_bytes = 0
-      bodies.append(body)
-      command_bytes += _task_command_bytes(len(body))
-    if bodies: self._submit_pcchain(bodies)
-    self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-    for tile,start in enumerate(range(0, op.count, 4)):
-      lanes = min(4, op.count-start)
-      if op.bool_output:
-        for lane in range(lanes):
-          ctypes.memmove(int(dest.va_addr)+op.dst.addend+start+lane, int(tiles.va_addr)+op.rhs.addend+tile*64+lane*4, 1)
-      else:
-        ctypes.memmove(int(dest.va_addr)+op.dst.addend+start*dst_itemsize, int(tiles.va_addr)+op.rhs.addend+tile*64,
-                       lanes*dst_itemsize)
-    self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    self.dev.reset_npu()
-
-  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]) -> None:
+  def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...]) -> None:
     if not ops: return
-    for i,op in enumerate(ops[:-1]):
-      if op.ew_cfg&_EW_NUMERIC_OUT and not ops[i+1].ew_cfg&_EW_NUMERIC_OUT: raise RuntimeError("FP32 EW output must be terminal")
-      if op.int32_output and not op.int32_input and op.dst.kind is RKBufferKind.ARG: raise RuntimeError("INT32 argument output must be terminal")
-    scratch_int16 = all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
-      op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
-    if scratch_int16:
-      if (cached:=self._scratch_ew_bodies.get(ops)) is None: self._scratch_ew_bodies[ops] = cached = tuple(
-        stage for op in ops for stage in self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=True,int16_output=True,int16_input=True))  # noqa: E501
+    M=RKEWMode
+    if all(op.mode==M.INT16 and not op.submit_barrier and
+           all(arg.kind is RKBufferKind.SCRATCH for arg in (op.dst,op.lhs,op.rhs)) for op in ops):
+      if (cached:=self._scratch_ew_bodies.get(ops)) is None: self._scratch_ew_bodies[ops]=cached=tuple(stage for op in ops for stage in self._tile(op,_MAX_EW_ELEMS_FP16,address))  # noqa: E501
       self._submit_pcchain(list(cached))
       return
     def run_group(group:tuple[RKEWOp, ...]) -> None:
@@ -229,59 +161,50 @@ class RockchipProgram(Program['RockchipDevice']):
         nonlocal body_precision
         if chain:
           self._submit_pcchain(chain)
-          if reset: self.dev.reset_npu()
+          if reset or body_precision >= 64: self.dev.reset_npu()
           chain.clear()
         body_precision = 0
-      for i,op in enumerate(group):
-        if op.ew_cfg&_EW_NUMERIC_OUT:
-          flush_chain()
-          stages = [patch_stage(emit_ew_stage(x.dst,x.lhs,x.rhs,x.count,x.ew_cfg),address) for x in group[i:]]
-          for start in range(0,len(stages),_MAX_EW_GROUP_NUMERIC_OPS):
-            self._submit_pcchain(stages[start:start+_MAX_EW_GROUP_NUMERIC_OPS])
-            self.dev.reset_npu()
-          break
-        convert = op.int16_input and op.int32_output
-        if convert and (op.int16_output or op.int32_input): raise RuntimeError("conflicting INT16→INT32 EW precision")
-        same = op.int16_input and op.int16_output or op.int32_input and op.int32_output
-        if convert or same:
-          precision = 0 if convert else 16 if op.int16_input else 32
-          if chain and (body_precision not in (0,16) if convert else body_precision!=precision): flush_chain()
-          if convert:
-            limit,itemsize = 8,1
-            flags = dict(dst_step=4,src_step=2,stateful=True,int32_output=True,int16_input=True)
-          else:
-            limit,itemsize = _MAX_EW_ELEMS_FP16//(precision//16),precision//8
-            flags = dict(stateful=True,int32_output=precision==32,int32_input=precision==32,
-                         int16_output=precision==16,int16_input=precision==16)
-          chain.extend(self._tile(op,limit,address,itemsize,**flags))
-          body_precision = precision
-        elif op.int32_input or op.int32_output:
-          flush_chain()
-          self._run_int32_conversion(op,address,buffer)
-        elif op.int16_input: raise RuntimeError("mixed INT16 EW conversion is unsupported")
-        elif op.compare:
+      for op in group:
+        mode=op.mode
+        if mode==M.COMPARE:
           if body_precision: flush_chain(True)
           flush_chain()
-          for start in range(0,op.count,_MAX_EW_ELEMS_FP16):
+          for body in self._tile(op,_MAX_EW_ELEMS_FP16,address):
             self.dev.reset_npu()
-            self._submit_standalone(patch_stage(_offset_stage(op,min(_MAX_EW_ELEMS_FP16,op.count-start),start*2,compare=True),address))
+            self._submit_standalone(body)
             self.dev.reset_npu()
+          continue
+        precision=128 if mode==M.HALF_TO_FLOAT else 64 if mode in (M.HALF_TO_INT32,M.INT32_TO_HALF) else \
+          16 if mode==M.INT16 else 32 if mode==M.INT32 else 0
+        if chain and precision!=body_precision and not (mode==M.INT16_TO_INT32 and body_precision in (0,16)):
+          flush_chain(not precision and mode!=M.INT16_TO_INT32 and bool(body_precision))
+        if mode in (M.HALF_TO_FLOAT,M.HALF_TO_INT32,M.INT32_TO_HALF): chain.append(patch_stage(emit_ew_stage(op),address))
         else:
-          if body_precision: flush_chain(True)
-          chain.extend(self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=op.stateful or op.int16_output,int16_output=op.int16_output))
+          limit,itemsize=(_MAX_EW_ELEMS_FP16//2,4) if mode==M.INT32 else (8,1) if mode==M.INT16_TO_INT32 else (_MAX_EW_ELEMS_FP16,2)  # noqa: E501
+          flags=dict(dst_step=4,src_step=2) if mode==M.INT16_TO_INT32 else {}
+          chain.extend(self._tile(op,limit,address,itemsize,**flags))
+        body_precision=precision
+        if precision==128 and len(chain)>=16: flush_chain()
       flush_chain()
-    for group in _ew_groups(ops):
-      split=group[0].stateful and len(group)>_MAX_EW_GROUP_OPS and max(op.count for op in group)<=_MAX_EW_ELEMS_FP16 and not any(op.int32_input or op.int32_output or op.ew_cfg&_EW_NUMERIC_OUT for op in group)  # noqa: E501
-      tiled=group[0].stateful and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and not (op.compare or op.int16_input or op.int16_output or op.int32_input or op.int32_output or op.ew_cfg&_EW_NUMERIC_OUT) for op in group)  # noqa: E501
+    cuts=(0,*(i for i,op in enumerate(ops) if i and op.submit_barrier),len(ops))
+    for begin,end in zip(cuts,cuts[1:]):
+      group=ops[begin:end]
+      split=group[0].mode in (M.STATEFUL,M.HALF_TO_INT16,M.FLOAT_TO_HALF) and len(group)>_MAX_EW_GROUP_OPS and max(op.count for op in group)<=_MAX_EW_ELEMS_FP16 and not any(op.mode in (M.INT32,M.INT16_TO_INT32,M.HALF_TO_INT32,M.INT32_TO_HALF,M.HALF_TO_FLOAT) for op in group)  # noqa: E501
+      tiled=group[0].mode in (M.STATEFUL,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.STATEFUL,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
       if split:
-        for start in range(0,len(group),_MAX_EW_GROUP_OPS): run_group((group[start]._replace(submit_barrier=False,stateful=True),*group[start+1:start+_MAX_EW_GROUP_OPS]))  # noqa: E501
+        for start in range(0,len(group),_MAX_EW_GROUP_OPS):
+          op=group[start]
+          run_group((op._replace(submit_barrier=False,mode=M.STATEFUL if op.mode==M.HALF else op.mode),*group[start+1:start+_MAX_EW_GROUP_OPS]))  # noqa: E501
       elif tiled:
-        for start in range(0,group[0].count,_MAX_EW_ELEMS_FP16): self._submit_pcchain([patch_stage(_offset_stage(op,min(_MAX_EW_ELEMS_FP16,group[0].count-start),start*2,stateful=op.stateful or i==0),address) for i,op in enumerate(group)])  # noqa: E501
+        tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.STATEFUL if i==0 and op.mode==M.HALF else op.mode)
+               for i,op in enumerate(group))
+        for bodies in zip(*tiles): self._submit_pcchain(list(bodies))
       else: run_group(group)
 
-  def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, **flags):
+  def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
     for start in range(0, op.count, limit):
-      yield patch_stage(_offset_stage(op, min(limit, op.count-start), start*itemsize, **flags), address)
+      args=tuple(arg._replace(addend=arg.addend+start*itemsize*(dst_step if i==0 else src_step)) for i,arg in enumerate((op.dst,op.lhs,op.rhs)))  # noqa: E501
+      yield patch_stage(emit_ew_stage(op._replace(dst=args[0],lhs=args[1],rhs=args[2],count=min(limit,op.count-start),**flags)),address)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
@@ -302,62 +225,52 @@ class RockchipProgram(Program['RockchipDevice']):
     def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
       for gather in gathers:
         lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
-        dst=view(gather.dst,lane_dtype,gather.itemsize)
+        dst,lanes=view(gather.dst,lane_dtype,gather.itemsize),linear.setdefault(gather.count,np.arange(gather.count,dtype=np.intp))
         if gather.index is not None:
           assert gather.src is not None
           src=view(gather.src,lane_dtype,gather.itemsize)
           idx=view(gather.index,{2:np.int16,4:np.int32}[gather.index_itemsize],gather.index_itemsize)[:gather.count].astype(np.intp)
           if len(idx)!=gather.count or len(src)<(gather.count if gather.scatter else gather.src_count) or len(dst)<(gather.dst_count if gather.scatter else gather.count): raise RuntimeError("runtime RKGather exceeds buffer")  # noqa: E501
           valid=(idx>=0)&(idx<(gather.dst_count if gather.scatter else gather.index_limit or gather.src_count))
-          if not gather.scatter:
-            idx=gather.base+np.arange(gather.count,dtype=np.intp)*gather.lane_stride+idx*gather.index_scale
-            valid&=(idx>=0)&(idx<gather.src_count)
           if gather.scatter:
-            for lane in range(gather.count):
-              if valid[lane]: dst[idx[lane]]=src[lane]
-          else:
-            dst[:gather.count]=gather.fill_bits
-            dst[np.nonzero(valid)[0]]=src[idx[valid]]
-          continue
-        dest=buffer(gather.dst.kind,gather.dst.index)
-        if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: ctypes.memset(int(dest.va_addr),0,dest.size)  # noqa: E501
-        if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
-        dst_index=gather.dst_addend+linear[gather.count]*gather.dst_stride
-        if gather.values: dst[dst_index] = gather.values[0] if len(gather.values)==1 else gather.values
-        elif gather.offsets:
-          assert gather.src is not None
-          src=view(gather.src,lane_dtype,gather.itemsize)
-          index=np.asarray(gather.offsets,dtype=np.intp)
-          valid = index >= 0
-          if not gather.partial: dst[dst_index] = gather.fill_bits
-          dst[dst_index[valid]] = src[index[valid]]
+            dst[idx[valid]]=src[lanes[valid]]
+            continue
+          index=gather.base+lanes*gather.lane_stride+idx*gather.index_scale
+          valid&=(index>=0)&(index<gather.src_count)
+          dst_index=lanes
+          dst[dst_index]=gather.fill_bits
         else:
+          dest=buffer(gather.dst.kind,gather.dst.index)
+          if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: ctypes.memset(int(dest.va_addr),0,dest.size)  # noqa: E501
+          dst_index=gather.dst_addend+lanes*gather.dst_stride
+          if gather.values:
+            dst[dst_index]=gather.values[0] if len(gather.values)==1 else gather.values
+            continue
           assert gather.src is not None
           src=view(gather.src,lane_dtype,gather.itemsize)
-          index=np.full(gather.count,gather.base,dtype=np.intp)
-          for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
-          dst[dst_index] = src[index]
-    cursor=0
-    while cursor<len(self.image.program) and isinstance(op:=self.image.program[cursor],RKGather) and not op.scatter:
-      apply_gathers((op,))
-      cursor+=1
+          index=np.asarray(gather.offsets,dtype=np.intp) if gather.offsets else np.full(gather.count,gather.base,dtype=np.intp)
+          valid=index>=0 if gather.offsets else np.ones(gather.count,dtype=np.bool_)
+          if gather.offsets and not gather.partial: dst[dst_index]=gather.fill_bits
+          for divisor,limit,stride in gather.axes: index+=(lanes//divisor%limit)*stride
+        dst[dst_index[valid]]=src[index[valid]]
+    cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather) or op.scatter),len(self.image.program))
+    apply_gathers(self.image.program[:cursor])  # type: ignore[arg-type]
     self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       return self._dma(buffer(kind, index))
     start = time.perf_counter()
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
-    native_int16=any(op.int16_input or op.int16_output for op in ew_ops)
-    if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.ew_cfg & _EW_NUMERIC_OUT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
-    def synchronized_gathers(gathers:tuple[RKGather, ...]) -> None:
-      touched={(arg.kind,arg.index) for gather in gathers for arg in (gather.src,gather.index,gather.dst) if arg is not None}
-      self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      apply_gathers(gathers)
-      self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in gathers),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # noqa: E501
+    native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
+    if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.mode==RKEWMode.HALF_TO_FLOAT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
     for _,items in itertools.groupby(self.image.program[cursor:],type):
       group=tuple(items); current=group[0]  # noqa: E702
       if isinstance(current,RKCMAC): self._submit_standalone(patch_stage(emit_cmac_stage(current),address),True)
-      elif isinstance(current,RKEWOp): self._run_ew_ops(address,buffer,group)  # type: ignore[arg-type]
-      else: synchronized_gathers(group)  # type: ignore[arg-type]
+      elif isinstance(current,RKEWOp): self._run_ew_ops(address,group)  # type: ignore[arg-type]
+      else:
+        touched={(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None}  # type: ignore[union-attr]  # noqa: E501
+        self.dev._sync_buffers(tuple(buffer(kind,index) for kind,index in touched),rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+        apply_gathers(group)  # type: ignore[arg-type]
+        self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in group),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # type: ignore[union-attr]  # noqa: E501
     if ew_ops: self.dev._native_int16 = native_int16
     return time.perf_counter()-start if wait else None
 
@@ -379,7 +292,7 @@ class RockchipDevice(Compiled):
   def _forget_program(self, program:RockchipProgram) -> None: self._program_resources.pop(id(program), None)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
-    try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=alloc, flags=flags|_BO_FLAGS)
+    try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl,size=alloc,flags=flags|rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT)  # noqa: E501
     except OSError as exc: raise MemoryError(f"RKNPU GEM allocation failed for {alloc} bytes") from exc
     try:
       mapping = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=meta.handle, reserved=0, offset=0)
