@@ -559,12 +559,12 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
 def test_runtime_chain_flush_preserves_mixed_boundaries():
   scratch = tuple(RKArg(RKBufferKind.SCRATCH,index,index*64) for index in range(3))
   external = tuple(RKArg(RKBufferKind.ARG,index,index*64) for index in range(3))
-  add = _EW_CFG[Ops.ADD]
-  def op(*,count=17,barrier=False,compare=False,int16_in=False,int16_out=False,int32_in=False,int32_out=False,
+  add, large = _EW_CFG[Ops.ADD], _MAX_EW_ELEMS_FP16+3
+  def op(*,count=17,barrier=False,compare=False,stateful=False,int16_in=False,int16_out=False,int32_in=False,int32_out=False,
          numeric=False,scratch_args=False):
     args = scratch if scratch_args else external
     return RKEWOp(args[0],args[1],args[2],count,add|(rockchip_renderer._EW_STAGE_FP32_OUT if numeric else 0),
-      submit_barrier=barrier,compare=compare,int16_input=int16_in,int16_output=int16_out,
+      submit_barrier=barrier,compare=compare,stateful=stateful,int16_input=int16_in,int16_output=int16_out,
       int32_input=int32_in,int32_output=int32_out)
   cases = (
     ((op(),op(barrier=True),op()), (("submit",(18,)),("submit",(18,18)))),
@@ -579,6 +579,10 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
      (("submit",(18,)),("reset",),("standalone",37),("reset",),("submit",(18,)))),
     ((op(),*(op(count=1,numeric=True) for _ in range(17))),
      (("submit",(18,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
+    ((op(),op(count=large,barrier=True,stateful=True),op(count=large),op(barrier=True)),
+     (("submit",(18,)),("submit",(31,18)),("submit",(31,18)),("submit",(18,)))),
+    ((op(stateful=True),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
+     (("submit",(31,)+(18,)*(rockchip_runtime._MAX_EW_GROUP_OPS-1)),("submit",(31,)))),
   )
   def address(kind:RKBufferKind,index:int) -> int: return 0x10000000+int(kind)*0x100000+index*0x10000
   for ops,expected in cases:
@@ -595,6 +599,10 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
       ("conversion",value.count,value.int32_input,value.int32_output))
     program._run_ew_ops(address,lambda _kind,_index:None,ops)
     assert tuple(events) == expected
+  with pytest.raises(RuntimeError,match="FP32 EW output must be terminal"):
+    program._run_ew_ops(address,lambda _kind,_index:None,(op(numeric=True),op(barrier=True)))
+  with pytest.raises(RuntimeError,match="INT32 argument output must be terminal"):
+    program._run_ew_ops(address,lambda _kind,_index:None,(op(int16_in=True,int32_out=True),op(barrier=True)))
 
 
 def test_native_ew_configs_keep_their_exact_register_values():

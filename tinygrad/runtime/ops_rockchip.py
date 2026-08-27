@@ -26,6 +26,9 @@ def _offset_stage(op:RKEWOp, count:int, offset:int, *, dst_step:int=1, src_step:
   dst, lhs, rhs = (RKArg(arg.kind, arg.index, arg.addend+offset*(dst_step if i == 0 else src_step))
                    for i,arg in enumerate((op.dst, op.lhs, op.rhs)))
   return emit_ew_stage(dst, lhs, rhs, count, op.ew_cfg, **flags)
+def _ew_groups(ops:tuple[RKEWOp, ...]) -> tuple[tuple[RKEWOp, ...], ...]:
+  cuts = (0, *(i for i,op in enumerate(ops) if i and op.submit_barrier), len(ops))
+  return tuple(ops[start:end] for start,end in zip(cuts,cuts[1:]))
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
   def _copyin(self, dest:HCQBuffer, src:memoryview):
@@ -207,107 +210,74 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self.dev.reset_npu()
 
-  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...], *, tile_groups:bool=True) -> None:
+  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]) -> None:
     if not ops: return
-    scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
+    for i,op in enumerate(ops[:-1]):
+      if op.ew_cfg&_EW_NUMERIC_OUT and not ops[i+1].ew_cfg&_EW_NUMERIC_OUT: raise RuntimeError("FP32 EW output must be terminal")
+      if op.int32_output and not op.int32_input and op.dst.kind is RKBufferKind.ARG: raise RuntimeError("INT32 argument output must be terminal")
+    scratch_int16 = all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
       op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
     if scratch_int16:
-      cached = self._scratch_ew_bodies.get(ops)
-      if cached is None:
-        stages = []
-        for op in ops: stages.extend(self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=True,int16_output=True,int16_input=True))
-        self._scratch_ew_bodies[ops] = cached = tuple(stages)
+      if (cached:=self._scratch_ew_bodies.get(ops)) is None: self._scratch_ew_bodies[ops] = cached = tuple(
+        stage for op in ops for stage in self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=True,int16_output=True,int16_input=True))  # noqa: E501
       self._submit_pcchain(list(cached))
       return
-    if tile_groups:
-      groups:list[tuple[RKEWOp, ...]] = []
-      start = 0
-      for i,op in enumerate(ops):
-        if i > start and op.submit_barrier:
-          groups.append(ops[start:i])
-          start = i
-      groups.append(ops[start:])
-      spatial = tuple(group[0].stateful and group[0].count > _MAX_EW_ELEMS_FP16 and
-        all(op.count == group[0].count and not (op.compare or op.int16_input or op.int16_output or op.int32_input or
-                                               op.int32_output or op.ew_cfg & _EW_NUMERIC_OUT) for op in group)
-        for group in groups)
-      sequential = tuple(group[0].stateful and len(group) > _MAX_EW_GROUP_OPS and max(op.count for op in group) <= _MAX_EW_ELEMS_FP16 and
-                         not any(op.int32_input or op.int32_output or op.ew_cfg & _EW_NUMERIC_OUT for op in group)
-                         for group in groups)
-      if any(tiled or split for tiled,split in zip(spatial, sequential)):
-        for group,tiled,split in zip(groups, spatial, sequential):
-          if split:
-            for chunk_start in range(0, len(group), _MAX_EW_GROUP_OPS):
-              chunk = list(group[chunk_start:chunk_start+_MAX_EW_GROUP_OPS])
-              chunk[0] = chunk[0]._replace(submit_barrier=False, stateful=True)
-              self._run_ew_ops(address, buffer, tuple(chunk), tile_groups=False)
-          elif not tiled:
-            self._run_ew_ops(address, buffer, group, tile_groups=False)
-          else:
-            for tile_start in range(0, group[0].count, _MAX_EW_ELEMS_FP16):
-              count, offset = min(_MAX_EW_ELEMS_FP16, group[0].count-tile_start), tile_start*2
-              tile_bodies = [patch_stage(_offset_stage(op, count, offset, stateful=op.stateful or i == 0), address)
-                             for i,op in enumerate(group)]
-              self._submit_pcchain(tile_bodies)
-        return
-    bodies:list[tuple[int, ...]] = []
-    body_precision = 0
-    def flush(reset:bool=False) -> None:
-      nonlocal body_precision
-      if bodies:
-        self._submit_pcchain(bodies)
-        if reset: self.dev.reset_npu()
-        bodies.clear()
+    def run_group(group:tuple[RKEWOp, ...]) -> None:
+      chain:list[tuple[int, ...]] = []
       body_precision = 0
-    for i, op in enumerate(ops):
-      if op.submit_barrier and bodies: flush()
-      if op.ew_cfg & _EW_NUMERIC_OUT:
-        if any(not later.ew_cfg & _EW_NUMERIC_OUT for later in ops[i+1:]):
-          raise RuntimeError("FP" "32 EW output must be terminal")
-        flush()
-        stages = [patch_stage(emit_ew_stage(later.dst, later.lhs, later.rhs, later.count, later.ew_cfg), address)
-                  for later in ops[i:]]
-        for start in range(0, len(stages), _MAX_EW_GROUP_NUMERIC_OPS):
-          self._submit_pcchain(stages[start:start+_MAX_EW_GROUP_NUMERIC_OPS])
-          self.dev.reset_npu()
-        break
-      if op.int16_input and op.int32_output:
-        if op.int16_output or op.int32_input: raise RuntimeError("conflicting INT16→INT32 EW precision")
-        if op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
-          raise RuntimeError("INT32 argument output must be terminal")
-        if bodies and body_precision not in (0, 16): flush()
-        bodies.extend(self._tile(op,8,address,1,dst_step=4,src_step=2,stateful=True,int32_output=True,int16_input=True))
+      def flush_chain(reset:bool=False) -> None:
+        nonlocal body_precision
+        if chain:
+          self._submit_pcchain(chain)
+          if reset: self.dev.reset_npu()
+          chain.clear()
         body_precision = 0
-        continue
-      if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
-        precision = 16 if op.int16_input else 32
-        if bodies and body_precision != precision: flush()
-        body_precision, itemsize, limit = precision, precision//8, _MAX_EW_ELEMS_FP16//(precision//16)
-        bodies.extend(self._tile(op,limit,address,itemsize,stateful=True,int32_output=precision == 32,
-          int32_input=precision == 32, int16_output=precision == 16, int16_input=precision == 16))
-        continue
-      if op.int32_input or op.int32_output:
-        if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
-          raise RuntimeError("INT32 argument output must be terminal")
-        flush()
-        self._run_int32_conversion(op, address, buffer)
-        continue
-      if op.int16_input:
-        raise RuntimeError("mixed INT16 EW conversion is unsupported")
-      if body_precision: flush(True)
-      if op.compare:
-        flush()
-        for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
-          count = min(_MAX_EW_ELEMS_FP16, op.count-start)
-          offset = start*2
-          stage = _offset_stage(op, count, offset, compare=True)
-          self.dev.reset_npu()
-          self._submit_standalone(patch_stage(stage, address))
-          self.dev.reset_npu()
-        continue
-      bodies.extend(self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=op.stateful or op.int16_output,
-        int16_output=op.int16_output))
-    flush()
+      for i,op in enumerate(group):
+        if op.ew_cfg&_EW_NUMERIC_OUT:
+          flush_chain()
+          stages = [patch_stage(emit_ew_stage(x.dst,x.lhs,x.rhs,x.count,x.ew_cfg),address) for x in group[i:]]
+          for start in range(0,len(stages),_MAX_EW_GROUP_NUMERIC_OPS):
+            self._submit_pcchain(stages[start:start+_MAX_EW_GROUP_NUMERIC_OPS])
+            self.dev.reset_npu()
+          break
+        convert = op.int16_input and op.int32_output
+        if convert and (op.int16_output or op.int32_input): raise RuntimeError("conflicting INT16→INT32 EW precision")
+        same = op.int16_input and op.int16_output or op.int32_input and op.int32_output
+        if convert or same:
+          precision = 0 if convert else 16 if op.int16_input else 32
+          if chain and (body_precision not in (0,16) if convert else body_precision!=precision): flush_chain()
+          if convert:
+            limit,itemsize = 8,1
+            flags = dict(dst_step=4,src_step=2,stateful=True,int32_output=True,int16_input=True)
+          else:
+            limit,itemsize = _MAX_EW_ELEMS_FP16//(precision//16),precision//8
+            flags = dict(stateful=True,int32_output=precision==32,int32_input=precision==32,
+                         int16_output=precision==16,int16_input=precision==16)
+          chain.extend(self._tile(op,limit,address,itemsize,**flags))
+          body_precision = precision
+        elif op.int32_input or op.int32_output:
+          flush_chain()
+          self._run_int32_conversion(op,address,buffer)
+        elif op.int16_input: raise RuntimeError("mixed INT16 EW conversion is unsupported")
+        elif op.compare:
+          if body_precision: flush_chain(True)
+          flush_chain()
+          for start in range(0,op.count,_MAX_EW_ELEMS_FP16):
+            self.dev.reset_npu()
+            self._submit_standalone(patch_stage(_offset_stage(op,min(_MAX_EW_ELEMS_FP16,op.count-start),start*2,compare=True),address))
+            self.dev.reset_npu()
+        else:
+          if body_precision: flush_chain(True)
+          chain.extend(self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=op.stateful or op.int16_output,int16_output=op.int16_output))
+      flush_chain()
+    for group in _ew_groups(ops):
+      split=group[0].stateful and len(group)>_MAX_EW_GROUP_OPS and max(op.count for op in group)<=_MAX_EW_ELEMS_FP16 and not any(op.int32_input or op.int32_output or op.ew_cfg&_EW_NUMERIC_OUT for op in group)  # noqa: E501
+      tiled=group[0].stateful and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and not (op.compare or op.int16_input or op.int16_output or op.int32_input or op.int32_output or op.ew_cfg&_EW_NUMERIC_OUT) for op in group)  # noqa: E501
+      if split:
+        for start in range(0,len(group),_MAX_EW_GROUP_OPS): run_group((group[start]._replace(submit_barrier=False,stateful=True),*group[start+1:start+_MAX_EW_GROUP_OPS]))  # noqa: E501
+      elif tiled:
+        for start in range(0,group[0].count,_MAX_EW_ELEMS_FP16): self._submit_pcchain([patch_stage(_offset_stage(op,min(_MAX_EW_ELEMS_FP16,group[0].count-start),start*2,stateful=op.stateful or i==0),address) for i,op in enumerate(group)])  # noqa: E501
+      else: run_group(group)
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, **flags):
     for start in range(0, op.count, limit):

@@ -8254,6 +8254,61 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — one nonrecursive EW scheduler at 1,984 combined lines
+
+This hardware-accepted runtime rewrite follows `9f932dbf8`, whose tree is
+identical to shared milestone `99cc5bace`.  Before implementation its runtime
+`sz.py` budget was at most **+75 additions**, at least **105 deletions**, and
+net **-30 or better**: replace recursive `_run_ew_ops(..., tile_groups=...)`
+and its `groups` / `spatial` / `sequential` mode reconstruction with
+`_ew_groups` plus one nonrecursive `_run_ew_ops`.  The exact production diff
+is **+64/-94 raw lines, net -30 executable `sz.py` lines**.  Thus the addition
+ceiling and net acceptance target are met exactly; the predeclared deletion
+estimate was 11 lines too high and is recorded rather than padded with
+artificial churn.  Runtime moves **415 -> 385**, renderer remains **1599**,
+their production total moves **2014 -> 1984**, and repository total moves
+**27078 -> 27048**.
+
+`_ew_groups` now owns submit-barrier partitioning once.  `_run_ew_ops` walks
+those groups directly, chooses sequential splitting or spatial tiling without
+recursive re-entry, and executes every ordinary group through one local
+command-chain owner.  The old `tile_groups` control argument, recursive calls,
+parallel mode tuples, mutable chunk construction, and duplicated tiled-submit
+path are obsolete.  Precision transitions share one readable tile recipe and
+one named chain flush; FP32-numeric and external INT32 terminal contracts are
+validated across the complete EW sequence rather than accidentally shrinking
+to a barrier-local scope.  Scratch-body caching, comparisons, integer
+conversion, reset placement, submission boundaries, and emitted register
+commands are unchanged.  No new IR, numeric operation, CPU/GPU fallback,
+retry path, tolerance, skip, or production test contract was added.
+
+An accepted-parent/candidate physical scheduler oracle covered barrier-only,
+barrier-plus-spatial-tile, sequential groups longer than 48 operations,
+barrier-plus-sequential-split, mixed FP16/FP32 precision, integer conversion,
+comparison, numeric-output batching, and cached scratch chains.  Every submit
+boundary, reset, body length, and packed command byte is identical; both sides
+have aggregate SHA-256
+`96f783eb7b16ac77eab76ce4a887d8caba205f9132d1876dfa025ff3d206696d`.
+The existing exact runtime event test now permanently covers combined spatial
+tiling, sequential splitting, and whole-sequence terminal validation without
+adding a collected unit case; the module remains **158/158 passed** with
+`-q -n12`.
+
+Final host verification reports repository-wide Ruff success, mypy success in
+**216 source files**, and a clean diff check.  Runtime SHA-256 is
+`48265438b62e45649eceb0f83cabfe83203d6679407102eb81b0ae5cda96deaf`;
+the unit module SHA-256 is
+`5e223401b465df42373a56f6a9be3414e3e54eaed1a8835b79a847d737fd4659`.
+The definitive production census actually executed all **445** top-level
+cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**994.48 seconds (16:34)** with zero failures.  Its slowest case was
+`test_avg_pool3d` at **62.76 seconds**, followed by `test_std_axis` at
+**37.57 seconds** and `test_var_axis` at **33.38 seconds**.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after the census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-27 — one ordered physical program owns execution at 1,599 lines
 
 This hardware-accepted architecture rewrite follows `f1e0df561`.  Before
