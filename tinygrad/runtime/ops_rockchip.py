@@ -40,28 +40,24 @@ class RockchipProgram(Program['RockchipDevice']):
       self._scratch_size = _align_up(self._scratch_size, spec.alignment)
       self._scratch_offsets.append(self._scratch_size)
       self._scratch_size += spec.size
-    self._scratch_arena:HCQBuffer|None = None
+    self._buffers:dict[str,HCQBuffer] = {}
     self.scratch:tuple[HCQBuffer, ...] = ()
     self.submit_count = 0
-    self._cmd_buf = self._task_buf = self._standalone_cmd_buf = self._standalone_task_buf = typing.cast(HCQBuffer|None,None)
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
     dev._touch_program(self)
     self._ensure_scratch()
 
   def _ensure_scratch(self) -> None:
-    if self._scratch_arena is not None or not self._scratch_size: return
-    self._scratch_arena = self.dev._gpu_alloc(self._scratch_size)
-    self.scratch = tuple(self._scratch_arena.offset(offset, spec.size)
+    if self.scratch or not self._scratch_size: return
+    arena=self._ensure_buffer("scratch",self._scratch_size,self._scratch_size)
+    self.scratch = tuple(arena.offset(offset, spec.size)
       for offset,spec in zip(self._scratch_offsets, self.image.scratch))
 
   def _release_resources(self) -> None:
-    self.scratch = ()
-    for attr in ("_scratch_arena", "_cmd_buf", "_task_buf", "_standalone_cmd_buf", "_standalone_task_buf"):
-      if (buf:=getattr(self, attr, None)) is not None:
-        setattr(self, attr, None)
-        self.dev._gpu_free(buf)
-    self._pcchain_bodies = None
+    self.scratch,self._pcchain_bodies = (),None
+    for buf in (buffers:=getattr(self,"_buffers",{})).values(): self.dev._gpu_free(buf)
+    buffers.clear()
     getattr(self,"_scratch_ew_bodies",{}).clear()
 
   @suppress_finalizing
@@ -72,9 +68,9 @@ class RockchipProgram(Program['RockchipDevice']):
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
 
   def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0) -> HCQBuffer:
-    if (buf:=getattr(self, attr)) is None or buf.size < size:
+    if (buf:=self._buffers.get(attr)) is None or buf.size < size:
       new = self.dev._gpu_alloc(max(size, minimum), flags)
-      setattr(self, attr, new)
+      self._buffers[attr] = new
       if buf is not None: self.dev._gpu_free(buf)
       return new
     return buf
@@ -99,52 +95,30 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev.submit_count += 1
     self.dev.task_count += n
 
-  def _submit_pcchain(self, bodies:list[tuple[int, ...]]) -> None:
-    """Submit contiguous FP16 EW tasks as one blocking PC chain."""
-    packed_bodies, n = tuple(bodies), len(bodies)
-    if self._pcchain_bodies == packed_bodies and self._cmd_buf is not None and self._task_buf is not None:
-      self._submit(self._cmd_buf, self._task_buf, n)
-      return
-    sizes = [len(body) for body in bodies]
-    if not sizes or not all(0 < s < 1<<16 for s in sizes): raise ValueError("invalid EW PC-chain body")
-    cmd_size, task_need = sum(_align_up(s+_PC_TAIL,2)*8 for s in sizes)+_CMD_PREFETCH_GUARD, len(sizes)*_TASK_DESC_BYTES
-    offsets = [0]
-    for body in bodies:
-      offsets.append(offsets[-1] + _align_up(len(body) + _PC_TAIL, 2))
-    assert cmd_size == offsets[-1]*8+_CMD_PREFETCH_GUARD
-    cmd = self._ensure_buffer("_cmd_buf", cmd_size, _CMD_BUF_MIN)
-    task = self._ensure_buffer("_task_buf", task_need, _TASK_BUF_MIN, rk.RKNPU_MEM_KERNEL_MAPPING)
-    ctypes.memset(int(cmd.va_addr), 0, cmd_size)
-    base_dma = self._dma(cmd)
-    for i, body in enumerate(bodies):
-      base = offsets[i]
-      ctypes.memmove(int(cmd.va_addr) + base*8, (ctypes.c_uint64 * len(body))(*body), len(body)*8)
-      # REGISTER_AMOUNTS=0 terminates the chain. Keep its speculative base-address fetch inside the mapped
+  # Submit contiguous FP16 EW tasks as one blocking PC chain, or one stateful DPU/CMAC body with its direct PC tail.
+  def _submit_bodies(self, bodies:typing.Iterable[tuple[int, ...]], standalone:bool=False, cmac:bool=False) -> None:
+    """Materialize one physical command/task batch while retaining each submission ABI."""
+    bodies=tuple(bodies); sizes=tuple(map(len,bodies)); n=len(bodies)  # noqa: E702
+    if not sizes or not all(0<s<1<<16 for s in sizes) or standalone and n!=1 or cmac and not standalone: raise ValueError("invalid NPU command body")  # noqa: E501
+    if not standalone and self._pcchain_bodies==bodies and all(name in self._buffers for name in ("cmd","task")): self._submit(self._buffers["cmd"],self._buffers["task"],n); return  # noqa: E501,E702
+    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(_align_up(size+tail_size,2) for size in sizes))  # noqa: E501,E702
+    prefix="standalone_" if standalone else ""; cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E702
+    cmd=self._ensure_buffer(f"{prefix}cmd",cmd_size,_CMD_BUF_MIN); task=self._ensure_buffer(f"{prefix}task",n*_TASK_DESC_BYTES,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501,E702
+    ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd)  # noqa: E702
+    for i,(body,size) in enumerate(zip(bodies,sizes)):
+      base=offsets[i]; ctypes.memmove(int(cmd.va_addr)+base*8,(ctypes.c_uint64*size)(*body),size*8)  # noqa: E702
+      # REGISTER_AMOUNTS=0 terminates a chain. Keep its speculative base-address fetch inside the mapped
       # zero-filled guard page: RK3588 can otherwise race completion with an IOMMU read from address zero.
-      next_addr = (base_dma + (offsets[i+1] if i+1 < n else offsets[-1])*8) & 0xfffffff0
-      next_amount = len(bodies[i+1]) if i+1 < n else 0
-      tail = (_pc(rk.TARGET_PC_REG, rk.REG_PC_BASE_ADDRESS, next_addr),
-              _pc(rk.TARGET_PC_REG, rk.REG_PC_REGISTER_AMOUNTS, next_amount),
-              _pc(rk.TARGET_VERSION, 0), _pc(rk.TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18))
-      ctypes.memmove(int(cmd.va_addr) + (base+len(body))*8, (ctypes.c_uint64 * _PC_TAIL)(*tail), _PC_TAIL*8)
-      desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(body)+_PC_TAIL, 0, base_dma+base*8)
-      ctypes.memmove(int(task.va_addr) + i*_TASK_DESC_BYTES, ctypes.addressof(desc), _TASK_DESC_BYTES)
-    self._pcchain_bodies = packed_bodies
-    self._submit(cmd, task, n)
-
-  def _submit_standalone(self, body:tuple[int, ...], cmac:bool=False) -> None:
-    """Submit one stateful DPU or CMAC body with its operation-specific direct PC tail."""
-    tail = (_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),)  # noqa: E501
-    enable,commands = (0xd if cmac else 0x18),body+tail
-    cmd_size, task_need = len(commands)*8+_CMD_PREFETCH_GUARD, _TASK_DESC_BYTES
-    cmd,task = self._ensure_buffer("_standalone_cmd_buf",cmd_size,_CMD_BUF_MIN),self._ensure_buffer("_standalone_task_buf",task_need,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501
-    ctypes.memset(int(cmd.va_addr), 0, cmd_size)
-    ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64 * len(commands))(*commands), len(commands)*8)
-    ctypes.memmove(int(task.va_addr),ctypes.byref(rk.struct_rknpu_task(0,0 if cmac else 4,enable,0x300,0x1ffff,0,len(body) if cmac else len(commands),0,self._dma(cmd))),_TASK_DESC_BYTES)  # noqa: E501
-    if cmac: self.dev.reset_npu()
-    try: self._submit(cmd, task, 1, standalone=True, **({"retry":False} if cmac else {}))
+      next_addr=(base_dma+(offsets[i+1] if i+1<n else offsets[-1])*8)&0xfffffff0; next_amount=sizes[i+1] if i+1<n else 0  # noqa: E702
+      tail=(_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),) if standalone else (_pc(rk.TARGET_PC_REG,rk.REG_PC_BASE_ADDRESS,next_addr),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS,next_amount),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18))  # noqa: E501
+      ctypes.memmove(int(cmd.va_addr)+(base+size)*8,(ctypes.c_uint64*len(tail))(*tail),len(tail)*8)
+      desc=rk.struct_rknpu_task(0,0 if cmac else 4,0xd if cmac else 0x18,0x300,0x1ffff,0,size if cmac else size+len(tail),0,base_dma+base*8)  # noqa: E501
+      ctypes.memmove(int(task.va_addr)+i*_TASK_DESC_BYTES,ctypes.addressof(desc),_TASK_DESC_BYTES)
+    if not standalone: self._pcchain_bodies=bodies
+    if standalone: self.dev.reset_npu()
+    try: self._submit(cmd,task,n,standalone=standalone,**({"retry":False} if cmac else {}))
     finally:
-      if cmac: self.dev.reset_npu()
+      if standalone: self.dev.reset_npu()
 
   def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...]) -> None:
     if not ops: return
@@ -152,7 +126,7 @@ class RockchipProgram(Program['RockchipDevice']):
     if all(op.mode==M.INT16 and not op.submit_barrier and
            all(arg.kind is RKBufferKind.SCRATCH for arg in (op.dst,op.lhs,op.rhs)) for op in ops):
       if (cached:=self._scratch_ew_bodies.get(ops)) is None: self._scratch_ew_bodies[ops]=cached=tuple(stage for op in ops for stage in self._tile(op,_MAX_EW_ELEMS_FP16,address))  # noqa: E501
-      self._submit_pcchain(list(cached))
+      self._submit_bodies(cached)
       return
     def run_group(group:tuple[RKEWOp, ...]) -> None:
       chain:list[tuple[int, ...]] = []
@@ -160,7 +134,7 @@ class RockchipProgram(Program['RockchipDevice']):
       def flush_chain(reset:bool=False) -> None:
         nonlocal body_precision
         if chain:
-          self._submit_pcchain(chain)
+          self._submit_bodies(chain)
           if reset or body_precision >= 64: self.dev.reset_npu()
           chain.clear()
         body_precision = 0
@@ -170,9 +144,7 @@ class RockchipProgram(Program['RockchipDevice']):
           if body_precision: flush_chain(True)
           flush_chain()
           for body in self._tile(op,_MAX_EW_ELEMS_FP16,address):
-            self.dev.reset_npu()
-            self._submit_standalone(body)
-            self.dev.reset_npu()
+            self._submit_bodies((body,),True)
           continue
         precision=128 if mode==M.HALF_TO_FLOAT else 64 if mode in (M.HALF_TO_INT32,M.INT32_TO_HALF) else \
           16 if mode==M.INT16 else 32 if mode==M.INT32 else 0
@@ -198,7 +170,7 @@ class RockchipProgram(Program['RockchipDevice']):
       elif tiled:
         tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.STATEFUL if i==0 and op.mode==M.HALF else op.mode)
                for i,op in enumerate(group))
-        for bodies in zip(*tiles): self._submit_pcchain(list(bodies))
+        for bodies in zip(*tiles): self._submit_bodies(bodies)
       else: run_group(group)
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
@@ -255,16 +227,15 @@ class RockchipProgram(Program['RockchipDevice']):
         dst[dst_index[valid]]=src[index[valid]]
     cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather) or op.scatter),len(self.image.program))
     apply_gathers(self.image.program[:cursor])  # type: ignore[arg-type]
-    self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    def address(kind:RKBufferKind, index:int) -> int:
-      return self._dma(buffer(kind, index))
+    self.dev._sync_buffers((*bufs,*((arena,) if (arena:=self._buffers.get("scratch")) is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    def address(kind:RKBufferKind,index:int) -> int: return self._dma(buffer(kind,index))
     start = time.perf_counter()
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
     native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
     if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.mode==RKEWMode.HALF_TO_FLOAT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
     for _,items in itertools.groupby(self.image.program[cursor:],type):
       group=tuple(items); current=group[0]  # noqa: E702
-      if isinstance(current,RKCMAC): self._submit_standalone(patch_stage(emit_cmac_stage(current),address),True)
+      if isinstance(current,RKCMAC): self._submit_bodies((patch_stage(emit_cmac_stage(current),address),),True,True)
       elif isinstance(current,RKEWOp): self._run_ew_ops(address,group)  # type: ignore[arg-type]
       else:
         touched={(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None}  # type: ignore[union-attr]  # noqa: E501
@@ -305,11 +276,9 @@ class RockchipDevice(Compiled):
   def _sync_buffer(self, buf:HCQBuffer, flags:int):
     rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
-    seen:set[int] = set()
-    for buf in bufs:
-      if buf.meta.obj_addr in seen: continue
-      seen.add(buf.meta.obj_addr)
-      self._sync_buffer(buf, flags)
+    unique:dict[int,HCQBuffer] = {}
+    for buf in bufs: unique.setdefault(buf.meta.obj_addr,buf)
+    for buf in unique.values(): self._sync_buffer(buf,flags)
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)

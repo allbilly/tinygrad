@@ -8254,6 +8254,71 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — one physical submission and buffer owner at 1,870 combined lines
+
+This hardware-accepted runtime rewrite follows `ae3c0a54b`.  The first honest
+submission-only candidate reached **1,882** combined lines.  Its second phase
+then declared a further **net -12 or better** executable-line target, with
+`_submit_bodies`, `_ensure_buffer`, and `_sync_buffers` named as the replacement
+owners.  The final raw production diff is **+41/-72 lines**; authoritative
+`sz.py` moves runtime **300 -> 270**, keeps renderer byte-identical at **1600**,
+and moves their combined size **1900 -> 1870** and repository total
+**26964 -> 26934** (**-30**).
+
+`_submit_bodies` now owns allocation, alignment, command copying, PC-tail
+selection, task descriptors, reset bracketing, and physical submission for
+both contiguous EW chains and direct DPU/CMAC bodies.  This makes the separate
+`_submit_pcchain` and `_submit_standalone` implementations and their forwarding
+call sites obsolete.  Contiguous EW bodies retain one blocking PC chain and
+its cached command/task pair; direct DPU bodies retain their one-word tail;
+CMAC retains its four-word tail, operation index zero, `0xd` enable mask,
+pre/post reset, and no-retry policy.  Compare's pre/post resets moved from its
+caller into the direct-body owner, so production reset order is unchanged.
+
+One `_buffers` dictionary replaces five parallel scratch/chain/standalone
+buffer attributes.  `_ensure_scratch` and `_ensure_buffer` now share that
+registry, eviction releases every registered allocation once, and PC-chain
+cache validity is tied to the registered command/task pair.  `_sync_buffers`
+uses insertion-ordered `dict.setdefault` ownership instead of a separate seen
+set while preserving the first object and first-seen DMA order.  No generic
+IR, operation matcher, image/wire change, CPU/GPU numeric fallback, or new
+runtime phase was introduced.
+
+An initially tempting renderer deletion was explicitly rejected rather than
+used to manufacture the target.  Full-census branch profiling observed
+`_fp32_ratio_to_half` **1,428** times but no successful body entry.  A broader
+production-lowering probe then found a ratio of two nonlinear FP32 EXP2 sums
+where the helper is live: the parent produced **752 EW / 27 gather** records,
+**5,455 bytes**, SHA-256
+`e44ff9a3e6496f9fbe5e4b8fbdeeea3aeab3fb155d8f77b096950c4800efc9cc`,
+while deletion produced **735 EW / 26 gather** records, **5,622 bytes**, SHA-256
+`5eca24a7fa4eb8dfce8d9fbd806e637828cd40543fe9dda9c26b016e3984b3b0`.
+The deletion was therefore coverage-driven, not obsolete architecture, and
+was fully restored before final verification.
+
+The adversarial diff audit finds **156 test definitions before and after** and
+no added skip, xfail, tolerance, CPU/GPU fallback, or deleted assertion.  The
+existing tests now address the single submission owner and continue to pin
+the exact 45-qword CMAC body, four-qword CMAC tail, one-qword DPU tail,
+descriptor fields, retry policy, reset count, grouping, and stage-body hashes.
+Final SHA-256 values are runtime
+`32fd7b84656ad681f0dc31ffb68e6936ca7af523d4c777f3ca60980a87fcec64`,
+unchanged renderer
+`c32213103e7d50c8cec4362d55346401b838193ffa7e213a56350f414c9ab7d9`,
+and unit module
+`ee852215012845cf61fd3851ce8cbd2bcd3f53d0a7a3bb41f18cebb1e6c06d55`.
+
+Final host verification actually executed **159/159 passed** in **97.16
+seconds** with `-q -n12 --dist=loadfile`; repository-wide Ruff passes, mypy
+reports success in **216 source files**, and diff checks are clean.  The
+uninterrupted production census actually executed all **445** top-level cases
+with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**936.48 seconds (15:36)** with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-28 — exclusive EW modes make conversion physical at 1,900 combined lines
 
 This hardware-accepted architecture rewrite follows `bef5c0a77`.  It began as

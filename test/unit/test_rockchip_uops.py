@@ -460,7 +460,7 @@ def test_numeric_output_program_resets_before_its_first_dpu_stage():
   op = RKEWOp(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,0),1,
               _EW_CFG[Ops.ADD],mode=RKEWMode.HALF_TO_FLOAT)
   program = object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev,program.image,program.scratch,program._scratch_arena = FakeDevice(),RKImage(program=(op,)),(),None
+  program.dev,program.image,program.scratch,program._buffers = FakeDevice(),RKImage(program=(op,)),(),{}
   program._ensure_scratch=lambda:None
   program._run_ew_ops=lambda *_args,**_kwargs:None
   program()
@@ -484,7 +484,7 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   program._ensure_buffer = lambda attr,*_args,**_kwargs: cmd if "cmd" in attr else task
   program._submit = lambda *args,**kwargs: submits.append((args,kwargs))
   addresses = (0x100000,0x200000,0x300000)
-  program._submit_standalone(patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index]),True)
+  program._submit_bodies((patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index]),),True,True)
   commands = tuple((ctypes.c_uint64*49).from_address(cmd.va_addr))
   assert commands[:45] == patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index])
   assert commands[45:] == (rockchip_runtime._pc(0x0001,0),
@@ -495,12 +495,12 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (0,0xd,0x300,0x1ffff,45)
   assert program.dev.resets == 2 and len(submits) == 1 and submits[0][1] == {"standalone":True,"retry":False}
   body = (1,2,3)
-  program._submit_standalone(body)
+  program._submit_bodies((body,),True)
   assert tuple((ctypes.c_uint64*4).from_address(cmd.va_addr)) == body+(rockchip_runtime._pc(
     rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0x18),)
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (4,0x18,0x300,0x1ffff,4)
-  assert program.dev.resets == 2 and len(submits) == 2 and submits[1][1] == {"standalone":True}
+  assert program.dev.resets == 4 and len(submits) == 2 and submits[1][1] == {"standalone":True}
 
 
 def test_mixed_cmac_runtime_runs_fixed_stage_before_ew_epilogue():
@@ -518,10 +518,10 @@ def test_mixed_cmac_runtime_runs_fixed_stage_before_ew_epilogue():
   cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),1,1,4,True)
   ew=RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD])
   program=object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev,program.image,program.scratch,program._scratch_arena=FakeDevice(),RKImage(program=(cmac,ew)),tuple(
-    memory(0x100000*(i+1)) for i in range(3)),None
+  program.dev,program.image,program.scratch,program._buffers=FakeDevice(),RKImage(program=(cmac,ew)),tuple(
+    memory(0x100000*(i+1)) for i in range(3)),{}
   program._ensure_scratch=lambda:None
-  program._submit_standalone=lambda *_args,**_kwargs:events.append("cmac")
+  program._submit_bodies=lambda *_args,**_kwargs:events.append("cmac")
   program._run_ew_ops=lambda *_args,**_kwargs:events.append("ew")
   program()
   assert events == ["cmac","ew"]
@@ -556,7 +556,7 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
     program = object.__new__(rockchip_runtime.RockchipProgram)
     program.dev, program.image, program._scratch_ew_bodies = FakeDevice(), SimpleNamespace(ew_ops=(op,)), {}
     submissions = []
-    program._submit_pcchain = lambda bodies:submissions.append(tuple(bodies))
+    program._submit_bodies = lambda bodies,*_args,**_kwargs:submissions.append(tuple(bodies))
     program._run_ew_ops(address,(op,))
     assert tuple(tuple(map(len, submission)) for submission in submissions) == expected_shape and program.dev.resets == 0
     packed = b"".join(struct.pack(f"<{len(body)}Q", *body) for submission in submissions for body in submission)
@@ -580,7 +580,7 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
     ((op(),op(count=4,mode=RKEWMode.INT32_TO_HALF,scratch_args=True),op()),
      (("submit",(18,)),("submit",(31,)),("reset",),("submit",(18,)))),
     ((op(),op(mode=RKEWMode.COMPARE),op()),
-     (("submit",(18,)),("reset",),("standalone",37),("reset",),("submit",(18,)))),
+     (("submit",(18,)),("standalone",37),("submit",(18,)))),
     ((op(),*(op(count=1,mode=RKEWMode.HALF_TO_FLOAT) for _ in range(17))),
      (("submit",(18,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
     ((op(),op(count=large,barrier=True,mode=RKEWMode.STATEFUL),op(count=large),op(barrier=True)),
@@ -597,8 +597,8 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
       def _gpu_free(self,_buffer): pass
     program = object.__new__(rockchip_runtime.RockchipProgram)
     program.dev,program.image,program._scratch_ew_bodies = FakeDevice(),SimpleNamespace(ew_ops=ops),{}
-    program._submit_pcchain = lambda bodies:events.append(("submit",tuple(map(len,bodies))))
-    program._submit_standalone = lambda body,*_args,**_kwargs:events.append(("standalone",len(body)))
+    program._submit_bodies = lambda bodies,standalone=False,*_args,**_kwargs:events.append(
+      ("standalone",len(tuple(bodies)[0])) if standalone else ("submit",tuple(map(len,bodies))))
     program._run_ew_ops(address,ops)
     assert tuple(events) == expected
   with pytest.raises(ValueError,match="invalid RKEWOp sequence"):
