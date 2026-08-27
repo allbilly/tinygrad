@@ -1108,7 +1108,7 @@ class TestRockchipWhereOps(unittest.TestCase):
                   lambda x: (x > .5).where(4, 2).clone().permute((1,0)), vals=[values], forward_only=True)
     _fp16_test_op(None, lambda x: torch.where(x < 0, x, 1).permute((1,0)),
                   lambda x: (x < 0).where(x, 1).clone().permute((1,0)), vals=[values], forward_only=True)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 36 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 9)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 36 if os.getenv("ROCKCHIP_UOPS", "1") == "0" else 8)
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

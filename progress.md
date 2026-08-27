@@ -8254,6 +8254,76 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — one ordered physical program owns execution at 1,599 lines
+
+This hardware-accepted architecture rewrite follows `f1e0df561`.  Before
+implementation its combined renderer/runtime `sz.py` budget was at most
+**+190 additions**, at least **240 deletions**, and net **-50 or better**:
+replace the phase-bucket `RKImage`, split host-address record, constant blob,
+and runtime phase reconstruction with `RKImage.program`, `_op_args`, rewritten
+`_map_image_args` / `_reuse_linear_scratch`, and ordered
+`RockchipProgram.__call__`.  The exact token-aware result is renderer
+**+134/-165, net -31** and runtime **+56/-83, net -27**, for **+190/-248,
+net -58** combined.  Authoritative size moves renderer **1630 -> 1599**,
+runtime **442 -> 415**, their production total **2072 -> 2014**, and repository
+total **27136 -> 27078**.
+
+`RKImage` now stores scratch declarations plus one ordered tuple of physical
+`RKGather`, `RKEWOp`, and `RKCMAC` records.  Serialization (RKIM v33),
+validation, scratch coloring, composition, and runtime all consume that tuple
+instead of independently rebuilding order from initial/mid/post gather lists,
+EW lists, host gather/scatter lists, and a singleton CMAC field.  `RKGather`
+owns constants, affine/static movement, bounded runtime-index movement, and
+scatter direction through the same source/destination argument contract.
+Runtime-index gathers still perform only raw lane movement on the host;
+arithmetic and reductions remain native NPU work.  There is no CPU/GPU numeric
+fallback, retry executor, second IR, or hand-rendered matcher shortcut.
+
+One scheduling pass moves only dependency-safe scratch materializations into
+the program prefix before coloring.  This restored uninterrupted native
+chains without restoring phase buckets: grouped convolution returned from 40
+submits to its required one, `sum(dtype=...)` returned from 69 to two, and the
+three `where_permute` programs improved from **9 to 8 total submits**.  The
+latter is pinned as **1 + 1 + 6** actual submissions; the third image also
+colors **14 rather than 16** scratch slots.  The test now requires that lower
+count after all three numerical comparisons, so the performance assertion is
+stronger rather than skipped.
+
+The first complete hardware diagnostic genuinely ran all 445 tests and found
+the ordering migration's remaining ownership defects.  A non-partial gather
+now starts a scratch lifetime only at destination origin zero; a nonzero
+destination origin necessarily preserves the earlier segment, while explicit
+same-origin overlays retain `partial=True`.  Mapped-reduction planes and FP32
+output groups mark their later records as overlays.  This single contract
+fixed transposed convolution, average pooling, cumulative sum, FP32
+`full_like` / `ones_like`, sort, and top-k.  The masked-load fallback guard was
+also restored to its original semantic boundary: it permits newly created
+static preload gathers but still rejects runtime-addressed gathers or NPU
+arithmetic.  That restored zero-axis concatenation and reflect padding without
+adding an operation-specific route.
+
+Final host verification reports **158/158 passed** for
+`test/unit/test_rockchip_uops.py -q -n12`, repository-wide Ruff success, mypy
+success in **216 source files**, and a clean diff check.  Production
+`Tensor.schedule_linear -> to_program` is exercised throughout both unit and
+hardware suites, including ordered codec round trips, CMAC, runtime-index
+gather/scatter, dynamic selection, raw-bit transfer, and large reductions.
+The final source SHA-256 values are
+`4377ffa7d521c15497304c2b3eeb3228c2d057270186a01994f80eeeabe130a1`
+for the renderer and
+`840eb0f23d3e72be752fcaed8d929413b0398f360856048c0194fe14787eb917`
+for the runtime.
+
+The uninterrupted final production census actually executed all **445**
+top-level cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and
+pytest `-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed**
+in **1097.28 seconds (18:17)** with zero failures.  Its slowest case was
+`test_normalize` at **100.31 seconds**, followed by `test_avg_pool3d` at
+**62.81 seconds** and `test_std_axis` at **37.26 seconds**.  The authoritative
+candidate-pinned `.venv/bin/python ~/rk3588/examples/simple_add.py` health
+gate passed before and after the census with `reset_npu ret=0`, `SUBMIT ret=0`,
+and exact `[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-27 — physical values are UOps at 1,630 lines
 
 This hardware-accepted architecture rewrite follows `d9a0c5871`.  Its

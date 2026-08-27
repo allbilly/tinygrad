@@ -1,10 +1,10 @@
 from __future__ import annotations
-import collections, ctypes, mmap, os, time, weakref as wr
+import collections, ctypes, itertools, mmap, os, time, weakref as wr
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
-  emit_cmac_stage, RKArg, RKGather, RKHostAddress, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+  emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -207,8 +207,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self.dev.reset_npu()
 
-  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None, *, tile_groups:bool=True) -> None:
-    addr, ops = address, self.image.ew_ops if ops is None else ops
+  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...], *, tile_groups:bool=True) -> None:
     if not ops: return
     scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
       op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
@@ -216,7 +215,7 @@ class RockchipProgram(Program['RockchipDevice']):
       cached = self._scratch_ew_bodies.get(ops)
       if cached is None:
         stages = []
-        for op in ops: stages.extend(self._tile(op, _MAX_EW_ELEMS_FP16, addr, stateful=True, int16_output=True, int16_input=True))
+        for op in ops: stages.extend(self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=True,int16_output=True,int16_input=True))
         self._scratch_ew_bodies[ops] = cached = tuple(stages)
       self._submit_pcchain(list(cached))
       return
@@ -277,14 +276,14 @@ class RockchipProgram(Program['RockchipDevice']):
         if op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
           raise RuntimeError("INT32 argument output must be terminal")
         if bodies and body_precision not in (0, 16): flush()
-        bodies.extend(self._tile(op, 8, addr, 1, dst_step=4, src_step=2, stateful=True, int32_output=True, int16_input=True))
+        bodies.extend(self._tile(op,8,address,1,dst_step=4,src_step=2,stateful=True,int32_output=True,int16_input=True))
         body_precision = 0
         continue
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
         precision = 16 if op.int16_input else 32
         if bodies and body_precision != precision: flush()
         body_precision, itemsize, limit = precision, precision//8, _MAX_EW_ELEMS_FP16//(precision//16)
-        bodies.extend(self._tile(op, limit, addr, itemsize, stateful=True, int32_output=precision == 32,
+        bodies.extend(self._tile(op,limit,address,itemsize,stateful=True,int32_output=precision == 32,
           int32_input=precision == 32, int16_output=precision == 16, int16_input=precision == 16))
         continue
       if op.int32_input or op.int32_output:
@@ -306,7 +305,7 @@ class RockchipProgram(Program['RockchipDevice']):
           self._submit_standalone(patch_stage(stage, address))
           self.dev.reset_npu()
         continue
-      bodies.extend(self._tile(op, _MAX_EW_ELEMS_FP16, addr, stateful=op.stateful or op.int16_output,
+      bodies.extend(self._tile(op,_MAX_EW_ELEMS_FP16,address,stateful=op.stateful or op.int16_output,
         int16_output=op.int16_output))
     flush()
 
@@ -325,98 +324,71 @@ class RockchipProgram(Program['RockchipDevice']):
       if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return self.scratch[index]
     self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-    for i in range(len(self.image.constants)//2):
-      if i >= len(self.scratch): break
-      lane = self.image.constants[i*2:i*2+2]
-      bits = lane * (self.scratch[i].size//len(lane))
-      ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
-    cleared_scratch:set[int] = set()
-    def apply_host_addresses(ops:tuple[RKHostAddress, ...], scatter:bool) -> None:
-      for op in ops:
-        source, indices, dest = buffer(op.src.kind, op.src.index), buffer(op.index.kind, op.index.index), buffer(op.dst.kind, op.dst.index)
-        lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[op.itemsize]
-        index_dtype = {2:np.int16, 4:np.int32}[op.index_itemsize]
-        if op.src.addend % op.itemsize or op.dst.addend % op.itemsize or op.index.addend % op.index_itemsize:
-          raise RuntimeError("unaligned RKHostAddress")
-        src = np.frombuffer(to_mv(int(source.va_addr), source.size), dtype=lane_dtype)[op.src.addend//op.itemsize:]
-        idx = np.frombuffer(to_mv(int(indices.va_addr), indices.size), dtype=index_dtype)[
-          op.index.addend//op.index_itemsize:op.index.addend//op.index_itemsize+op.count].astype(np.intp)
-        dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)[op.dst.addend//op.itemsize:]
-        if len(idx) != op.count or len(src) < (op.count if scatter else op.src_count) or len(dst) < (op.dst_count if scatter else op.count):
-          raise RuntimeError("RKHostAddress exceeds buffer")
-        limit = op.dst_count if scatter else op.index_limit or op.src_count
-        valid = (idx >= 0) & (idx < limit)
-        if not scatter:
-          idx = op.base + np.arange(op.count, dtype=np.intp)*op.lane_stride + idx*op.index_scale
-          valid &= (idx >= 0) & (idx < op.src_count)
-        if scatter:
-          for lane in range(op.count):
-            if valid[lane]: dst[idx[lane]] = src[lane]
-        else:
-          dst[:op.count] = op.fill_bits
-          dst[np.nonzero(valid)[0]] = src[idx[valid]]
-    def apply_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+    def view(arg:RKArg,dtype,itemsize:int) -> np.ndarray:
+      if arg.addend%itemsize: raise RuntimeError("unaligned RKGather")
+      raw=buffer(arg.kind,arg.index)
+      return np.frombuffer(to_mv(int(raw.va_addr),raw.size),dtype=dtype)[arg.addend//itemsize:]
+    def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
       for gather in gathers:
-        dest = buffer(gather.dst_kind, gather.dst_index)
-        if clear_scratch and gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
-          ctypes.memset(int(dest.va_addr), 0, dest.size)
-          cleared_scratch.add(gather.dst_index)
         lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
-        dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)
+        dst=view(gather.dst,lane_dtype,gather.itemsize)
+        if gather.index is not None:
+          assert gather.src is not None
+          src=view(gather.src,lane_dtype,gather.itemsize)
+          idx=view(gather.index,{2:np.int16,4:np.int32}[gather.index_itemsize],gather.index_itemsize)[:gather.count].astype(np.intp)
+          if len(idx)!=gather.count or len(src)<(gather.count if gather.scatter else gather.src_count) or len(dst)<(gather.dst_count if gather.scatter else gather.count): raise RuntimeError("runtime RKGather exceeds buffer")  # noqa: E501
+          valid=(idx>=0)&(idx<(gather.dst_count if gather.scatter else gather.index_limit or gather.src_count))
+          if not gather.scatter:
+            idx=gather.base+np.arange(gather.count,dtype=np.intp)*gather.lane_stride+idx*gather.index_scale
+            valid&=(idx>=0)&(idx<gather.src_count)
+          if gather.scatter:
+            for lane in range(gather.count):
+              if valid[lane]: dst[idx[lane]]=src[lane]
+          else:
+            dst[:gather.count]=gather.fill_bits
+            dst[np.nonzero(valid)[0]]=src[idx[valid]]
+          continue
+        dest=buffer(gather.dst.kind,gather.dst.index)
+        if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: ctypes.memset(int(dest.va_addr),0,dest.size)  # noqa: E501
         if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
-        dst_index = gather.dst_addend + linear[gather.count] * gather.dst_stride
-        if gather.values: dst[dst_index] = gather.values
+        dst_index=gather.dst_addend+linear[gather.count]*gather.dst_stride
+        if gather.values: dst[dst_index] = gather.values[0] if len(gather.values)==1 else gather.values
         elif gather.offsets:
-          source = buffer(gather.src_kind, gather.src_index)
-          src = np.frombuffer(to_mv(int(source.va_addr), source.size), dtype=lane_dtype)
-          index = np.asarray(gather.offsets, dtype=np.intp)
+          assert gather.src is not None
+          src=view(gather.src,lane_dtype,gather.itemsize)
+          index=np.asarray(gather.offsets,dtype=np.intp)
           valid = index >= 0
           if not gather.partial: dst[dst_index] = gather.fill_bits
           dst[dst_index[valid]] = src[index[valid]]
         else:
-          source = buffer(gather.src_kind, gather.src_index)
-          src = np.frombuffer(to_mv(int(source.va_addr), source.size), dtype=lane_dtype)
-          index = np.full(gather.count, gather.base, dtype=np.intp)
+          assert gather.src is not None
+          src=view(gather.src,lane_dtype,gather.itemsize)
+          index=np.full(gather.count,gather.base,dtype=np.intp)
           for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
           dst[dst_index] = src[index]
-    apply_gathers(self.image.gathers, True)
-    apply_host_addresses(self.image.host_gathers, False)
+    cursor=0
+    while cursor<len(self.image.program) and isinstance(op:=self.image.program[cursor],RKGather) and not op.scatter:
+      apply_gathers((op,))
+      cursor+=1
     self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       return self._dma(buffer(kind, index))
     start = time.perf_counter()
-    native_int16 = any(op.int16_input or op.int16_output for op in self.image.ew_ops)
-    if self.image.ew_ops and (self.dev._native_int16 and not native_int16 or any(op.ew_cfg & _EW_NUMERIC_OUT for op in self.image.ew_ops)): self.dev.reset_npu()  # noqa: E501
-    def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
-      touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
-      touched.update((g.dst_kind, g.dst_index) for g in gathers)
+    ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
+    native_int16=any(op.int16_input or op.int16_output for op in ew_ops)
+    if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.ew_cfg & _EW_NUMERIC_OUT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
+    def synchronized_gathers(gathers:tuple[RKGather, ...]) -> None:
+      touched={(arg.kind,arg.index) for gather in gathers for arg in (gather.src,gather.index,gather.dst) if arg is not None}
       self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      apply_gathers(gathers, clear_scratch)
-      self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}),
-                             rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    # Run one fixed CMAC body with its proven terminal tail and no timeout replay.
-    if (cmac:=self.image.cmac) is not None: self._submit_standalone(patch_stage(emit_cmac_stage(cmac),address),True)
-    if self.image.mid_gathers:
-      cursor = 0
-      by_point:dict[int, list[RKGather]] = {}
-      for gather in self.image.mid_gathers:
-        by_point.setdefault(gather.after if gather.after >= 0 else self.image.gather_after, []).append(gather)
-      for point,gathers in sorted(by_point.items()):
-        self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:point])
-        synchronized_gathers(tuple(gathers), True)
-        cursor = point
-      self._run_ew_ops(address, buffer, self.image.ew_ops[cursor:])
-    else: self._run_ew_ops(address, buffer)
-    if self.image.ew_ops: self.dev._native_int16 = native_int16
-    if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
-    if self.image.host_scatters:
-      touched = {(op.src.kind, op.src.index) for op in self.image.host_scatters} | \
-                {(op.index.kind, op.index.index) for op in self.image.host_scatters} | \
-                {(op.dst.kind, op.dst.index) for op in self.image.host_scatters}
-      self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      apply_host_addresses(self.image.host_scatters, True)
-      self.dev._sync_buffers(tuple(buffer(op.dst.kind, op.dst.index) for op in self.image.host_scatters), rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      apply_gathers(gathers)
+      self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in gathers),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # noqa: E501
+    for _,items in itertools.groupby(self.image.program[cursor:],type):
+      group=tuple(items); current=group[0]  # noqa: E702
+      if isinstance(current,RKCMAC): self._submit_standalone(patch_stage(emit_cmac_stage(current),address),True)
+      elif isinstance(current,RKEWOp): self._run_ew_ops(address,buffer,group)  # type: ignore[arg-type]
+      else: synchronized_gathers(group)  # type: ignore[arg-type]
+    if ew_ops: self.dev._native_int16 = native_int16
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):
