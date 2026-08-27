@@ -79,6 +79,10 @@ spec_shared = PatternMatcher([
   (UPat(Ops.RANGE, src=(UPat.var("x"),), allow_any_len=True, name="rng"), lambda rng,x:
     matches_dtype(x, rng.dtype) and isinstance(rng.arg, tuple) and len(rng.arg) >= 2 and \
       all(isinstance(ra, int) for ra in rng.arg[0:-1]) and isinstance(rng.arg[-1], AxisType)),
+  # REDUCE has arg=(op, num_axes), src[1:] are ranges after lowering
+  (UPat(Ops.REDUCE, src=(UPat(),), allow_any_len=True, name="x"),
+   lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in GroupOp.Reduce
+   and isinstance(x.arg[1], int) and all(y.dtype in (dtypes.weakint, dtypes.int) for y in x.src[1:])),
   (UPat(Ops.INDEX, name="x"), lambda x: len(x.src)>0 and all(dtypes.is_int(y.dtype) or y.base.is_invalid for y in x.src[1:]) or None),
   # END closes RANGEs
   (UPat(Ops.END, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(u.op is Ops.RANGE for u in x.src[1:]) or None),
@@ -164,11 +168,6 @@ spec_tensor = PatternMatcher([
   (UPat((Ops.RESHAPE, Ops.EXPAND), src=(UPat(), UPat())), lambda: True),
   (UPat((Ops.PAD, Ops.SHRINK), src=(UPat(), UPat(), UPat()), name="x"), lambda x: x.src[1].shape == x.src[2].shape),
   (UPat((Ops.PERMUTE, Ops.FLIP), name="mv", src=(UPat(),)), lambda mv: isinstance(mv.arg, tuple)),
-
-  # REDUCE has arg=(op, num_axes), src[1:] are ranges after lowering
-  (UPat(Ops.REDUCE, src=(UPat(),), allow_any_len=True, name="x"),
-   lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in GroupOp.Reduce
-   and isinstance(x.arg[1], int) and all(y.dtype in (dtypes.weakint, dtypes.int) for y in x.src[1:])),
 
   # COPY
   (UPat(Ops.COPY, name="copy", src=(UPat.var("x"),)), lambda copy,x: matches_dtype(x, copy.dtype) and is_device(copy.arg)),

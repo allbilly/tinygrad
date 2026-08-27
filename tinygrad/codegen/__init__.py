@@ -224,14 +224,14 @@ def expand_horizontal_reduce(r:UOp):
   vals = [inp.index(*idx) for idx in itertools.product(*[range(inp.max_shape[a]) for a in range(r.arg[1])])]
   return functools.reduce(lambda x,y: x.alu(r.arg[0], y), vals)
 
+pm_horizontal_reduce = PatternMatcher([(UPat(Ops.REDUCE, src=(UPat(),), name="r"), expand_horizontal_reduce)])
 pm_reduce_local = pm_wmma_add+PatternMatcher([
   # fix group for reduce
   (UPat(Ops.REDUCE, name="x"), fix_group_for_reduce),
   # remove reduces
   (UPat(Ops.REDUCE, src=(UPat(), UPat()), allow_any_len=True, name="r"), reduce_ranges_to_acc),
-  (UPat(Ops.REDUCE, src=(UPat(),), name="r"), expand_horizontal_reduce),
   (UPat(Ops.SINK, name="sink"), merge_reduce_ends),
-])+pm_clean_up_group_sink
+])+pm_horizontal_reduce+pm_clean_up_group_sink
 
 def maybe_load(u:UOp): return u.load() if u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL, AddrSpace.REG) else u
 pm_add_loads = PatternMatcher([
@@ -317,7 +317,8 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink), name="expander")
 
   # remove reduce
-  sink = graph_rewrite(sink, mop_cleanup+pm_reduce_local, ctx=ReduceContext(), name="remove reduces")
+  reduce_pm = pm_wmma_add+pm_horizontal_reduce if ren.direct_reduces else pm_reduce_local
+  sink = graph_rewrite(sink, mop_cleanup+reduce_pm, ctx=ReduceContext(), name="remove reduces")
 
   # add locals
   sink = graph_rewrite(sink, pm_add_local_buffers, ctx=itertools.count(0), name="add local buffers")

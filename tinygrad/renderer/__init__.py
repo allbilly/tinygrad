@@ -64,6 +64,7 @@ class Renderer:
   has_local: bool = True
   has_threads: bool = False
   has_shared: bool = True
+  direct_reduces: bool = False
   # NOTE: these two should be in (x,y,z) order to match the max_sizes argument in get_grouped_dims
   global_max: tuple[int, ...]|None = (0x8FFFFFFF,) * (3) # TODO: Ops.SPECIAL int32 indexes right now
   local_max: tuple[int, ...]|None = (0x8FFFFFFF,) * (3) # TODO: Ops.SPECIAL int32 indexes right now

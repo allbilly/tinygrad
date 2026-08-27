@@ -8254,6 +8254,73 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — mapped reductions and static planning stay bounded at 1,699 lines
+
+This hardware-accepted milestone follows `86b5e9152`.  Correctness work first
+grew the isolated renderer **1698 -> 1730** and repository total **27208 ->
+27236** to cover output-padded transpose convolution, two-surface `std_mean`,
+composite product residuals, dynamic LOAD defaults, and direct scalar sums.
+The predeclared cleanup budget was exactly **+11/-42 executable lines, net
+-31**.  The observed `sz.py` result meets it exactly: renderer **1730 ->
+1699** and repository **27236 -> 27205**.  Relative to the accepted parent,
+the renderer is **+1** while the complete repository is still **-3**, with the
+new production coverage retained.  The raw renderer diff is **+221/-216
+physical lines**; comments and docstrings remain.
+
+The cleanup changes ownership rather than packing unrelated statements.
+`_root_param` now reuses the core `UOp.buf_uop` traversal, deleting the local
+`_root_node`.  `RKContext._operand` owns finite masked-LOAD materialization, so
+the nested `_alu.operand` and `_where.exact_operand` forwarders are gone.
+`_finite_int_max_neutrals` directly substitutes the two physical neutral
+boundaries instead of maintaining a second context-sensitive graph cache.
+The outer output selector now lets each recursively compiled child prove its
+own dense output index instead of duplicating an affine-axis proof, while
+retaining the required aligned scratch commits.  A draft that wrote the second
+EW surface directly at argument byte offset two failed the actual NPU
+`std_mean` case and was reverted before acceptance.
+
+Mapped reductions now flatten nested static ADD ranges, preserve composite
+TwoProduct residuals with Kahan carriers, chain scalar epilogues, and recognize
+an identity LOAD so scalar sums avoid a redundant copy/barrier.  The CMAC
+planner can gate zero-selected terms and use the vector-product fallback only
+at the proven FP32 storage boundary.  Dynamic nonconstant LOAD defaults are
+materialized before a partial typed gather rather than interpreted as literal
+fill bits.  These are production `to_program` paths and introduce no CPU/GPU
+numeric fallback, hand-built render shortcut, generic single-op IR, or wire
+format change.
+
+Static address evaluation uses NumPy-native vector ALU operations instead of
+`np.frompyfunc(exec_alu)`.  Production `simple_conv_transpose3d` compilation
+dropped from about **145 seconds to 16 seconds**, with identical image metrics;
+the accepted census ran that case in **16.94 seconds**.  A shorter root-only
+static-expression cache made `test_all_large` regress from about **36 seconds
+to 140 seconds** during an interrupted census.  The linear bottom-up subnode
+cache was restored, and the focused hardware rerun passed in **36.62 seconds**.
+
+The complete Rockchip UOp module passes **158/158 in 31.71 seconds** with
+`-q -n12`; repository-wide Ruff passes and mypy reports no issues in **216
+source files**.  The unit module contains **155** test functions versus **153**
+in the parent: former `LOCAL` fixtures were renamed to their production
+`REDUCE` structure, while transpose-convolution and `std_mean` regressions were
+added.  Diff checks are clean.  Focused actual-NPU `std_mean` passes both cases,
+and the authoritative health gate passed before focused testing, before the
+full census, and after it with exact `[8 8 8 8 8 8 8 8] PASS`.
+
+The uninterrupted final production-path census actually executed all **445**
+top-level cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and
+pytest `-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed**
+in **1188.74 seconds (19:48)** with zero failures.  Its slowest cases were
+`test_logsumexp` at **100.58 seconds**, `test_normalize` at **93.41 seconds**,
+and `test_avg_pool3d` at **63.45 seconds**.  The earlier 358-case run was
+explicitly interrupted after exposing the rejected cache regression and is
+not counted as acceptance.
+
+The existing REDUCE-to-native-CMAC boundary remains the clean physical
+contraction carrier.  The audited `Ops.WMMA` thread-tile model would require
+new optimizer/swizzle ownership without replacing irregular mapped reductions;
+the available LUT/PPU artifacts likewise contain no proven net-negative
+encoder path.  None was promoted in this milestone.
+
 ## 2026-08-27 — semantic recipes and physical records have one owner at 1,698 lines
 
 This hardware-accepted milestone follows `143c46a4b` and is an architecture
