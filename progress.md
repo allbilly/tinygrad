@@ -8254,6 +8254,71 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — dependent extrema share mapped reduction ownership at 1,662 lines
+
+This hardware-accepted milestone follows `9412dadbf`.  Its predeclared
+executable renderer budget was at most **+15/-46, net -31**: extend
+`_lower_mapped_reduce`, then delete `_match_scalar_extrema`,
+`_lower_scalar_extrema`, and their dispatch.  The authoritative result is
+renderer **1699 -> 1662** and repository total **27205 -> 27168** (**-37**),
+while runtime remains **442**.  The raw renderer diff is **+29/-71 physical
+lines**; comments and docstrings remain.  The existing test was strengthened
+in place, so the unit module still contains **158** cases.
+
+`_lower_mapped_reduce` now owns the complete dependent scalar-extrema graph.
+It physically lowers the innermost HALF MAX, substitutes its scalar carrier,
+then recursively lowers the remaining bounded INT MAX through the same UOp
+path.  Every successful recursion removes one REDUCE.  Synthetic mapped
+integer programs use tinygrad's existing `pm_lower_index_dtype`, proven
+INT16 carriers, native `_reduce_rows`, and the ordinary image composer; there
+is no shape-specific coordinate matcher, second executor, new IR, wire/runtime
+field, CPU/GPU numeric fallback, or hand-built production render shortcut.
+
+The supporting static rules close existing ownership gaps rather than encode
+argmax syntax.  `_exact_int_range` preserves already-proven integer casts and
+fully static lane expressions.  Static CDIV/CMOD are evaluated by the same
+vector ALU that already implemented them.  `RKContext` chooses integer width
+from the semantic value slice, stopping at LOADs so address-only division does
+not force value arithmetic wide.  Dynamic integer loads and dynamic division
+remain INT32.  Floating nested reductions retain the original admission and
+accumulation order; the relaxed small dependent-reduction threshold is scoped
+to INT output only.
+
+Profiling was part of acceptance.  The first recursive draft still disabled
+reduction lowering in its suffix, so `test_softmax_argmax` fell through to a
+2,925-term generic expansion and one xdist worker aborted.  After enabling
+strictly decreasing suffix recursion and committing weak lane types, each
+2,925-lane row reducer plans in about **3 ms**, the two image compositions take
+about **18 ms** and **38 ms**, and the complete argmax program compiles in
+about **0.16 seconds**.  The focused actual-NPU test now runs both axes in
+**3.13 seconds**.  The existing dependent-extrema unit twin now includes both
+one-axis width four and multi-axis `(45,65)` lowering, wire round-trip, image
+bounds, native execution class, no host address fallback, and a linear EW-size
+ceiling.
+
+The first complete numerical census after that performance fix was rejected:
+it reported **432 passed, 1 failed, 12 skipped** because an over-broad mapped
+admission changed the accumulation order of the third `test_sum_twice`
+subcase.  The untouched parent passed the deterministic twin.  Scoping the
+relaxed threshold to INT dependent reductions restored `test_sum_twice` while
+retaining `test_softmax_argmax`; the two focused hardware twins pass together
+in **1.27 seconds** and **3.13 seconds** respectively.  No tolerance or test
+was weakened.
+
+Final host verification reports **158/158 passed in 27.91 seconds** with
+`-q -n12`, repository-wide Ruff success, mypy success in **216 source files**,
+and clean diff checks.  The authoritative `.venv/bin/python
+~/rk3588/examples/simple_add.py` health gate passed immediately before and
+after the final census with exact `[8 8 8 8 8 8 8 8] PASS`.
+
+The uninterrupted final production `to_program` census actually executed all
+**445** top-level cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`
+and pytest `-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests
+passed** in **1118.68 seconds (18:38)** with zero failures.  Its slowest cases
+were `test_normalize` at **67.60 seconds**, `test_avg_pool3d` at **62.30
+seconds**, and list fancy indexing at **37.96 seconds**.  The worker-abort run
+and the 432/1/12 run are explicitly not counted as acceptance.
+
 ## 2026-08-27 — mapped reductions and static planning stay bounded at 1,699 lines
 
 This hardware-accepted milestone follows `86b5e9152`.  Correctness work first

@@ -1797,23 +1797,24 @@ def test_boolean_reductions_are_physically_executed():
 
 
 def test_dependent_scalar_extrema_uses_direct_native_lowering():
-  count = 4
-  out, source = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.half, (count,))
-  value_axis = UOp.range(count, 0, AxisType.REDUCE)
-  value_candidate = source.index(value_axis).load()
-  best=UOp(Ops.REDUCE,dtypes.half,src=(value_candidate,value_axis),arg=(Ops.MAX,0))
-  index_axis = UOp.range(count, 1, AxisType.REDUCE)
-  index_candidate = source.index(index_axis).load()
-  equal = (index_candidate != best) != UOp.const(True, dtypes.bool)
-  coordinate = UOp.const(count, dtypes.int)-index_axis
-  selected=UOp(Ops.REDUCE,dtypes.int,src=(equal.cast(dtypes.int)*coordinate,index_axis),arg=(Ops.MAX,0))
-  output = out.index(0).store(UOp.const(count, dtypes.int)-selected)
+  for extents in ((4,), (45,65)):
+    count=math.prod(extents)
+    out,source=UOp.param(0,dtypes.int,(1,)),UOp.param(1,dtypes.half,(count,))
+    value_axes=tuple(UOp.range(extent,axis,AxisType.REDUCE) for axis,extent in enumerate(extents))
+    index_axes=tuple(UOp.range(extent,axis+len(extents),AxisType.REDUCE) for axis,extent in enumerate(extents))
+    def flatten(axes:tuple[UOp,...])->UOp: return functools.reduce(lambda value,item:value*item[1]+item[0],zip(axes,extents),UOp.const(0,dtypes.int))  # noqa: E501
+    value_candidate=source.index(flatten(value_axes)).load()
+    best=UOp(Ops.REDUCE,dtypes.half,src=(value_candidate,*value_axes),arg=(Ops.MAX,0))
+    index_candidate=source.index(flatten(index_axes)).load()
+    equal=(index_candidate!=best)!=UOp.const(True,dtypes.bool)
+    coordinate=UOp.const(count,dtypes.int)-flatten(index_axes)
+    selected=UOp(Ops.REDUCE,dtypes.int,src=(equal.cast(dtypes.int)*coordinate,*index_axes),arg=(Ops.MAX,0))
+    output=out.index(0).store(UOp.const(count,dtypes.int)-selected)
 
-  image = _lower_uop_program(list(output.sink().toposort()))
-  assert image is not None and len(image.ew_ops) < 256 and image.execution_class is RKExecutionClass.NATIVE
-  assert not image.host_gathers and not image.host_scatters and decode_image(encode_image(image)) == image
-  assert _assert_decoded_image_bounds(image) == image
-  assert image.ew_ops[-1].dst == RKArg(RKBufferKind.ARG, 0)
+    image=_lower_uop_program(list(output.sink().toposort()))
+    assert image is not None and len(image.ew_ops)<2*count+256 and image.execution_class is RKExecutionClass.NATIVE
+    assert not image.host_gathers and not image.host_scatters and decode_image(encode_image(image))==image
+    assert _assert_decoded_image_bounds(image)==image and image.ew_ops[-1].dst==RKArg(RKBufferKind.ARG,0)
 
 
 def test_nested_static_reductions_materialize_load_addresses():
