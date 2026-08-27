@@ -17,16 +17,9 @@ RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 32, (1 << 16) - 1
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
-class RKLayout(IntEnum):
-  FP16 = 0; INT16 = 1; INT32 = 2
-  def itemsize(self) -> int: return 4 if self is RKLayout.INT32 else 2
 class RKExecutionClass(IntEnum): NATIVE = 0; HOST_ADDRESS = 1
 
 class RKArg(NamedTuple): kind: RKBufferKind; index: int; addend: int = 0  # type: ignore[assignment]
-
-class RKValue(NamedTuple):
-  """Typed value in one physical FP16, INT16, or INT32 carrier."""
-  arg: RKArg; dtype: DType; count: int; layout: RKLayout  # type: ignore[assignment]
 
 class RKScratch(NamedTuple): size: int; alignment: int = 4096
 
@@ -997,8 +990,8 @@ class RKContext:
   def __init__(self, output:RKOutput):
     self.store,self.out_param,self.count,self.out_index,self.root=output; self.out=RKArg(RKBufferKind.ARG,self.out_param.arg.slot)
     # Initialize per-context state before checking the root-derived layout.
-    self.values:dict[UOp,RKValue]={}; self.scratch:list[RKScratch]=[]; self.constants:dict[bytes,int]={}; self.materialized_slots:dict[tuple,int]={}  # noqa: E501
-    self.raw_components:dict[RKArg,tuple[RKValue,...]]={}
+    self.values:dict[UOp,UOp]={}; self.scratch:list[RKScratch]=[]; self.constants:dict[bytes,int]={}; self.materialized_slots:dict[tuple,int]={}  # noqa: E501
+    self.raw_components:dict[RKArg,tuple[UOp,...]]={}
     self.recipe_owners:dict[UOp,UOp]={}
     self.gathers:list[RKGather]=[]; self.host_gathers:list[RKHostAddress]=[]; self.mid_gathers:list[RKGather]=[]; self.post_gathers:list[RKGather]=[]  # noqa: E501
     self.ew_ops:list[RKEWOp] = []
@@ -1009,70 +1002,70 @@ class RKContext:
     wide_int=dynamic_int_load or any(node.op is Ops.CDIV and not _is_static_expr(node) for node in value_nodes) or False in cmod_support
     narrow_int=not wide_int and (self.root.dtype.scalar() is dtypes.int and int_range is not None and \
       -32768 <= int_range[0] <= int_range[1] <= 32767 or self.root.dtype.scalar() is not dtypes.int and bool(cmod_support))
-    self.int_layout = RKLayout.INT16 if narrow_int else RKLayout.INT32
+    self.int_layout = dtypes.int16 if narrow_int else dtypes.int
 
-  def _layout(self, dtype:DType) -> RKLayout:
-    if (layout:={dtypes.half:RKLayout.FP16, dtypes.float:RKLayout.FP16, dtypes.int16:RKLayout.INT16,
-      dtypes.uchar:RKLayout.INT16, dtypes.bool:RKLayout.INT16, dtypes.uint:RKLayout.INT32}.get(
+  def _layout(self, dtype:DType) -> DType:
+    if (layout:={dtypes.half:dtypes.half, dtypes.float:dtypes.half, dtypes.int16:dtypes.int16,
+      dtypes.uchar:dtypes.int16, dtypes.bool:dtypes.int16, dtypes.uint:dtypes.int}.get(
         dtype,self.int_layout if dtype is dtypes.int else None)) is None: raise _RKGenericReject(f"layout {dtype}")
     return layout
 
-  def _scratch(self, dtype:DType, layout:RKLayout, size:int|None=None, u:UOp|None=None) -> RKValue:
-    output_layout = {dtypes.half:RKLayout.FP16,dtypes.int16:RKLayout.INT16,dtypes.int:RKLayout.INT32}.get(dtype)
-    if (u is self.root or u is not None and self.recipe_owners.get(u) is self.root) and self.out_param.dtype.scalar() is dtype and layout is output_layout: return RKValue(self.out,dtype,self.count,layout)  # noqa: E501
-    self.scratch.append(RKScratch(size if size is not None else self.count*layout.itemsize() if layout is RKLayout.INT32 else _scratch_bytes(self.count)))  # noqa: E501
-    return RKValue(RKArg(RKBufferKind.SCRATCH, len(self.scratch)-1), dtype, self.count, layout)
+  def _carrier(self, arg:RKArg, dtype:DType) -> UOp: return UOp(Ops.NOOP,dtype,src=(UOp.const(0,dtype),),arg=arg)
 
-  def _slot(self, cache:dict, source:bytes|RKGather|tuple, dtype:DType, layout:RKLayout,
-            size:int|None=None, key:tuple|None=None) -> RKValue:
+  def _scratch(self, layout:DType, size:int|None=None, u:UOp|None=None) -> UOp:
+    if u is not None and (u is self.root or self.recipe_owners.get(u) is self.root) and self.out_param.dtype.scalar() is u.dtype.scalar() and \
+       layout is {dtypes.half:dtypes.half,dtypes.int16:dtypes.int16,dtypes.int:dtypes.int}.get(u.dtype.scalar()): return self._carrier(self.out,layout)  # noqa: E501
+    self.scratch.append(RKScratch(size if size is not None else self.count*layout.itemsize if layout is dtypes.int else _scratch_bytes(self.count)))  # noqa: E501
+    return self._carrier(RKArg(RKBufferKind.SCRATCH,len(self.scratch)-1),layout)
+
+  def _slot(self, cache:dict, source:bytes|RKGather|tuple, layout:DType, size:int|None=None, key:tuple|None=None) -> UOp:
     if isinstance(source, RKGather):
       plan, cache_key = source, typing_cast(bytes|tuple,("gather",layout,_gather_cache_key((source,))) if key is None else ("gather",key))
     elif isinstance(source, tuple):
-      plan = RKGather(0, 0, self.count, values=source, itemsize=layout.itemsize())
+      plan = RKGather(0, 0, self.count, values=source, itemsize=layout.itemsize)
       cache_key = ("static", layout, source)
     else:
       plan, cache_key = None, source
     if cache_key not in cache:
-      value = self._scratch(dtype, layout, size)
+      value = self._scratch(layout,size)
       if plan is not None: self.gathers.append(plan._replace(dst_index=value.arg.index))
       cache[cache_key] = value.arg.index
-    return RKValue(RKArg(RKBufferKind.SCRATCH, cache[cache_key]), dtype, self.count, layout)
+    return self._carrier(RKArg(RKBufferKind.SCRATCH,cache[cache_key]),layout)
 
-  def _constant(self, u:UOp, dtype_hint:DType|None=None) -> RKValue:
-    dtype, layout = dtype_hint or u.dtype.scalar(), self._layout(dtype_hint or u.dtype.scalar())
-    if layout is RKLayout.INT32: return self._slot(self.materialized_slots,(int(u.arg)&0xffffffff,)*self.count,dtype,layout)
-    bits = struct.pack("<e",float(u.arg)) if layout is RKLayout.FP16 else struct.pack("<H",_int16_bits(u.arg))
-    return self._slot(self.constants, bits, dtype, layout)
+  def _constant(self, u:UOp, dtype_hint:DType|None=None) -> UOp:
+    layout = self._layout(dtype_hint or u.dtype.scalar())
+    if layout is dtypes.int: return self._slot(self.materialized_slots,(int(u.arg)&0xffffffff,)*self.count,layout)
+    bits = struct.pack("<e",float(u.arg)) if layout is dtypes.half else struct.pack("<H",_int16_bits(u.arg))
+    return self._slot(self.constants,bits,layout)
 
-  def _operand(self, u:UOp, dtype:DType, finite_min:bool=False) -> RKValue:
+  def _operand(self, u:UOp, dtype:DType, finite_min:bool=False) -> UOp:
     if finite_min and u.op is Ops.LOAD and len(u.src)>2 and u.src[1].op is Ops.CONST and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0 and _is_static_expr(u.src[2]): return self._load(u,_fp16_bits(-65504.0))  # noqa: E501
     return self._constant(u, dtype) if u.op is Ops.CONST and \
       (u.dtype.scalar() in dtypes.weaks or dtype is dtypes.half and u.dtype.scalar() is dtypes.float) else self.lower(u)
 
-  def _static(self, u:UOp) -> RKValue:
+  def _static(self, u:UOp) -> UOp:
     dtype, layout = u.dtype.scalar(), self._layout(u.dtype.scalar())
     if not _index_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_expr(u,{},{})),dtype))
-    values = _static_values(self.out_index,u,self.count,_fp16_bits if layout is RKLayout.FP16 else int)
-    if dtype is dtypes.int and layout is RKLayout.INT16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
-    encoded = values if layout is RKLayout.FP16 else tuple(value&0xffffffff if layout is RKLayout.INT32 else _int16_bits(value) for value in values)
-    return self._slot(self.materialized_slots,encoded,dtype,layout)
+    values = _static_values(self.out_index,u,self.count,_fp16_bits if layout is dtypes.half else int)
+    if dtype is dtypes.int and layout is dtypes.int16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
+    encoded = values if layout is dtypes.half else tuple(value&0xffffffff if layout is dtypes.int else _int16_bits(value) for value in values)
+    return self._slot(self.materialized_slots,encoded,layout)
 
-  def _masked_load_default(self, u:UOp, dtype:DType, layout:RKLayout, gate:UOp|None, default:UOp,
-                           runtime_address:bool) -> RKValue:
+  def _masked_load_default(self, u:UOp, dtype:DType, layout:DType, gate:UOp|None, default:UOp,
+                           runtime_address:bool) -> UOp:
     """Overlay a static masked load on a separately materialized default."""
     if dtype not in (dtypes.half,dtypes.int16,dtypes.int,dtypes.uint) or gate is None or runtime_address: raise _RKGenericReject
     schedule, fallback = (len(self.ew_ops),len(self.mid_gathers),len(self.host_gathers)),self.lower(default)
-    if fallback.layout is not layout or fallback.count != self.count or \
-       schedule != (len(self.ew_ops),len(self.mid_gathers),len(self.host_gathers)): raise _RKGenericReject
+    if schedule != (len(self.ew_ops),len(self.mid_gathers),len(self.host_gathers)): raise _RKGenericReject
     if (plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=0)) is None: raise _RKGenericReject
-    value = self._scratch(dtype,layout,self.count*dtype.itemsize)
+    value = self._scratch(layout,self.count*dtype.itemsize)
     self.gathers.extend((RKGather(fallback.arg.index,value.arg.index,self.count,base=fallback.arg.addend//dtype.itemsize,
       axes=((1,self.count,1),),src_kind=fallback.arg.kind,itemsize=dtype.itemsize),
       plan.gather._replace(dst_index=value.arg.index,partial=True,itemsize=dtype.itemsize)))
     return value
 
   def _host_address_load(self, param:UOp, index:UOp, gate:UOp|None, address_loads:tuple[UOp, ...],
-                         dtype:DType, layout:RKLayout, fill_bits:int) -> RKValue:
+                         dtype:DType, layout:DType, fill_bits:int) -> UOp:
     """Materialize a proved dynamic address as explicit raw host movement."""
     if os.getenv("ROCKCHIP_HOST_GATHER","1") != "1" or \
        (address:=_runtime_load_address(index,self.out_index,self.count,address_loads)) is None: raise _RKGenericReject
@@ -1089,31 +1082,31 @@ class RKContext:
       offsets = tuple(candidates[candidate][lane] for lane in range(self.count) for candidate in range(index_limit))
       plan = RKGather(param.arg.slot,0,len(offsets),offsets=offsets,itemsize=dtype.itemsize)
       _validate_gather_bounds(plan,source_count)
-      source,source_count = self._slot(self.materialized_slots,plan,dtype,layout,len(offsets)*dtype.itemsize).arg,len(offsets)
+      source,source_count = self._slot(self.materialized_slots,plan,layout,len(offsets)*dtype.itemsize).arg,len(offsets)
       base,index_scale,lane_stride = 0,1,index_limit
-    value = self._scratch(dtype,layout,self.count*dtype.itemsize)
+    value = self._scratch(layout,self.count*dtype.itemsize)
     self.host_gathers.append(RKHostAddress(source,
       RKArg(RKBufferKind.ARG,address.param.arg.slot,address.offset*address.itemsize),value.arg,
       self.count,source_count,self.count,dtype.itemsize,address.itemsize,fill_bits,index_limit,base,index_scale,lane_stride))
     return value
 
-  def _fp32_load(self, plan:RKTypedLoadPlan) -> RKValue:
+  def _fp32_load(self, plan:RKTypedLoadPlan) -> UOp:
     """Convert gathered FP32 storage through the NPU's aligned FP16 input ABI."""
     groups = tuple(range(0,self.count,_EW_ELEMS_32BIT))
-    raw = self._slot(self.materialized_slots,plan.gather._replace(itemsize=4),dtypes.float,RKLayout.FP16,len(groups)*16,
+    raw = self._slot(self.materialized_slots,plan.gather._replace(itemsize=4),dtypes.half,len(groups)*16,
       ("fp32_raw",_gather_cache_key((plan.gather._replace(itemsize=4),))))
-    aligned,zero = self._scratch(dtypes.half,RKLayout.FP16,len(groups)*16),self._scratch(dtypes.float,RKLayout.FP16,16)
+    aligned,zero = self._scratch(dtypes.half,len(groups)*16),self._scratch(dtypes.half,16)
     self.gathers.append(RKGather(0,zero.arg.index,_EW_ELEMS_32BIT,values=(0,)*_EW_ELEMS_32BIT,itemsize=4))
     for group,start in enumerate(groups): self.ew_ops.append(RKEWOp(aligned.arg._replace(addend=group*16),
       raw.arg._replace(addend=group*16),zero.arg,min(_EW_ELEMS_32BIT,self.count-start),
       _EW_CFG[Ops.ADD]|_EW_STAGE_FP32_IN,stateful=True))
-    compact = self._scratch(dtypes.half,RKLayout.FP16,self.count*2)
+    compact = self._scratch(dtypes.half,self.count*2)
     self.mid_gathers.append(RKGather(aligned.arg.index,compact.arg.index,self.count,
       offsets=tuple((lane//_EW_ELEMS_32BIT)*8+lane%_EW_ELEMS_32BIT for lane in range(self.count)),
       src_kind=RKBufferKind.SCRATCH,after=len(self.ew_ops)))
-    return RKValue(compact.arg,dtypes.float,self.count,RKLayout.FP16)
+    return compact
 
-  def _load(self, u:UOp, fill_override:int|None=None) -> RKValue:
+  def _load(self, u:UOp, fill_override:int|None=None) -> UOp:
     dtype,layout = u.dtype.scalar(),self._layout(u.dtype.scalar())
     if not u.src or u.src[0].op is not Ops.INDEX or (param:=_root_param(u.src[0])) is None or \
        param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST: raise _RKGenericReject
@@ -1139,15 +1132,15 @@ class RKContext:
     if dtype is dtypes.bool:
       return self._slot(self.materialized_slots,plan.gather._replace(
         fill_bits=int(bool(default.arg)) if default is not None else 0,dst_stride=2,itemsize=1),
-        dtype,RKLayout.INT16,self.count*2)
+        dtypes.int16,self.count*2)
     if gate is None and index.key == self.out_index.key and int(plan.param.src[0].arg) == self.count:
-      return RKValue(RKArg(RKBufferKind.ARG,plan.param.arg.slot),dtype,self.count,layout)
+      return self._carrier(RKArg(RKBufferKind.ARG,plan.param.arg.slot),layout)
     return self._slot(self.materialized_slots,plan.gather._replace(itemsize=dtype.itemsize),
-      dtype,layout,self.count*dtype.itemsize)
+      layout,self.count*dtype.itemsize)
 
-  def _emit(self, dst:RKValue, lhs:RKValue, rhs:RKValue, cfg:int, *, compare:bool=False) -> RKValue:
-    integer16, integer32 = dst.layout is RKLayout.INT16, dst.layout is RKLayout.INT32
-    if lhs.layout is not dst.layout or rhs.layout is not dst.layout: raise _RKGenericReject
+  def _emit(self, dst:UOp, lhs:UOp, rhs:UOp, cfg:int, *, compare:bool=False) -> UOp:
+    integer16, integer32 = dst.dtype is dtypes.int16, dst.dtype is dtypes.int
+    if lhs.dtype is not dst.dtype or rhs.dtype is not dst.dtype: raise _RKGenericReject
     barrier = not integer16 and not integer32 and cfg in (_EW_CFG_FLOOR, _EW_CFG[Ops.FDIV])
     self.ew_ops.append(RKEWOp(dst.arg, lhs.arg, rhs.arg, self.count, cfg, submit_barrier=barrier,
       compare=compare, stateful=integer32 or not integer16 and (self.mask_program and not compare or barrier),
@@ -1160,154 +1153,121 @@ class RKContext:
       axes=((1, count if source_limit is None else source_limit, source_stride),), dst_stride=dst_stride, dst_addend=dst_addend,
       dst_kind=dest.kind, src_kind=source.kind, itemsize=itemsize, after=after)); return dest
 
-  def _raw(self, source:RKValue|Iterable[RKValue|RKArg], layout:RKLayout|None=None, *, u:UOp|None=None,
-           dst:RKValue|None=None, cache:bool=True, copy_wide:bool=True) -> Any:
-    if isinstance(source, RKValue):
+  def _raw(self, source:UOp|Iterable[UOp], layout:DType|None=None, *, u:UOp|None=None,
+           dst:UOp|None=None, cache:bool=True, copy_wide:bool=True) -> Any:
+    if isinstance(source,UOp):
       value = source
       if cache and value.arg in self.raw_components: return self.raw_components[value.arg]
-      itemsize, source = value.layout.itemsize(), value
+      itemsize = value.dtype.itemsize
       if itemsize == 4 and copy_wide:
-        source = self._scratch(dtypes.int, RKLayout.INT32)
+        source = self._scratch(dtypes.int)
         self._emit(source, value, value, _EW_CFG[Ops.MAX])
-      parts = tuple(self._scratch(dtypes.int16, RKLayout.INT16) for _ in range(itemsize))
+      parts = tuple(self._scratch(dtypes.int16) for _ in range(itemsize))
       for byte,part in enumerate(parts): self._byte_gather(source.arg, part.arg, self.count, base=source.arg.addend+byte, source_stride=itemsize,
                                                            dst_stride=2, itemsize=1, after=len(self.ew_ops))
       if cache: self.raw_components[value.arg] = parts
       return parts
     if layout is None or u is None: raise _RKGenericReject
-    parts = tuple(part if isinstance(part, RKValue) else RKValue(part, dtypes.int16, self.count, RKLayout.INT16) for part in source)
-    itemsize = layout.itemsize()
+    parts = tuple(source)
+    itemsize = layout.itemsize
     if len(parts) != itemsize: raise _RKGenericReject
-    result = self._scratch(u.dtype.scalar(), layout, u=u) if dst is None else dst
+    result = self._scratch(layout,u=u) if dst is None else dst
     for byte,part in enumerate(parts): self._byte_gather(part.arg, result.arg, self.count, base=part.arg.addend, source_stride=2,
                                                          dst_stride=itemsize, dst_addend=byte, itemsize=1, after=len(self.ew_ops))
     if cache: self.raw_components[result.arg] = parts
     return result
 
-  def _physical(self, value:RKValue|RKArg|UOp) -> UOp:
-    """Bind an existing physical carrier into an ordinary semantic UOp recipe."""
-    if isinstance(value,UOp): return value
-    arg,layout=(value.arg,value.layout) if isinstance(value,RKValue) else (value,RKLayout.INT16)
-    dtype={RKLayout.FP16:dtypes.half,RKLayout.INT16:dtypes.int16,RKLayout.INT32:dtypes.int}[layout]
-    node=UOp(Ops.NOOP,dtype,src=(UOp.const(0,dtype),),arg=arg)
-    self.values.setdefault(node,RKValue(arg,dtype,self.count,layout)); return node
+  def _lower_recipe(self, owner:UOp, recipe:UOp) -> UOp:
+    self.recipe_owners[recipe]=owner; return self.lower(recipe)
 
-  def _lower_recipe(self, owner:UOp, recipe:UOp, dtype:DType|None=None) -> RKValue:
-    self.recipe_owners[recipe]=owner; value=self.lower(recipe)
-    return value if dtype is None else value._replace(dtype=dtype)
+  def _bitplanes(self, value:UOp) -> tuple[UOp, ...]:
+    return tuple(itertools.chain.from_iterable(map(_byte_bits,self._raw(value,copy_wide=False))))
 
-  def _bitplanes(self, value:RKValue) -> tuple[UOp, ...]:
-    return tuple(itertools.chain.from_iterable(_byte_bits(self._physical(part)) for part in self._raw(value,copy_wide=False)))
-
-  def _pack_bits(self, bits:Iterable[UOp], layout:RKLayout, u:UOp) -> RKValue:
+  def _pack_bits(self, bits:Iterable[UOp], layout:DType, u:UOp) -> UOp:
     planes=tuple(bits)
-    if len(planes)!=layout.itemsize()*8: raise _RKGenericReject
+    if len(planes)!=layout.itemsize*8: raise _RKGenericReject
     raw=tuple(functools.reduce(lambda x,y:x.alu(Ops.ADD,y),
       (planes[byte*8+bit].alu(Ops.MUL,planes[byte*8+bit].const_like(1<<bit)) for bit in range(1,8)),planes[byte*8])
-      for byte in range(layout.itemsize()))
+      for byte in range(layout.itemsize))
     return self._raw(tuple(self.lower(part) for part in raw),layout,u=u)
 
-  def _alu(self, u:UOp) -> RKValue:
+  def _alu(self, u:UOp) -> UOp:
     if u.op in (Ops.RECIPROCAL, Ops.NEG):
       src = self.lower(u.src[0])
       if u.op is Ops.RECIPROCAL:
         one = self.lower(UOp.const(1.0, dtypes.half))
-        return self._emit(self._scratch(dtypes.half, RKLayout.FP16, u=u), one, src, _EW_CFG[Ops.FDIV])
-      return self._emit(self._scratch(u.dtype.scalar(), src.layout, u=u), src, src, _EW_CFG_NEG)
+        return self._emit(self._scratch(dtypes.half,u=u),one,src,_EW_CFG[Ops.FDIV])
+      return self._emit(self._scratch(src.dtype,u=u),src,src,_EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
     if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None:
       return self.lower(recipe)
     if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
       return self.lower(recipe)
     dtype, int_range = u.dtype.scalar(), _exact_int_range(u) if u.dtype.scalar() is dtypes.int else None
-    bounded = self.int_layout is RKLayout.INT32 or self.int_layout is RKLayout.INT16 and int_range is not None and \
+    bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and \
       -32768 <= int_range[0] <= int_range[1] <= 32767
     if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
     expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
     sources=tuple(UOp.const(-65504.0,dtypes.half) if finite_min and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg)<0 else src for src in u.src)  # noqa: E501
     lhs,rhs=(self._operand(src,dtype,finite_min) for src in sources)
-    if lhs.layout is not expected or rhs.layout is not expected: raise _RKGenericReject
-    left,right=self._physical(lhs),self._physical(rhs)
+    left,right=lhs,rhs
     if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:
-      if expected is not RKLayout.FP16: raise _RKGenericReject
+      if expected is not dtypes.half: raise _RKGenericReject
       zero=left.const_like(0.0)
       return self._lower_recipe(u,_positive_mask(left).alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,left))))
     if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
-      if expected is not RKLayout.FP16: return self._emit(self._scratch(dtype,RKLayout.INT16,u=u),lhs,rhs,_EW_CFG_MIN)
+      if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
       zero=left.const_like(0.0)
       return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,left).alu(Ops.MAX,zero.alu(Ops.SUB,right))))
     cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else \
       _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
-    return self._emit(self._scratch(dtype,expected,u=u),lhs,rhs,cfg,compare=compare)
+    return self._emit(self._scratch(expected,u=u),lhs,rhs,cfg,compare=compare)
 
-  def _convert(self, u:UOp|None, source:RKValue, dtype:DType, layout:RKLayout) -> RKValue:
+  def _convert(self, u:UOp|None, source:UOp, target:DType, barrier:bool=False) -> UOp:
     """Cross one physical carrier boundary using the native DPU conversion stage."""
-    if source.layout is layout: return source._replace(dtype=dtype)
-    pair, flags, cfg = (source.layout,layout), {}, _EW_CFG[Ops.MAX]
-    result=None if pair==(RKLayout.INT16,RKLayout.INT32) else self._scratch(dtype,layout,u=None if pair==(RKLayout.INT32,RKLayout.FP16) else u)  # noqa: E501
-    if pair == (RKLayout.FP16,RKLayout.INT16): rhs,flags=source.arg,dict(stateful=True,int16_output=True,submit_barrier=dtype in (dtypes.bool,dtypes.uchar))  # noqa: E501
-    elif pair == (RKLayout.FP16,RKLayout.INT32): rhs,flags=self._scratch(dtypes.int,RKLayout.INT32,(self.count+3)//4<<6).arg,dict(stateful=True,int32_output=True)  # noqa: E501
-    elif pair == (RKLayout.INT32,RKLayout.FP16): rhs,flags=self._scratch(dtypes.int,RKLayout.INT32,(self.count+3)//4<<6).arg,dict(int32_input=True)  # noqa: E501
-    elif pair == (RKLayout.INT16,RKLayout.INT32): rhs,flags,cfg=self._constant(UOp.const(0,dtypes.int16)).arg,dict(int16_input=True,int32_output=True),_EW_CFG[Ops.ADD]  # noqa: E501
-    else: raise _RKGenericReject(f"convert {source.layout.name}->{layout.name}")
-    if result is None: result=self._scratch(dtype,layout,u=u)
+    if source.dtype is target: return source
+    pair, flags, cfg = (source.dtype,target), {}, _EW_CFG[Ops.MAX]
+    result=None if pair==(dtypes.int16,dtypes.int) else self._scratch(target,u=None if pair==(dtypes.int,dtypes.half) else u)
+    if pair == (dtypes.half,dtypes.int16): rhs,flags=source.arg,dict(stateful=True,int16_output=True,submit_barrier=barrier)
+    elif pair == (dtypes.half,dtypes.int): rhs,flags=self._scratch(dtypes.int,(self.count+3)//4<<6).arg,dict(stateful=True,int32_output=True)  # noqa: E501
+    elif pair == (dtypes.int,dtypes.half): rhs,flags=self._scratch(dtypes.int,(self.count+3)//4<<6).arg,dict(int32_input=True)
+    elif pair == (dtypes.int16,dtypes.int): rhs,flags,cfg=self._constant(UOp.const(0,dtypes.int16)).arg,dict(int16_input=True,int32_output=True),_EW_CFG[Ops.ADD]  # noqa: E501
+    else: raise _RKGenericReject(f"convert {source.dtype}->{target}")
+    if result is None: result=self._scratch(target,u=u)
     self.ew_ops.append(RKEWOp(result.arg,source.arg,rhs,self.count,cfg,**flags)); return result
 
-  def _bool_binary(self, u:UOp) -> RKValue:
-    if len(u.src) != 2: raise _RKGenericReject
-    ordered=next(((expression,typing_cast(tuple[UOp,UOp],sources)) for expression,marker in (u.src,u.src[::-1])
-      if u.op is Ops.CMPNE and marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and expression.op is Ops.CMPLT
-      for sources in (tuple(_half_backed_value(src) for src in expression.src),) if all(src is not None for src in sources)),None)
-    if ordered is not None:
-      expression,sources=ordered; less=self.lower(expression)
-      if less.layout is not RKLayout.INT16: raise _RKGenericReject
-      nan=tuple(self._fp16_component_values(self._operand(src,dtypes.half))[2] for src in sources); one=self._physical(less).const_like(1)
-      return self._lower_recipe(u,one.alu(Ops.SUB,self._physical(less)).alu(Ops.MUL,
-        one.alu(Ops.SUB,nan[0].alu(Ops.MAX,nan[1]))),dtypes.bool)
-    values=tuple(self.lower(src) for src in u.src)
-    if any(value.dtype is not dtypes.bool or value.layout is not RKLayout.INT16 for value in values): raise _RKGenericReject
-    lhs,rhs=(self._physical(value) for value in values)
-    if u.op in (Ops.AND,Ops.OR): result=lhs.alu(Ops.MUL if u.op is Ops.AND else Ops.MAX,rhs)
-    if u.op in (Ops.XOR, Ops.CMPNE):
-      complement=next((other for source,other in zip(u.src,(rhs,lhs)) if source.op is Ops.CONST and bool(source.arg)),None)
-      result=lhs.const_like(1).alu(Ops.SUB,complement) if complement is not None else _i16_compare(Ops.CMPNE,lhs,rhs)
-    elif u.op is Ops.CMPEQ: result=_i16_compare(Ops.CMPEQ,lhs,rhs)
-    elif u.op not in (Ops.AND,Ops.OR): raise _RKGenericReject
-    return self._lower_recipe(u,result,dtypes.bool)
-
-  def _integer_bitwise(self, u:UOp) -> RKValue:
+  def _integer_bitwise(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
     dtype,layout=u.dtype.scalar(),self._layout(u.dtype.scalar())
     if dtype not in (dtypes.int16,dtypes.int) or u.op not in (Ops.AND,Ops.OR,Ops.XOR): raise _RKGenericReject
     if u.op is Ops.XOR and (pair:=next(((source,marker) for source,marker in (u.src,u.src[::-1])
       if marker.op is Ops.CONST and int(marker.arg)==-1),None)) is not None:
       value=self.lower(pair[0])
-      if value.layout is RKLayout.INT16: return self._lower_recipe(u,UOp.const(-1,dtypes.int16).alu(Ops.SUB,self._physical(value)))
-      inverted=tuple(self.lower(self._physical(component).const_like(255).alu(Ops.SUB,self._physical(component))) for component in self._raw(value))  # noqa: E501
-      return self._raw(inverted,RKLayout.INT32,u=u)
+      if value.dtype is dtypes.int16: return self._lower_recipe(u,UOp.const(-1,dtypes.int16).alu(Ops.SUB,value))
+      inverted=tuple(self.lower(component.const_like(255).alu(Ops.SUB,component)) for component in self._raw(value))
+      return self._raw(inverted,dtypes.int,u=u)
     masked=tuple(_const_operand(term,Ops.AND) for term in u.src) if dtype is dtypes.int16 and u.op is Ops.OR else ()
     if len(masked)==2 and all(pair is not None for pair in masked) and {int(typing_cast(tuple[UOp,UOp],pair)[1].arg)&0xffff for pair in masked}=={0x7fff,0x8000}:  # noqa: E501
       sources={int(typing_cast(tuple[UOp,UOp],pair)[1].arg)&0xffff:typing_cast(tuple[UOp,UOp],pair)[0] for pair in masked}
       (low,high),(_,sign_high)=(self._raw(self.lower(sources[mask])) for mask in (0x7fff,0x8000))
-      hi,shi=self._physical(high),self._physical(sign_high)
+      hi,shi=high,sign_high
       magnitude_sign=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))).alu(Ops.MUL,hi.const_like(128))
       sign=_i16_bit(shi.alu(Ops.SUB,shi.const_like(127))).alu(Ops.MUL,shi.const_like(128))
-      return self._raw(tuple(self.lower(part) for part in (self._physical(low),hi.alu(Ops.SUB,magnitude_sign).alu(Ops.ADD,sign))),layout,u=u)  # noqa: E501
+      return self._raw(tuple(self.lower(part) for part in (low,hi.alu(Ops.SUB,magnitude_sign).alu(Ops.ADD,sign))),layout,u=u)
     values = tuple(self.lower(source) for source in u.src)
-    if any(value.layout is not layout for value in values): raise _RKGenericReject
-    if not 1 <= self.count*layout.itemsize() <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
+    if not 1 <= self.count*layout.itemsize <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
     lhs_bits,rhs_bits=(self._bitplanes(value) for value in values)
     combined=tuple(left.alu(Ops.MUL,right) if u.op is Ops.AND else left.alu(Ops.MAX,right) if u.op is Ops.OR else
                    _i16_abs(left.alu(Ops.SUB,right))
                    for left,right in zip(lhs_bits,rhs_bits))
     return self._pack_bits(combined,layout,u)
 
-  def _int32_shift(self, u:UOp) -> RKValue:
+  def _int32_shift(self, u:UOp) -> UOp:
     if len(u.src) != 2 or u.dtype.scalar() not in (dtypes.int, dtypes.uint) or \
-       u.src[1].dtype.scalar() not in (dtypes.int, dtypes.uint) or self.int_layout is not RKLayout.INT32:
+       u.src[1].dtype.scalar() not in (dtypes.int, dtypes.uint) or self.int_layout is not dtypes.int:
       raise _RKGenericReject
-    if (value:=self.lower(u.src[0])).layout is not RKLayout.INT32: raise _RKGenericReject
+    value=self.lower(u.src[0])
     if self.count<1 or 16*((self.count*2+63)&-64)>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
     current=self._bitplanes(value); signed=u.op is Ops.SHR and u.dtype.scalar() is dtypes.int
     masks=() if u.src[1].op is Ops.CONST else self._bitplanes(self.lower(u.src[1]))[:5]
@@ -1318,45 +1278,57 @@ class RKContext:
         current[index+amount] if u.op is Ops.SHR and index+amount<32 else fill for index in range(32))
       current=shifted if not masks else tuple(old.alu(Ops.ADD,masks[bit].alu(Ops.MUL,new.alu(Ops.SUB,old)))
         for old,new in zip(current,shifted))
-    return self._pack_bits(current,RKLayout.INT32,u)
+    return self._pack_bits(current,dtypes.int,u)
 
-  def _compare(self, u:UOp) -> RKValue:
+  def _compare(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
-    if all(src.dtype.scalar() is dtypes.bool for src in u.src): return self._bool_binary(u)
+    if all(src.dtype.scalar() is dtypes.bool for src in u.src):
+      if (expression:=_inverted_condition(u,typed=True)) is not None and expression.op is Ops.CMPLT:
+        sources=tuple(_half_backed_value(src) for src in expression.src)
+      if expression is not None and expression.op is Ops.CMPLT and all(src is not None for src in sources):
+        less=self.lower(expression)
+        unordered=tuple(self._fp16_component_values(self._operand(src,dtypes.half))[2]
+                        for src in typing_cast(tuple[UOp,UOp],sources)); one=less.const_like(1)
+        return self._lower_recipe(u,one.alu(Ops.SUB,less).alu(Ops.MUL,one.alu(Ops.SUB,unordered[0].alu(Ops.MAX,unordered[1]))))
+      values=tuple(self.lower(src) for src in u.src)
+      lhs,rhs=values; op=Ops.AND if u.op is Ops.MUL else Ops.OR if u.op is Ops.MAX else u.op
+      if op in (Ops.AND,Ops.OR): result=lhs.alu(Ops.MUL if op is Ops.AND else Ops.MAX,rhs)
+      elif op in (Ops.XOR,Ops.CMPNE):
+        complement=next((other for source,other in zip(u.src,(rhs,lhs)) if source.op is Ops.CONST and bool(source.arg)),None)
+        result=lhs.const_like(1).alu(Ops.SUB,complement) if complement is not None else _i16_compare(Ops.CMPNE,lhs,rhs)
+      elif op is Ops.CMPEQ: result=_i16_compare(Ops.CMPEQ,lhs,rhs)
+      else: raise _RKGenericReject
+      return self._lower_recipe(u,result)
     if u.op is Ops.CMPNE and (u is self.root or any(src.op is Ops.INDEX for src in u.src)) and (nonzero:=_fp16_nonzero_mask(u)) is not None:  # noqa: E501
       value = self.lower(nonzero)
-      if value.layout is not RKLayout.FP16: raise _RKGenericReject
-      return self._convert(u,value,dtypes.bool,RKLayout.INT16)
+      return self._convert(u,value,dtypes.int16,True)
     nan:tuple[UOp,...]=()
     if all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
       int_sources = typing_cast(tuple[UOp, UOp], tuple(UOp.const(int(src.arg), dtypes.int) if src.dtype.scalar() is dtypes.weakint else src for src in u.src))  # noqa: E501
       half_sources=tuple(_half_int_expr(src) for src in int_sources)
-      if self.int_layout is RKLayout.INT16 and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
-      if self.int_layout is RKLayout.INT16: return self._lower_recipe(u,_i16_compare(u.op,*(self._physical(self._operand(src,dtypes.int)) for src in int_sources)),dtypes.bool)  # noqa: E501
+      if self.int_layout is dtypes.int16 and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
+      if self.int_layout is dtypes.int16: return self._lower_recipe(u,_i16_compare(u.op,*(self._operand(src,dtypes.int) for src in int_sources)))  # noqa: E501
       values=tuple(self._operand(src,dtypes.int) for src in int_sources)
-      if any(value.layout is not RKLayout.INT32 for value in values): raise _RKGenericReject
-      components=tuple(tuple(self._physical(part) for part in self._raw(value)) for value in values)
+      components=tuple(self._raw(value) for value in values)
       if u.op is Ops.CMPLT: components=tuple((_sign_bias(parts[3]),*parts[2::-1]) for parts in components)
-    elif all(src.dtype.scalar() is dtypes.int16 for src in u.src): return self._lower_recipe(u,_i16_compare(u.op,*(self._physical(self._operand(src,dtypes.int16)) for src in u.src)),dtypes.bool)  # noqa: E501
+    elif all(src.dtype.scalar() is dtypes.int16 for src in u.src): return self._lower_recipe(u,_i16_compare(u.op,*(self._operand(src,dtypes.int16) for src in u.src)))  # noqa: E501
     else:
       half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
       values=tuple(self._operand(src,dtypes.half) for src in typing_cast(tuple[UOp,UOp],half_sources))
-      if any(value.layout is not RKLayout.FP16 for value in values): raise _RKGenericReject
       nan=tuple(self._fp16_component_values(value)[2] for value in values)
       components=tuple(self._fp16_ordered_values(value) if u.op is Ops.CMPLT else
-        (self._physical(parts[0]),parts[1]) for value in values for parts in (self._fp16_component_values(value),))
+        (parts[0],parts[1]) for value in values for parts in (self._fp16_component_values(value),))
     result=_ordered_bits(*components) if u.op is Ops.CMPLT else functools.reduce(
       lambda equal,pair:equal.alu(Ops.MUL,_i16_equal(*pair)),zip(*components),components[0][0].const_like(1))
     if nan: result=result.alu(Ops.MUL,result.const_like(1).alu(Ops.SUB,nan[0].alu(Ops.MAX,nan[1])))
     if u.op is Ops.CMPNE: result=result.const_like(1).alu(Ops.SUB,result)
-    return self.lower(result)._replace(dtype=dtypes.bool)
+    return self.lower(result)
 
-  def _int32_divmod(self, u:UOp) -> RKValue:
+  def _int32_divmod(self, u:UOp) -> UOp:
     if len(u.src) != 2 or not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
     values = tuple(self._operand(src, dtypes.int) for src in u.src)
-    if any(value.layout is not RKLayout.INT32 for value in values): raise _RKGenericReject
-    raw=tuple(tuple(self._physical(part) for part in self._raw(value)) for value in values)
+    raw=tuple(self._raw(value) for value in values)
     signs=tuple(_i16_bit(value[3].alu(Ops.SUB,value[3].const_like(127))) for value in raw)
     numerator,denominator=(_twos_complement(value,sign) for value,sign in zip(raw,signs))
     denominator_nonzero=functools.reduce(lambda x,y:x.alu(Ops.MAX,y),map(_i16_bit,denominator))
@@ -1378,26 +1350,25 @@ class RKContext:
       quotient[byte_index]=quotient[byte_index].alu(Ops.ADD,ge.alu(Ops.MUL,zero.const_like(weight)))
     quotient_raw, remainder_raw, remainder_sign, quotient_sign = tuple(quotient),tuple(remainder),signs[0],_i16_abs(signs[0].alu(Ops.SUB,signs[1]))
     packed_raw, sign = (quotient_raw, quotient_sign) if u.op is Ops.CDIV else (remainder_raw, remainder_sign)
-    return self._raw(tuple(self.lower(value) for value in _twos_complement(packed_raw,sign)),RKLayout.INT32,u=u)
+    return self._raw(tuple(self.lower(value) for value in _twos_complement(packed_raw,sign)),dtypes.int,u=u)
 
-  def _fp16_component_values(self, value:RKValue) -> tuple[RKValue, UOp, UOp]:
+  def _fp16_component_values(self, value:UOp) -> tuple[UOp, UOp, UOp]:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
-    if value.layout is not RKLayout.FP16: raise _RKGenericReject
-    low,high=self._raw(value); lo,hi=self._physical(low),self._physical(high)
+    lo,hi=self._raw(value)
     sign_scale=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))).alu(Ops.MUL,hi.const_like(128)); magnitude=hi.alu(Ops.SUB,sign_scale)
     clean=hi.alu(Ops.SUB,sign_scale.alu(Ops.MUL,_i16_equal(magnitude,magnitude.const_like(0)).alu(Ops.MUL,_i16_equal(lo,lo.const_like(0)))))
     exponent=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(123)))
     mantissa=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(124))).alu(Ops.MAX,_i16_min(lo,lo.const_like(1)))
-    return low,clean,exponent.alu(Ops.MUL,mantissa)
+    return lo,clean,exponent.alu(Ops.MUL,mantissa)
 
-  def _fp16_ordered_values(self, value:RKValue) -> tuple[UOp, UOp]:
+  def _fp16_ordered_values(self, value:UOp) -> tuple[UOp, UOp]:
     """Map a classified FP16 lane to two unsigned bytes whose lexical order is IEEE numeric order."""
-    low,hi,_=self._fp16_component_values(value); lo=self._physical(low)
+    lo,hi,_=self._fp16_component_values(value)
     sign=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))); positive=hi.alu(Ops.ADD,hi.const_like(128))
     high_delta=hi.const_like(255).alu(Ops.SUB,hi).alu(Ops.SUB,positive); low_delta=lo.const_like(255).alu(Ops.SUB,lo).alu(Ops.SUB,lo)
     return positive.alu(Ops.ADD,sign.alu(Ops.MUL,high_delta)),lo.alu(Ops.ADD,sign.alu(Ops.MUL,low_delta))
 
-  def _threshold_where(self, u:UOp) -> RKValue|None:
+  def _threshold_where(self, u:UOp) -> UOp|None:
     """Build a cheap FP16 0/1 predicate for a finite-threshold mask while excluding unordered lanes.
     Select a compared value or finite constant without multiplying an inactive nonfinite value."""
     gate = _unwrap_condition(u.src[0])
@@ -1405,32 +1376,28 @@ class RKContext:
     lhs, yes, no = gate.src[0], *(_unwrap_condition(src) for src in u.src[1:])
     if not (yes.key == lhs.key and no.op is Ops.CONST and math.isfinite(float(no.arg)) and float(no.arg) != float(gate.src[1].arg) or no.key == lhs.key and yes.op is Ops.CONST and math.isfinite(float(yes.arg)) and float(yes.arg) != float(gate.src[1].arg)): return None  # noqa: E501
     value = self.lower(lhs.cast(dtypes.half))
-    if value.layout is not RKLayout.FP16: raise _RKGenericReject
     selector = self.lower(_positive_mask(gate.src[1].cast(dtypes.half).alu(Ops.SUB, lhs.cast(dtypes.half))))
-    if selector.layout is not RKLayout.FP16 or selector.dtype is not dtypes.half: raise _RKGenericReject
     nan = self._fp16_component_values(value)[2]
-    selector_uop=self._physical(self._convert(None,selector,dtypes.bool,RKLayout.INT16)); nan_uop=self._physical(nan)
-    return self._raw_where(u,self.lower(selector_uop.alu(Ops.MUL,nan_uop.const_like(1).alu(Ops.SUB,nan_uop)))._replace(dtype=dtypes.bool))
+    selector=self._convert(None,selector,dtypes.int16,True)
+    return self._raw_where(u,self.lower(selector.alu(Ops.MUL,nan.const_like(1).alu(Ops.SUB,nan))))
 
-  def _raw_where(self, u:UOp, selector:RKValue|None=None) -> RKValue:
+  def _raw_where(self, u:UOp, selector:UOp|None=None) -> UOp:
     """Select typed values through one canonical INT16 mask, preserving nonfinite arms as raw bytes."""
     yes, no = (self.lower(src) for src in u.src[1:])
-    if yes.layout is not no.layout or not isinstance(yes.layout, RKLayout): raise _RKGenericReject
     if selector is None: selector = self.lower(u.src[0])
-    if selector.dtype is not dtypes.bool or selector.layout is not RKLayout.INT16: raise _RKGenericReject
-    if yes.layout is RKLayout.INT16:
-      return self._lower_recipe(u,_i16_select(*(self._physical(value) for value in (selector,yes,no))),u.dtype.scalar())
-    mask=self._physical(selector); yes_bytes,no_bytes=(self._raw(x,cache=False,copy_wide=False) for x in (yes,no))
-    selected_bytes=[self.lower((n:=self._physical(no_byte)).alu(Ops.ADD,mask.alu(Ops.MUL,self._physical(yes_byte).alu(Ops.SUB,n)))) for yes_byte,no_byte in zip(yes_bytes,no_bytes)]  # noqa: E501
-    return self._raw(selected_bytes, yes.layout, u=u, dst=self._scratch(u.dtype.scalar(), yes.layout), cache=False)
+    if yes.dtype is dtypes.int16: return self._lower_recipe(u,_i16_select(selector,yes,no))
+    yes_bytes,no_bytes=(self._raw(x,cache=False,copy_wide=False) for x in (yes,no))
+    selected_bytes=[self.lower((n:=no_byte).alu(Ops.ADD,selector.alu(Ops.MUL,yes_byte.alu(Ops.SUB,n))))
+                    for yes_byte,no_byte in zip(yes_bytes,no_bytes)]
+    return self._raw(selected_bytes,yes.dtype,u=u,dst=self._scratch(yes.dtype),cache=False)
 
-  def _where(self, u:UOp) -> RKValue:
+  def _where(self, u:UOp) -> UOp:
     if len(u.src) != 3: raise _RKGenericReject
     if u is self.root and u.dtype.scalar() is dtypes.uchar and (source:=_typed_cast_source(u.src[1],dtypes.uchar,dtypes.half)) is not None and (condition:=u.src[0]).op is Ops.CMPLT and condition.src[0].op is Ops.CONST and float(condition.src[0].arg)==0.0 and condition.src[1].key==source.key and u.src[2].op is Ops.CONST and int(u.src[2].arg)==0:  # noqa: E501
       return self.lower(source.alu(Ops.MAX,UOp.const(0.0,dtypes.half)).cast(dtypes.uchar))
     if u is self.root and u.dtype.scalar() is dtypes.int and all(arm.op is Ops.CONST and -32768<=int(arm.arg)<=32767 for arm in u.src[1:]):  # noqa: E501
       selector=self.lower(u.src[0]); yes,no=(self._constant(UOp.const(int(arm.arg),dtypes.int16)) for arm in u.src[1:])
-      return self._convert(u,self._lower_recipe(u,_i16_select(*(self._physical(value) for value in (selector,yes,no))),u.dtype.scalar()),dtypes.int,RKLayout.INT32)  # noqa: E501
+      return self._convert(u,self._lower_recipe(u,_i16_select(selector,yes,no)),dtypes.int)
     if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
       dtype = u.dtype.scalar()
       routes:dict[UOp, list[bool]] = {}
@@ -1441,20 +1408,19 @@ class RKContext:
             route(child, tuple(live and pick for live,pick in zip(active, take)))
         else: routes[node] = [old or live for old,live in zip(routes.get(node, [False]*self.count), active)]
       route(u, (True,)*self.count)
-      expected, itemsize = RKLayout.FP16 if dtype is dtypes.half else RKLayout.INT16, dtype.itemsize
+      expected, itemsize = dtype, dtype.itemsize
       for partial,(leaf,mask) in enumerate(routes.items()):
         value=self._operand(leaf,dtype,dtype is dtypes.half and leaf.op is Ops.LOAD and (param:=_root_param(leaf.src[0])) is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg)<self.count)  # noqa: E501
-        if value.layout is not expected: raise _RKGenericReject
         offsets = tuple(value.arg.addend//itemsize+i if take else -1 for i,take in enumerate(mask))
         self.post_gathers.append(RKGather(value.arg.index, self.out_param.arg.slot, self.count, offsets=offsets,
           partial=bool(partial), dst_kind=RKBufferKind.ARG, src_kind=value.arg.kind, itemsize=itemsize))
-      return RKValue(self.out, dtype, self.count, expected)
+      return self._carrier(self.out,expected)
     if (threshold:=self._threshold_where(u)) is not None: return threshold
     for fold in (_fold_where_abs, _fold_ordered_where):
       if (recipe:=fold(u)) is not None: return self.lower(recipe)
     return self._raw_where(u)
 
-  def _cast(self, u:UOp) -> RKValue:
+  def _cast(self, u:UOp) -> UOp:
     dtype, source_dtype = u.dtype.scalar(), u.src[0].dtype.scalar()
     if dtype in (dtypes.bool,dtypes.uchar) and source_dtype is not dtypes.half or \
        dtype is dtypes.float and source_dtype not in (dtypes.half,dtypes.int,dtypes.bool) or \
@@ -1474,17 +1440,17 @@ class RKContext:
       source=self._load(u.src[0]) if u.src[0].op is Ops.LOAD else self.lower(_fp32_expr_to_half(u.src[0]))
     elif dtype is dtypes.half and source_dtype is dtypes.int and (recipe:=_half_int_expr(u.src[0])) is not None: source=self.lower(recipe)
     else: source=self.lower(source_u)
-    if source_dtype is dtypes.int and source.layout is RKLayout.INT16 and dtype in (dtypes.half,dtypes.float):
-      source=self._convert(u.src[0],source,dtypes.int,RKLayout.INT32)
-    if dtype in (dtypes.int16,dtypes.uint) and source.layout is not self._layout(dtype): raise _RKGenericReject
-    return self._convert(u,source,dtype,self._layout(dtype))
+    if source_dtype is dtypes.int and source.dtype is dtypes.int16 and dtype in (dtypes.half,dtypes.float):
+      source=self._convert(u.src[0],source,dtypes.int)
+    if dtype in (dtypes.int16,dtypes.uint) and source.dtype is not self._layout(dtype): raise _RKGenericReject
+    return self._convert(u,source,self._layout(dtype),dtype in (dtypes.bool,dtypes.uchar))
 
-  def _finish_value(self, result:RKValue, dtype:DType) -> None:
-    if dtype is dtypes.int and result.layout is RKLayout.INT16: result=self._convert(self.root,result,dtype,RKLayout.INT32)
-    expected=RKLayout.INT32 if dtype is dtypes.int else self._layout(dtype)
-    if result.layout is not expected: raise _RKGenericReject
+  def _finish_value(self, result:UOp, dtype:DType) -> None:
+    if dtype is dtypes.int and result.dtype is dtypes.int16: result=self._convert(self.root,result,dtypes.int)
+    expected=dtypes.int if dtype is dtypes.int else self._layout(dtype)
+    if result.dtype is not expected: raise _RKGenericReject
     if dtype is dtypes.float:
-      groups=tuple(range(0,self.count,_EW_ELEMS_32BIT)); aligned,split=self._scratch(dtypes.half,RKLayout.FP16,len(groups)*16),len(self.ew_ops)
+      groups=tuple(range(0,self.count,_EW_ELEMS_32BIT)); aligned,split=self._scratch(dtypes.half,len(groups)*16),len(self.ew_ops)
       for group,start in enumerate(groups):
         lanes=min(_EW_ELEMS_32BIT,self.count-start); self.mid_gathers.append(RKGather(result.arg.index,aligned.arg.index,lanes,
           offsets=tuple(result.arg.addend//2+lane for lane in range(start,start+lanes)),dst_addend=group*8,src_kind=result.arg.kind,after=split))  # noqa: E501
@@ -1492,13 +1458,14 @@ class RKContext:
           _EW_CFG[Ops.MAX]|_EW_STAGE_FP32_OUT))
       return
     if result.arg == self.out: return
-    if dtype in (dtypes.half,dtypes.int16): self._emit(RKValue(self.out,dtype,self.count,expected),result,result,_EW_CFG[Ops.MAX]); return
+    if dtype in (dtypes.half,dtypes.int16): self._emit(self._carrier(self.out,expected),result,result,_EW_CFG[Ops.MAX]); return
     source=result.arg._replace(addend=result.arg.addend//4) if dtype is dtypes.int else result.arg
     self.post_gathers.append(_raw_gather(source,self.out_param.arg.slot,self.count,stride=1 if dtype is dtypes.int else 2,
       itemsize=dtype.itemsize,src_kind=source.kind))
 
-  def lower(self, u:UOp) -> RKValue:
+  def lower(self, u:UOp) -> UOp:
     if u in self.values: return self.values[u]
+    if u.op is Ops.NOOP and isinstance(u.arg,RKArg): return u
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
     elif (dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool, dtypes.uchar) and u in self.semantic_nodes and _is_static_expr(u) and  # noqa: E501
@@ -1507,30 +1474,27 @@ class RKContext:
     elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
     elif u.op is Ops.BITCAST and len(u.src) == 1:
       source = self.lower(u.src[0])
-      if dtype is dtypes.int16 and u.src[0].dtype.scalar() is dtypes.half and source.layout is RKLayout.FP16:
-        value = RKValue(source.arg, dtype, self.count, RKLayout.INT16)
-      elif dtype is dtypes.half and u.src[0].dtype.scalar() is dtypes.int16 and source.layout is RKLayout.INT16:
-        value = RKValue(source.arg, dtype, self.count, RKLayout.FP16)
+      if dtype is dtypes.int16 and u.src[0].dtype.scalar() is dtypes.half and source.dtype is dtypes.half:
+        value = self._carrier(source.arg,dtypes.int16)
+      elif dtype is dtypes.half and u.src[0].dtype.scalar() is dtypes.int16 and source.dtype is dtypes.int16:
+        value = self._carrier(source.arg,dtypes.half)
       else: raise _RKGenericReject(f"bitcast {u.src[0].dtype.scalar()}->{dtype}")
       if u is self.root and value.arg != self.out:
         self.post_gathers.append(_raw_gather(value.arg._replace(addend=value.arg.addend//2), self.out_param.arg.slot, self.count,
                                              stride=1, itemsize=2, src_kind=value.arg.kind))
-        value = RKValue(self.out, dtype, self.count, value.layout)
+        value = self._carrier(self.out,value.dtype)
     elif u.op is Ops.CAST and len(u.src) == 1: value=self._cast(u)
-    elif dtype is dtypes.bool and u.op in (Ops.MUL, Ops.MAX):
-      value = self._bool_binary(UOp(Ops.AND if u.op is Ops.MUL else Ops.OR, dtype, src=u.src))
+    elif dtype is dtypes.bool and u.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR,Ops.XOR): value=self._compare(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ): value = self._compare(u)
-    elif u.op in (Ops.AND, Ops.OR, Ops.XOR) and dtype in (dtypes.bool, dtypes.int16, dtypes.int):
-      value = self._bool_binary(u) if dtype is dtypes.bool else self._integer_bitwise(u)
+    elif u.op in (Ops.AND,Ops.OR,Ops.XOR) and dtype in (dtypes.int16,dtypes.int): value=self._integer_bitwise(u)
     elif u.op in (Ops.SHL, Ops.SHR) and dtype in (dtypes.int, dtypes.uint): value = self._int32_shift(u)
-    elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is RKLayout.INT16 and (recipe:=_half_int_expr(u)) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
-    elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not RKLayout.INT16): value=self._int32_divmod(u)  # noqa: E501
+    elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is dtypes.int16 and (recipe:=_half_int_expr(u)) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
+    elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not dtypes.int16): value=self._int32_divmod(u)  # noqa: E501
     elif u.op is Ops.WHERE: value = self._where(u)
     elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) and len(u.src) == 1 and dtype is dtypes.half and \
          (recipe:=_DPU_MATH[u.op](u.src[0])) is not None:
       value = self.lower(_physical_recipe(recipe,(u.src[0],)))
-      if value.layout is not RKLayout.FP16: raise _RKGenericReject
     else: raise _RKGenericReject(f"uop {u.op.name} {dtype}")
     return self.values.setdefault(u, value)
 

@@ -7,7 +7,7 @@ from tinygrad import Tensor
 from tinygrad.codegen import expand_horizontal_reduce, to_program, to_program_cache
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Context, Target
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKExecutionClass, RKImage, RKLayout, RKTarget, RKValue, RKEWOp,
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKExecutionClass, RKImage, RKTarget, RKEWOp,
   RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _EW_STAGE_FP32_IN, _EW_STAGE_FP32_OUT, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
@@ -383,9 +383,12 @@ def test_exact_integer_range_analysis_covers_supported_carriers_only():
   assert tuple(map(rockchip_renderer._exact_int_range,expressions)) == ((0,3),(-6,3),(-5,3),(-4,-1),(1,1),None)
 
 
-def test_rkvalue_is_the_typed_physical_abi():
-  value = RKValue(RKArg(RKBufferKind.ARG, 0), dtypes.half, 1, RKLayout.FP16)
-  assert value.dtype is dtypes.half and value.count == 1 and value.layout is RKLayout.FP16
+def test_uop_is_the_typed_physical_abi():
+  program = _program(dtypes.half, lambda _:UOp.const(0.0,dtypes.half), 1)
+  output=rockchip_renderer._outs(program)[0]
+  assert output is not None
+  value = rockchip_renderer.RKContext(output)._carrier(RKArg(RKBufferKind.ARG,0),dtypes.half)
+  assert value.op is Ops.NOOP and value.dtype is dtypes.half and value.arg == RKArg(RKBufferKind.ARG,0)
 
 
 def test_submit_retries_once_after_driver_timeout(monkeypatch):

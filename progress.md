@@ -8254,6 +8254,56 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-27 — physical values are UOps at 1,630 lines
+
+This hardware-accepted architecture rewrite follows `d9a0c5871`.  Its
+predeclared executable renderer budget was at most **+83/-115, net -32**:
+replace `RKLayout`, `RKValue`, `_physical`, and `_bool_binary` with
+`RKContext._carrier` plus rewritten physical helpers and BOOL ownership in
+`_compare`.  The authoritative result meets that budget exactly: renderer
+**1662 -> 1630** and repository total **27168 -> 27136** (**-32**), while
+runtime remains **442**.  The raw renderer diff is **+162/-198 physical
+lines**; comments and docstrings were not targeted for size reduction.
+
+Physical values are no longer represented twice.  A carrier is now an
+ordinary `Ops.NOOP` UOp whose existing `dtype` records the actual HALF,
+INT16, or INT32 storage and whose `arg` is the existing `RKArg`.  `RKContext`
+stores those UOps directly, so recipes can consume physical values without
+wrapping each `RKValue(dtype,count,layout)` through `_physical`.  `_scratch`,
+`_slot`, constants, typed loads, byte planes, conversions, casts, WHERE,
+comparisons, division, and output finishing all share that one
+representation.  `_compare` also owns BOOL AND/OR/XOR/equality recipes, making
+the separate `_bool_binary` dispatcher obsolete.
+
+This is a deletion of the backend's parallel value/layout IR, not a new
+generic framework or a shape-specific shortcut.  Semantic Tinygrad UOps
+still enter the actual production `Tensor.schedule_linear -> to_program ->
+RKImage` path; no renderer bypass, wire/runtime field, CPU/GPU numeric
+fallback, or arithmetic recipe was added.  Physical invariants remain
+centralized at `_layout`, `_convert`, `_emit`, and `_finish_value`; repeated
+interior `.layout` assertions became obsolete once an invalid wrapper state
+could no longer be constructed.  The former wrapper ABI unit test was
+replaced, not removed: it now pins `Ops.NOOP`, the physical dtype, and
+`RKArg`, and the module still contains and passes all **158** cases.
+
+Final host verification reports **158/158 passed in 27.06 seconds** with
+`-q -n12`, repository-wide Ruff success, mypy success in **216 source files**,
+clean diff checks, and exact candidate/shared SHA-256 equality for both
+changed files at promotion.  The authoritative candidate-pinned
+`.venv/bin/python ~/rk3588/examples/simple_add.py` health gate passed before
+and after the final census with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
+The uninterrupted final production census actually executed all **445**
+top-level cases with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and
+pytest `-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed**
+in **1022.32 seconds (17:02)** with zero failures.  Its slowest cases were
+`test_avg_pool3d` at **62.12 seconds**, list fancy indexing at **37.12
+seconds**, and injected-dimension fancy indexing at **35.43 seconds**.  An
+earlier complete 433/12/154 run preceded a final readability-only source
+change and is explicitly not counted as acceptance; the reported run used
+the exact promoted executable source.
+
 ## 2026-08-27 — dependent extrema share mapped reduction ownership at 1,662 lines
 
 This hardware-accepted milestone follows `9412dadbf`.  Its predeclared
