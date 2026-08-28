@@ -2488,7 +2488,7 @@ def test_large_divided_range_address_uses_compact_gather_axes():
   assert set(plan.axes) == {(1, 64, 1), (4096, 256, 1024)}
 
 
-def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_out(monkeypatch):
+def test_dynamic_host_gather_is_explicit_and_direct_scatter_fails_closed(monkeypatch):
   monkeypatch.delenv("ROCKCHIP_HOST_GATHER", raising=False)
   indices = UOp.param(2, dtypes.int, (4,))
   axis = UOp.range(4, 0)
@@ -2504,10 +2504,7 @@ def test_dynamic_host_gather_and_scatter_are_explicit_and_opt_out(monkeypatch):
   scatter_out, scatter_source = UOp.param(0, dtypes.half, (8,)), UOp.param(1, dtypes.half, (4,))
   scatter = scatter_out.index(indices.index(axis).load()).store(scatter_source.index(axis).load())
   scatter_uops = list(scatter.end(axis).sink().toposort())
-  scatter_image = _lower_uop_program(scatter_uops)
-  assert scatter_image is not None and bool(_runtime_gathers(scatter_image))
-  assert len(_runtime_gathers(scatter_image,True)) == 1 and not _runtime_gathers(scatter_image,False)
-  assert decode_image(encode_image(scatter_image)) == scatter_image
+  assert _lower_uop_program(scatter_uops) is None
 
   monkeypatch.setenv("ROCKCHIP_HOST_GATHER", "0")
   assert _lower_uop_program(gather_uops) is None and _lower_uop_program(scatter_uops) is None

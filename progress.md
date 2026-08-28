@@ -8254,6 +8254,63 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — cache CMAC views and retire direct host scatter at 1,638 combined lines
+
+This hardware-accepted cleanup follows `62252517d`.  Its two declared changes
+were a **+3 executable-line** CMAC planning repair and a **+0/-12 executable-line**
+gather-ownership cleanup; the subsequent mypy name repair was **+0/-0**.  Final
+authoritative `sz.py` moves renderer **1417 -> 1409**, runtime **230 -> 229**,
+their combined size **1647 -> 1638**, and repository total **26711 -> 26702**
+(**-9**).  The raw production diff is **+18/-29 physical lines**.
+
+`_lower_cmac_reduce.plan_offsets` replaces repeated scalar reconstruction of an
+affine gather address with one cached NumPy lane vector per gather pattern.
+The proof and packed CMAC addresses are unchanged; only host-side planning is
+vectorized.  On actual hardware this moves
+`TestRockchipConvOps::test_large_input_conv2d` from **73.61 seconds to 5.35
+seconds** (about **13.8x**) without adding a numeric fallback or bypassing
+production `to_program`.
+
+Runtime-index `RKGather` now has one direction and one owner: source ARG to
+destination SCRATCH.  `_validate_image` enforces that contract,
+`RockchipProgram.apply_gathers` performs only that gather, and its cursor is the
+first non-gather operation.  The parallel `_lower_host_scatter` admission and
+runtime scatter branch are deleted.  Census route tracing had admitted direct
+host scatter **0 times** while rejecting it **1,025 times**; production scatter
+semantics remain covered through the existing dense output reconstruction.
+The synthetic direct-scatter fixture now asserts fail-closed behavior rather
+than preserving an unused second ownership direction.  The unused
+`vector_products` parameter was removed from `_lower_cmac_reduce` and
+`_lower_reduction` at the same boundary.
+
+The complete Rockchip UOp module executes **161/161 passed** in **23.30
+seconds** with `-q -n12`.  Mypy reports success in **216 source files**,
+repository-wide Ruff passes, and diff checks are clean.  Final SHA-256 values
+are renderer
+`5e4ba19a4663da59ed1f3273c557481cffee8c232c948c5b93695287b7dd63fe`,
+runtime
+`0f10d5f75a4654e4902ab6babfeb62e8028a4aa6d43c66965d268f8cf95ed12a`,
+and unit module
+`ae44b442ea728369444b50f279cb9b416167f7ec4f3fb3cd28b81358c7f8df5c`.
+
+The final uninterrupted production `Tensor -> schedule_linear -> to_program`
+hardware census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**786.83 seconds (13:06)** with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before and after
+with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
+One earlier source-equivalent full run after the identifier-only mypy repair
+reported a single gross `test_silu` misexecution.  It was not accepted and no
+retry, tolerance, or lowering workaround was added.  After reboot, the health
+gate, isolated SiLU, its three preceding sigmoid cases in one process, the
+complete 445-case census, and the post-run health gate all passed.  A still
+earlier full run before the identifier-only repair also passed all 445 cases in
+**791.76 seconds**.  The anomaly is therefore recorded as non-deterministic
+device state, not represented as a source fix.
+
 ## 2026-08-28 — unify static evaluation, CMAC shaping, and device arenas at 1,647 combined lines
 
 This hardware-accepted renderer/runtime rewrite follows `b670bc07f`.  The
