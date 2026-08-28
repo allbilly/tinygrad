@@ -8,10 +8,10 @@ from tinygrad.codegen import expand_horizontal_reduce, to_program, to_program_ca
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Context, Target
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
-  RKGather, RKScratch,
+  RKGather,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _static_lanes,
-  _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image, patch_stage)
+  _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 import tinygrad.renderer.rockchip as rockchip_renderer
 from tinygrad.uop.ops import AxisType, Ops, UOp
@@ -148,7 +148,7 @@ def _apply_test_gather(gather:RKGather, buffer, linear:dict[int,np.ndarray]) -> 
 
 def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -> bytes:
   """Execute the selector's raw gathers plus native INT16 mask/reduction subset."""
-  args, scratch = [bytearray(output_bytes), *(bytearray(value) for value in inputs)], [bytearray(spec.size) for spec in image.scratch]
+  args, scratch = [bytearray(output_bytes), *(bytearray(value) for value in inputs)], [bytearray(size) for size in image.scratch]
   def buffer(kind:RKBufferKind, index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
   def execute(op:RKEWOp) -> None:
     if op.mode in (RKEWMode.HALF,RKEWMode.STATEFUL,RKEWMode.COMPARE):
@@ -206,7 +206,7 @@ def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
   """Test-only physical executor for raw gathers and the signed integer EW subset used by INT32 division."""
   count = len(inputs[0])
   args = [bytearray(count*4), *(bytearray(value.astype("<i4").tobytes()) for value in inputs)]
-  scratch = [bytearray(spec.size) for spec in image.scratch]
+  scratch = [bytearray(size) for size in image.scratch]
   def buffer(kind:RKBufferKind, index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
   def view(arg:RKArg, dtype, lanes:int) -> np.ndarray:
     return np.frombuffer(buffer(arg.kind, arg.index), dtype=dtype, count=lanes, offset=arg.addend)
@@ -239,7 +239,7 @@ def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
 def _assert_scratch_extent(image:RKImage, arg:RKArg, need:int) -> None:
   if arg.kind is RKBufferKind.SCRATCH:
     assert 0 <= arg.index < len(image.scratch)
-    assert arg.addend >= 0 and need <= image.scratch[arg.index].size
+    assert arg.addend >= 0 and need <= image.scratch[arg.index]
 
 def _assert_decoded_image_bounds(image:RKImage) -> RKImage:
   decoded = decode_image(encode_image(image))
@@ -264,7 +264,7 @@ def _assert_decoded_image_bounds(image:RKImage) -> RKImage:
 
 def _execute_fp16_reduction_tail(image:RKImage, values:np.ndarray) -> np.ndarray:
   args = [bytearray(max(64,_ew_ops(image)[-1].count)*2)]
-  scratch = [bytearray(spec.size) for spec in image.scratch]
+  scratch = [bytearray(size) for size in image.scratch]
   def raw_buffer(kind:RKBufferKind,index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
   def view(arg:RKArg,count:int|None=None) -> np.ndarray:
     return np.frombuffer(raw_buffer(arg.kind,arg.index),dtype="<f2",count=-1 if count is None else count,offset=arg.addend)
@@ -293,7 +293,7 @@ def _execute_fp16_reduction_tail(image:RKImage, values:np.ndarray) -> np.ndarray
 def _execute_scalar_reduction_image(image:RKImage, values:np.ndarray) -> float:
   """Execute the native scalar FP16 reduction subset without opening a device."""
   args = [bytearray(4), bytearray(np.asarray(values, dtype="<f2").tobytes())]
-  scratch = [bytearray(spec.size) for spec in image.scratch]
+  scratch = [bytearray(size) for size in image.scratch]
   def raw_buffer(kind:RKBufferKind,index:int) -> bytearray: return args[index] if kind is RKBufferKind.ARG else scratch[index]
   def storage(arg:RKArg) -> bytearray: return raw_buffer(arg.kind,arg.index)
   def read(arg:RKArg, dtype:np.dtype, count:int) -> np.ndarray:
@@ -318,28 +318,28 @@ def _execute_scalar_reduction_image(image:RKImage, values:np.ndarray) -> float:
 def test_cmac_codec_and_body_match_the_proven_gemm_contract():
   cmac = RKCMAC(RKArg(RKBufferKind.SCRATCH, 2), RKArg(RKBufferKind.SCRATCH, 0),
     RKArg(RKBufferKind.SCRATCH, 1), 3, 4, 5)
-  image = RKImage((RKScratch(192),RKScratch(2048),RKScratch(384)),(cmac,))
+  image = RKImage((192,2048,384),(cmac,))
   assert decode_image(encode_image(image)) == image
   for invalid in (image._replace(program=(cmac._replace(lhs=RKArg(RKBufferKind.ARG,0)),)),
-                  image._replace(scratch=(RKScratch(191), *image.scratch[1:]))):
+                  image._replace(scratch=(191, *image.scratch[1:]))):
     try: encode_image(invalid)
     except ValueError: pass
     else: raise AssertionError("invalid CMAC image was encoded")
-  try: emit_cmac_stage(cmac._replace(m=2, k=385))
+  try: encode_image(image._replace(program=(cmac._replace(m=2,k=385),)))
   except ValueError: pass
   else: raise AssertionError("multi-row CMAC exceeded the donor CBUF contract")
-  try: emit_cmac_stage(cmac._replace(m=1, k=417))
+  try: encode_image(image._replace(program=(cmac._replace(m=1,k=417),)))
   except ValueError: pass
   else: raise AssertionError("CMAC exceeded the thirteen encoded K blocks")
-  stage = emit_cmac_stage(cmac)
-  assert len(stage.commands) == 45 and tuple(index for index,_ in stage.relocs) == (18, 24, 31)
-  body = patch_stage(stage, lambda _kind,index:(0x100000,0x200000,0x300000)[index])
+  stage = emit_cmac_stage(cmac,lambda _arg:0)
+  assert len(stage) == 45
+  body = emit_cmac_stage(cmac,lambda arg:(0x100000,0x200000,0x300000)[arg.index]+arg.addend)
   assert hashlib.sha256(struct.pack("<45Q", *body)).hexdigest() == "d754ae668b210999c7d568131c0387e46be9c934ad3812b51fb956c789e3db22"
   relu_image = image._replace(program=(cmac._replace(relu=True),))
   assert decode_image(encode_image(relu_image)) == relu_image
-  relu_stage = emit_cmac_stage(_cmac(relu_image))
-  changed = [(old,new) for old,new in zip(stage.commands,relu_stage.commands) if old != new]
-  assert len(relu_stage.commands) == 45 and len(changed) == 1
+  relu_stage = emit_cmac_stage(_cmac(relu_image),lambda _arg:0)
+  changed = [(old,new) for old,new in zip(stage,relu_stage) if old != new]
+  assert len(relu_stage) == 45 and len(changed) == 1
   assert changed[0][0]&0xffff == changed[0][1]&0xffff == rockchip_renderer.rk.REG_DPU_BS_CFG
   assert ((changed[0][0]>>16)&0xffffffff,(changed[0][1]>>16)&0xffffffff) == (0x53,0x12)
   mixed = image._replace(program=(cmac,RKGather(cmac.dst,RKArg(RKBufferKind.SCRATCH,0),1),
@@ -347,14 +347,14 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
   assert decode_image(encode_image(mixed)) == mixed
 
 def test_image_codec_rejects_malformed_and_trailing_payloads():
-  blob = encode_image(RKImage((RKScratch(64),)))
+  blob = encode_image(RKImage((64,)))
   scratch = RKArg(RKBufferKind.SCRATCH,0)
   with pytest.raises(ValueError,match="invalid RKEWOp flags"):
-    encode_image(RKImage((RKScratch(64),),(RKEWOp(scratch,scratch,scratch,5,_EW_CFG[Ops.MAX],mode=RKEWMode.HALF_TO_INT32),)))
+    encode_image(RKImage((64,),(RKEWOp(scratch,scratch,scratch,5,_EW_CFG[Ops.MAX],mode=RKEWMode.HALF_TO_INT32),)))
   payload = rockchip_renderer.zlib.decompress(blob[6:])
   malformed = (b"", blob[:4]+b"\0\0"+blob[6:], blob[:-1], blob+b"\0",
     blob[:6]+rockchip_renderer.zlib.compress(payload+b"\0", 1),
-    blob[:6]+rockchip_renderer.zlib.compress(rockchip_renderer.marshal.dumps((), 4), 1))
+    blob[:6]+rockchip_renderer.zlib.compress(rockchip_renderer.pickle.dumps((),5),1))
   for candidate in malformed:
     with pytest.raises(ValueError, match="invalid RKImage"): decode_image(candidate)
 
@@ -499,7 +499,7 @@ def test_numeric_output_program_resets_before_its_first_dpu_stage():
   op = RKEWOp(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,0),1,
               _EW_CFG[Ops.ADD],mode=RKEWMode.HALF_TO_FLOAT)
   program = object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev,program.image,program._scratch_offsets,program._scratch_size=FakeDevice(),RKImage(program=(op,)),[],0
+  program.dev,program.image,program._scratch_offsets=FakeDevice(),RKImage(program=(op,)),(0,)
   program._run_ew_ops=lambda *_args,**_kwargs:None
   program()
   assert program.dev.resets == 1
@@ -520,9 +520,9 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   program.dev._ensure_buffer = lambda attr,*_args,**_kwargs: cmd if "cmd" in attr else task
   program._submit = lambda *args,**kwargs: submits.append((args,kwargs))
   addresses = (0x100000,0x200000,0x300000)
-  program._submit_bodies((patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index]),),True,True)
+  program._submit_bodies((emit_cmac_stage(cmac,lambda arg:addresses[arg.index]+arg.addend),),True,True)
   commands = tuple((ctypes.c_uint64*49).from_address(cmd.va_addr))
-  assert commands[:45] == patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index])
+  assert commands[:45] == emit_cmac_stage(cmac,lambda arg:addresses[arg.index]+arg.addend)
   assert commands[45:] == (rockchip_runtime._pc(0x0001,0),
     rockchip_runtime._pc(rockchip_runtime.rk.TARGET_PC_REG,rockchip_runtime.rk.REG_PC_REGISTER_AMOUNTS),
     rockchip_runtime._pc(rockchip_runtime.rk.TARGET_VERSION,0),
@@ -543,15 +543,15 @@ def test_mixed_cmac_runtime_runs_fixed_stage_before_ew_epilogue():
   events = []
   class FakeDevice:
     _native_int16 = False
-    def __init__(self): self._lock,self.arena=threading.Lock(),_runtime_memory(4096,0x100000)
+    def __init__(self): self._lock,self.arena=threading.Lock(),_runtime_memory(16384,0x100000)
     def _ensure_buffer(self, *_args): return self.arena
     def _sync_buffers(self, _buffers, _flags): pass
     def reset_npu(self): pass
   cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),1,1,4,True)
   ew=RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD])
   program=object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev,program.image=FakeDevice(),RKImage((RKScratch(2),)*3,program=(cmac,ew))
-  program._scratch_offsets,program._scratch_size=[0,2,4],6
+  program.dev,program.image=FakeDevice(),RKImage((2,)*3,program=(cmac,ew))
+  program._scratch_offsets=(0,4096,8192,12288)
   program._submit_bodies=lambda *_args,**_kwargs:events.append("cmac")
   program._run_ew_ops=lambda *_args,**_kwargs:events.append("ew")
   program()
@@ -582,7 +582,7 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
       RKEWOp(external[0],external[1],external[2],17,add,mode=RKEWMode.STATEFUL)),
     ("2f075321eab33020cf9ae176f91235110c26e2e01e3d4790070c5f6e85f00d88", ((31,31),),
       RKEWOp(external[0],external[1],external[2],large,add,mode=RKEWMode.HALF_TO_INT16)),)
-  def address(kind:RKBufferKind, index:int) -> int: return 0x10000000+int(kind)*0x01000000+index*0x00100000
+  def address(arg:RKArg) -> int: return 0x10000000+int(arg.kind)*0x01000000+arg.index*0x00100000+arg.addend
   for expected_hash,expected_shape,op in cases:
     program = object.__new__(rockchip_runtime.RockchipProgram)
     program.dev,program.image=FakeDevice(),SimpleNamespace(ew_ops=(op,))
@@ -619,7 +619,7 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
     ((op(mode=RKEWMode.STATEFUL),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
      (("submit",(31,)+(18,)*(rockchip_runtime._MAX_EW_GROUP_OPS-1)),("submit",(31,)))),
   )
-  def address(kind:RKBufferKind,index:int) -> int: return 0x10000000+int(kind)*0x100000+index*0x10000
+  def address(arg:RKArg) -> int: return 0x10000000+int(arg.kind)*0x100000+arg.index*0x10000+arg.addend
   for ops,expected in cases:
     events = []
     class FakeDevice:
@@ -737,8 +737,8 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("052b81ea5947bf111c6c14458393b8133dc194e1b4617a53f2f696ecac70df83",1423,120,6),
-                     ("e4581018b478fc55a9365481809ecdbf0b939b9a4e24d9d25f56d8bec2460e74",168,4,0)]
+  assert records == [("0f41dc6fb5117c80263ffce34c224736edc17d46c850b1994366a1dbc158bdec",1345,120,6),
+                     ("6b4f9c0fc3228c0d4672c2d1a39e3740806fc4c32fe83268e628729698845bda",258,4,0)]
 
 
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
@@ -785,7 +785,7 @@ def test_zero_count_raw_fp16_bitcast_uses_empty_generic_image():
     high = rhs.index(i).load().bitcast(dtypes.ushort).cast(dtypes.uint).alu(Ops.SHL, UOp.const(16, dtypes.int))
     return (low + high).bitcast(dtypes.int)
   image = _lower_uop_program(_program(dtypes.int, packed, count=0))
-  assert image is not None and not image.program and len(encode_image(image))==21
+  assert image is not None and not image.program and len(encode_image(image))==69
 
 
 def test_generic_bool_where_uses_canonical_int16_ternary():
@@ -1196,7 +1196,7 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
   lhs_values, rhs_values = np.arange(15, dtype=np.float16), np.arange(20, dtype=np.float16).reshape(5,4)
   sources = {_initial_gathers(image)[0].src.index:lhs_values.view(np.uint16),
              _initial_gathers(image)[1].src.index:rhs_values.reshape(-1).view(np.uint16)}
-  scratch = [np.zeros(spec.size//2, dtype=np.uint16) for spec in image.scratch]
+  scratch = [np.zeros(size//2, dtype=np.uint16) for size in image.scratch]
   for gather in _initial_gathers(image):
     destination, offsets = scratch[gather.dst.index], np.asarray(gather.offsets)
     valid = offsets >= 0
@@ -1250,12 +1250,12 @@ def test_real_matmul_relu_routes_one_production_cmac_stage():
     program = to_program(ast, RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
   assert _cmac(image) is not None and _cmac(image).relu and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (3,4,5)
-  assert not _ew_ops(image) and len(emit_cmac_stage(_cmac(image)).commands) == 45
+  assert not _ew_ops(image) and len(emit_cmac_stage(_cmac(image),lambda _arg:0)) == 45
   lhs_values = (np.arange(15)-7).astype(np.float16).reshape(3,5)
   rhs_values = (np.arange(20)%5-2).astype(np.float16).reshape(5,4)
   sources = {_initial_gathers(image)[0].src.index:lhs_values.view(np.uint16).reshape(-1),
              _initial_gathers(image)[1].src.index:rhs_values.view(np.uint16).reshape(-1)}
-  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  scratch = [np.zeros(size//2,dtype=np.uint16) for size in image.scratch]
   for gather in _initial_gathers(image):
     offsets = np.asarray(gather.offsets)
     valid = offsets >= 0
@@ -1283,7 +1283,7 @@ def test_zero_gated_padded_convolution_routes_production_cmac():
   source_values = (np.arange(324)%5-2).astype(np.float16).reshape(1,4,9,9)
   weight_values = (np.arange(144)%5-2).astype(np.float16).reshape(4,4,3,3)
   sources = {1:source_values.view(np.uint16).reshape(-1),2:weight_values.view(np.uint16).reshape(-1)}
-  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  scratch = [np.zeros(size//2,dtype=np.uint16) for size in image.scratch]
   for gather in _initial_gathers(image):
     destination,offsets = scratch[gather.dst.index],np.asarray(gather.offsets)
     valid = offsets >= 0
@@ -1317,7 +1317,7 @@ def test_batched_zero_gated_convolution_reorders_one_production_cmac():
   source_values = (np.arange(648)%5-2).astype(np.float16).reshape(2,4,9,9)
   weight_values = (np.arange(144)%5-2).astype(np.float16).reshape(4,4,3,3)
   sources = {1:source_values.view(np.uint16).reshape(-1),2:weight_values.view(np.uint16).reshape(-1)}
-  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  scratch = [np.zeros(size//2,dtype=np.uint16) for size in image.scratch]
   for gather in _initial_gathers(image):
     destination,offsets = scratch[gather.dst.index],np.asarray(gather.offsets)
     valid = offsets >= 0
@@ -1414,7 +1414,7 @@ def test_literal_fp32_bias_and_large_broadcast_share_cmac_candidate_planner():
   assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (64,64,2)
   assert not _ew_ops(image) and len(_initial_gathers(image)) == 3 and sum(bool(gather.values) for gather in _initial_gathers(image)) == 2
   source_values = np.arange(64,dtype=np.float16)
-  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
+  scratch = [np.zeros(size//2,dtype=np.uint16) for size in image.scratch]
   for gather in _initial_gathers(image):
     destination = scratch[gather.dst.index]
     if gather.values: destination[:gather.count] = gather.values
@@ -1996,13 +1996,13 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
     assert decode_image(encode_image(image)) == image
     for gather in _static_gathers(image):
       if gather.dst.kind is RKBufferKind.SCRATCH:
-        assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst.index].size//gather.itemsize
+        assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst.index]//gather.itemsize
 
   coordinate = images[-1]
   assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (130,148,11132,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="1a08872f03274e933131822263999b93bc6463cefe2b327040ec414d65a9e0f1"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="7584e2b48a92fbf5dc42f74e5abc2bfd4f508c544e14d3564784e048a8f7a121"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -2375,7 +2375,7 @@ def test_cmac_candidate_filter_keeps_later_valid_layout():
   assert _output_gathers(boundary)[0].offsets == (0,64) and _output_gathers(expanded)[0].offsets == (0,1)
   assert all(not _ew_ops(image) and len(_initial_gathers(image)) == 2 and decode_image(encode_image(image)) == image for image in (boundary,expanded))
   source_values = (np.arange(770)%17-8).astype(np.float16).reshape(2,385)
-  scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in expanded.scratch]
+  scratch = [np.zeros(size//2,dtype=np.uint16) for size in expanded.scratch]
   for gather in _initial_gathers(expanded):
     destination = scratch[gather.dst.index]
     if gather.values: destination[:gather.count] = gather.values
@@ -2474,7 +2474,7 @@ def test_generic_ew_chain_reuses_dead_scratch_values():
 
 
 def test_scratch_reuse_follows_the_ordered_program_lifetime():
-  scratch = tuple(RKScratch(64) for _ in range(5))
+  scratch = (64,)*5
   arg, slots = RKArg(RKBufferKind.ARG, 0), tuple(RKArg(RKBufferKind.SCRATCH, i) for i in range(5))
   gather=RKGather(arg,slots[3],1,offsets=(0,),partial=True)
   image = RKImage(scratch,program=(RKGather(None,slots[0],1,values=(0,)),
@@ -2486,6 +2486,10 @@ def test_scratch_reuse_follows_the_ordered_program_lifetime():
   physical_gather=next(op for op in colored.program if isinstance(op,RKGather) and op.src is not None)
   assert colored.program.index(physical_gather)==3 and physical_gather.dst==_ew_ops(colored)[-1].lhs
   assert decode_image(encode_image(colored)) == colored
+
+  runtime=object.__new__(rockchip_runtime.RockchipProgram)
+  rockchip_runtime.RockchipProgram.__init__(runtime,SimpleNamespace(),SimpleNamespace(name="alignment",lib=encode_image(RKImage((1,4097,64)))))
+  assert runtime._scratch_offsets == (0,4096,12288,16384)
 
 
 def test_large_divided_range_address_uses_compact_gather_axes():

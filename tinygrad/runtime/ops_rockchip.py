@@ -2,8 +2,8 @@ from __future__ import annotations
 import ctypes, itertools, mmap, os, threading, time, typing
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
-from tinygrad.helpers import from_mv, to_mv
-from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage,
+from tinygrad.helpers import from_mv, round_up, to_mv
+from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
   emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
@@ -16,7 +16,6 @@ _MAX_EW_GROUP_OPS = 48
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
-def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) & ~(alignment - 1)
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
   def _copyin(self, dest:HCQBuffer, src:memoryview):
@@ -34,12 +33,7 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
-    self._scratch_offsets:list[int] = []
-    self._scratch_size = 0
-    for spec in self.image.scratch:
-      self._scratch_size = _align_up(self._scratch_size, spec.alignment)
-      self._scratch_offsets.append(self._scratch_size)
-      self._scratch_size += spec.size
+    self._scratch_offsets=(0,*itertools.accumulate(round_up(size,4096) for size in self.image.scratch))
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
 
@@ -68,7 +62,7 @@ class RockchipProgram(Program['RockchipDevice']):
     bodies=tuple(bodies); sizes=tuple(map(len,bodies)); n=len(bodies)  # noqa: E702
     if not sizes or not all(0<s<1<<16 for s in sizes) or standalone and n!=1 or cmac and not standalone: raise ValueError("invalid NPU command body")  # noqa: E501
     if not standalone and self.dev._pcchain_bodies==bodies and all(name in self.dev._buffers for name in ("cmd","task")): self._submit(self.dev._buffers["cmd"],self.dev._buffers["task"],n); return  # noqa: E501,E702
-    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(_align_up(size+tail_size,2) for size in sizes))  # noqa: E501,E702
+    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(round_up(size+tail_size,2) for size in sizes))  # noqa: E501,E702
     prefix="standalone_" if standalone else ""; cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E702
     cmd=self.dev._ensure_buffer(f"{prefix}cmd",cmd_size,_CMD_BUF_MIN); task=self.dev._ensure_buffer(f"{prefix}task",n*_TASK_DESC_BYTES,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501,E702
     ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd)  # noqa: E702
@@ -112,7 +106,7 @@ class RockchipProgram(Program['RockchipDevice']):
           16 if mode==M.INT16 else 32 if mode==M.INT32 else 0
         if chain and precision!=body_precision and not (mode==M.INT16_TO_INT32 and body_precision in (0,16)):
           flush_chain(not precision and mode!=M.INT16_TO_INT32 and bool(body_precision))
-        if mode in (M.HALF_TO_FLOAT,M.HALF_TO_INT32,M.INT32_TO_HALF): chain.append(patch_stage(emit_ew_stage(op),address))
+        if mode in (M.HALF_TO_FLOAT,M.HALF_TO_INT32,M.INT32_TO_HALF): chain.append(emit_ew_stage(op,address))
         else:
           limit,itemsize=(_MAX_EW_ELEMS_FP16//2,4) if mode==M.INT32 else (8,1) if mode==M.INT16_TO_INT32 else (_MAX_EW_ELEMS_FP16,2)  # noqa: E501
           flags=dict(dst_step=4,src_step=2) if mode==M.INT16_TO_INT32 else {}
@@ -138,15 +132,15 @@ class RockchipProgram(Program['RockchipDevice']):
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
     for start in range(0, op.count, limit):
       args=tuple(arg._replace(addend=arg.addend+start*itemsize*(dst_step if i==0 else src_step)) for i,arg in enumerate((op.dst,op.lhs,op.rhs)))  # noqa: E501
-      yield patch_stage(emit_ew_stage(op._replace(dst=args[0],lhs=args[1],rhs=args[2],count=min(limit,op.count-start),**flags)),address)
+      yield emit_ew_stage(op._replace(dst=args[0],lhs=args[1],rhs=args[2],count=min(limit,op.count-start),**flags),address)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
     with self.dev._lock: return self._run(bufs,wait)
 
   def _run(self, bufs:tuple[HCQBuffer, ...], wait:bool):
-    arena=self.dev._ensure_buffer("scratch",self._scratch_size,self._scratch_size) if self._scratch_size else None
-    scratch=tuple(arena.offset(offset,spec.size) for offset,spec in zip(self._scratch_offsets,self.image.scratch)) if arena is not None else ()  # noqa: E501
+    arena=self.dev._ensure_buffer("scratch",self._scratch_offsets[-1],self._scratch_offsets[-1]) if self._scratch_offsets[-1] else None
+    scratch=tuple(arena.offset(offset,size) for offset,size in zip(self._scratch_offsets,self.image.scratch)) if arena is not None else ()
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
@@ -183,14 +177,14 @@ class RockchipProgram(Program['RockchipDevice']):
     cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather)),len(self.image.program))
     apply_gathers(self.image.program[:cursor])  # type: ignore[arg-type]
     self.dev._sync_buffers((*bufs,*((arena,) if arena is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE)
-    def address(kind:RKBufferKind,index:int) -> int: return self._dma(buffer(kind,index))
+    def address(arg:RKArg) -> int: return self._dma(buffer(arg.kind,arg.index))+arg.addend
     start = time.perf_counter()
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
     native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
     if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.mode==RKEWMode.HALF_TO_FLOAT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
     for _,items in itertools.groupby(self.image.program[cursor:],type):
       group=tuple(items); current=group[0]  # noqa: E702
-      if isinstance(current,RKCMAC): self._submit_bodies((patch_stage(emit_cmac_stage(current),address),),True,True)
+      if isinstance(current,RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
       elif isinstance(current,RKEWOp): self._run_ew_ops(address,group)  # type: ignore[arg-type]
       else:
         touched={(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None}  # type: ignore[union-attr]  # noqa: E501

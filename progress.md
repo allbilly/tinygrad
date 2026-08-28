@@ -8254,6 +8254,71 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-29 — typed image transport reaches 1,572 combined lines
+
+This hardware-accepted architecture rewrite follows the 1,603-line milestone
+`5e52a0bfe`.  Its predeclared production budget was at most **+45** and at
+least **-75 executable lines**, for net **-30 or better**, replacing the
+handwritten RKImage reconstruction, per-scratch alignment record, and
+relocatable RKStage layer.  The observed raw production diff is **+44/-79
+physical lines**.  Authoritative token-aware `sz.py` moves renderer **1374 ->
+1349**, runtime **229 -> 223**, their combined size **1603 -> 1572**, and
+repository total **26667 -> 26636** (**-31 executable lines**).  Comments and
+docstrings remain intact.
+
+`encode_image` and `decode_image` now transport the typed `RKImage` directly
+through a versioned pickle/zlib stream.  The compressed and object-stream
+boundaries remain independently checked, malformed roots still fail closed,
+and post-decode `_validate_image` retains every width, schedule, scratch,
+gather, and CMAC invariant.  The private wire version is 36.  This deletes the
+recursive `_plain_image` normalization and handwritten `RKArg`/operation
+reconstructor.  On the seven-image `simple_cummin` compile sample used in the
+no-write preflight, pickle plus zlib took **1.070 seconds / 695,610 bytes**
+versus marshal plus zlib at **2.598 seconds / 868,404 bytes**.  Small-image
+overhead is recorded rather than hidden: the empty image is now 69 bytes, ABS
+is 1,345 bytes, and MINIMUM is 258 bytes.
+
+Scratch declarations are immutable byte extents rather than
+`RKScratch(size, alignment)` records.  Production had no non-4096 alignment
+constructor, so `RockchipProgram` now owns one fixed page-aligned accumulated
+layout.  The lifetime colorer uses its active interval heap directly and
+retains the maximum extent for every reused physical slot.  A focused runtime
+regression pins extents `(1,4097,64)` to arena boundaries
+`(0,4096,12288,16384)`, while all existing decoded-image and physical scratch
+bounds assertions remain active.
+
+`emit_ew_stage` and `emit_cmac_stage` now receive one `RKArg -> DMA address`
+resolver and emit final command tuples.  `RKStage`, its parallel relocation
+tuple, and `patch_stage` are obsolete.  Static EW templates remain cached and
+retain register order; CMAC's three addresses are written at their existing
+register positions.  Exact command hashes, tiling shapes, chain boundaries,
+four-qword CMAC tail, reset behavior, and raw CMAC packing oracles pass
+unchanged.  Validation is owned by RKImage encode/decode before runtime
+emission, not duplicated by the emitter.
+
+The exact current Rockchip UOp module executes **161/161 passed** in **27.31
+seconds** with `-q -n12`; the focused codec/scratch checks also pass.
+Mypy reports success in **216 source files**, repository-wide Ruff passes, and
+diff checks are clean.  Final SHA-256 values are renderer
+`7b2f34a34d8c023cfd8b8e4fb2b149daadc07f07be226a407370a07073b44bc2`,
+runtime
+`e8f825a740b60153bb75a8b336ebbf218aa2e0019bdd3ad92344e749cec83e4b`,
+and unit module
+`e668b65b795df989e1cf33f657c1355ae89fda70ed89f8ed98c38a80a16f03af`.
+
+The uninterrupted production `Tensor -> schedule_linear -> to_program`
+hardware census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**739.83 seconds (12:19)** with zero failures.  Its five slowest calls were
+`simple_cummin` 52.70 seconds, `std_axis` 32.27, `cummin` 30.83, `nonzero`
+29.88, and `var_axis` 29.77.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.  No matcher route, arithmetic recipe, tolerance,
+test assertion, CPU/GPU numeric fallback, or production-path requirement was
+removed.
+
 ## 2026-08-29 — integer, conversion, and suffix ownership reach 1,603 combined lines
 
 This hardware-accepted cleanup follows the 1,634-line shared milestone
