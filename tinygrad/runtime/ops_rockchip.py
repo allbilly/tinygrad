@@ -1,8 +1,8 @@
 from __future__ import annotations
-import collections, ctypes, itertools, mmap, os, time, typing, weakref as wr
+import ctypes, itertools, mmap, os, threading, time, typing
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
-from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
+from tinygrad.helpers import from_mv, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage,
   emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16)
 from tinygrad.runtime.autogen import rockchip as rk
@@ -40,40 +40,8 @@ class RockchipProgram(Program['RockchipDevice']):
       self._scratch_size = _align_up(self._scratch_size, spec.alignment)
       self._scratch_offsets.append(self._scratch_size)
       self._scratch_size += spec.size
-    self._buffers:dict[str,HCQBuffer] = {}
-    self.scratch:tuple[HCQBuffer, ...] = ()
-    self.submit_count = 0
-    self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
-    self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
-    dev._touch_program(self)
-    self._ensure_scratch()
-
-  def _ensure_scratch(self) -> None:
-    if self.scratch or not self._scratch_size: return
-    arena=self._ensure_buffer("scratch",self._scratch_size,self._scratch_size)
-    self.scratch = tuple(arena.offset(offset, spec.size)
-      for offset,spec in zip(self._scratch_offsets, self.image.scratch))
-
-  def _release_resources(self) -> None:
-    self.scratch,self._pcchain_bodies = (),None
-    for buf in (buffers:=getattr(self,"_buffers",{})).values(): self.dev._gpu_free(buf)
-    buffers.clear()
-    getattr(self,"_scratch_ew_bodies",{}).clear()
-
-  @suppress_finalizing
-  def __del__(self):
-    self._release_resources()
-    self.dev._forget_program(self)
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
-
-  def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0) -> HCQBuffer:
-    if (buf:=self._buffers.get(attr)) is None or buf.size < size:
-      new = self.dev._gpu_alloc(max(size, minimum), flags)
-      self._buffers[attr] = new
-      if buf is not None: self.dev._gpu_free(buf)
-      return new
-    return buf
 
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False, retry:bool=True) -> None:
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
@@ -91,7 +59,6 @@ class RockchipProgram(Program['RockchipDevice']):
         self.dev.timeout_retries += 1
         if attempt == retries: raise
         self.dev.reset_npu()
-    self.submit_count += 1
     self.dev.submit_count += 1
     self.dev.task_count += n
 
@@ -100,10 +67,10 @@ class RockchipProgram(Program['RockchipDevice']):
     """Materialize one physical command/task batch while retaining each submission ABI."""
     bodies=tuple(bodies); sizes=tuple(map(len,bodies)); n=len(bodies)  # noqa: E702
     if not sizes or not all(0<s<1<<16 for s in sizes) or standalone and n!=1 or cmac and not standalone: raise ValueError("invalid NPU command body")  # noqa: E501
-    if not standalone and self._pcchain_bodies==bodies and all(name in self._buffers for name in ("cmd","task")): self._submit(self._buffers["cmd"],self._buffers["task"],n); return  # noqa: E501,E702
+    if not standalone and self.dev._pcchain_bodies==bodies and all(name in self.dev._buffers for name in ("cmd","task")): self._submit(self.dev._buffers["cmd"],self.dev._buffers["task"],n); return  # noqa: E501,E702
     tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(_align_up(size+tail_size,2) for size in sizes))  # noqa: E501,E702
     prefix="standalone_" if standalone else ""; cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E702
-    cmd=self._ensure_buffer(f"{prefix}cmd",cmd_size,_CMD_BUF_MIN); task=self._ensure_buffer(f"{prefix}task",n*_TASK_DESC_BYTES,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501,E702
+    cmd=self.dev._ensure_buffer(f"{prefix}cmd",cmd_size,_CMD_BUF_MIN); task=self.dev._ensure_buffer(f"{prefix}task",n*_TASK_DESC_BYTES,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501,E702
     ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd)  # noqa: E702
     for i,(body,size) in enumerate(zip(bodies,sizes)):
       base=offsets[i]; ctypes.memmove(int(cmd.va_addr)+base*8,(ctypes.c_uint64*size)(*body),size*8)  # noqa: E702
@@ -114,7 +81,7 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(cmd.va_addr)+(base+size)*8,(ctypes.c_uint64*len(tail))(*tail),len(tail)*8)
       desc=rk.struct_rknpu_task(0,0 if cmac else 4,0xd if cmac else 0x18,0x300,0x1ffff,0,size if cmac else size+len(tail),0,base_dma+base*8)  # noqa: E501
       ctypes.memmove(int(task.va_addr)+i*_TASK_DESC_BYTES,ctypes.addressof(desc),_TASK_DESC_BYTES)
-    if not standalone: self._pcchain_bodies=bodies
+    if not standalone: self.dev._pcchain_bodies=bodies
     if standalone: self.dev.reset_npu()
     try: self._submit(cmd,task,n,standalone=standalone,**({"retry":False} if cmac else {}))
     finally:
@@ -123,11 +90,6 @@ class RockchipProgram(Program['RockchipDevice']):
   def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...]) -> None:
     if not ops: return
     M=RKEWMode
-    if all(op.mode==M.INT16 and not op.submit_barrier and
-           all(arg.kind is RKBufferKind.SCRATCH for arg in (op.dst,op.lhs,op.rhs)) for op in ops):
-      if (cached:=self._scratch_ew_bodies.get(ops)) is None: self._scratch_ew_bodies[ops]=cached=tuple(stage for op in ops for stage in self._tile(op,_MAX_EW_ELEMS_FP16,address))  # noqa: E501
-      self._submit_bodies(cached)
-      return
     def run_group(group:tuple[RKEWOp, ...]) -> None:
       chain:list[tuple[int, ...]] = []
       body_precision = 0
@@ -180,14 +142,17 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
-    self.dev._touch_program(self)
-    self._ensure_scratch()
+    with self.dev._lock: return self._run(bufs,wait)
+
+  def _run(self, bufs:tuple[HCQBuffer, ...], wait:bool):
+    arena=self.dev._ensure_buffer("scratch",self._scratch_size,self._scratch_size) if self._scratch_size else None
+    scratch=tuple(arena.offset(offset,spec.size) for offset,spec in zip(self._scratch_offsets,self.image.scratch)) if arena is not None else ()  # noqa: E501
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
         return bufs[index]
-      if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
-      return self.scratch[index]
+      if index >= len(scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
+      return scratch[index]
     self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     linear:dict[int, np.ndarray] = {}
     def view(arg:RKArg,dtype,itemsize:int) -> np.ndarray:
@@ -218,7 +183,7 @@ class RockchipProgram(Program['RockchipDevice']):
         dst[dst_index[valid]]=src[source_index[valid]]
     cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather) or op.index is not None and op.dst.kind is RKBufferKind.ARG),len(self.image.program))  # noqa: E501
     apply_gathers(self.image.program[:cursor])  # type: ignore[arg-type]
-    self.dev._sync_buffers((*bufs,*((arena,) if (arena:=self._buffers.get("scratch")) is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    self.dev._sync_buffers((*bufs,*((arena,) if arena is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind,index:int) -> int: return self._dma(buffer(kind,index))
     start = time.perf_counter()
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
@@ -240,18 +205,17 @@ class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count = self.task_count = self.timeout_retries = 0
-    self._native_int16 = False
+    self._lock, self._buffers = threading.Lock(), dict[str,HCQBuffer]()
+    self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self.reset_npu()
-    self._program_resource_limit = max(1, int(os.getenv("ROCKCHIP_PROGRAM_CACHE", "32")))
-    self._program_resources:collections.OrderedDict[int, wr.ReferenceType[RockchipProgram]] = collections.OrderedDict()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
-  def _touch_program(self, program:RockchipProgram) -> None:
-    self._program_resources.pop(id(program), None)
-    self._program_resources[id(program)] = wr.ref(program)
-    while len(self._program_resources) > self._program_resource_limit:
-      _, reference = self._program_resources.popitem(last=False)
-      if (old:=reference()) is not None: old._release_resources()
-  def _forget_program(self, program:RockchipProgram) -> None: self._program_resources.pop(id(program), None)
+  def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0) -> HCQBuffer:
+    if (buf:=self._buffers.get(attr)) is None or buf.size < size:
+      new = self._gpu_alloc(max(size, minimum), flags)
+      self._buffers[attr] = new
+      if buf is not None: self._gpu_free(buf)
+      return new
+    return buf
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
     try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl,size=alloc,flags=flags|rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT)  # noqa: E501
@@ -276,4 +240,6 @@ class RockchipDevice(Compiled):
   def reset_npu(self):
     rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
     self._native_int16 = False
-  def synchronize(self): pass
+  def finalize(self):
+    for buf in self._buffers.values(): self._gpu_free(buf)
+    self._buffers.clear()

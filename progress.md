@@ -8254,6 +8254,75 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — unify static evaluation, CMAC shaping, and device arenas at 1,647 combined lines
+
+This hardware-accepted renderer/runtime rewrite follows `b670bc07f`.  The
+predeclared base rewrite reached **1,654 lines**, a **-105** reduction from the
+1,759-line parent.  After the first hardware census exposed two unsafe
+admissions, the declared repair budget allowed at most **+45 executable lines**
+while retaining at least **60** of that saving.  The final result instead saves
+another seven lines: authoritative `sz.py` moves renderer **1498 -> 1417**,
+runtime **261 -> 230**, their combined size **1759 -> 1647**, and repository
+total **26823 -> 26711** (**-112**).  The raw production diff is **+165/-286
+physical lines**.
+
+`_static_ranges`, `_eval_static`, and `_static_lanes` replace the separate
+scalar caster, vector ALU interpreter, expression evaluator, manual static
+cache, range-environment builder, and vector-environment adapter.  One NumPy
+typed evaluator now proves and enumerates bounded static lane spaces for
+constant materialization, gathers, generic unrolling, and affine CMAC inputs.
+The replacement functions serve several existing owners; this is not a
+single-operation IR or a renderer shortcut.
+
+`_lower_cmac_reduce` now owns the complete separable reduction proof, affine
+view selection, packed A/B construction, and output commit.  It removes the
+parallel `_RKCMACShape` model, broad divisor/view search, and duplicated dense
+versus irregular materialization.  `_lower_reduction` is only the policy
+boundary: try the fixed CMAC contraction, then the existing mapped DPU reducer.
+The final mapped-reducer admission remains scalar-only and retains its original
+large/complex threshold; ordinary vector reductions continue through their
+proven generic or CMAC paths.
+
+Runtime workspaces likewise have one owner.  `RockchipDevice._ensure_buffer`
+maintains a reusable command/task/scratch arena under one device lock, replacing
+per-program buffer dictionaries, weak-reference LRU eviction, destructors,
+scratch reconstruction, and duplicate command-body caches.  Programs contain
+only immutable decoded images and scratch offsets.  The NPU still performs all
+numeric work; the host allocates, synchronizes, gathers raw lanes, patches
+physical addresses, and submits the same hardware records.  There is no CPU or
+GPU numeric fallback and no alternate path around production `to_program`.
+
+The first uninterrupted census of the 1,654-line draft was intentionally not
+accepted: it reported **10 failures, 424 passed, 12 skipped, 153 subtests
+passed**.  Hardware route tracing attributed nine failures to the new vector
+mapped-reduction admission, including grouped/padded convolutions, cumsum,
+zero-stride accumulation, and NaN-max semantics.  Removing that admission made
+all nine pass on the ordinary paths.  The remaining tan failure exposed lost
+FP16 phase residual near odd multiples of pi/2; `_dpu_periodic_reduce` now
+returns a compensated high/low residual and the cosine spelling consumes both
+parts.  The actual NPU tan case then passed.  Unit expectations that asserted
+the disproven vector route were replaced with generic-path structure plus
+numeric execution checks rather than preserved as false architecture tests.
+
+The complete Rockchip UOp module executes **161/161 passed** in **31.92
+seconds** with `-q -n12`.  Mypy reports success in **216 source files**,
+repository-wide Ruff passes, and diff checks are clean.  Final SHA-256 values
+are renderer
+`7b22cbf6310e9e97c853ba1f34f8c566594ebae78da35634292eee9045dbd780`,
+runtime
+`b771137d43116e99801d84f30c3f15867962342d8a65e2701cf4a6c29e26d02e`,
+and unit module
+`0f37169488b5cfc84f6b37e9b92c9f46db14577b537960fb21d82d8c519adcb9`.
+
+The final uninterrupted production `Tensor -> schedule_linear -> to_program`
+hardware census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**877.91 seconds (14:37)** with zero failures.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before and after
+with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-28 — one NPU-owned dynamic address contract at 1,759 combined lines
 
 This hardware-accepted renderer/runtime rewrite follows `24ac785a4`.  After a

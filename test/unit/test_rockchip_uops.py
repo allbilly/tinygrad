@@ -1,4 +1,4 @@
-import ctypes, functools, hashlib, itertools, math, struct
+import ctypes, functools, hashlib, itertools, math, struct, threading
 import numpy as np
 import pytest
 from collections.abc import Callable
@@ -10,7 +10,7 @@ from tinygrad.helpers import Context, Target
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather, RKScratch,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
-  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _iter_range_env,
+  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _static_lanes,
   _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image, patch_stage)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 import tinygrad.renderer.rockchip as rockchip_renderer
@@ -155,7 +155,9 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
       def fp16(arg:RKArg) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype="<f2",count=op.count,offset=arg.addend)
       lhs,rhs=fp16(op.lhs).copy(),fp16(op.rhs).copy()
       value=(lhs+rhs if op.ew_cfg==_EW_CFG[Ops.ADD] else lhs-rhs if op.ew_cfg==_EW_CFG[Ops.SUB] else lhs*rhs if op.ew_cfg==_EW_CFG[Ops.MUL]
-             else np.maximum(lhs,rhs) if op.ew_cfg==_EW_CFG[Ops.MAX] else np.abs(lhs) if op.ew_cfg==_EW_CFG_ABS else None)
+             else np.maximum(lhs,rhs) if op.ew_cfg==_EW_CFG[Ops.MAX] else lhs/rhs if op.ew_cfg==_EW_CFG[Ops.FDIV]
+             else np.floor(lhs) if op.ew_cfg==_EW_CFG_FLOOR else np.minimum(lhs,rhs) if op.ew_cfg==_EW_CFG_MIN
+             else np.abs(lhs) if op.ew_cfg==_EW_CFG_ABS else None)
       assert value is not None, hex(op.ew_cfg)
       fp16(op.dst)[:]=value.astype("<f2")
       return
@@ -180,11 +182,24 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
     else: raise AssertionError(f"unsupported dynamic selector EW config {op.ew_cfg:#x}")
     value=np.clip(value,-32768,32767) if destination_dtype.itemsize==2 else (value+(1<<31))%(1<<32)-(1<<31)
     view(op.dst,destination_dtype)[:] = value.astype(destination_dtype)
+  def execute_cmac(op:RKCMAC) -> None:
+    ai,ao,_=rockchip_renderer._cmac_layout(op.n,op.k)
+    lhs=np.frombuffer(buffer(op.lhs.kind,op.lhs.index),dtype="<f2",count=op.m*ai,offset=op.lhs.addend).reshape(op.m,ai)
+    packed=np.frombuffer(buffer(op.rhs.kind,op.rhs.index),dtype="<f2",count=ao*ai,offset=op.rhs.addend)
+    rhs=packed.reshape(ao//16,ai//32,16,32).transpose(1,3,0,2).reshape(ai,ao)
+    value=lhs[:,:op.k].astype("<f4")@rhs[:op.k,:op.n].astype("<f4")
+    if op.relu: value=np.maximum(value,0)
+    storage=buffer(op.dst.kind,op.dst.index)
+    if op.out_fp16:
+      dst=np.frombuffer(storage,dtype="<f2",count=op.m*ao*2,offset=op.dst.addend)
+      for row,col in itertools.product(range(op.m),range(op.n)): dst[row*ao*2+col//16*32+col%16]=value[row,col]
+    else: np.frombuffer(storage,dtype="<f4",count=op.m*ao,offset=op.dst.addend).reshape(op.m,ao)[:,:op.n]=value
   linear:dict[int,np.ndarray]={}
   for op in image.program:
     if isinstance(op,RKGather): _apply_test_gather(op,buffer,linear)
     elif isinstance(op,RKEWOp): execute(op)
-    else: raise AssertionError("CMAC is outside the raw-image test executor")
+    elif isinstance(op,RKCMAC): execute_cmac(op)
+    else: raise AssertionError(type(op))
   return bytes(args[0])
 
 def _execute_integer_image(image:RKImage, *inputs:np.ndarray) -> np.ndarray:
@@ -233,8 +248,8 @@ def _assert_decoded_image_bounds(image:RKImage) -> RKImage:
     return tuple(gather.base+sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
   for gather in _static_gathers(decoded):
     if gather.count <= 0: continue
-    _assert_scratch_extent(decoded, gather.dst,
-      (gather.dst_addend+(gather.count-1)*gather.dst_stride+1)*gather.itemsize)
+    dst_indices=tuple(gather.dst_addend+lane*gather.dst_stride for lane in range(gather.count))
+    _assert_scratch_extent(decoded, gather.dst,(max(dst_indices)+1)*gather.itemsize)
     if gather.src is not None:
       indices = gather_indices(gather)
       if indices: _assert_scratch_extent(decoded, gather.src, (max(indices)+1)*gather.itemsize)
@@ -379,18 +394,19 @@ def test_static_vector_values_match_scalar_typed_evaluation():
   for expr,encode in zip(expressions, (int, int, rockchip_renderer._fp16_bits, lambda x:int(bool(x)),
                                        rockchip_renderer._fp16_bits, rockchip_renderer._fp16_bits)):
     expected = [None]*20
-    for env in rockchip_renderer._iter_range_env([outer, inner]):
+    for values in itertools.product(range(5),range(4)):
+      env=dict(zip((outer,inner),values))
       cache = {}
-      expected[int(rockchip_renderer._eval_expr(out_index, env, cache))] = encode(rockchip_renderer._eval_expr(expr, env, cache))
+      expected[int(rockchip_renderer._eval_static(out_index,env,cache))] = encode(rockchip_renderer._eval_static(expr,env,cache).item())
     assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
 
 
 def test_index_range_analysis_keeps_first_seen_order_and_hides_range_dependencies():
   first,second = UOp.range(3,20),UOp.range(4,21)
   root = UOp(Ops.ADD,dtypes.int,src=(UOp(Ops.ADD,dtypes.int,src=(second,first)),UOp(Ops.MUL,dtypes.int,src=(second,first))))
-  assert rockchip_renderer._index_ranges(root) == [second,first]
+  assert rockchip_renderer._static_ranges(root) == (second,first)
   dependent = UOp(Ops.RANGE,dtypes.int,src=(UOp.const(2,dtypes.int),first),arg=(22,AxisType.REDUCE))
-  assert rockchip_renderer._index_ranges(dependent) == [dependent]
+  assert rockchip_renderer._static_ranges(dependent) == (dependent,)
 
 
 def test_exact_integer_range_analysis_covers_supported_carriers_only():
@@ -407,16 +423,21 @@ def test_uop_is_the_typed_physical_abi():
   value = rockchip_renderer.RKContext(output)._carrier(RKArg(RKBufferKind.ARG,0),dtypes.half)
   assert value.op is Ops.NOOP and value.dtype is dtypes.half and value.arg == RKArg(RKBufferKind.ARG,0)
 
+def _runtime_memory(size:int, dma:int):
+  storage=ctypes.create_string_buffer(size)
+  base=SimpleNamespace(va_addr=ctypes.addressof(storage))
+  memory=SimpleNamespace(va_addr=base.va_addr,size=size,meta=SimpleNamespace(dma_addr=dma,obj_addr=dma),base=base,storage=storage)
+  memory.offset=lambda offset,size:SimpleNamespace(va_addr=memory.va_addr+offset,size=size,meta=memory.meta,base=memory.base)
+  return memory
+
 
 def test_submit_retries_once_after_driver_timeout(monkeypatch):
   class FakeDevice:
     fd_ctl, submit_count, task_count, timeout_retries, resets = object(), 0, 0, 0, 0
     def _sync_buffer(self, _buffer, _flags): pass
     def reset_npu(self): self.resets += 1
-    def _forget_program(self, _program): pass
-    def _gpu_free(self, _buffer): pass
   program = object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev, program.submit_count = FakeDevice(), 0
+  program.dev = FakeDevice()
   buffer = SimpleNamespace(meta=SimpleNamespace(obj_addr=1))
   calls = 0
   def submit(_fd, **_kwargs):
@@ -426,7 +447,24 @@ def test_submit_retries_once_after_driver_timeout(monkeypatch):
   monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_SUBMIT", submit)
   program._submit(buffer, buffer, 1)
   assert calls == 2 and program.dev.resets == program.dev.timeout_retries == 1
-  assert program.submit_count == program.dev.submit_count == 1 and program.dev.task_count == 1
+  assert program.dev.submit_count == program.dev.task_count == 1
+
+def test_device_workspace_reuses_grows_and_finalizes_each_role_once():
+  device=object.__new__(rockchip_runtime.RockchipDevice)
+  device._buffers,allocated,freed={},[],[]
+  def alloc(size,flags=0):
+    allocated.append(SimpleNamespace(size=size,flags=flags))
+    return allocated[-1]
+  device._gpu_alloc,device._gpu_free=alloc,freed.append
+  first=device._ensure_buffer("cmd",4,8)
+  assert first.size == 8 and device._ensure_buffer("cmd",7,8) is first and freed == []
+  second=device._ensure_buffer("cmd",9,8,3)
+  scratch=device._ensure_buffer("scratch",2,2)
+  assert second is not first and (second.size,second.flags) == (9,3) and freed == [first]
+  device.finalize()
+  assert device._buffers == {} and freed == [first,second,scratch]
+  device.finalize()
+  assert freed == [first,second,scratch]
 
 
 def test_cmac_submit_never_replays_a_timeout(monkeypatch):
@@ -434,10 +472,8 @@ def test_cmac_submit_never_replays_a_timeout(monkeypatch):
     fd_ctl, submit_count, task_count, timeout_retries, resets = object(), 0, 0, 0, 0
     def _sync_buffer(self, _buffer, _flags): pass
     def reset_npu(self): self.resets += 1
-    def _forget_program(self, _program): pass
-    def _gpu_free(self, _buffer): pass
   program = object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev, program.submit_count = FakeDevice(), 0
+  program.dev = FakeDevice()
   buffer = SimpleNamespace(meta=SimpleNamespace(obj_addr=1))
   calls = 0
   def submit(_fd, **_kwargs):
@@ -450,22 +486,20 @@ def test_cmac_submit_never_replays_a_timeout(monkeypatch):
   except TimeoutError: pass
   else: raise AssertionError("CMAC timeout was swallowed")
   assert calls == 1 and program.dev.resets == 0 and program.dev.timeout_retries == 1
-  assert program.submit_count == program.dev.submit_count == program.dev.task_count == 0
+  assert program.dev.submit_count == program.dev.task_count == 0
 
 
 def test_numeric_output_program_resets_before_its_first_dpu_stage():
   class FakeDevice:
     _native_int16, resets = False, 0
-    def _touch_program(self, _program): pass
-    def _forget_program(self, _program): pass
-    def _gpu_free(self, _buffer): pass
+    def __init__(self): self._lock=threading.Lock()
+    def _ensure_buffer(self, *_args): raise AssertionError("scratchless program allocated a workspace")
     def _sync_buffers(self, _buffers, _flags): pass
     def reset_npu(self): self.resets += 1
   op = RKEWOp(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,0),1,
               _EW_CFG[Ops.ADD],mode=RKEWMode.HALF_TO_FLOAT)
   program = object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev,program.image,program.scratch,program._buffers = FakeDevice(),RKImage(program=(op,)),(),{}
-  program._ensure_scratch=lambda:None
+  program.dev,program.image,program._scratch_offsets,program._scratch_size=FakeDevice(),RKImage(program=(op,)),[],0
   program._run_ew_ops=lambda *_args,**_kwargs:None
   program()
   assert program.dev.resets == 1
@@ -475,8 +509,6 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   class FakeDevice:
     resets = 0
     def reset_npu(self): self.resets += 1
-    def _forget_program(self, _program): pass
-    def _gpu_free(self, _buffer): pass
   def memory(size, dma):
     storage = ctypes.create_string_buffer(size)
     base = SimpleNamespace(va_addr=ctypes.addressof(storage))
@@ -485,7 +517,7 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev,program.image=FakeDevice(),RKImage(program=(cmac,))
   cmd, task, submits = memory(8192,0x400000), memory(4096,0x500000), []
-  program._ensure_buffer = lambda attr,*_args,**_kwargs: cmd if "cmd" in attr else task
+  program.dev._ensure_buffer = lambda attr,*_args,**_kwargs: cmd if "cmd" in attr else task
   program._submit = lambda *args,**kwargs: submits.append((args,kwargs))
   addresses = (0x100000,0x200000,0x300000)
   program._submit_bodies((patch_stage(emit_cmac_stage(cmac),lambda _kind,index:addresses[index]),),True,True)
@@ -511,20 +543,15 @@ def test_mixed_cmac_runtime_runs_fixed_stage_before_ew_epilogue():
   events = []
   class FakeDevice:
     _native_int16 = False
-    def _touch_program(self, _program): pass
+    def __init__(self): self._lock,self.arena=threading.Lock(),_runtime_memory(4096,0x100000)
+    def _ensure_buffer(self, *_args): return self.arena
     def _sync_buffers(self, _buffers, _flags): pass
     def reset_npu(self): pass
-    def _forget_program(self, _program): pass
-    def _gpu_free(self, _buffer): pass
-  def memory(dma):
-    base=SimpleNamespace(va_addr=0)
-    return SimpleNamespace(va_addr=0,base=base,meta=SimpleNamespace(dma_addr=dma))
   cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,0),RKArg(RKBufferKind.SCRATCH,1),1,1,4,True)
   ew=RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD])
   program=object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev,program.image,program.scratch,program._buffers=FakeDevice(),RKImage(program=(cmac,ew)),tuple(
-    memory(0x100000*(i+1)) for i in range(3)),{}
-  program._ensure_scratch=lambda:None
+  program.dev,program.image=FakeDevice(),RKImage((RKScratch(2),)*3,program=(cmac,ew))
+  program._scratch_offsets,program._scratch_size=[0,2,4],6
   program._submit_bodies=lambda *_args,**_kwargs:events.append("cmac")
   program._run_ew_ops=lambda *_args,**_kwargs:events.append("ew")
   program()
@@ -558,7 +585,7 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
   def address(kind:RKBufferKind, index:int) -> int: return 0x10000000+int(kind)*0x01000000+index*0x00100000
   for expected_hash,expected_shape,op in cases:
     program = object.__new__(rockchip_runtime.RockchipProgram)
-    program.dev, program.image, program._scratch_ew_bodies = FakeDevice(), SimpleNamespace(ew_ops=(op,)), {}
+    program.dev,program.image=FakeDevice(),SimpleNamespace(ew_ops=(op,))
     submissions = []
     program._submit_bodies = lambda bodies,*_args,**_kwargs:submissions.append(tuple(bodies))
     program._run_ew_ops(address,(op,))
@@ -597,10 +624,8 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
     events = []
     class FakeDevice:
       def reset_npu(self): events.append(("reset",))
-      def _forget_program(self,_program): pass
-      def _gpu_free(self,_buffer): pass
     program = object.__new__(rockchip_runtime.RockchipProgram)
-    program.dev,program.image,program._scratch_ew_bodies = FakeDevice(),SimpleNamespace(ew_ops=ops),{}
+    program.dev,program.image=FakeDevice(),SimpleNamespace(ew_ops=ops)
     program._submit_bodies = lambda bodies,standalone=False,*_args,**_kwargs:events.append(
       ("standalone",len(tuple(bodies)[0])) if standalone else ("submit",tuple(map(len,bodies))))
     program._run_ew_ops(address,ops)
@@ -1087,6 +1112,7 @@ def test_batched_unrolled_math_reduction_materializes_each_uop_result():
 
 
 def test_static_reduce_uops_are_structurally_executed():
+  values=np.asarray(((1.5,-2,0.5),(-1,3,2)),dtype=np.float16)
   for op in (Ops.ADD, Ops.MAX, Ops.MUL):
     out, source = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,))
     row, axis = UOp.range(2, 0), UOp.range(3, 1, AxisType.REDUCE)
@@ -1095,9 +1121,10 @@ def test_static_reduce_uops_are_structurally_executed():
     image = _lower_uop_program(list(out.index(row).store(reduced).end(row, axis).sink().toposort()))
     assert image is not None
     if op is Ops.ADD: assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (2,1,3)
-    else:
-      assert _cmac(image) is None and len(_ew_ops(image))==3
-      assert tuple(type(record) for record in image.program)==(RKGather,)*4+(RKEWOp,)*3
+    else: assert _cmac(image) is None and len(_ew_ops(image))==3
+    expected={Ops.ADD:values.sum(1,dtype=np.float16),Ops.MAX:values.max(1),Ops.MUL:values.prod(1,dtype=np.float16)}[op]
+    assert _execute_raw_dynamic_image(image,4,values.tobytes()) == expected.tobytes()
+    assert not _runtime_gathers(image) and decode_image(encode_image(image)) == image
 
 def test_multi_axis_reduce_routes_cmac_unrolling():
   out, source = UOp.param(0,dtypes.half,(2,)), UOp.param(1,dtypes.half,(12,))
@@ -1302,7 +1329,7 @@ def test_batched_zero_gated_convolution_reorders_one_production_cmac():
   assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
 
 
-def test_output_padded_transpose_convolution_uses_one_chained_vector_reduction():
+def test_output_padded_transpose_convolution_avoids_stateful_vector_reduction():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     source = Tensor(UOp.new_buffer("ROCKCHIP",240,dtypes.half,num=14001)).reshape(2,4,6,5)
     weight = Tensor(UOp.new_buffer("ROCKCHIP",144,dtypes.half,num=14002)).reshape(4,4,3,3)
@@ -1310,8 +1337,12 @@ def test_output_padded_transpose_convolution_uses_one_chained_vector_reduction()
     ast = source.conv_transpose2d(weight,bias,output_padding=(1,1),stride=(2,3)).schedule_linear().src[0].src[0]
     to_program_cache.clear()
     image = decode_image(next(u for u in to_program(ast,RockchipRenderer(Target(device="ROCKCHIP"))).src if u.op is Ops.BINARY).arg)
-  assert _cmac(image) is None and len(_ew_ops(image)) == 179 and len(_initial_gathers(image)) == 74 and not _intermediate_gathers(image)
-  assert not any(op.submit_barrier for op in _ew_ops(image)) and not _runtime_gathers(image)
+  assert _cmac(image) is None and len(_ew_ops(image)) == 2214 and len(_initial_gathers(image)) == 125 and not _intermediate_gathers(image)
+  assert not any(op.submit_barrier or op.mode != RKEWMode.HALF for op in _ew_ops(image)) and not _runtime_gathers(image)
+  source_values,weight_values,bias_values=np.ones((2,4,6,5),dtype=np.float16),np.ones((4,4,3,3),dtype=np.float16),np.ones(4,dtype=np.float16)
+  expected=np.ones((2,4,14,16),dtype=np.float16)
+  for y,x in itertools.product(range(6),range(5)): expected[:,:,y*2:y*2+3,x*3:x*3+3] += np.float16(4)
+  assert _execute_raw_dynamic_image(image,expected.nbytes,source_values.tobytes(),weight_values.tobytes(),bias_values.tobytes()) == expected.tobytes()
   assert decode_image(encode_image(image)) == image
 
 
@@ -1322,7 +1353,7 @@ def test_biased_eight_channel_convolutions_use_shared_kahan_recipe():
     bias = Tensor(UOp.new_buffer("ROCKCHIP",8,dtypes.half,num=13003))
     schedule = source.conv2d(weight,bias).relu().conv2d(weight,bias).schedule_linear()
     calls = [u for u in schedule.toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
-    records = []
+    records,images = [],[]
     for call in calls:
       to_program_cache.clear()
       program = to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP")))
@@ -1330,10 +1361,19 @@ def test_biased_eight_channel_convolutions_use_shared_kahan_recipe():
       image = decode_image(blob)
       assert encode_image(image) == blob and _cmac(image) is None
       inputs=sum(g.src is not None and g.src.kind is RKBufferKind.ARG for g in _static_gathers(image))
-      records.append((hashlib.sha256(blob).hexdigest(),len(blob),len(_ew_ops(image)),inputs,_cmac(image)))
-  assert records == [
-    ("7a4d7ed9731c83ba532133d8c6541ab7d01f26690d0cdd985befda92b95a66fc",2133,253,17,None),
-    ("661197510a693da9cf566587ae4588c3378c61ec845003bbe81404e51fdf1892",2117,251,17,None)]
+      records.append((len(_ew_ops(image)),inputs))
+      images.append(image)
+  assert records == [(253,17),(251,17)]
+  rng=np.random.RandomState(0)
+  source_values=rng.uniform(-1,1,(1,8,5,5)).astype(np.float16)
+  weight_values=rng.uniform(-1,1,(8,8,1,1)).astype(np.float16)
+  bias_values=rng.uniform(-1,1,8).astype(np.float16)
+  expected_first=np.maximum(np.einsum("bcyx,oc->boyx",source_values.astype(np.float32),weight_values[:,:,0,0].astype(np.float32))+bias_values[None,:,None,None],0).astype(np.float16)  # noqa: E501
+  got_first=np.frombuffer(_execute_raw_dynamic_image(images[0],400,source_values.tobytes(),weight_values.tobytes(),bias_values.tobytes()),dtype="<f2").reshape(1,8,5,5)  # noqa: E501
+  expected_second=(np.einsum("bcyx,oc->boyx",expected_first.astype(np.float32),weight_values[:,:,0,0].astype(np.float32))+bias_values[None,:,None,None]).astype(np.float16)  # noqa: E501
+  got_second=np.frombuffer(_execute_raw_dynamic_image(images[1],400,got_first.tobytes(),weight_values.tobytes(),bias_values.tobytes()),dtype="<f2").reshape(1,8,5,5)  # noqa: E501
+  np.testing.assert_allclose(got_first,expected_first,atol=5e-3,rtol=5e-3)
+  np.testing.assert_allclose(got_second,expected_second,atol=5e-3,rtol=5e-3)
 
 
 def test_fp32_contraction_biases_route_one_production_cmac_surface():
@@ -1352,20 +1392,9 @@ def test_fp32_contraction_biases_route_one_production_cmac_surface():
     image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
     assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (2,2,4)
     assert not _ew_ops(image) and len(_initial_gathers(image)) == 4 and sum(bool(gather.values) for gather in _initial_gathers(image)) == 1
-    sources = {1:lhs_values.view(np.uint16).reshape(-1),2:rhs_values.view(np.uint16).reshape(-1),
-               3:bias_values.view(np.uint16).reshape(-1)}
-    scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
-    for gather in _initial_gathers(image):
-      destination,offsets = scratch[gather.dst.index],np.asarray(gather.offsets)
-      if gather.values: destination[:gather.count] = gather.values
-      else:
-        valid = offsets >= 0
-        if not gather.partial: destination[:gather.count] = gather.fill_bits
-        destination[:gather.count][valid] = sources[gather.src.index][offsets[valid]]
-    packed_lhs = scratch[_cmac(image).lhs.index].view(np.float16).reshape(2,32)
-    packed_rhs = scratch[_cmac(image).rhs.index].view(np.float16).reshape(2,1,16,32).transpose(0,2,1,3).reshape(32,32)
-    np.testing.assert_array_equal(packed_lhs[:,:4].astype(np.float32)@packed_rhs[:2,:4].T.astype(np.float32),
-                                  lhs_values.astype(np.float32)@rhs_values.astype(np.float32)+bias_values.astype(np.float32))
+    got=np.frombuffer(_execute_raw_dynamic_image(image,8,lhs_values.tobytes(),rhs_values.tobytes(),bias_values.tobytes()),dtype="<f2").reshape(2,2)  # noqa: E501
+    expected=(lhs_values.astype(np.float32)@rhs_values.astype(np.float32)+bias_values.astype(np.float32)).astype(np.float16)
+    np.testing.assert_array_equal(got,expected)
     assert not _runtime_gathers(image) and decode_image(encode_image(image)) == image
 
 
@@ -1376,7 +1405,7 @@ def test_literal_fp32_bias_and_large_broadcast_share_cmac_candidate_planner():
     to_program_cache.clear()
     program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
-  assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (128,32,2)
+  assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (64,64,2)
   assert not _ew_ops(image) and len(_initial_gathers(image)) == 3 and sum(bool(gather.values) for gather in _initial_gathers(image)) == 2
   source_values = np.arange(64,dtype=np.float16)
   scratch = [np.zeros(spec.size//2,dtype=np.uint16) for spec in image.scratch]
@@ -1422,8 +1451,10 @@ def test_avg_pool3d_static_denominator_stays_compile_time_data():
     to_program_cache.clear()
     program = to_program(output.schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
-  assert len(_ew_ops(image)) == 4088 and len(_static_gathers(image)) == 574 and len(image.scratch) == 37
+  assert len(_ew_ops(image)) == 4084 and len(_static_gathers(image)) == 573 and len(image.scratch) == 542
   assert not any(op.mode in _TYPED_EW_MODES for op in _ew_ops(image))
+  values=np.ones((1,1,16,16,16),dtype=np.float16)
+  assert _execute_raw_dynamic_image(image,54,values.tobytes()) == np.ones((1,1,3,3,3),dtype=np.float16).tobytes()
   assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
 
 
@@ -1816,7 +1847,7 @@ def test_static_reduce_preserves_range_order_dependencies():
   uops=list(out.index(lane).store(root).end(lane,reduce_axis).sink().toposort())
   expanded = _unroll_static_reduces(root)
   assert dependency in expanded.toposort()
-  assert rockchip_renderer._is_static_expr(lane)
+  assert rockchip_renderer._static_ranges(lane) == (lane,)
   assert any(node.key == lane.key and len(node.src) > 1 and node.src[1].key == dependency.key
              for node in expanded.toposort() if node.op is Ops.RANGE)
   assert _lower_uop_program(uops) is not None
@@ -2411,7 +2442,7 @@ def test_deep_generic_graph_canonicalization_is_iterative():
 
 def test_static_range_environment_allocation_is_bounded():
   axes = [UOp.range(1024, 0), UOp.range(1024, 1)]
-  try: _iter_range_env(axes, max_envs=1024)
+  try: _static_lanes(tuple(axes),*axes,limit=1024)
   except RuntimeError as error: assert "static_index_budget" in str(error)
   else: raise AssertionError("oversized static RANGE product was materialized")
 
