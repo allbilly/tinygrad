@@ -8254,6 +8254,71 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-29 — integer, conversion, and suffix ownership reach 1,603 combined lines
+
+This hardware-accepted cleanup follows the 1,634-line shared milestone
+`4e2a22ce6`.  The original declared renderer budget was **+55/-85 executable
+lines, net -30** for `_int_info`, `RKContext._convert`, and
+`_append_inplace_image`.  That draft measured only net -27 and was rejected.
+The separately declared **+3/-7, net -4** ownership extension then moved the
+sole-use `_runtime_index` proof into `RKContext._host_address_load`, producing
+an accepted measured result of renderer **1405 -> 1374**, unchanged runtime
+**229**, combined **1634 -> 1603**, and repository total **26698 -> 26667**
+(**-31 executable lines**).  The raw production diff is **+69/-104 physical
+lines**.  Comments and docstrings remain intact.
+
+`_int_info` now computes one cached integer graph's conservative exact range
+and optional HALF arithmetic recipe together, replacing the parallel
+`_exact_int_range` and `_half_int_expr` walks; the thin `_exact_int_range`
+compatibility name remains for the direct unit contract.  `RKContext._convert`
+now owns both FP32-to-HALF input materialization and HALF-to-FP32 final output,
+deleting `_fp32_load` and the separate output conversion loop.  Extended
+`_append_inplace_image` owns link aliasing, unsafe-chain preloading, scratch
+rebasing, and the submit barrier for both CMAC storage epilogues and mapped
+reduction suffixes.  Finally, `_host_address_load` owns its sole remaining
+runtime-index width proof directly.  These are existing-owner consolidations,
+not a generic IR or a matcher/render shortcut.
+
+The RKImage codec now shallow-copies homogeneous primitive tuples instead of
+recursively visiting every explicit offset.  Renderer-side validation is
+omitted only for the just-constructed image; `RKProgram` immediately decodes
+and validates the identical blob before execution.  The million-offset encode
+probe drops from about **0.8 seconds to 0.24-0.28 seconds**.  A production
+`simple_cummin` profile reduced cumulative encoding from **14.08 to 3.36
+seconds** and total profiled call time from **72.06 to 61.98 seconds**.  The
+full census is noisy per case (`simple_cummin` measured 60.66 seconds here),
+but total wall time improved from **778.95 to 768.95 seconds**.
+
+Rejected experiments were not retained.  Removing the dense affine CMAC path
+transposed a rectangular contraction and expanded images beyond the resource
+cap.  Folding same-carrier output commits into `_convert` doubled one scratch
+extent and changed the `std_mean` EW schedule.  `_gate_zero_term` remains
+because it preserves padded and asymmetric convolution semantics.  No test,
+tolerance, CPU/GPU numeric fallback, runtime arithmetic path, or hand-built
+program path changed; WMMA remains unintroduced because the physical CMAC
+planner still has stricter surface and rounding contracts than `Ops.WMMA`.
+
+The complete Rockchip UOp module actually executes **161/161 passed** in
+**24.61 seconds** with `-q -n12`.  Mypy reports success in **216 source
+files**, repository-wide Ruff passes, and diff checks are clean.  Final
+SHA-256 values are renderer
+`211c5ddbeeccfcd66d8f2e4c759d75a32dd99b1aef53652ba71118573a048e85`,
+unchanged runtime
+`0f10d5f75a4654e4902ab6babfeb62e8028a4aa6d43c66965d268f8cf95ed12a`,
+and unchanged unit module
+`586fbaef33ccbd5d87f3118815ffbe8cbf72f626d9b9f6a61dcda9c98ca13ef1`.
+
+The uninterrupted production `Tensor -> schedule_linear -> to_program`
+hardware census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**768.95 seconds (12:48)** with zero failures.  Its five slowest calls were
+`simple_cummin` 60.66 seconds, `nonzero` 33.75, `std_axis` 33.68,
+`simple_cummax` 31.93, and `cummin` 31.39.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before and after
+with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-28 — atom-aligned mapped trees replace scalar reduction forests at 1,634 combined lines
 
 This hardware-accepted rewrite follows `e6560f482`.  The original declared
