@@ -276,7 +276,7 @@ def _execute_fp16_reduction_tail(image:RKImage, values:np.ndarray) -> np.ndarray
              np.minimum(lhs, rhs) if op.ew_cfg == _EW_CFG_MIN else np.abs(lhs) if op.ew_cfg == _EW_CFG_ABS else None)
     assert value is not None, hex(op.ew_cfg)
     view(op.dst,op.count)[:]=value.astype(np.float16)
-  spread=next((g for g in reversed(_static_gathers(image)) if g.dst_stride==32),
+  spread=next((g for g in reversed(_static_gathers(image)) if g.dst_stride in (8,32)),
               next(g for g in reversed(_static_gathers(image)) if g.src is not None and g.src.kind is RKBufferKind.SCRATCH))
   split=next(i for i,op in enumerate(image.program) if op is spread)
   linear:dict[int,np.ndarray]={}
@@ -1171,7 +1171,13 @@ def test_scalar_sum_beyond_cmac_k_blocks_uses_production_dpu_reduction():
     to_program_cache.clear()
     program=to_program(source.sum().schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
   image=decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY))
-  assert _cmac(image) is None and len(_ew_ops(image)) == 417 and _ew_ops(image)[-1].dst == RKArg(RKBufferKind.ARG,0)
+  tree=_ew_ops(image)
+  spread=next(gather for gather in _static_gathers(image) if gather.dst_stride==8)
+  assert _cmac(image) is None and tuple(op.count for op in tree)==(2048,1024,512,256,128,64,32,16,8,1)
+  assert spread.count==512 and sorted(offset for offset in spread.offsets if offset>=0)==list(range(417))
+  assert all(arg.addend%16==0 for op in tree for arg in (op.lhs,op.rhs)) and tree[-1].dst==RKArg(RKBufferKind.ARG,0)
+  values=(np.arange(417)%7-3).astype(np.float16)
+  assert _execute_fp16_reduction_tail(image,values)[0] == values.sum(dtype=np.float16)
   assert not _runtime_gathers(image) and decode_image(encode_image(image)) == image
 
 
@@ -1542,9 +1548,10 @@ def test_production_composite_product_sum_uses_mapped_reduction_after_cmac_rejec
     to_program_cache.clear()
     program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
-  spread=next(gather for gather in reversed(_intermediate_gathers(image)) if gather.dst_stride == 32)
+  spread=next(gather for gather in reversed(_intermediate_gathers(image)) if gather.dst_stride == 8)
   assert _cmac(image) is None and spread.count == math.prod(shape)*6
   assert len(_ew_ops(image)) == _gather_point(image,spread)+4*(spread.count-1)+2
+  assert all(arg.addend%16==0 for op in _ew_ops(image) for arg in (op.lhs,op.rhs))
   values=np.ones(spread.count,dtype=np.float16)
   assert _execute_fp16_reduction_tail(image,values)[0] == np.float16(-len(values))
   assert not _runtime_gathers(image) and decode_image(encode_image(image)) == image
@@ -1687,7 +1694,10 @@ def test_std_mean_outer_selector_commits_two_aligned_output_surfaces():
     to_program_cache.clear()
     image = decode_image(next(u for u in to_program(linear.src[-1].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if u.op is Ops.BINARY).arg)
   commits=tuple(gather for gather in _static_gathers(image) if gather.dst.kind is RKBufferKind.ARG)
-  assert _cmac(image) is None and len(_ew_ops(image)) == 26310 and [(g.count,g.dst_addend) for g in commits] == [(1,0),(1,1)]
+  atoms=tuple(gather for gather in _static_gathers(image) if gather.dst_stride==8)
+  assert _cmac(image) is None and len(_ew_ops(image))==90 and [(g.count,g.dst_stride) for g in atoms]==[(16384,8)]*2
+  assert all(arg.addend%16==0 for op in _ew_ops(image) for arg in (op.lhs,op.rhs))
+  assert [(g.count,g.dst_addend) for g in commits] == [(1,0),(1,1)]
   assert not _runtime_gathers(image,False) and not _runtime_gathers(image,True) and not _runtime_gathers(image)
   assert decode_image(encode_image(image)) == image
 

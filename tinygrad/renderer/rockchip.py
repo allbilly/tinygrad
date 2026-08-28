@@ -32,7 +32,7 @@ class RKGather(NamedTuple):
   axes: tuple[tuple[int, int, int], ...] = (); offsets: tuple[int, ...] = (); fill_bits: int = 0
   # Compile-time values have no source argument; partial gathers preserve lanes populated by another gather.
   values: tuple[int, ...] = (); partial: bool = False
-  # Scalar FP16 reductions use a destination stride of 32 for 64-byte spacing.
+  # Mapped reductions use a destination stride of 8 for 16-byte DPU atom alignment.
   dst_stride: int = 1; dst_addend: int = 0
   itemsize: int = 2
   # A runtime index makes this raw movement host-addressed; numeric semantics remain on the NPU.
@@ -579,24 +579,23 @@ def _lower_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Prefer one contraction, then map and reduce every remaining bounded reduction on the DPU."""
   return _lower_cmac_reduce(output,uops) or _lower_mapped_reduce(output,uops)
 
-def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int, int16:bool=False, barrier:bool=True) -> RKArg:
-  """Append a balanced row reduction, making its first dependent stage self-contained."""
-  first = barrier and not int16
-  while len(active) > 1:
-    for lhs,rhs in zip(active[::2], active[1::2]):
-      ops.append(RKEWOp(lhs,lhs,rhs,count,cfg,submit_barrier=first,
-        mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first = False
-    active = active[::2]
-  return active[0]
-
-def _kahan_rows(ops:list[RKEWOp], scratch:list[RKScratch], gathers:list[RKGather], active:list[RKArg], count:int, barrier:bool=True) -> RKArg:
-  """Reduce mapped HALF rows with four reusable physical carriers."""
-  total,updated,correction,adjusted=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(4)); scratch.extend((RKScratch(_scratch_bytes(count)),)*4)  # noqa: E501
-  gathers.append(RKGather(None,correction,count,values=(0,)*count)); ops.append(RKEWOp(total,active[0],active[0],count,
-    _EW_CFG[Ops.MAX],submit_barrier=barrier,mode=RKEWMode.STATEFUL))
-  for value in active[1:]:
-    ops.append(RKEWOp(adjusted,value,correction,count,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(updated,total,adjusted,count,_EW_CFG[Ops.ADD])); ops.append(RKEWOp(correction,updated,total,count,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(correction,correction,adjusted,count,_EW_CFG[Ops.SUB])); total,updated=updated,total  # noqa: E501
-  return total
+def _reduce_mapped_rows(ops:list[RKEWOp], scratch:list[RKScratch], gathers:list[RKGather], source:RKArg, lanes:int,
+                        cfg:int, int16:bool=False, kahan:bool=False, barrier:bool=True) -> RKArg:
+  """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
+  if kahan:
+    arena=RKArg(RKBufferKind.SCRATCH,len(scratch)); total,updated,correction,adjusted=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i+1) for i in range(4)); scratch.extend((RKScratch(_scratch_bytes(lanes*8)),*(RKScratch(64),)*4))  # noqa: E501
+    gathers.extend((RKGather(source,arena,lanes,axes=((1,lanes,1),),dst_stride=8),RKGather(None,correction,1,values=(0,)))); ops.append(RKEWOp(total,arena,arena,1,_EW_CFG[Ops.MAX],submit_barrier=barrier,mode=RKEWMode.STATEFUL))  # noqa: E501
+    for index in range(1,lanes):
+      value=arena._replace(addend=index*16); ops.append(RKEWOp(adjusted,value,correction,1,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(updated,total,adjusted,1,_EW_CFG[Ops.ADD])); ops.append(RKEWOp(correction,updated,total,1,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(correction,correction,adjusted,1,_EW_CFG[Ops.SUB])); total,updated=updated,total  # noqa: E501
+    return total
+  size=1<<(lanes-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((RKScratch(_scratch_bytes(size*8)),)*2)  # noqa: E501
+  bits=size.bit_length()-1; offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<lanes else -1 for lane in range(size))  # noqa: E501
+  neutral=0 if cfg==_EW_CFG[Ops.ADD] else _int16_bits(dtypes.int16.min) if int16 else _fp16_bits(-math.inf)
+  gathers.append(RKGather(source,current,size,offsets=offsets,fill_bits=neutral,dst_stride=8)); first=barrier and not int16
+  while size>1:
+    size//=2; count=size*8; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,
+      mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current
+  return current
 
 def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Render one canonical mapped reduction, reduce it physically, then compile its dependent scalar suffix."""
@@ -632,16 +631,11 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   mapped=_lower_uop_program(list(graph_rewrite(mapped_sink,pm_lower_index_dtype,ctx={}).toposort() if integer else mapped_sink.toposort()),vectorize_reductions=False)  # noqa: E501
   if mapped is None or any(isinstance(op,RKCMAC) or isinstance(op,RKGather) and op.index is not None and op.dst.kind is RKBufferKind.ARG for op in mapped.program): return None  # noqa: E501
   direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and len(mapped.scratch)==1 and len(mapped.program)==2 and isinstance(mapped.program[0],RKGather) and isinstance(mapped.program[1],RKEWOp) and mapped.program[1].dst==RKArg(RKBufferKind.ARG,slot) and mapped.program[1].lhs==mapped.program[1].rhs  # noqa: E501
-  if direct:
-    scratch=[RKScratch(lanes*64)]; prefix_program:tuple[RKGather|RKEWOp|RKCMAC,...]=(typing_cast(RKGather,mapped.program[0])._replace(dst=RKArg(RKBufferKind.SCRATCH,0),dst_stride=32),); spaced=RKArg(RKBufferKind.SCRATCH,0)  # noqa: E501
-  else:
-    value_slot,arena=len(mapped.scratch),len(mapped.scratch)+1; scratch=list(mapped.scratch)+[RKScratch(_scratch_bytes(lanes)),RKScratch(lanes*64)]; spaced=RKArg(RKBufferKind.SCRATCH,arena)  # noqa: E501
-    mapped=_alias_image_args(mapped,{slot:RKArg(RKBufferKind.SCRATCH,value_slot)})
-    spread=RKGather(RKArg(RKBufferKind.SCRATCH,value_slot),spaced,lanes,axes=((1,lanes,1),),dst_stride=32)
-    prefix_program=mapped.program+(spread,)
-  active=[spaced._replace(addend=i*64) for i in range(lanes)]
+  value_slot=len(mapped.scratch); source=typing_cast(RKEWOp,mapped.program[1]).lhs if direct else RKArg(RKBufferKind.SCRATCH,value_slot); scratch=list(mapped.scratch)+([] if direct else [RKScratch(_scratch_bytes(lanes))])  # noqa: E501
+  mapped=_alias_image_args(mapped,{slot:source}); prefix_program=mapped.program[:1] if direct else mapped.program
   gathers:list[RKGather]=[]; ops:list[RKEWOp]=[]
-  reduced=_kahan_rows(ops,scratch,gathers,active,1) if value.arg[0] is Ops.ADD and product.op is not Ops.LOAD and lanes<=4096 else _reduce_rows(ops,active,1,_EW_CFG[value.arg[0]],int16=integer,barrier=not direct)  # noqa: E501
+  reduced=_reduce_mapped_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],int16=integer,
+    kahan=value.arg[0] is Ops.ADD and product.op is not Ops.LOAD and lanes<=4096,barrier=not direct)
   prefix=RKImage(tuple(scratch),program=prefix_program+tuple(gathers)+tuple(ops))
   scalar=UOp.param(slot+1,mapped_dtype,(1,)); replacement=scalar.index(out_index).load().cast(value.dtype); suffix_root=root.substitute({value:replacement})  # noqa: E501
   suffix=_lower_uop_program(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()))  # noqa: E501

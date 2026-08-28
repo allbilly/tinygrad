@@ -8254,6 +8254,67 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-28 — atom-aligned mapped trees replace scalar reduction forests at 1,634 combined lines
+
+This hardware-accepted rewrite follows `e6560f482`.  The original declared
+replacement budget for `_reduce_rows` and `_kahan_rows` was **+27/-33
+executable renderer lines, net -6**.  A first draft measured only net -1 and
+was rejected.  A contiguous in-place draft and its two-surface ping-pong repair
+reached 1,632 lines but both failed the real `test_sum_full` with **162.5
+instead of -369.8**, so neither was accepted and no test was changed around
+them.  The final hardware-alignment repair was capped at 1,634 combined lines;
+one zero-behavior initialization consolidation enforced that cap exactly.
+Authoritative `sz.py` moves renderer **1409 -> 1405**, runtime remains **229**,
+their combined size moves **1638 -> 1634**, and repository total moves **26702
+-> 26698** (**-4**).  The final production diff is **+22/-28 physical lines**.
+
+`_reduce_mapped_rows` replaces the two parallel scalar reduction emitters.  A
+mapped value now occupies lane zero of one eight-HALF, 16-byte DPU atom.  The
+ordinary ADD/MAX/INT16 tree pads to a power of two, bit-reverses source lanes
+to preserve the old adjacent balanced arithmetic order, and reduces two
+ping-pong atom surfaces in `O(log N)` EW stages.  Every physical count remains
+at least eight and every source base is 16-byte aligned.  The Kahan branch uses
+the same atom stride while retaining its exact sequential arithmetic and four
+carrier ownership.  Direct LOAD reductions still omit their identity map and
+chain their scalar suffix, preserving the one-submit production contract.
+
+This layout is a hardware rule, not delay padding.  Deterministic hardware
+probes showed the contiguous tree matched through logical count eight, then
+diverged at count four because the DPU rounds sub-atom work to eight lanes and
+an eight-byte RHS addend is not a valid atom base.  Host identity boundaries,
+job-level ping-pong disable, and engine-pointer ping-pong disable did not alter
+the wrong result.  The final atom layout exactly matches ramp reductions at
+417, 512, 1,024, and 16,384 lanes.  A 417-lane direct sum now emits **10 EW
+stages instead of 417**; the production `std_mean` image emits **90 instead of
+26,310**.  Unit oracles pin the exact logarithmic schedule, non-power-of-two
+neutral padding, aligned bases, Kahan arithmetic, codec round trip, and scratch
+bounds.
+
+Focused real-hardware acceptance passed `test_sum_full` while retaining its
+one-submit assertion.  NaN MAX, INT16 `argmin`, composite cross-entropy Kahan,
+`std`, and `std_mean` then passed together; their focused call times were 0.72,
+7.68, 15.00, 9.57, and 15.53 seconds respectively.  The complete Rockchip UOp
+module executes **161/161 passed** in **24.42 seconds** with `-q -n12`.  Mypy
+reports success in **216 source files**, repository-wide Ruff passes, and diff
+checks are clean.  Final SHA-256 values are renderer
+`7acdaadd95aa6a4572a796c19b8f19f81bd7794ae95969ca9dc35c3e742245f7`,
+unchanged runtime
+`0f10d5f75a4654e4902ab6babfeb62e8028a4aa6d43c66965d268f8cf95ed12a`,
+and unit module
+`586fbaef33ccbd5d87f3118815ffbe8cbf72f626d9b9f6a61dcda9c98ca13ef1`.
+
+The final uninterrupted production `Tensor -> schedule_linear -> to_program`
+hardware census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**778.95 seconds (12:58)** with zero failures.  The slowest calls were
+`simple_cummin` 58.04 seconds, `nonzero` 35.67, `std_axis` 35.62,
+`simple_cummax` 33.68, and `var_axis` 32.80.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed before and after
+with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.  There is no CPU/GPU numeric fallback, tolerance
+change, hand-built renderer shortcut, new IR, or runtime arithmetic path.
+
 ## 2026-08-28 — cache CMAC views and retire direct host scatter at 1,638 combined lines
 
 This hardware-accepted cleanup follows `62252517d`.  Its two declared changes
