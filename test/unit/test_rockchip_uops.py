@@ -1075,6 +1075,15 @@ def test_math_uops_own_multi_stage_recipes():
     assert _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG
 
 
+def test_quadratic_math_rewrite_requires_one_shared_log_source():
+  source, unrelated = UOp.param(1,dtypes.half,(1,)), UOp.param(2,dtypes.half,(1,))
+  radical=(source*source+UOp.const(1.0,dtypes.half)).sqrt()
+  scale=UOp.const(math.log(2),dtypes.half)
+  assert rockchip_renderer._fold_quadratic(radical) is not None
+  assert rockchip_renderer._fold_quadratic((source+radical).log2()*scale) is not None
+  assert rockchip_renderer._fold_quadratic((unrelated+radical).log2()*scale) is None
+
+
 def test_generic_sign_recipe_owns_tagged_semantics():
   source = UOp.param(1, dtypes.half, (4,))
   def sign(i):

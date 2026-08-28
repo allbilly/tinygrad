@@ -1253,7 +1253,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
   if (ratio:=_fp32_ratio_to_half(root)) is not None: return ratio
   bounded_recipes = len(root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES
-  if bounded_recipes and (composite_math:=next((recipe for fold in (_fold_inverse_hyperbolic,_fold_atan) if (recipe:=fold(root)) is not None),None)) is not None: root=_physical_recipe(composite_math)  # noqa: E501
+  if bounded_recipes: root=root.substitute({u:recipe for u in root.toposort() if (recipe:=_fold_quadratic(u)) is not None})
   @functools.cache
   def rewrite(u:UOp) -> UOp:
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float and not _has_runtime_address(u.src[0]):  # noqa: E501
@@ -1443,54 +1443,17 @@ _pm_storage_common = PatternMatcher([(UPat((Ops.WHERE, Ops.ADD, Ops.MUL), dtypes
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),])
-def _square_offset(radicand:UOp, source:UOp, values:tuple[float, ...]) -> float|None:
-  if radicand.op is not Ops.ADD or not any(u.op is Ops.MUL and len(u.src) == 2 and all(x.key == source.key for x in u.src)
-                                             for u in radicand.src): return None
-  return next((float(u.arg) for u in radicand.src if u.op is Ops.CONST and float(u.arg) in values), None)
-
-def _fold_atan(root:UOp) -> UOp|None:
-  """Replace Tinygrad's asin-based atan with a compact range-reduced DPU polynomial."""
-  nodes = root.toposort()
-  sources:dict[bytes, UOp] = {}
-  for u in nodes:
-    # Match Tinygrad's x/sqrt(1+x*x) normalization.
-    candidates = ((u.src[0],u.src[1]),) if u.op is Ops.FDIV else tuple((source,inverse.src[0]) for source,inverse in
-      (u.src,u.src[::-1]) if inverse.op is Ops.RECIPROCAL and len(inverse.src) == 1) if u.op is Ops.MUL else ()
-    if (source:=next((source for source,denominator in candidates if denominator.op is Ops.SQRT and len(denominator.src) == 1 and
-                     _square_offset(denominator.src[0],source,(1.0,)) is not None),None)) is not None: sources[source.key] = source
-  constants = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float)}
-  if len(sources) != 1 or any(not any(abs(v-target) < tolerance for v in constants) for target,tolerance in
-                              ((math.pi/2, 1e-12), (1.570796305, 1e-10), (-0.0012624911, 1e-8))): return None
-  source, one = next(iter(sources.values())).cast(dtypes.half), UOp.const(1.0, dtypes.half)
-  magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS)
-  reduced = UOp(Ops.MAX, magnitude.dtype, src=(magnitude, one.alu(Ops.FDIV, magnitude)), arg=_NATIVE_MIN)
-  tail = one.alu(Ops.SUB, reduced).alu(Ops.MUL, _half(0.2447).alu(Ops.ADD, reduced.alu(Ops.MUL, _half(0.0663))))
-  angle = reduced.alu(Ops.MUL, _half(math.pi/4).alu(Ops.ADD, tail))
-  large, reflected = _finite_positive_mask(magnitude.alu(Ops.SUB, one)), UOp.const(math.pi/2, dtypes.half).alu(Ops.SUB, angle)
-  selected = angle.alu(Ops.ADD, large.alu(Ops.MUL, reflected.alu(Ops.SUB, angle)))
-  return selected.alu(Ops.MUL, source.alu(Ops.FDIV, magnitude.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))))
-
-def _fold_inverse_hyperbolic(root:UOp) -> UOp|None:
-  """Stabilize Tinygrad's FP16 asinh/acosh expansions without LUT or CMAC."""
-  if root.op is not Ops.MUL: return None
-  # Match log(x + sqrt(x*x +/- 1)) after natural log expands to LOG2 times ln(2).
-  matched = next(((source,int(offset)) for logarithm,scale in (root.src,root.src[::-1]) if scale.op is Ops.CONST and
-    not abs(float(scale.arg)-math.log(2)) > 1e-12 and logarithm.op is Ops.LOG2 and len(logarithm.src) == 1 and
-    (argument:=logarithm.src[0]).op is Ops.ADD for source,radical in (argument.src,argument.src[::-1]) if
-    radical.op is Ops.SQRT and len(radical.src) == 1 and (offset:=_square_offset(radical.src[0],source,(-1.0,1.0))) is not None),None)
-  if matched is None: return None
-  source, offset = matched; source = source.cast(dtypes.half); one, ln2 = UOp.const(1.0, dtypes.half), UOp.const(math.log(2), dtypes.half)
-  asinh, threshold = offset == 1, _half(1.5 if offset == 1 else 2.0); magnitude = UOp(Ops.MAX, dtypes.half, src=(source, source), arg=_NATIVE_ABS) if asinh else source  # noqa: E501
-  bounded = _native_min(magnitude, threshold) if asinh else _native_min(source, threshold).alu(Ops.MAX, _half(-2.0)); square = bounded.alu(Ops.MUL, bounded)  # noqa: E501
-  small = bounded.alu(Ops.MUL, polyN(square, [0.00268578, -0.01879756, 0.06135906, -0.16376462, 0.99989513])) if asinh else bounded.alu(Ops.ADD, square.alu(Ops.SUB, one).sqrt()).alu(Ops.LOG2).alu(Ops.MUL, ln2)  # noqa: E501
-  safe = (magnitude if asinh else source).alu(Ops.MAX,threshold)
-  # Approximate log(2*x) plus an inverse-even-power correction for large positive x.
-  inverse = one.alu(Ops.FDIV,safe); inverse_square = inverse.alu(Ops.MUL,inverse)
-  correction = inverse_square.alu(Ops.MUL,polyN(inverse_square,[5/96,-3/32,0.25] if asinh else [-5/96,-3/32,-0.25]))
-  large = safe.alu(Ops.LOG2).alu(Ops.MUL,ln2).alu(Ops.ADD,ln2).alu(Ops.ADD,correction)
-  selected = small.alu(Ops.ADD,_finite_positive_mask((magnitude if asinh else source).alu(Ops.SUB,threshold)).alu(Ops.MUL,large.alu(Ops.SUB,small)))  # noqa: E501
-  return selected.alu(Ops.MUL,source.alu(Ops.FDIV,magnitude.alu(Ops.MAX,_half(2**-24)))) if asinh else selected
-
+def _fold_quadratic(root:UOp) -> UOp|None:
+  """Scale sqrt(x*x +/- 1), and stabilize its canonical natural-log envelope."""
+  logarithm=next((logarithm for logarithm,scale in ((root.src,root.src[::-1]) if root.op is Ops.MUL and len(root.src)==2 else ()) if scale.op is Ops.CONST and abs(float(scale.arg)-math.log(2))<1e-12 and logarithm.op is Ops.LOG2 and len(logarithm.src)==1 and logarithm.src[0].op is Ops.ADD),None)  # noqa: E501
+  radical=root if root.op is Ops.SQRT and len(root.src)==1 else next((term for term in logarithm.src[0].src if term.op is Ops.SQRT and len(term.src)==1),None) if logarithm is not None else None  # noqa: E501
+  if (matched:=next(((square.src[0],float(offset.arg)) for square,offset in ((radical.src[0].src,radical.src[0].src[::-1]) if radical is not None and radical.src[0].op is Ops.ADD else ()) if square.op is Ops.MUL and len(square.src)==2 and square.src[0].key==square.src[1].key and offset.op is Ops.CONST and float(offset.arg) in (-1.0,1.0) and (logarithm is None or any(term is not radical and term.key==square.src[0].key for term in logarithm.src[0].src))),None)) is None: return None  # noqa: E501
+  source,offset=matched; source=source.cast(dtypes.half); magnitude=UOp(Ops.MAX,dtypes.half,src=(source,source),arg=_NATIVE_ABS)
+  scale=_native_min(magnitude,_half(65504.0)).alu(Ops.MAX,_half(1.0)); ratio=source.alu(Ops.FDIV,scale)
+  scaled=scale.alu(Ops.MUL,ratio.alu(Ops.MUL,ratio).alu(Ops.ADD,_half(offset).alu(Ops.FDIV,scale.alu(Ops.MUL,scale))).sqrt())
+  if logarithm is None: return scaled
+  result=(magnitude if offset==1 else source).alu(Ops.ADD,scaled).log2().alu(Ops.MUL,_half(math.log(2)))
+  return result.alu(Ops.MUL,source.alu(Ops.FDIV,magnitude.alu(Ops.MAX,_half(2**-24)))) if offset==1 else result.alu(Ops.ADD,(valid:=_half(1).alu(Ops.SUB,_finite_positive_mask(_half(1).alu(Ops.SUB,source)))).alu(Ops.FDIV,valid).alu(Ops.SUB,_half(1)))  # noqa: E501
 def _dpu_math_base(source:UOp) -> tuple[UOp, UOp, UOp, Callable[[UOp], UOp]]:
   source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0)
   return source, zero, one, _positive_mask if source.op in (Ops.INDEX, Ops.LOAD) else _finite_positive_mask

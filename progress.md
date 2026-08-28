@@ -8254,6 +8254,58 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-29 — shared quadratic stabilization reaches 1,542 combined lines
+
+This hardware-accepted renderer rewrite follows the 1,572-line milestone
+`918408bca`.  The isolated experiment initially declared **+10/-41 executable
+lines, net -31**, replacing `_square_offset`, `_fold_atan`, and
+`_fold_inverse_hyperbolic` with `_fold_quadratic`.  A required same-source
+semantic guard first left the candidate at net -29; before promotion the
+replacement was tightened against a revised exact **net -30** acceptance
+budget.  The observed raw renderer diff is **+12/-49 physical lines**.
+Authoritative token-aware `sz.py` moves renderer **1349 -> 1319**, leaves
+runtime at **223**, moves their combined size **1572 -> 1542**, and moves the
+repository total **26636 -> 26606** (**-30 executable lines**).  Comments and
+docstrings remain intact.
+
+`_fold_quadratic` recognizes the shared structural primitive
+`sqrt(x*x +/- 1)` before physical allocation.  It computes the radical from a
+bounded half-precision ratio so the intermediate square cannot overflow.  If
+the radical is enclosed by Tinygrad's canonical natural-log expansion, the
+same rewrite also stabilizes asinh/acosh while preserving asinh sign and acosh
+invalid-domain NaNs.  The logarithm is admitted only when its non-radical
+addend is the exact source used by the square; a focused regression proves
+that `log(y + sqrt(x*x+1))` is rejected.  Atan retains Tinygrad's normal
+asin-based expression and benefits only from the common radical rewrite.
+
+This deletes the operation-name and constant-fingerprint recognition in
+`_fold_atan`, the separate square recognizer, and the private piecewise
+asinh/acosh polynomial dialect.  `_expand_math_uops` now substitutes one
+structural identity across the bounded graph.  There is no new IR, LUT, WMMA
+carrier, operation-specific graph dialect, runtime/wire/CMAC change, numeric
+tolerance change, test weakening, or CPU/GPU numeric fallback.
+
+The exact current Rockchip UOp module executes **162/162 passed** in **30.83
+seconds** with `-x -q -n12`.  Mypy reports success in **216 source files**,
+repository-wide Ruff passes, and diff checks are clean.  Final SHA-256 values
+are renderer
+`bb31e5cacbebebb24b167ac0fea56800d2c2115f877cfa355fb5be821a7ca83f`,
+unchanged runtime
+`e8f825a740b60153bb75a8b336ebbf218aa2e0019bdd3ad92344e749cec83e4b`,
+and unit module
+`b463a32ea7ed5b9a9cad665aafe6a14cd9adc542b99cbec029e3569ffa5be5f3`.
+
+The unchanged production `Tensor -> schedule_linear -> to_program` hardware
+census actually executes all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-n12 --dist=loadfile`: **433 passed, 12 skipped, 154 subtests passed** in
+**774.64 seconds (12:54)** with zero failures.  Its five slowest calls were
+`simple_cummin` 56.03 seconds, `std_axis` 32.12, `cummin` 31.16, `nonzero`
+31.11, and `var_axis` 29.74.  The authoritative
+`.venv/bin/python ~/rk3588/examples/simple_add.py` gate passed immediately
+before and after with `reset_npu ret=0`, `SUBMIT ret=0`, and exact
+`[8 8 8 8 8 8 8 8] PASS`.
+
 ## 2026-08-29 — typed image transport reaches 1,572 combined lines
 
 This hardware-accepted architecture rewrite follows the 1,603-line milestone
