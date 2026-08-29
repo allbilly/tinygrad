@@ -13,6 +13,7 @@ _CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
 _SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
+_EW_MODE_INFO=((128,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(16,_MAX_EW_ELEMS_FP16,2,1,1),(32,_MAX_EW_ELEMS_FP16//2,4,1,1),(0,8,1,4,2),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1))  # noqa: E501
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
@@ -85,49 +86,35 @@ class RockchipProgram(Program['RockchipDevice']):
     if not ops: return
     M=RKEWMode
     def run_group(group:tuple[RKEWOp, ...]) -> None:
-      chain:list[tuple[int, ...]] = []
-      body_precision = 0
+      chain:list[tuple[int, ...]]=[]; precision=0  # noqa: E702
       def flush_chain(reset:bool=False) -> None:
-        nonlocal body_precision
-        if chain:
-          self._submit_bodies(chain)
-          if reset or body_precision >= 64: self.dev.reset_npu()
-          chain.clear()
-        body_precision = 0
+        if not chain: return
+        self._submit_bodies(chain)
+        if reset or precision>=64: self.dev.reset_npu()
+        chain.clear()
       for op in group:
         mode=op.mode
         if mode==M.COMPARE:
-          if body_precision: flush_chain(True)
-          flush_chain()
-          for body in self._tile(op,_MAX_EW_ELEMS_FP16,address):
-            self._submit_bodies((body,),True)
+          flush_chain(bool(precision))
+          for body in self._tile(op,_MAX_EW_ELEMS_FP16,address): self._submit_bodies((body,),True)
           continue
-        precision=128 if mode==M.HALF_TO_FLOAT else 64 if mode in (M.HALF_TO_INT32,M.INT32_TO_HALF) else \
-          16 if mode==M.INT16 else 32 if mode==M.INT32 else 0
-        if chain and precision!=body_precision and not (mode==M.INT16_TO_INT32 and body_precision in (0,16)):
-          flush_chain(not precision and mode!=M.INT16_TO_INT32 and bool(body_precision))
-        if mode in (M.HALF_TO_FLOAT,M.HALF_TO_INT32,M.INT32_TO_HALF): chain.append(emit_ew_stage(op,address))
-        else:
-          limit,itemsize=(_MAX_EW_ELEMS_FP16//2,4) if mode==M.INT32 else (8,1) if mode==M.INT16_TO_INT32 else (_MAX_EW_ELEMS_FP16,2)  # noqa: E501
-          flags=dict(dst_step=4,src_step=2) if mode==M.INT16_TO_INT32 else {}
-          chain.extend(self._tile(op,limit,address,itemsize,**flags))
-        body_precision=precision
+        next_precision,limit,itemsize,dst_step,src_step=_EW_MODE_INFO[mode]
+        if chain and next_precision!=precision and not (mode==M.INT16_TO_INT32 and precision in (0,16)):
+          flush_chain(not next_precision and mode!=M.INT16_TO_INT32 and bool(precision))
+        chain.extend((emit_ew_stage(op,address),) if not limit else self._tile(op,limit,address,itemsize,dst_step,src_step,mode=M.BOUNDED if not chain and mode in (M.HALF,M.BOUNDED) else M.HALF if mode==M.BOUNDED else mode))  # noqa: E501
+        precision=next_precision
         if precision==128 and len(chain)>=16: flush_chain()
       flush_chain()
     cuts=(0,*(i for i,op in enumerate(ops) if i and op.submit_barrier),len(ops))
     for begin,end in zip(cuts,cuts[1:]):
       group=ops[begin:end]
-      split=group[0].mode in (M.STATEFUL,M.HALF_TO_INT16,M.FLOAT_TO_HALF) and len(group)>_MAX_EW_GROUP_OPS and max(op.count for op in group)<=_MAX_EW_ELEMS_FP16 and not any(op.mode in (M.INT32,M.INT16_TO_INT32,M.HALF_TO_INT32,M.INT32_TO_HALF,M.HALF_TO_FLOAT) for op in group)  # noqa: E501
-      tiled=group[0].mode in (M.STATEFUL,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.STATEFUL,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
-      if split:
-        for start in range(0,len(group),_MAX_EW_GROUP_OPS):
-          op=group[start]
-          run_group((op._replace(submit_barrier=False,mode=M.STATEFUL if op.mode==M.HALF else op.mode),*group[start+1:start+_MAX_EW_GROUP_OPS]))  # noqa: E501
-      elif tiled:
-        tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.STATEFUL if i==0 and op.mode==M.HALF else op.mode)
-               for i,op in enumerate(group))
+      split=group[0].mode in (M.BOUNDED,M.HALF_TO_INT16,M.FLOAT_TO_HALF) and len(group)>_MAX_EW_GROUP_OPS and max(op.count for op in group)<=_MAX_EW_ELEMS_FP16 and not any(op.mode in (M.INT32,M.INT16_TO_INT32,M.HALF_TO_INT32,M.INT32_TO_HALF,M.HALF_TO_FLOAT) for op in group)  # noqa: E501
+      tiled=len(group)>1 and group[0].mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
+      if tiled:
+        tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(group))  # noqa: E501
         for bodies in zip(*tiles): self._submit_bodies(bodies)
-      else: run_group(group)
+      else:
+        for chunk in (itertools.batched(group,_MAX_EW_GROUP_OPS) if split else (group,)): run_group(tuple(op._replace(submit_barrier=False) for op in chunk))  # noqa: E501
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
     for start in range(0, op.count, limit):

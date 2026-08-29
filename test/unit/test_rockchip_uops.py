@@ -576,7 +576,7 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
       RKEWOp(scratch[0],external[1],scratch[2],large,add,mode=RKEWMode.INT16)),
     ("a8dffe2406a897e0d7f225ac7b4fba7879ca8d476dc410ba15b552d9e733145f", ((31,31),),
       RKEWOp(scratch[0],scratch[1],scratch[2],_MAX_EW_ELEMS_FP16//2+3,add,mode=RKEWMode.INT32)),
-    ("b16caeded014eca42e067c91c6e7b07094bafa4fb5eb4b0a62a1239b82aee7d5", ((18,18),),
+    ("977a482cf35150b50d77165dff1011411d14b1fe6b70a3bd6846252176c07d40", ((31,31),),
       RKEWOp(external[0],external[1],external[2],large,add)),
     ("bb30c192a115976317e2ed0341666192a4d3bcf758e0910f5f1ec09a1d44b215", ((31,),),
       RKEWOp(external[0],external[1],external[2],17,add,mode=RKEWMode.STATEFUL)),
@@ -602,20 +602,21 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
     args = scratch if scratch_args else external
     return RKEWOp(args[0],args[1],args[2],count,add,submit_barrier=barrier,mode=mode)
   cases = (
-    ((op(),op(barrier=True),op()), (("submit",(18,)),("submit",(18,18)))),
+    ((op(),op(barrier=True),op()), (("submit",(31,)),("submit",(31,18)))),
     ((op(mode=RKEWMode.INT16,scratch_args=True),op(mode=RKEWMode.INT32,scratch_args=True),
       op(mode=RKEWMode.INT16_TO_INT32,scratch_args=True),op()),
      (("submit",(31,)),("submit",(31,)),("submit",(32,32,32,18)))),
     ((op(mode=RKEWMode.INT16,scratch_args=True),op()),
-     (("submit",(31,)),("reset",), ("submit",(18,)))),
+     (("submit",(31,)),("reset",), ("submit",(31,)))),
     ((op(),op(count=4,mode=RKEWMode.INT32_TO_HALF,scratch_args=True),op()),
-     (("submit",(18,)),("submit",(31,)),("reset",),("submit",(18,)))),
+     (("submit",(31,)),("submit",(31,)),("reset",),("submit",(31,)))),
     ((op(),op(mode=RKEWMode.COMPARE),op()),
-     (("submit",(18,)),("standalone",37),("submit",(18,)))),
+     (("submit",(31,)),("standalone",37),("submit",(31,)))),
     ((op(),*(op(count=1,mode=RKEWMode.HALF_TO_FLOAT) for _ in range(17))),
-     (("submit",(18,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
+     (("submit",(31,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
+    ((op(count=large),op(count=large)), (("submit",(31,18)),("submit",(31,18)))),
     ((op(),op(count=large,barrier=True,mode=RKEWMode.STATEFUL),op(count=large),op(barrier=True)),
-     (("submit",(18,)),("submit",(31,18)),("submit",(31,18)),("submit",(18,)))),
+     (("submit",(31,)),("submit",(31,18)),("submit",(31,18)),("submit",(31,)))),
     ((op(mode=RKEWMode.STATEFUL),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
      (("submit",(31,)+(18,)*(rockchip_runtime._MAX_EW_GROUP_OPS-1)),("submit",(31,)))),
   )
@@ -642,6 +643,10 @@ def test_native_ew_configs_keep_their_exact_register_values():
   assert tuple(getattr(rockchip_renderer,name) for name in
     ("_EW_CFG_RELU6","_EW_CFG_MIN","_EW_CFG_ABS","_EW_CFG_NEG","_EW_CFG_FLOOR","_EW_CFG_CEIL")) == (
     0x108004c0,0x108102c0,0x108502c0,0x108602c0,0x108702c0,0x108802c0)
+  arg=RKArg(RKBufferKind.ARG,0)
+  relu6=RKEWOp(arg,arg,arg,4,rockchip_renderer._EW_CFG_RELU6,mode=RKEWMode.STATEFUL)
+  assert rockchip_renderer._cmd(rockchip_renderer._DPU,rockchip_renderer.rk.REG_DPU_EW_RELUX_CMP_VALUE,
+    rockchip_renderer._EW_RELUX_CMP_RELU6) in rockchip_renderer.emit_ew_stage(relu6,lambda _arg:0x10000000)
 
 
 def test_cmac_packs_fp16_exact_per_term_weights_and_rejects_invalid_weights():
@@ -713,6 +718,17 @@ def test_infinite_numerator_fdiv_preserves_dynamic_denominator_sign():
   assert image is not None and len(_ew_ops(image)) == 3
   assert all(op.ew_cfg == _EW_CFG[Ops.FDIV] for op in _ew_ops(image)[:2])
   assert _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG
+
+
+def test_production_scatter_add_keeps_nonfinite_terms_out_of_kahan():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",120,dtypes.half,num=13020)).reshape(4,5,6)
+    index=Tensor(UOp.new_buffer("ROCKCHIP",60,dtypes.int,num=13021)).reshape(3,4,5)
+    linear=source.scatter(dim=1,index=index,src=math.inf,reduce="add").schedule_linear()
+    to_program_cache.clear()
+    image=decode_image(to_program(linear.src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src[-1].arg)
+  half_ops=[op for op in _ew_ops(image) if op.mode in (RKEWMode.HALF,RKEWMode.STATEFUL)]
+  assert half_ops and all(op.ew_cfg==_EW_CFG[Ops.ADD] for op in half_ops)
 
 
 def test_generic_where_owns_ternary_arity():
@@ -2440,7 +2456,7 @@ def test_multiple_output_stores_execute_sequentially():
   image = _lower_uop_program(program)
   assert image is not None and len(_ew_ops(image)) == 2
   assert _ew_ops(image)[1].lhs == RKArg(RKBufferKind.ARG, 0)
-  assert _ew_ops(image)[1].submit_barrier and _ew_ops(image)[1].mode==RKEWMode.STATEFUL
+  assert _ew_ops(image)[1].submit_barrier and _ew_ops(image)[1].mode==RKEWMode.HALF
 
 
 def test_static_structural_expansion_is_bounded():

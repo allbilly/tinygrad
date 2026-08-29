@@ -8254,6 +8254,61 @@ health, reset, reboot, hardware execution, or full census command was run
 because the board remains untrusted; fresh-boot acceptance and its pre/post
 `.venv/bin/python ~/rk3588/examples/simple_add.py` bracket remain pending.
 
+## 2026-08-29 — one-pass storage lowering and initialized chains reach 1,499 combined lines
+
+This hardware-accepted milestone follows `90f4a272a`.  The declared boundary
+was the existing production `to_program` path, with `_pm_storage_common` and
+`_replace_infinite_multiply` deleted in favor of `_expand_math_uops` and
+`_lower_uop_program`, and the runtime precision branches replaced by
+`_EW_MODE_INFO` plus the existing `run_group`/`_tile` owners.  Authoritative
+token-aware `sz.py` moves renderer **1319 -> 1289** and runtime **223 -> 210**,
+so their combined size moves **1542 -> 1499** (**-43 executable lines**).
+The final post-rewrite hardening tranche moved the already-reduced shared
+candidate **1528 -> 1499** (**-29**).  The raw production diff is **+59/-111
+physical lines**; comments and docstrings remain.
+
+Half-storage semantics are now folded during the existing recursive math walk
+instead of rebuilding and traversing a second whole sink graph.  Boolean
+comparison, ordered FP16 components, and finite-threshold WHERE selection also
+use their existing physical owners.  Runtime scheduling now models a
+self-initializing `BOUNDED` body followed by lean HALF continuations, uses one
+live precision state, and ensures every independently submitted large HALF
+tile begins with the complete register body.  This is a concrete lifecycle
+contract in the current EW scheduler, not a new framework, IR, or operation
+dialect.
+
+The first full census exposed three architecture defects and each repair is
+covered at its owner.  Large input convolution had started a 90,720-element
+HALF group with a lean body; the tiled path now emits two independently
+initialized chains.  Scatter-add sent a nonfinite constant through Kahan's
+finite TwoSum identity and produced `inf-inf`; `_kahan_sum` now selects the
+ordinary ordered fold for nonfinite term graphs.  A promoted ReLU6 body omitted
+its operation-specific threshold; both full and lean `_stage_template` bodies
+now contain `REG_DPU_EW_RELUX_CMP_VALUE`.  An experimental signed-zero FDIV
+rewrite for infinite multiplication was rejected and removed after hardware
+showed it lost the negative sign; the accepted tree retains native MUL and has
+no extra submit.  No test tolerance, CPU/GPU numeric fallback, handwritten
+matcher execution shortcut, or Tinygrad-core path changed.
+
+The exact production `Tensor -> schedule_linear -> to_program` census actually
+executed all **445** top-level cases with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP` and pytest
+`-x -q -n12 --dist=loadfile --durations=10`: **433 passed, 12 skipped, 154
+subtests passed** in **679.20 seconds (11:19)**.  A focused hardware replay of
+ReLU6, scatter-add, both infinity-multiply coverage paths, large input
+convolution, `simple_cummin`, and mean passed **6/6** in **58.24 seconds**.
+The authoritative `.venv/bin/python ~/rk3588/examples/simple_add.py` gate
+passed before and after the census, and passed again from the promoted shared
+tree with exact `[8 8 8 8 8 8 8 8] PASS` output.
+
+Shared-tree verification reports **163 passed in 28.92 seconds** for
+`test/unit/test_rockchip_uops.py -x -q -n12`, mypy success in **216 source
+files**, repository-wide Ruff success, and clean diff checks.  The shared files
+are byte-identical to the fully executed isolated candidate: renderer SHA-256
+`584ade714022b2a61624a1ff0569c0f0c1e6af9186564982fe08830ab733be6b`, runtime
+`dfde14d0f079ff6cdccedafac273690e24158e0e892c6e12897a0bb8603097b4`, and
+unit module `eccdcd0ae53a2798552508c28098709fcfbb46d494a4fd2cdd384f679e643ee1`.
+
 ## 2026-08-29 — shared quadratic stabilization reaches 1,542 combined lines
 
 This hardware-accepted renderer rewrite follows the 1,572-line milestone

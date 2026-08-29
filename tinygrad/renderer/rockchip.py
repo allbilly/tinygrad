@@ -19,7 +19,7 @@ class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 
 class RKEWMode(IntEnum):
   HALF_TO_FLOAT=0; FLOAT_TO_HALF=1; INT16=2; INT32=3; INT16_TO_INT32=4; HALF_TO_INT32=5
-  HALF_TO_INT16=6; INT32_TO_HALF=7; HALF=8; STATEFUL=9; COMPARE=10
+  HALF_TO_INT16=6; INT32_TO_HALF=7; HALF=8; BOUNDED=9; STATEFUL=9; COMPARE=10
 
 class RKArg(NamedTuple): kind: RKBufferKind; index: int; addend: int = 0  # type: ignore[assignment]
 
@@ -168,14 +168,14 @@ def _raw_gather(source:RKArg, out_slot:int, count:int, stride:int=2, itemsize:in
 
 @functools.lru_cache(maxsize=256)
 def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple[tuple[int, ...], int]:
-  """Emit one DPU EW register template, sharing its physical prefix and RDMA tail across every precision."""
+  """Emit either a self-initializing DPU EW body or a lean FP16 continuation body."""
   D, R = _DPU, rk
   native_int16,int16_to_int32,fp32_output,fp32_input = (mode == x for x in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_FLOAT,RKEWMode.FLOAT_TO_HALF))  # noqa: E501
   int32_output,int32_input = mode in (RKEWMode.INT32,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32), mode in (RKEWMode.INT32,RKEWMode.INT32_TO_HALF)  # noqa: E501
   special,compare = mode != RKEWMode.HALF, mode == RKEWMode.COMPARE
   limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if mode==RKEWMode.INT32 else _EW_ELEMS_32BIT if \
     int32_output or int32_input or fp32_output or fp32_input else _MAX_EW_ELEMS_FP16
-  if not 0 < count <= limit: raise ValueError(f"{'stateful EW' if special else 'EW fp16'} count {count} out of range")
+  if not 0 < count <= limit: raise ValueError(f"{'initialized EW' if special else 'EW fp16'} count {count} out of range")
   lanes, is_div = (4 if int32_input or fp32_input else 8), ew_cfg == _EW_CFG[Ops.FDIV]
   width, data_format = (count + lanes-1) // lanes - 1, _DPU_DATA_FORMATS[mode]
   regs:tuple[tuple[int, int, int], ...] = ((D,R.REG_DPU_S_POINTER,0xe),(D,R.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
@@ -183,7 +183,6 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
     (D,R.REG_DPU_DATA_CUBE_WIDTH,width),(D,R.REG_DPU_DATA_CUBE_HEIGHT,0),(D,R.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
     (D,R.REG_DPU_DATA_CUBE_CHANNEL,0 if fp32_output and count == 1 else ((lanes-1)<<16)|(lanes-1)))
   if special:
-    # Keep the compare phase lazy so invalid ordinary EW configs do not inspect it.
     pipeline = (((D,R.REG_DPU_BS_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BN_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BS_ALU_CFG,0),(D,R.REG_DPU_BS_MUL_CFG,0),
       (D,R.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 or fp32_output and count == 1 else 2),
       (D,R.REG_DPU_WDMA_SIZE_0,0 if fp32_output and count == 1 else 3 if fp32_output else lanes-1),(D,R.REG_DPU_WDMA_SIZE_1,width),
@@ -191,6 +190,7 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
       + (((D,R.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(D,R.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),(D,R.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),
       (D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),
       (D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE)) if compare else ())
+      + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ())
       + ((D,R.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else \
       ew_cfg & ~_EW_OP_CVT_BYPASS if native_int16 or int16_to_int32 else ew_cfg),
       (D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),
@@ -220,9 +220,6 @@ def _strip_cast(u:UOp) -> UOp:
 
 def _typed_cast_source(u:UOp, dtype:DType, source:DType) -> UOp|None:
   return u.src[0] if u.op is Ops.CAST and u.dtype.scalar() is dtype and len(u.src) == 1 and u.src[0].dtype.scalar() is source else None
-
-def _inverted_condition(u:UOp, typed:bool=False) -> UOp|None: return None if u.op is not Ops.CMPNE else next(
-  (v for v,m in (u.src, u.src[::-1]) if m.op is Ops.CONST and bool(m.arg) and (not typed or m.dtype.scalar() is dtypes.bool)), None)
 
 @functools.lru_cache(maxsize=4096)
 def _semantic_loads(u:UOp) -> tuple[UOp, ...]:
@@ -397,6 +394,7 @@ def _physical_recipe(recipe:UOp, opaque:tuple[UOp, ...]=()) -> UOp: return _tag_
 
 def _kahan_sum(terms:tuple[UOp,...]|list[UOp]) -> UOp:
   """Accumulate physical HALF terms while retaining the running rounding correction."""
+  if any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float,dtypes.weakfloat) and not math.isfinite(float(node.arg)) for term in terms for node in term.toposort()): return _fold_static_terms(Ops.ADD,terms[0].dtype,list(terms),False)  # noqa: E501
   total,correction=terms[0],UOp.const(0.0,dtypes.half)
   for value in terms[1:]: adjusted=value.alu(Ops.SUB,correction); updated=total.alu(Ops.ADD,adjusted); correction=updated.alu(Ops.SUB,total).alu(Ops.SUB,adjusted); total=updated  # noqa: E501
   return _tag_precise_adds(total)
@@ -422,7 +420,7 @@ def _append_inplace_image(first:RKImage, second:RKImage, *, link:tuple[int,RKArg
       target=RKArg(RKBufferKind.SCRATCH,fs+len(second.scratch)); second=second._replace(scratch=second.scratch+(_scratch_bytes(count),),program=(RKGather(source,target,count,axes=((1,count,1),)),)+second.program)  # noqa: E501
     second=_alias_image_args(second,{source_slot:target})
   program=list(second.program); first_ew=next(i for i,op in enumerate(program) if isinstance(op,RKEWOp)); op=typing_cast(RKEWOp,program[first_ew])
-  program[first_ew]=op._replace(submit_barrier=not chained,mode=RKEWMode.STATEFUL if op.mode==RKEWMode.HALF else op.mode)
+  program[first_ew]=op._replace(submit_barrier=not chained)
   if not chained: return RKImage(first.scratch+second.scratch,program=first.program+tuple(program))
   split=next(i for i,op in enumerate(first.program) if isinstance(op,RKEWOp))
   return RKImage(first.scratch+second.scratch,program=first.program[:split]+tuple(program[:first_ew])+first.program[split:]+tuple(program[first_ew:]))  # noqa: E501
@@ -701,7 +699,7 @@ def _has_runtime_address(root:UOp) -> bool:
 
 def _fp32_expr_to_half(u:UOp) -> UOp:
   """Represent a float ADD/MUL expression with a three-half expansion at its FP16 storage boundary."""
-  if u.dtype.scalar() is dtypes.half: return u
+  if u.dtype.scalar() is dtypes.half or u.op is Ops.CONST and u.dtype.scalar() is dtypes.weakfloat: return u if u.dtype.scalar() is dtypes.half else UOp.const(float(u.arg),dtypes.half)  # noqa: E501
   if u.dtype.scalar() is not dtypes.float: raise _RKGenericReject
   if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.half: return u.src[0]
   if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() in (dtypes.int, dtypes.int16, dtypes.bool): return u.src[0].cast(dtypes.half)
@@ -758,7 +756,7 @@ class RKContext:
     self.raw_components:dict[RKArg,tuple[UOp,...]]={}
     self.recipe_owners:dict[UOp,UOp]={}
     self.program:list[RKGather|RKEWOp|RKCMAC]=[]
-    nodes=self.root.toposort(); value_nodes=self.root.toposort(gate=lambda node:node.op is not Ops.LOAD); self.semantic_nodes=set(nodes); self.mask_program=any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)  # noqa: E501
+    nodes=self.root.toposort(); value_nodes=self.root.toposort(gate=lambda node:node.op is not Ops.LOAD); self.semantic_nodes=set(nodes); self.bounded_chain=any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)  # noqa: E501
     int_range=_int_info(self.root)[0] if self.root.dtype.scalar() is dtypes.int else None
     dynamic_int_load=any(node.op is Ops.LOAD and node.dtype.scalar() in (dtypes.int,dtypes.uint) and node.src and _root_param(node.src[0]) is not None for node in nodes)  # noqa: E501
     cmod_support=tuple(_int_info(node)[1] is not None for node in value_nodes if node.op is Ops.CMOD and not _is_static_expr(node))
@@ -876,10 +874,8 @@ class RKContext:
     integer16, integer32 = dst.dtype is dtypes.int16, dst.dtype is dtypes.int
     if lhs.dtype is not dst.dtype or rhs.dtype is not dst.dtype: raise _RKGenericReject
     barrier = not integer16 and not integer32 and cfg in (_EW_CFG_FLOOR, _EW_CFG[Ops.FDIV])
-    mode=RKEWMode.INT16 if integer16 else RKEWMode.INT32 if integer32 else RKEWMode.COMPARE if compare else \
-      RKEWMode.STATEFUL if self.mask_program or barrier else RKEWMode.HALF
-    self.program.append(RKEWOp(dst.arg,lhs.arg,rhs.arg,self.count,cfg,submit_barrier=barrier,mode=mode))
-    self.mask_program |= compare; return dst
+    mode=RKEWMode.INT16 if integer16 else RKEWMode.INT32 if integer32 else RKEWMode.COMPARE if compare else RKEWMode.BOUNDED if self.bounded_chain or barrier else RKEWMode.HALF  # noqa: E501
+    self.program.append(RKEWOp(dst.arg,lhs.arg,rhs.arg,self.count,cfg,submit_barrier=barrier,mode=mode)); self.bounded_chain |= compare; return dst
 
   def _byte_gather(self, source:RKArg, dest:RKArg, count:int, *, base:int=0, source_stride:int=1,
                    source_limit:int|None=None, dst_stride:int=1, dst_addend:int=0, itemsize:int=2, partial:bool=False) -> RKArg:
@@ -933,8 +929,7 @@ class RKContext:
         return self._emit(self._scratch(dtypes.half,u=u),one,src,_EW_CFG[Ops.FDIV])
       return self._emit(self._scratch(src.dtype,u=u),src,src,_EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
-    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None:
-      return self.lower(recipe)
+    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
     if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
       return self.lower(recipe)
     dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
@@ -1033,21 +1028,14 @@ class RKContext:
   def _compare(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
     if all(src.dtype.scalar() is dtypes.bool for src in u.src):
-      if (expression:=_inverted_condition(u,typed=True)) is not None and expression.op is Ops.CMPLT:
-        sources=tuple(_half_backed_value(src) for src in expression.src)
-      if expression is not None and expression.op is Ops.CMPLT and all(src is not None for src in sources):
-        less=self.lower(expression)
-        unordered=tuple(self._fp16_component_values(self._operand(src,dtypes.half))[2]
-                        for src in typing_cast(tuple[UOp,UOp],sources)); one=less.const_like(1)
+      expression=next((v for v,m in (u.src,u.src[::-1]) if u.op is Ops.CMPNE and m.op is Ops.CONST and bool(m.arg) and m.dtype.scalar() is dtypes.bool),None); sources=tuple(_half_backed_value(src) for src in expression.src) if expression is not None and expression.op is Ops.CMPLT else ()  # noqa: E501,E702
+      if sources and all(src is not None for src in sources):
+        less=self.lower(typing_cast(UOp,expression)); unordered=tuple(self._fp16_component_values(self._operand(src,dtypes.half))[2] for src in typing_cast(tuple[UOp,UOp],sources)); one=less.const_like(1)  # noqa: E501
         return self._lower_recipe(u,one.alu(Ops.SUB,less).alu(Ops.MUL,one.alu(Ops.SUB,unordered[0].alu(Ops.MAX,unordered[1]))))
-      values=tuple(self.lower(src) for src in u.src)
-      lhs,rhs=values; op=Ops.AND if u.op is Ops.MUL else Ops.OR if u.op is Ops.MAX else u.op
-      if op in (Ops.AND,Ops.OR): result=lhs.alu(Ops.MUL if op is Ops.AND else Ops.MAX,rhs)
-      elif op in (Ops.XOR,Ops.CMPNE):
-        complement=next((other for source,other in zip(u.src,(rhs,lhs)) if source.op is Ops.CONST and bool(source.arg)),None)
-        result=lhs.const_like(1).alu(Ops.SUB,complement) if complement is not None else _i16_compare(Ops.CMPNE,lhs,rhs)
-      elif op is Ops.CMPEQ: result=_i16_compare(Ops.CMPEQ,lhs,rhs)
-      else: raise _RKGenericReject
+      lhs,rhs=(self.lower(src) for src in u.src); op=Ops.AND if u.op is Ops.MUL else Ops.OR if u.op is Ops.MAX else u.op
+      if op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.CMPNE,Ops.CMPEQ): raise _RKGenericReject
+      complement=next((other for source,other in zip(u.src,(rhs,lhs)) if op in (Ops.XOR,Ops.CMPNE) and source.op is Ops.CONST and bool(source.arg)),None)  # noqa: E501
+      result=lhs.const_like(1).alu(Ops.SUB,complement) if complement is not None else lhs.alu(Ops.MUL if op is Ops.AND else Ops.MAX,rhs) if op in (Ops.AND,Ops.OR) else _i16_compare(op,lhs,rhs)  # noqa: E501
       return self._lower_recipe(u,result)
     if u.op is Ops.CMPNE and (u is self.root or any(src.op is Ops.INDEX for src in u.src)) and (nonzero:=_fp16_nonzero_mask(u)) is not None:  # noqa: E501
       value = self.lower(nonzero)
@@ -1067,7 +1055,7 @@ class RKContext:
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
       values=tuple(self._operand(src,dtypes.half) for src in typing_cast(tuple[UOp,UOp],half_sources))
       nan=tuple(self._fp16_component_values(value)[2] for value in values)
-      components=tuple(self._fp16_ordered_values(value) if u.op is Ops.CMPLT else
+      components=tuple(self._fp16_component_values(value,True) if u.op is Ops.CMPLT else
         (parts[0],parts[1]) for value in values for parts in (self._fp16_component_values(value),))
     result=_ordered_bits(*components) if u.op is Ops.CMPLT else functools.reduce(
       lambda equal,pair:equal.alu(Ops.MUL,_i16_equal(*pair)),zip(*components),components[0][0].const_like(1))
@@ -1102,37 +1090,26 @@ class RKContext:
     packed_raw, sign = (quotient_raw, quotient_sign) if u.op is Ops.CDIV else (remainder_raw, remainder_sign)
     return self._raw(tuple(self.lower(value) for value in _twos_complement(packed_raw,sign)),dtypes.int,u=u)
 
-  def _fp16_component_values(self, value:UOp) -> tuple[UOp, UOp, UOp]:
+  def _fp16_component_values(self, value:UOp, ordered:bool=False) -> tuple[UOp, ...]:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
     lo,hi=self._raw(value)
     sign_scale=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))).alu(Ops.MUL,hi.const_like(128)); magnitude=hi.alu(Ops.SUB,sign_scale)
     clean=hi.alu(Ops.SUB,sign_scale.alu(Ops.MUL,_i16_equal(magnitude,magnitude.const_like(0)).alu(Ops.MUL,_i16_equal(lo,lo.const_like(0)))))
     exponent=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(123)))
     mantissa=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(124))).alu(Ops.MAX,_i16_min(lo,lo.const_like(1)))
-    return lo,clean,exponent.alu(Ops.MUL,mantissa)
-
-  def _fp16_ordered_values(self, value:UOp) -> tuple[UOp, UOp]:
-    """Map a classified FP16 lane to two unsigned bytes whose lexical order is IEEE numeric order."""
-    lo,hi,_=self._fp16_component_values(value)
-    sign=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))); positive=hi.alu(Ops.ADD,hi.const_like(128))
-    high_delta=hi.const_like(255).alu(Ops.SUB,hi).alu(Ops.SUB,positive); low_delta=lo.const_like(255).alu(Ops.SUB,lo).alu(Ops.SUB,lo)
+    if not ordered: return lo,clean,exponent.alu(Ops.MUL,mantissa)
+    sign=_i16_bit(clean.alu(Ops.SUB,clean.const_like(127))); positive=clean.alu(Ops.ADD,clean.const_like(128))
+    high_delta=clean.const_like(255).alu(Ops.SUB,clean).alu(Ops.SUB,positive); low_delta=lo.const_like(255).alu(Ops.SUB,lo).alu(Ops.SUB,lo)
     return positive.alu(Ops.ADD,sign.alu(Ops.MUL,high_delta)),lo.alu(Ops.ADD,sign.alu(Ops.MUL,low_delta))
-
-  def _threshold_where(self, u:UOp) -> UOp|None:
-    """Build a cheap FP16 0/1 predicate for a finite-threshold mask while excluding unordered lanes.
-    Select a compared value or finite constant without multiplying an inactive nonfinite value."""
-    gate = _unwrap_condition(u.src[0])
-    if gate.op is not Ops.CMPLT or gate.src[1].op is not Ops.CONST or not math.isfinite(float(gate.src[1].arg)) or any(src.dtype.scalar() not in (dtypes.half,dtypes.float) for src in gate.src): return None  # noqa: E501
-    lhs, yes, no = gate.src[0], *(_unwrap_condition(src) for src in u.src[1:])
-    if not (yes.key == lhs.key and no.op is Ops.CONST and math.isfinite(float(no.arg)) and float(no.arg) != float(gate.src[1].arg) or no.key == lhs.key and yes.op is Ops.CONST and math.isfinite(float(yes.arg)) and float(yes.arg) != float(gate.src[1].arg)): return None  # noqa: E501
-    value = self.lower(lhs.cast(dtypes.half))
-    selector = self.lower(_positive_mask(gate.src[1].cast(dtypes.half).alu(Ops.SUB, lhs.cast(dtypes.half))))
-    nan = self._fp16_component_values(value)[2]
-    selector=self._convert(None,selector,dtypes.int16,True)
-    return self._raw_where(u,self.lower(selector.alu(Ops.MUL,nan.const_like(1).alu(Ops.SUB,nan))))
 
   def _raw_where(self, u:UOp, selector:UOp|None=None) -> UOp:
     """Select typed values through one canonical INT16 mask, preserving nonfinite arms as raw bytes."""
+    gate,arms=_unwrap_condition(u.src[0]),tuple(_unwrap_condition(src) for src in u.src[1:])
+    lhs=gate.src[0] if gate.op is Ops.CMPLT and gate.src[1].op is Ops.CONST and math.isfinite(float(gate.src[1].arg)) and all(src.dtype.scalar() in (dtypes.half,dtypes.float) for src in gate.src) else None  # noqa: E501
+    if selector is None and lhs is not None and any(dynamic.key==lhs.key and constant.op is Ops.CONST and math.isfinite(float(constant.arg)) and float(constant.arg)!=float(gate.src[1].arg) for dynamic,constant in (arms,arms[::-1])):  # noqa: E501
+      value=self.lower(lhs.cast(dtypes.half)); nan=self._fp16_component_values(value)[2]
+      selector=self._convert(None,self.lower(_positive_mask(gate.src[1].cast(dtypes.half).alu(Ops.SUB,lhs.cast(dtypes.half)))),dtypes.int16,True)
+      selector=self.lower(selector.alu(Ops.MUL,nan.const_like(1).alu(Ops.SUB,nan)))
     yes, no = (self.lower(src) for src in u.src[1:])
     if selector is None: selector = self.lower(u.src[0])
     if yes.dtype is dtypes.int16: return self._lower_recipe(u,_i16_select(selector,yes,no))
@@ -1165,7 +1142,6 @@ class RKContext:
         commits.append(RKGather(value.arg._replace(addend=0),self.out,self.count,offsets=offsets,partial=bool(partial),itemsize=itemsize))
       self.program.extend(commits)
       return self._carrier(self.out,expected)
-    if (threshold:=self._threshold_where(u)) is not None: return threshold
     for fold in (_fold_where_abs, _fold_ordered_where):
       if (recipe:=fold(u)) is not None: return self.lower(recipe)
     return self._raw_where(u)
@@ -1257,10 +1233,13 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   @functools.cache
   def rewrite(u:UOp) -> UOp:
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float and not _has_runtime_address(u.src[0]):  # noqa: E501
-      return (rewrite(_physical_recipe(_dpu_sin(u.src[0].src[0]),(u.src[0].src[0],)))
-        if u.src[0].op is Ops.SIN else _canonical_half_storage(u.src[0]))
+      if u.src[0].op is Ops.SIN: return rewrite(_physical_recipe(_dpu_sin(u.src[0].src[0]),(u.src[0].src[0],)))
+      try: return _canonical_half_storage(u.src[0])
+      except _RKGenericReject: pass
     if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None and (recipe:=_accurate_add_recipe(u)) is not None: return recipe  # noqa: E501
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
+    if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped): mapped=UOp(Ops.WHERE,dtypes.half,src=(mapped.src[0],mapped.src[1].cast(dtypes.half),mapped.src[2].cast(dtypes.half)),arg=mapped.arg) if mapped.op is Ops.WHERE else mapped.src[0].cast(dtypes.half).alu(mapped.op,mapped.src[1].cast(dtypes.half))  # noqa: E501
+    if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half: mapped=mapped.src[0]  # noqa: E501
     if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
     if mapped.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
       if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
@@ -1321,15 +1300,13 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
   if (cmac:=_try(local_output, (dtypes.half,dtypes.float,dtypes.int), _lower_reduction, uops, v=vectorize_reductions)) is not None: return cmac
   if (mixed:=_try(strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops,v=vectorize_reductions)) is not None: return mixed
   if (image:=_try(strict_output,dtypes.int,_lower_raw_fp16_bitcast)) is not None: return image
-  storage_uops, storage_product_adds = None, False
-  if any(u.dtype.scalar() is dtypes.float for u in uops) and (sink:=next((u for u in uops if u.op is Ops.SINK),None)) is not None:
+  storage_precision,storage_product_adds=any(u.dtype.scalar() is dtypes.float for u in uops),False
+  if storage_precision and (storage_output:=_admit(local_output,dtypes.half)) is not None:
     try:
-      if (storage_output:=_admit(local_output,dtypes.half)) is not None:
-        storage_root=storage_output[4]; storage_product_adds=any((boundary is not storage_root or len(boundary.src[0].toposort())>64) and _accurate_add_recipe(boundary) is not None for boundary in storage_root.toposort() if _typed_cast_source(boundary,dtypes.half,dtypes.float) is not None)  # noqa: E501
-        sink=sink.substitute({storage_root:_expand_math_uops(storage_root,accurate_adds=False)})
+      storage_root=storage_output[4]; storage_product_adds=any((boundary is not storage_root or len(boundary.src[0].toposort())>64) and _accurate_add_recipe(boundary) is not None for boundary in storage_root.toposort() if _typed_cast_source(boundary,dtypes.half,dtypes.float) is not None)  # noqa: E501
+      storage_root=_expand_math_uops(storage_root,accurate_adds=False); local_output=(storage_output[0].replace(src=(storage_output[0].src[0],storage_root)),*storage_output[1:4],storage_root)  # noqa: E501
     except _RKGenericReject: pass
-    storage_uops=list(graph_rewrite(sink,_pm_storage_common,name="rockchip generic storage precision").toposort())
-  if (output:=local_output if storage_uops is None else _admit(_outs(uops:=storage_uops)[1],accepted)) is None or len(output[0].src) != 2:  # noqa: E501
+  if (output:=local_output) is None or len(output[0].src) != 2:
     if os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject("output store")
     return None
   if output[2] <= 0: return RKImage()
@@ -1338,7 +1315,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
             set(affine[1]) == set(_index_ranges(output[3])) and _affine_output_axes(affine, output[2]) is not None) and \
        _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return None
     root=_finite_int_max_neutrals(_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4])
-    root = _expand_math_uops(root,accurate_adds=storage_uops is None or storage_product_adds) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
+    root = _expand_math_uops(root,accurate_adds=not storage_precision or storage_product_adds) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
     if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES and os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject(f"expanded nodes {len(n)}")  # noqa: E501
     if len(n) > _MAX_GENERIC_EXPANDED_NODES: return None
     if root is not output[4]: output = (output[0].replace(src=(output[0].src[0], root)), *output[1:4], root)
@@ -1421,28 +1398,12 @@ def _fold_trunc(x:UOp) -> UOp:
   negative = zero.alu(Ops.SUB, zero.alu(Ops.SUB, source).alu(Ops.MAX, zero))
   return _native_same(source.alu(Ops.MAX, zero), _NATIVE_FLOOR).alu(Ops.ADD, _native_same(negative, _NATIVE_CEIL))
 
-def _replace_infinite_multiply(x:UOp) -> UOp|None:
-  """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
-  for value, factor in (x.src, x.src[::-1]):
-    if factor.op is not Ops.CONST or not math.isinf(scale:=float(factor.arg)): continue
-    if scale < 0: value = value.alu(Ops.MUL, UOp.const(-1.0, dtypes.half))
-    return value.alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
-  return None
-
 def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
   """RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates."""
   numerator, denominator = x.src
   if numerator.op is not Ops.CONST or not math.isinf(value:=float(numerator.arg)): return None
   return UOp.const(-1.0 if value < 0 else 1.0, dtypes.half).alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
 
-_pm_storage_common = PatternMatcher([(UPat((Ops.WHERE, Ops.ADD, Ops.MUL), dtypes.float, name="x"), lambda x:None if _is_static_expr(x) else
-  UOp(Ops.WHERE, dtypes.half, src=(x.src[0], x.src[1].cast(dtypes.half), x.src[2].cast(dtypes.half)), arg=x.arg) if x.op is Ops.WHERE else
-  x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))),
-  *[(UPat(op, dtypes.half, name="x"), callback) for op,callback in (
-    (Ops.ADD, _fold_relu_cap), (Ops.MUL, _replace_infinite_multiply), (Ops.FDIV, _preserve_infinite_division_sign))],
-  (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
-  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),])
 def _fold_quadratic(root:UOp) -> UOp|None:
   """Scale sqrt(x*x +/- 1), and stabilize its canonical natural-log envelope."""
   logarithm=next((logarithm for logarithm,scale in ((root.src,root.src[::-1]) if root.op is Ops.MUL and len(root.src)==2 else ()) if scale.op is Ops.CONST and abs(float(scale.arg)-math.log(2))<1e-12 and logarithm.op is Ops.LOG2 and len(logarithm.src)==1 and logarithm.src[0].op is Ops.ADD),None)  # noqa: E501
