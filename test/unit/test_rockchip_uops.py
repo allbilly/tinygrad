@@ -1919,6 +1919,25 @@ def test_boolean_reductions_are_physically_executed():
       assert decode_image(encode_image(image))==image
 
 
+def test_production_large_all_uses_bounded_row_reduction():
+  count=1 << 20
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    output=Tensor.ones(count,device="ROCKCHIP").bool().all()
+    calls=[u for u in output.schedule_linear().toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+    to_program_cache.clear()
+    images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in calls]
+  assert len(images)==3 and len(_ew_ops(images[1]))<5000
+  assert all(_assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image for image in images)
+  values=np.ones(count,dtype="<f2")
+  values[:4]=np.asarray((np.nan,np.inf,-np.inf,np.nextafter(np.float16(0),np.float16(1))),dtype="<f2")
+  values[[4095,4096,500000,count-1]]=np.float16(0)
+  expected=np.all(values.reshape(256,4096)!=0,axis=1).astype(np.uint8)
+  rows=_execute_raw_dynamic_image(images[1],256,values.tobytes())
+  np.testing.assert_array_equal(np.frombuffer(rows,dtype=np.uint8),expected)
+  assert _execute_raw_dynamic_image(images[2],1,rows)==bytes((int(expected.all()),))
+
+
 def test_dependent_scalar_extrema_uses_direct_native_lowering():
   for extents in ((4,), (45,65)):
     count=math.prod(extents)
