@@ -8,10 +8,9 @@ from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
-_PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
+_PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN, _MAX_PC_TASKS = 4, 65536, 16384, 0xfff
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
-_SUBMIT_RETRIES = max(0, int(os.getenv("ROCKCHIP_SUBMIT_RETRIES", "4")))
 _MAX_EW_GROUP_OPS = 48
 _EW_MODE_INFO=((128,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(16,_MAX_EW_ELEMS_FP16,2,1,1),(32,_MAX_EW_ELEMS_FP16//2,4,1,1),(0,8,1,4,2),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1))  # noqa: E501
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
@@ -38,22 +37,20 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
 
-  def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False, retry:bool=True) -> None:
+  def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
+    if not 0<n<=_MAX_PC_TASKS: raise ValueError("invalid NPU task count")
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
-    retries = _SUBMIT_RETRIES if retry else 0
-    for attempt in range(retries+1):
-      try:
-        for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
-          task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
-          regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
-          subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
-        break
-      except TimeoutError:
-        self.dev.timeout_retries += 1
-        if attempt == retries: raise
-        self.dev.reset_npu()
+    self.dev._check_healthy()
+    try:
+      for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
+        task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
+        regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
+        subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
+    except TimeoutError as exc:
+      self.dev.timeout_retries,self.dev._poisoned=self.dev.timeout_retries+1,True
+      raise RuntimeError("RKNPU submit timed out; platform NPU reset or power cycle required") from exc
     self.dev.submit_count += 1
     self.dev.task_count += n
 
@@ -78,18 +75,18 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(task.va_addr)+i*_TASK_DESC_BYTES,ctypes.addressof(desc),_TASK_DESC_BYTES)
     if not standalone: self.dev._pcchain_bodies=bodies
     if standalone: self.dev.reset_npu()
-    try: self._submit(cmd,task,n,standalone=standalone,**({"retry":False} if cmac else {}))
+    try: self._submit(cmd,task,n,standalone=standalone)
     finally:
-      if standalone: self.dev.reset_npu()
+      if standalone and not self.dev._poisoned: self.dev.reset_npu()
 
   def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...]) -> None:
     if not ops: return
-    M=RKEWMode
-    def run_group(group:tuple[RKEWOp, ...]) -> None:
+    M=RKEWMode; program_modes={op.mode for op in getattr(getattr(self,"image",None),"program",ops) if isinstance(op,RKEWOp)}  # noqa: E501,E702
+    def run_group(group:tuple[RKEWOp, ...], pc_limit:int) -> None:
       chain:list[tuple[int, ...]]=[]; precision=0  # noqa: E702
       def flush_chain(reset:bool=False) -> None:
         if not chain: return
-        self._submit_bodies(chain)
+        for chunk in itertools.batched(chain,pc_limit): self._submit_bodies(chunk)
         if reset or precision>=64: self.dev.reset_npu()
         chain.clear()
       for op in group:
@@ -105,16 +102,15 @@ class RockchipProgram(Program['RockchipDevice']):
         precision=next_precision
         if precision==128 and len(chain)>=16: flush_chain()
       flush_chain()
-    cuts=(0,*(i for i,op in enumerate(ops) if i and op.submit_barrier),len(ops))
+    cuts=tuple(sorted({0,len(ops),*(j for i,o in enumerate(ops) if o.submit_barrier for j in ((i,) if o.mode!=M.BOUNDED else (i,i+1)) if j)}))
     for begin,end in zip(cuts,cuts[1:]):
-      group=ops[begin:end]
-      split=group[0].mode in (M.BOUNDED,M.HALF_TO_INT16,M.FLOAT_TO_HALF) and len(group)>_MAX_EW_GROUP_OPS and max(op.count for op in group)<=_MAX_EW_ELEMS_FP16 and not any(op.mode in (M.INT32,M.INT16_TO_INT32,M.HALF_TO_INT32,M.INT32_TO_HALF,M.HALF_TO_FLOAT) for op in group)  # noqa: E501
-      tiled=len(group)>1 and group[0].mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
-      if tiled:
-        tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(group))  # noqa: E501
-        for bodies in zip(*tiles): self._submit_bodies(bodies)
-      else:
-        for chunk in (itertools.batched(group,_MAX_EW_GROUP_OPS) if split else (group,)): run_group(tuple(op._replace(submit_barrier=False) for op in chunk))  # noqa: E501
+      section=ops[begin:end]; limit=_MAX_EW_GROUP_OPS if M.HALF in program_modes and M.INT16 in program_modes or section[0].mode in (M.BOUNDED,M.HALF_TO_INT16,M.FLOAT_TO_HALF) and len(section)>_MAX_EW_GROUP_OPS and max(op.count for op in section)<=_MAX_EW_ELEMS_FP16 and not any(op.mode in (M.INT32,M.INT16_TO_INT32,M.HALF_TO_INT32,M.INT32_TO_HALF,M.HALF_TO_FLOAT) for op in section) else _MAX_PC_TASKS  # noqa: E501,E702
+      for group in map(tuple,itertools.batched(section,limit)):
+        tiled=len(group)>1 and group[0].mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
+        if tiled:
+          tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(group))  # noqa: E501
+          for bodies in zip(*tiles): self._submit_bodies(bodies)
+        else: run_group(tuple(op._replace(submit_barrier=False) for op in group),limit)
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
     for start in range(0, op.count, limit):
@@ -184,11 +180,13 @@ class RockchipProgram(Program['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
-    self.submit_count = self.task_count = self.timeout_retries = 0
+    self.submit_count,self.task_count,self.timeout_retries,self._poisoned=0,0,0,False
     self._lock, self._buffers = threading.Lock(), dict[str,HCQBuffer]()
     self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self.reset_npu()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
+  def _check_healthy(self):
+    if self._poisoned: raise RuntimeError("RKNPU is unavailable after a submit timeout; platform NPU reset or power cycle required")
   def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0) -> HCQBuffer:
     if (buf:=self._buffers.get(attr)) is None or buf.size < size:
       new = self._gpu_alloc(max(size, minimum), flags)
@@ -197,7 +195,7 @@ class RockchipDevice(Compiled):
       return new
     return buf
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
-    alloc = max(4096, (size+4095)&-4096)
+    alloc = max(self._check_healthy() or 4096, (size+4095)&-4096)
     try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl,size=alloc,flags=flags|rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT)  # noqa: E501
     except OSError as exc: raise MemoryError(f"RKNPU GEM allocation failed for {alloc} bytes") from exc
     try:
@@ -209,16 +207,16 @@ class RockchipDevice(Compiled):
       raise MemoryError(f"RKNPU GEM mapping failed for {alloc} bytes") from exc
     return HCQBuffer(mapped, size, meta=meta)
   def _sync_buffer(self, buf:HCQBuffer, flags:int):
-    rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
+    self._check_healthy() or rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
     unique:dict[int,HCQBuffer] = {}
     for buf in bufs: unique.setdefault(buf.meta.obj_addr,buf)
     for buf in unique.values(): self._sync_buffer(buf,flags)
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
-    rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
+    if not self._poisoned: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
   def reset_npu(self):
-    rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
+    self._check_healthy() or rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
     self._native_int16 = False
   def finalize(self):
     for buf in self._buffers.values(): self._gpu_free(buf)

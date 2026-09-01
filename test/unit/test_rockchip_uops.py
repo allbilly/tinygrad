@@ -431,11 +431,12 @@ def _runtime_memory(size:int, dma:int):
   return memory
 
 
-def test_submit_retries_once_after_driver_timeout(monkeypatch):
+def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
   class FakeDevice:
-    fd_ctl, submit_count, task_count, timeout_retries, resets = object(), 0, 0, 0, 0
-    def _sync_buffer(self, _buffer, _flags): pass
-    def reset_npu(self): self.resets += 1
+    fd_ctl, submit_count, task_count, timeout_retries, _poisoned = object(), 0, 0, 0, False
+    def _check_healthy(self):
+      if self._poisoned: raise RuntimeError("poisoned")
+    def _sync_buffer(self, _buffer, _flags): self._check_healthy()
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev = FakeDevice()
   buffer = SimpleNamespace(meta=SimpleNamespace(obj_addr=1))
@@ -443,11 +444,12 @@ def test_submit_retries_once_after_driver_timeout(monkeypatch):
   def submit(_fd, **_kwargs):
     nonlocal calls
     calls += 1
-    if calls == 1: raise TimeoutError
+    raise TimeoutError
   monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_SUBMIT", submit)
-  program._submit(buffer, buffer, 1)
-  assert calls == 2 and program.dev.resets == program.dev.timeout_retries == 1
-  assert program.dev.submit_count == program.dev.task_count == 1
+  with pytest.raises(RuntimeError,match="platform NPU reset or power cycle required"): program._submit(buffer, buffer, 1)
+  with pytest.raises(RuntimeError,match="poisoned"): program._submit(buffer, buffer, 1)
+  assert calls == program.dev.timeout_retries == 1 and program.dev._poisoned
+  assert program.dev.submit_count == program.dev.task_count == 0
 
 def test_device_workspace_reuses_grows_and_finalizes_each_role_once():
   device=object.__new__(rockchip_runtime.RockchipDevice)
@@ -467,26 +469,35 @@ def test_device_workspace_reuses_grows_and_finalizes_each_role_once():
   assert freed == [first,second,scratch]
 
 
-def test_cmac_submit_never_replays_a_timeout(monkeypatch):
-  class FakeDevice:
-    fd_ctl, submit_count, task_count, timeout_retries, resets = object(), 0, 0, 0, 0
-    def _sync_buffer(self, _buffer, _flags): pass
-    def reset_npu(self): self.resets += 1
+def test_runtime_bounds_risky_and_oversize_pc_chains(monkeypatch):
+  arg = RKArg(RKBufferKind.ARG,0)
   program = object.__new__(rockchip_runtime.RockchipProgram)
-  program.dev = FakeDevice()
-  buffer = SimpleNamespace(meta=SimpleNamespace(obj_addr=1))
-  calls = 0
-  def submit(_fd, **_kwargs):
-    nonlocal calls
-    calls += 1
-    raise TimeoutError
-  monkeypatch.setattr(rockchip_runtime.rk, "DRM_IOCTL_RKNPU_SUBMIT", submit)
-  try:
-    program._submit(buffer, buffer, 1, retry=False)
-  except TimeoutError: pass
-  else: raise AssertionError("CMAC timeout was swallowed")
-  assert calls == 1 and program.dev.resets == 0 and program.dev.timeout_retries == 1
-  assert program.dev.submit_count == program.dev.task_count == 0
+  program.dev = SimpleNamespace(reset_npu=lambda:None)
+  monkeypatch.setattr(rockchip_runtime,"emit_ew_stage",lambda *_args,**_kwargs:(1,))
+  half = RKEWOp(arg,arg,arg,1,_EW_CFG[Ops.ADD])
+  submitted = []
+  program._submit_bodies=lambda bodies,*_args,**_kwargs:submitted.append(len(tuple(bodies)))
+  program._run_ew_ops(lambda _arg:0,(half,)*(rockchip_runtime._MAX_EW_GROUP_OPS+1))
+  assert submitted == [rockchip_runtime._MAX_EW_GROUP_OPS+1]
+  submitted.clear()
+  program._run_ew_ops(lambda _arg:0,(half,)*(rockchip_runtime._MAX_PC_TASKS+1))
+  assert submitted == [rockchip_runtime._MAX_PC_TASKS,1]
+  submitted.clear()
+  int16 = half._replace(mode=RKEWMode.INT16)
+  program._run_ew_ops(lambda _arg:0,(half,)*rockchip_runtime._MAX_EW_GROUP_OPS+(int16,))
+  assert submitted == [rockchip_runtime._MAX_EW_GROUP_OPS,1]
+  submitted.clear()
+  conversion = half._replace(count=8*(rockchip_runtime._MAX_EW_GROUP_OPS+1),mode=RKEWMode.INT16_TO_INT32)
+  program._run_ew_ops(lambda _arg:0,(half,int16,conversion))
+  assert submitted == [1,rockchip_runtime._MAX_EW_GROUP_OPS,2]
+  submitted.clear()
+  program._run_ew_ops(lambda _arg:0,(int16,)*77+(conversion._replace(count=25),))
+  assert submitted == [81]
+  submitted.clear()
+  program.image = SimpleNamespace(program=(half,int16))
+  program._run_ew_ops(lambda _arg:0,(half,)*(rockchip_runtime._MAX_EW_GROUP_OPS+1))
+  assert submitted == [rockchip_runtime._MAX_EW_GROUP_OPS,1]
+  with pytest.raises(ValueError,match="invalid NPU task count"): program._submit(None,None,rockchip_runtime._MAX_PC_TASKS+1)  # type: ignore[arg-type]
 
 
 def test_numeric_output_program_resets_before_its_first_dpu_stage():
@@ -507,7 +518,7 @@ def test_numeric_output_program_resets_before_its_first_dpu_stage():
 
 def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   class FakeDevice:
-    resets = 0
+    resets, _poisoned = 0, False
     def reset_npu(self): self.resets += 1
   def memory(size, dma):
     storage = ctypes.create_string_buffer(size)
@@ -529,7 +540,7 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
     rockchip_runtime._pc(rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0xd))
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (0,0xd,0x300,0x1ffff,45)
-  assert program.dev.resets == 2 and len(submits) == 1 and submits[0][1] == {"standalone":True,"retry":False}
+  assert program.dev.resets == 2 and len(submits) == 1 and submits[0][1] == {"standalone":True}
   body = (1,2,3)
   program._submit_bodies((body,),True)
   assert tuple((ctypes.c_uint64*4).from_address(cmd.va_addr)) == body+(rockchip_runtime._pc(
@@ -616,7 +627,7 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
      (("submit",(31,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
     ((op(count=large),op(count=large)), (("submit",(31,18)),("submit",(31,18)))),
     ((op(),op(count=large,barrier=True,mode=RKEWMode.STATEFUL),op(count=large),op(barrier=True)),
-     (("submit",(31,)),("submit",(31,18)),("submit",(31,18)),("submit",(31,)))),
+     (("submit",(31,)),("submit",(31,31)),("submit",(31,31)),("submit",(31,)))),
     ((op(mode=RKEWMode.STATEFUL),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
      (("submit",(31,)+(18,)*(rockchip_runtime._MAX_EW_GROUP_OPS-1)),("submit",(31,)))),
   )
