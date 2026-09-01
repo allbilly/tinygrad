@@ -544,27 +544,26 @@ def _lower_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   return _lower_cmac_reduce(output,uops) or _lower_mapped_reduce(output,uops)
 
 def _reduce_mapped_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGather], source:RKArg, lanes:int,
-                        cfg:int, int16:bool=False, kahan:bool=False, barrier:bool=True) -> RKArg:
+                        cfg:int, rows:int=1, int16:bool=False, kahan:bool=False, barrier:bool=True) -> RKArg:
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
+  block=8 if rows==1 else round_up(rows,8); groups=lanes if rows==1 else lanes//block
   if kahan:
-    arena=RKArg(RKBufferKind.SCRATCH,len(scratch)); total,updated,correction,adjusted=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i+1) for i in range(4)); scratch.extend((_scratch_bytes(lanes*8),*(64,)*4))  # noqa: E501
-    gathers.extend((RKGather(source,arena,lanes,axes=((1,lanes,1),),dst_stride=8),RKGather(None,correction,1,values=(0,)))); ops.append(RKEWOp(total,arena,arena,1,_EW_CFG[Ops.MAX],submit_barrier=barrier,mode=RKEWMode.STATEFUL))  # noqa: E501
-    for index in range(1,lanes):
-      value=arena._replace(addend=index*16); ops.append(RKEWOp(adjusted,value,correction,1,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(updated,total,adjusted,1,_EW_CFG[Ops.ADD])); ops.append(RKEWOp(correction,updated,total,1,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(correction,correction,adjusted,1,_EW_CFG[Ops.SUB])); total,updated=updated,total  # noqa: E501
+    arena=RKArg(RKBufferKind.SCRATCH,len(scratch)); total,updated,correction,adjusted=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i+1) for i in range(4)); scratch.extend((_scratch_bytes(groups*block),*(_scratch_bytes(rows),)*4))  # noqa: E501
+    gathers.extend((RKGather(source,arena,lanes,axes=((1,lanes,1),),dst_stride=block if rows==1 else 1),RKGather(None,correction,rows,values=(0,)))); ops.append(RKEWOp(total,arena,arena,rows,_EW_CFG[Ops.MAX],submit_barrier=barrier,mode=RKEWMode.STATEFUL))  # noqa: E501
+    for index in range(1,groups):
+      value=arena._replace(addend=index*block*2); ops.append(RKEWOp(adjusted,value,correction,rows,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(updated,total,adjusted,rows,_EW_CFG[Ops.ADD])); ops.append(RKEWOp(correction,updated,total,rows,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(correction,correction,adjusted,rows,_EW_CFG[Ops.SUB])); total,updated=updated,total  # noqa: E501
     return total
-  size=1<<(lanes-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*8),)*2)  # noqa: E501
-  bits=size.bit_length()-1; offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<lanes else -1 for lane in range(size))  # noqa: E501
-  neutral=0 if cfg==_EW_CFG[Ops.ADD] else _int16_bits(dtypes.int16.min) if int16 else _fp16_bits(-math.inf)
-  gathers.append(RKGather(source,current,size,offsets=offsets,fill_bits=neutral,dst_stride=8)); first=barrier and not int16
+  size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*block),)*2); bits=size.bit_length()-1; offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<groups else -1 for lane in range(size))  # noqa: E501
+  neutral=0 if cfg==_EW_CFG[Ops.ADD] else _int16_bits(dtypes.int16.min) if int16 else _fp16_bits(-math.inf); offsets=offsets if rows==1 else tuple(index*block+row if index>=0 else -1 for index in offsets for row in range(block))  # noqa: E501
+  gathers.append(RKGather(source,current,len(offsets),offsets=offsets,fill_bits=neutral,dst_stride=block if rows==1 else 1)); first=barrier and not int16  # noqa: E501
   while size>1:
-    size//=2; count=size*8; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,
-      mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current
+    size//=2; count=size*block; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current  # noqa: E501
   return current
 
 def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Render one canonical mapped reduction, reduce it physically, then compile its dependent scalar suffix."""
   store,out,rows,out_index,root=output
-  if rows != 1 or out.dtype.scalar() not in (dtypes.half,dtypes.int): return None
+  if rows<1 or out.dtype.scalar() not in (dtypes.half,dtypes.int) or rows>16 and out.dtype.scalar() is not dtypes.int: return None
   reductions=tuple(node for node in root.toposort() if node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] in (Ops.ADD,Ops.MAX))
   nested={child for value in reductions for child in value.src[0].toposort() if child is not value and child.op is Ops.REDUCE}
   if len(outer:=tuple(value for value in reductions if value not in nested)) != 1: return None
@@ -576,20 +575,23 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     if len(leaves)!=1: return None
     value=leaves[0]; body=value.src[0]; ranges=list(value.src[1:])
   if not ranges or any(axis.op not in (Ops.RANGE,Ops.SPECIAL) or not axis.src or axis.src[0].op is not Ops.CONST for axis in ranges): return None  # noqa: E501
-  extents=tuple(int(axis.src[0].arg) for axis in ranges); total=math.prod(extents); graph=body.toposort()
-  if not 2<=total<=_MAX_GENERIC_UNROLL or not _semantic_loads(body) or (out.dtype.scalar() is not dtypes.int or len(reductions)==1) and (total<32 or not (total>416 or len(_semantic_loads(body))>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN) for node in graph))): return None  # noqa: E501
-  try: product=_strip_cast(_fp32_expr_to_half(body))
+  loaded_indices={node.src[0] for node in body.toposort() if node.op is Ops.LOAD}; body=body.substitute({node:node.load() for node in body.toposort() if node.op is Ops.INDEX and node not in loaded_indices},walk=True); extents=tuple(int(axis.src[0].arg) for axis in ranges); total=math.prod(extents); graph=body.toposort()  # noqa: E501
+  if not 2<=total<=_MAX_GENERIC_UNROLL or not _semantic_loads(body) or (out.dtype.scalar() is not dtypes.int or len(reductions)==1) and (total<32 or not (rows>1 and out.dtype.scalar() is dtypes.int or total>416 or len(_semantic_loads(body))>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN) for node in graph))): return None  # noqa: E501
+  try: product=body if out.dtype.scalar() is dtypes.int else _strip_cast(_fp32_expr_to_half(body))
   except _RKGenericReject: product=_strip_cast(body)
-  integer=product.dtype.scalar() is dtypes.int; bounds=_int_info(product)[0] if integer else None
+  integer=dtypes.is_int(product.dtype.scalar()); bounds=_int_info(product)[0] if integer else None
   if product.dtype.scalar() is not dtypes.half and (bounds is None or not -32768<=bounds[0]<=bounds[1]<=32767): return None
   mapped_dtype=dtypes.int16 if integer else dtypes.half
   mapped_terms:tuple[UOp,...]=(body,)
   if product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in product.src) and any(_strip_cast(source).op is not Ops.LOAD for source in product.src):  # noqa: E501
     factor,multiplier=next(((a,b) for a,b in (product.src,product.src[::-1]) if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD),product.src); products=tuple(term.alu(Ops.MUL,multiplier) for term in _iter_binary(factor,Ops.ADD,dtypes.half,plain=True)) if factor.op is Ops.ADD else (product,); pairs=tuple(_two_product(term,UOp.const(-1.0,dtypes.half),UOp.const(65.0,dtypes.half)) for term in products); mapped_terms=tuple(pair[0] for pair in pairs)+tuple(_tag_precise_adds(pair[1]) for pair in pairs)  # noqa: E501
-  lanes=total*len(mapped_terms); lane=UOp.range(lanes,1+max((u.arg[0] for u in uops if u.op is Ops.RANGE and isinstance(u.arg,tuple)),default=-1),dtype=dtypes.int); logical=lane.alu(Ops.CMOD,lane.const_like(total)) if len(mapped_terms)>1 else lane  # noqa: E501
+  out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); output_axes=_affine_output_axes(out_affine,rows) if out_affine is not None and out_affine[0]==0 else None; block=round_up(rows,8) if rows>1 else 1; groups=total*len(mapped_terms); lanes=groups*block  # noqa: E501
+  if rows>1 and (value.arg[0] is not Ops.ADD or output_axes is None or lanes>(_MAX_STATIC_RANGE_ENVS if integer else _MAX_GENERIC_UNROLL)): return None  # noqa: E501
+  lane=UOp.range(lanes,1+max((u.arg[0] for u in uops if u.op is Ops.RANGE and isinstance(u.arg,tuple)),default=-1),dtype=dtypes.int); row_lane=lane.alu(Ops.CMOD,lane.const_like(block)); logical=lane.alu(Ops.CDIV,lane.const_like(block)); logical=logical.alu(Ops.CMOD,logical.const_like(total)) if len(mapped_terms)>1 else logical; output_row=row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(row_lane,row_lane.const_like(0)) if block>rows else row_lane  # noqa: E501
   replacements={axis:(logical.alu(Ops.CDIV,logical.const_like(stride)).alu(Ops.CMOD,logical.const_like(extent)) if stride>1 else logical.alu(Ops.CMOD,logical.const_like(extent))) for axis,extent,stride in  # noqa: E501
     zip(ranges,extents,(math.prod(extents[i+1:]) for i in range(len(extents))))}
-  terms=tuple(term.substitute(replacements,walk=True) for term in mapped_terms); mapped_body=functools.reduce(lambda selected,item:lane.alu(Ops.CMPLT,lane.const_like((item[0]+1)*total)).where(item[1],selected),reversed(tuple(enumerate(terms[:-1]))),terms[-1])  # noqa: E501
+  replacements.update({axis:output_row.alu(Ops.CDIV,output_row.const_like(stride)).alu(Ops.CMOD,output_row.const_like(extent)) if stride>1 else output_row.alu(Ops.CMOD,output_row.const_like(extent)) for axis,stride,extent in output_axes or ()}); terms=tuple(term.substitute(replacements,walk=True) for term in mapped_terms)  # noqa: E501
+  mapped_body=functools.reduce(lambda selected,item:lane.alu(Ops.CMPLT,lane.const_like((item[0]+1)*total*block)).where(item[1],selected),reversed(tuple(enumerate(terms[:-1]))),terms[-1]); mapped_body=row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(mapped_body,mapped_body.const_like(0 if value.arg[0] is Ops.ADD else dtypes.int16.min if integer else -math.inf)) if block>rows else mapped_body  # noqa: E501
   slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=out.arg.slot); fake=UOp.param(slot,mapped_dtype,(lanes,))
   mapped_sink=fake.index(lane).store(mapped_body).end(lane).sink()
   mapped=_lower_uop_program(list(graph_rewrite(mapped_sink,pm_lower_index_dtype,ctx={}).toposort() if integer else mapped_sink.toposort()),vectorize_reductions=False)  # noqa: E501
@@ -598,12 +600,10 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   value_slot=len(mapped.scratch); source=typing_cast(RKEWOp,mapped.program[1]).lhs if direct else RKArg(RKBufferKind.SCRATCH,value_slot); scratch=list(mapped.scratch)+([] if direct else [_scratch_bytes(lanes)])  # noqa: E501
   mapped=_alias_image_args(mapped,{slot:source}); prefix_program=mapped.program[:1] if direct else mapped.program
   gathers:list[RKGather]=[]; ops:list[RKEWOp]=[]
-  reduced=_reduce_mapped_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],int16=integer,
-    kahan=value.arg[0] is Ops.ADD and product.op is not Ops.LOAD and lanes<=4096,barrier=not direct)
+  reduced=_reduce_mapped_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,kahan=value.arg[0] is Ops.ADD and product.op is not Ops.LOAD and groups<=4096,barrier=not direct)  # noqa: E501
   prefix=RKImage(tuple(scratch),program=prefix_program+tuple(gathers)+tuple(ops))
-  scalar=UOp.param(slot+1,mapped_dtype,(1,)); replacement=scalar.index(out_index).load().cast(value.dtype); suffix_root=root.substitute({value:replacement})  # noqa: E501
-  suffix=_lower_uop_program(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()))  # noqa: E501
-  return None if suffix is None else _append_inplace_image(prefix,suffix,link=(slot+1,reduced,1),chain=direct)
+  scalar=UOp.param(slot+1,mapped_dtype,(rows,)); replacement=scalar.index(out_index).load().cast(value.dtype); suffix_root=root.substitute({value:replacement})  # noqa: E501
+  return None if (suffix:=_lower_uop_program(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()))) is None else _append_inplace_image(prefix,suffix,link=(slot+1,reduced,rows),chain=direct)  # noqa: E501
 
 def _i16_min(lhs:UOp, rhs:UOp) -> UOp: return UOp(Ops.MAX,dtypes.int16,src=(lhs,rhs),arg=_NATIVE_MIN)
 def _i16_abs(value:UOp) -> UOp: return UOp(Ops.MAX,dtypes.int16,src=(value,value),arg=_NATIVE_ABS)

@@ -2043,6 +2043,25 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
 
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",320,dtypes.half,num=12042).reshape((32,10)))
+    large_linear=(source>0.5).nonzero(size=120).schedule_linear()
+    large_calls=[u for u in large_linear.toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    to_program_cache.clear()
+    large_images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in large_calls]
+  assert len(large_images)==5
+  prefix,large_coordinate=large_images[0],large_images[-1]
+  assert (len(prefix.scratch),len(_static_gathers(prefix)),len(_ew_ops(prefix)),len(_output_gathers(prefix))) == (27,16,1099,0)
+  assert (len(large_coordinate.scratch),len(_static_gathers(large_coordinate)),len(_ew_ops(large_coordinate)),
+          len(_output_gathers(large_coordinate))) == (149,147,12755,1)
+  values=np.random.default_rng(1001).uniform(-1,1,size=320).astype("<f2")
+  assert hashlib.sha256(_execute_raw_dynamic_image(prefix,768*4,values.tobytes())).hexdigest() == \
+    "60fbd91c95bad020944066ff92feac468dc5f4713dcf489e24df1988dff7f79d"
+  indices=((np.arange(240,dtype=np.int64)*7+3)%17).astype("<i4")
+  assert hashlib.sha256(_execute_raw_dynamic_image(large_coordinate,240*4,
+    np.random.default_rng(1005).uniform(-1,1,size=320).astype("<f2").tobytes(),indices.tobytes())).hexdigest() == \
+    "5eb5c4574e3ce639b7e9920d1d6698b5bf2d9110ceab18833a1a76296f5fcd22"
+
 
 def test_normalized_int_prefix_executes_generic_int32_uops():
   source = UOp.param(1, dtypes.int, (4,))
@@ -2395,6 +2414,39 @@ def test_dependent_reduction_range_preserves_vector_output_axis():
   scalar, vector, large = lower(1), lower(45), lower(128, 128)
   assert scalar is not None and vector is not None and large is not None
   assert len(_ew_ops(vector)) == len(_ew_ops(scalar)) < 200 and len(_ew_ops(large)) < 300
+
+  def lower_mapped(rows:int, depth:int, centered:bool):
+    out=UOp.param(0,dtypes.half,(rows,))
+    data,center=UOp.param(1,dtypes.half,(rows*depth,)),UOp.param(2,dtypes.half,(rows,))
+    row=UOp.range(rows,1)
+    axis=UOp.range(depth,0,AxisType.REDUCE,src=(row,))
+    value=data.index(row*depth+axis).load()
+    if centered:
+      value=value-center.index(row).load()
+      value=value*value
+    reduced=UOp(Ops.REDUCE,dtypes.float,src=(value.cast(dtypes.float),axis),arg=(Ops.ADD,0))
+    return _lower_uop_program(list(out.index(row).store(reduced.cast(dtypes.half)).sink().toposort()))
+  for depth,centered in ((65,True),(513,False)):
+    scalar_mapped,vector_mapped=lower_mapped(1,depth,centered),lower_mapped(15,depth,centered)
+    assert scalar_mapped is not None and vector_mapped is not None and len(_ew_ops(vector_mapped))==len(_ew_ops(scalar_mapped))
+    values=(np.arange(15*depth,dtype=np.float16)%17-8)/8
+    centers=(np.arange(15,dtype=np.float16)%5-2)/4
+    actual=np.frombuffer(_execute_raw_dynamic_image(vector_mapped,30,values.tobytes(),centers.tobytes()),dtype="<f2")
+    expected=np.asarray([np.frombuffer(_execute_raw_dynamic_image(scalar_mapped,2,
+      values[row*depth:(row+1)*depth].tobytes(),centers[row:row+1].tobytes()),dtype="<f2")[0] for row in range(15)])
+    np.testing.assert_array_equal(actual,expected)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",15*25*35,dtypes.half,num=1041).reshape((15,25,35)))
+    linear=source.var((1,2)).schedule_linear()
+    calls=[u for u in linear.toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    to_program_cache.clear()
+    images=[decode_image(next(u for u in to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+      if u.op is Ops.BINARY).arg) for call in calls]
+  assert len(images)==2 and sum(len(_ew_ops(image)) for image in images)==3512 and all(_assert_decoded_image_bounds(image)==image for image in images)
+  values=np.random.default_rng(0).uniform(-2,2,size=(15,25,35)).astype(np.float16)
+  mean=_execute_raw_dynamic_image(images[0],30,values.tobytes())
+  actual=np.frombuffer(_execute_raw_dynamic_image(images[1],30,values.tobytes(),mean),dtype="<f2")
+  np.testing.assert_allclose(actual,values.astype(np.float32).var(axis=(1,2),ddof=1).astype(np.float16),atol=1e-6,rtol=1e-3)
 
 
 def test_cmac_candidate_filter_keeps_later_valid_layout():
