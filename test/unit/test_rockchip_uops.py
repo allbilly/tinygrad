@@ -2530,6 +2530,26 @@ def test_large_predicate_graph_keeps_fp16_prelude_before_typed_comparisons():
   assert images and not any(typed(lhs) and not typed(rhs) for lhs,rhs in zip(_ew_ops(images[-1]),_ew_ops(images[-1])[1:]))
 
 
+def test_production_cumulative_index_uses_bounded_mapped_max():
+  count=512
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=13011))
+    values,indices=source.cummax(0)
+    calls=[u for u in values.schedule_linear(indices).toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+    to_program_cache.clear()
+    images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in calls]
+  assert len(images)==2 and len(_ew_ops(images[1]))<100
+  assert all(_assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image for image in images)
+  data=np.random.default_rng(0).uniform(-2,2,size=count).astype("<f2")
+  data[:12]=np.asarray((0,-0.0,1,1,-1,-1,np.inf,np.inf,-np.inf,-np.inf,np.nan,2),dtype="<f2")
+  running=np.frombuffer(_execute_raw_dynamic_image(images[0],count*2,data.tobytes()),dtype="<f2")
+  actual=np.frombuffer(_execute_raw_dynamic_image(images[1],count*4,data.tobytes(),running.tobytes()),dtype="<i4")
+  match=(data[:,None]==running[None,:])&np.triu(np.ones((count,count),dtype=bool))
+  expected=count-(match*np.arange(count,0,-1,dtype=np.int32)[:,None]).max(axis=0)
+  np.testing.assert_array_equal(actual,expected)
+
+
 def test_multiple_output_stores_execute_sequentially():
   first, second = UOp.param(0, dtypes.half, (4,)), UOp.param(1, dtypes.half, (4,))
   source, lane = UOp.param(2, dtypes.half, (4,)), UOp.range(4, 0)
