@@ -221,7 +221,7 @@ def _strip_cast(u:UOp) -> UOp:
 def _typed_cast_source(u:UOp, dtype:DType, source:DType) -> UOp|None:
   return u.src[0] if u.op is Ops.CAST and u.dtype.scalar() is dtype and len(u.src) == 1 and u.src[0].dtype.scalar() is source else None
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=65536)
 def _semantic_loads(u:UOp) -> tuple[UOp, ...]:
   sources = () if u.op in (Ops.RANGE, Ops.SPECIAL) else u.src[:1] if u.op is Ops.AFTER else u.src
   return (u,) if u.op is Ops.LOAD else tuple(dict.fromkeys(y for x in sources for y in _semantic_loads(x)))
