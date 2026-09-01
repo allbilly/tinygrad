@@ -570,7 +570,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   store,out,rows,out_index,root=output
   if rows<1 or out.dtype.scalar() not in (dtypes.half,dtypes.int,dtypes.bool): return None
   reductions=tuple(node for node in root.toposort() if node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] in (Ops.ADD,Ops.MAX,Ops.MUL)); nested={child for value in reductions for child in value.src[0].toposort() if child is not value and child.op is Ops.REDUCE}  # noqa: E501
-  if len(outer:=tuple(value for value in reductions if value not in nested)) != 1 or rows>16 and out.dtype.scalar() is dtypes.half and outer[0].arg[0] is not Ops.MAX: return None  # noqa: E501
+  if len(outer:=tuple(value for value in reductions if value not in nested)) != 1: return None
   value=outer[0]; body=value.src[0]; ranges=list(value.src[1:])
   while (inner:=_strip_cast(body)).op is Ops.REDUCE and isinstance(inner.arg,tuple) and inner.arg[0] is value.arg[0]:
     body=inner.src[0]; ranges.extend(inner.src[1:])
@@ -580,7 +580,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     value=leaves[0]; body=value.src[0]; ranges=list(value.src[1:])
   if not ranges or any(axis.op not in (Ops.RANGE,Ops.SPECIAL) or not axis.src or axis.src[0].op is not Ops.CONST for axis in ranges): return None  # noqa: E501
   loaded_indices={node.src[0] for node in body.toposort() if node.op is Ops.LOAD}; body=body.substitute({node:node.load() for node in body.toposort() if node.op is Ops.INDEX and node not in loaded_indices},walk=True); extents=tuple(int(axis.src[0].arg) for axis in ranges); total=math.prod(extents); graph=body.toposort()  # noqa: E501
-  if not 2<=total<=_MAX_GENERIC_UNROLL or not _semantic_loads(body) or (out.dtype.scalar() is not dtypes.int or len(reductions)==1) and (total<32 or not (rows>1 and out.dtype.scalar() is dtypes.int or total>416 or len(_semantic_loads(body))>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN) for node in graph))): return None  # noqa: E501
+  if not 2<=total<=_MAX_GENERIC_UNROLL or rows>16 and out.dtype.scalar() is dtypes.half and value.arg[0] is Ops.ADD and total>416 or not _semantic_loads(body) or (out.dtype.scalar() is not dtypes.int or len(reductions)==1) and (total<32 or not (rows>1 and out.dtype.scalar() is dtypes.int or total>416 or len(_semantic_loads(body))>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN,Ops.CMPLT,Ops.CMPNE,Ops.WHERE) for node in graph))): return None  # noqa: E501
   try: product=body if out.dtype.scalar() in (dtypes.int,dtypes.bool) else _strip_cast(_fp32_expr_to_half(body))
   except _RKGenericReject: product=_strip_cast(body)
   boolean=product.dtype.scalar() is dtypes.bool; integer=boolean or dtypes.is_int(product.dtype.scalar()); bounds=(0,1) if boolean else _int_info(product)[0] if integer else None  # noqa: E501

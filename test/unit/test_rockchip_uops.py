@@ -2468,6 +2468,33 @@ def test_dependent_reduction_range_preserves_vector_output_axis():
   np.testing.assert_allclose(actual,values.astype(np.float32).var(axis=(1,2),ddof=1).astype(np.float16),atol=1e-6,rtol=1e-3)
 
 
+def test_production_normalize_maps_predicated_rows():
+  rng=np.random.default_rng(5)
+  for case,kwargs in enumerate(({}, {"dim":0}, {"p":1}, {"p":3,"dim":0}, {"p":-1})):
+    shape=(45,65)
+    count=math.prod(shape)
+    data=rng.uniform(-2,2,size=shape).astype("<f2")
+    with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+      source=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=13020+case).reshape(shape))
+      output=source.normalize(**kwargs)
+      calls=[u for u in output.schedule_linear().toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+      renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+      to_program_cache.clear()
+      images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in calls]
+    assert len(images)==2 and len(_ew_ops(images[0]))<700
+    assert all(_assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image for image in images)
+    norm_count=rockchip_renderer._outs(list(calls[0].src[0].toposort()))[1][2]
+    with np.errstate(over="ignore",invalid="ignore",divide="ignore"):
+      denominator=_execute_raw_dynamic_image(images[0],norm_count*2,data.tobytes())
+      actual=np.frombuffer(_execute_raw_dynamic_image(images[1],count*2,data.tobytes(),denominator),dtype="<f2").reshape(shape)
+    wide=data.astype(np.float32)
+    p=float(kwargs.get("p",2))
+    dim=int(kwargs.get("dim",1))
+    norm=np.sum(np.abs(wide)**p,axis=dim,keepdims=True)**(1/p)
+    expected=(wide/np.maximum(norm,1e-12)).astype("<f2")
+    np.testing.assert_allclose(actual,expected,atol=5e-3,rtol=5e-3)
+
+
 def test_cmac_candidate_filter_keeps_later_valid_layout():
   def lower(depth:int) -> RKImage:
     with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
