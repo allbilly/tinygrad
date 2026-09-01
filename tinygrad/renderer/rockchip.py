@@ -1069,7 +1069,7 @@ class RKContext:
     raw=tuple(self._raw(value) for value in values)
     signs=tuple(_i16_bit(value[3].alu(Ops.SUB,value[3].const_like(127))) for value in raw)
     numerator,denominator=(_twos_complement(value,sign) for value,sign in zip(raw,signs))
-    denominator_nonzero=functools.reduce(lambda x,y:x.alu(Ops.MAX,y),map(_i16_bit,denominator))
+    denominator_nonzero=functools.reduce(lambda x,y:x.alu(Ops.MAX,y),map(_i16_bit,denominator)); one=denominator_nonzero.const_like(1)
     numerator_bits=tuple(itertools.chain.from_iterable(map(_byte_bits,numerator)))
     zero=numerator[0].const_like(0); remainder,quotient=[zero]*4,[zero]*4
     for bit_index in range(31, -1, -1):
@@ -1079,12 +1079,12 @@ class RKContext:
         wrapped=byte.alu(Ops.ADD,byte).alu(Ops.SUB,carry.alu(Ops.MUL,byte.const_like(256)))
         shifted.append(wrapped.alu(Ops.ADD,incoming)); incoming=carry
       remainder=shifted
-      ge=denominator_nonzero.alu(Ops.MUL,denominator_nonzero.const_like(1).alu(Ops.SUB,
-        _ordered_bits(reversed(remainder),reversed(denominator)))); borrow,reduced=zero,[]
+      borrow,reduced=zero,[]
       for left,right in zip(remainder, denominator):
-        delta=left.alu(Ops.SUB,right.alu(Ops.MUL,ge)).alu(Ops.SUB,borrow)
+        delta=left.alu(Ops.SUB,right).alu(Ops.SUB,borrow)
         borrow=_i16_bit(zero.alu(Ops.SUB,delta)); reduced.append(delta.alu(Ops.ADD,borrow.alu(Ops.MUL,zero.const_like(256))))
-      remainder=reduced; byte_index,weight=bit_index>>3,1<<(bit_index&7)
+      ge=denominator_nonzero.alu(Ops.MUL,one.alu(Ops.SUB,borrow))
+      remainder=[left.alu(Ops.ADD,ge.alu(Ops.MUL,right.alu(Ops.SUB,left))) for left,right in zip(remainder,reduced)]; byte_index,weight=bit_index>>3,1<<(bit_index&7)  # noqa: E501
       quotient[byte_index]=quotient[byte_index].alu(Ops.ADD,ge.alu(Ops.MUL,zero.const_like(weight)))
     quotient_raw, remainder_raw, remainder_sign, quotient_sign = tuple(quotient),tuple(remainder),signs[0],_i16_abs(signs[0].alu(Ops.SUB,signs[1]))
     packed_raw, sign = (quotient_raw, quotient_sign) if u.op is Ops.CDIV else (remainder_raw, remainder_sign)

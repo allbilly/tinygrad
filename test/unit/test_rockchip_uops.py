@@ -2035,10 +2035,10 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
         assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst.index]//gather.itemsize
 
   coordinate = images[-1]
-  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (129,148,10141,1)
+  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (135,148,7861,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="b10534c6aca4478a574c041044df268c69d7f6b77fce43e8e79419019b4c5067"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="35e50a800397d5fccee67c44a1b284f7ed977f1c1499c86d43072f88cc1e7f63"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -2306,7 +2306,7 @@ def test_wide_int32_cdiv_cmod_physical_semantics_and_composition():
   for select,expression in enumerate(expressions):
     image = _lower_uop_program(_int32_binary_program(expression, len(lhs)))
     assert image is not None and not _runtime_gathers(image)
-    assert len(_ew_ops(image)) > 3000 and decode_image(encode_image(image)) == image
+    assert len(_ew_ops(image)) == (2545,2499,2547)[select] and decode_image(encode_image(image)) == image
     expected = []
     for left,right in zip(lhs.tolist(), rhs.tolist()):
       if select == 2: left, right = _wrap_int32(left+1), _wrap_int32(right*3)
