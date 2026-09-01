@@ -632,8 +632,8 @@ def _ordered_bits(lhs:Iterable[UOp], rhs:Iterable[UOp]) -> UOp:
   """Compare equal-width unsigned components from most to least significant."""
   left=tuple(lhs); less,equal=left[0].const_like(0),left[0].const_like(1)
   for a,b in zip(left,rhs):
-    maximum=a.alu(Ops.MAX,b); a_less,b_less=(_i16_bit(maximum.alu(Ops.SUB,value)) for value in (a,b))
-    less=less.alu(Ops.MAX,equal.alu(Ops.MUL,a_less)); equal=equal.alu(Ops.MUL,equal.const_like(1).alu(Ops.SUB,a_less.alu(Ops.MAX,b_less)))
+    delta=b.alu(Ops.SUB,a); one=delta.const_like(1); component_less=_i16_bit(delta); component_equal=one.alu(Ops.SUB,_i16_min(_i16_abs(delta),one))
+    less=less.alu(Ops.MAX,equal.alu(Ops.MUL,component_less)); equal=equal.alu(Ops.MUL,component_equal)
   return less
 
 def _twos_complement(raw:Iterable[UOp], sign:UOp) -> tuple[UOp, ...]:
@@ -1054,9 +1054,9 @@ class RKContext:
       half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
       values=tuple(self._operand(src,dtypes.half) for src in typing_cast(tuple[UOp,UOp],half_sources))
-      nan=tuple(self._fp16_component_values(value)[2] for value in values)
-      components=tuple(self._fp16_component_values(value,True) if u.op is Ops.CMPLT else
-        (parts[0],parts[1]) for value in values for parts in (self._fp16_component_values(value),))
+      classified=tuple(self._fp16_component_values(value,u.op is Ops.CMPLT) for value in values)
+      nan=tuple(parts[2] for parts in classified)
+      components=tuple(parts[:2] for parts in classified)
     result=_ordered_bits(*components) if u.op is Ops.CMPLT else functools.reduce(
       lambda equal,pair:equal.alu(Ops.MUL,_i16_equal(*pair)),zip(*components),components[0][0].const_like(1))
     if nan: result=result.alu(Ops.MUL,result.const_like(1).alu(Ops.SUB,nan[0].alu(Ops.MAX,nan[1])))
@@ -1099,7 +1099,7 @@ class RKContext:
     if not ordered: return lo,clean,nan
     sign=_i16_bit(clean.alu(Ops.SUB,clean.const_like(127))); positive=clean.alu(Ops.ADD,clean.const_like(128))
     high_delta=clean.const_like(255).alu(Ops.SUB,clean).alu(Ops.SUB,positive); low_delta=lo.const_like(255).alu(Ops.SUB,lo).alu(Ops.SUB,lo)
-    return positive.alu(Ops.ADD,sign.alu(Ops.MUL,high_delta)),lo.alu(Ops.ADD,sign.alu(Ops.MUL,low_delta))
+    return positive.alu(Ops.ADD,sign.alu(Ops.MUL,high_delta)),lo.alu(Ops.ADD,sign.alu(Ops.MUL,low_delta)),nan
 
   def _raw_where(self, u:UOp, selector:UOp|None=None) -> UOp:
     """Select typed values through one canonical INT16 mask, preserving nonfinite arms as raw bytes."""

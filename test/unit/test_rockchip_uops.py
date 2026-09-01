@@ -753,7 +753,7 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("948d5d2336a8d92f38de907046295698dcfa19d61e1cc528048f9cdfa74dbe10",1227,102,6),
+  assert records == [("765c50748dc3fdc7eab909360bcd22002fc790a70525c4bb18bb26fcde8c2e1b",1195,98,6),
                      ("6b4f9c0fc3228c0d4672c2d1a39e3740806fc4c32fe83268e628729698845bda",258,4,0)]
 
 
@@ -1601,7 +1601,7 @@ def test_production_causal_attention_applies_infinite_mask_after_precise_dot():
 
 
 def test_generic_image_allows_many_small_ew_stages():
-  count = 1080
+  count = 1237
   out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.int, (count,)), UOp.param(2, dtypes.int, (count,))
   value = UOp.const(0.0, dtypes.half)
   for index in range(count):
@@ -2024,10 +2024,10 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
         assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst.index]//gather.itemsize
 
   coordinate = images[-1]
-  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (130,148,11132,1)
+  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (129,148,10141,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="7584e2b48a92fbf5dc42f74e5abc2bfd4f508c544e14d3564784e048a8f7a121"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="b10534c6aca4478a574c041044df268c69d7f6b77fce43e8e79419019b4c5067"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
