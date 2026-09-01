@@ -2053,7 +2053,7 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   prefix,large_coordinate=large_images[0],large_images[-1]
   assert (len(prefix.scratch),len(_static_gathers(prefix)),len(_ew_ops(prefix)),len(_output_gathers(prefix))) == (27,16,1099,0)
   assert (len(large_coordinate.scratch),len(_static_gathers(large_coordinate)),len(_ew_ops(large_coordinate)),
-          len(_output_gathers(large_coordinate))) == (149,147,12755,1)
+          len(_output_gathers(large_coordinate))) == (153,147,10451,1)
   values=np.random.default_rng(1001).uniform(-1,1,size=320).astype("<f2")
   assert hashlib.sha256(_execute_raw_dynamic_image(prefix,768*4,values.tobytes())).hexdigest() == \
     "60fbd91c95bad020944066ff92feac468dc5f4713dcf489e24df1988dff7f79d"
