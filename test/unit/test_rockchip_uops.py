@@ -494,7 +494,7 @@ def test_runtime_bounds_risky_and_oversize_pc_chains(monkeypatch):
   program._run_ew_ops(lambda _arg:0,(int16,)*77+(conversion._replace(count=25),))
   assert submitted == [81]
   submitted.clear()
-  program.image = SimpleNamespace(program=(half,int16))
+  program._ew_modes = {half.mode,int16.mode}
   program._run_ew_ops(lambda _arg:0,(half,)*(rockchip_runtime._MAX_EW_GROUP_OPS+1))
   assert submitted == [rockchip_runtime._MAX_EW_GROUP_OPS,1]
   with pytest.raises(ValueError,match="invalid NPU task count"): program._submit(None,None,rockchip_runtime._MAX_PC_TASKS+1)  # type: ignore[arg-type]

@@ -33,7 +33,7 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
-    self._scratch_offsets=(0,*itertools.accumulate(round_up(size,4096) for size in self.image.scratch))
+    self._scratch_offsets=(0,*itertools.accumulate(round_up(size,4096) for size in self.image.scratch)); self._ew_modes={op.mode for op in self.image.program if isinstance(op,RKEWOp)}  # noqa: E501,E702
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
 
@@ -81,7 +81,7 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...]) -> None:
     if not ops: return
-    M=RKEWMode; program_modes={op.mode for op in getattr(getattr(self,"image",None),"program",ops) if isinstance(op,RKEWOp)}  # noqa: E501,E702
+    M=RKEWMode; program_modes=getattr(self,"_ew_modes",None) or {op.mode for op in ops}  # noqa: E702
     def run_group(group:tuple[RKEWOp, ...], pc_limit:int) -> None:
       chain:list[tuple[int, ...]]=[]; precision=0  # noqa: E702
       def flush_chain(reset:bool=False) -> None:
