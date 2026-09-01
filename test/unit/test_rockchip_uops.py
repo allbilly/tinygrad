@@ -154,10 +154,12 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
     if op.mode in (RKEWMode.HALF,RKEWMode.STATEFUL,RKEWMode.COMPARE):
       def fp16(arg:RKArg) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype="<f2",count=op.count,offset=arg.addend)
       lhs,rhs=fp16(op.lhs).copy(),fp16(op.rhs).copy()
-      value=(lhs+rhs if op.ew_cfg==_EW_CFG[Ops.ADD] else lhs-rhs if op.ew_cfg==_EW_CFG[Ops.SUB] else lhs*rhs if op.ew_cfg==_EW_CFG[Ops.MUL]
-             else np.maximum(lhs,rhs) if op.ew_cfg==_EW_CFG[Ops.MAX] else lhs/rhs if op.ew_cfg==_EW_CFG[Ops.FDIV]
-             else np.floor(lhs) if op.ew_cfg==_EW_CFG_FLOOR else np.minimum(lhs,rhs) if op.ew_cfg==_EW_CFG_MIN
-             else np.abs(lhs) if op.ew_cfg==_EW_CFG_ABS else None)
+      if op.mode==RKEWMode.COMPARE: value=(lhs>0).astype("<f2")
+      else:
+        value=(lhs+rhs if op.ew_cfg==_EW_CFG[Ops.ADD] else lhs-rhs if op.ew_cfg==_EW_CFG[Ops.SUB] else
+               lhs*rhs if op.ew_cfg==_EW_CFG[Ops.MUL] else np.maximum(lhs,rhs) if op.ew_cfg==_EW_CFG[Ops.MAX] else
+               lhs/rhs if op.ew_cfg==_EW_CFG[Ops.FDIV] else np.floor(lhs) if op.ew_cfg==_EW_CFG_FLOOR else
+               np.minimum(lhs,rhs) if op.ew_cfg==_EW_CFG_MIN else np.abs(lhs) if op.ew_cfg==_EW_CFG_ABS else None)
       assert value is not None, hex(op.ew_cfg)
       fp16(op.dst)[:]=value.astype("<f2")
       return
@@ -1102,6 +1104,22 @@ def test_math_uops_own_multi_stage_recipes():
     assert _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG
 
 
+def test_sqrt_recipe_covers_the_positive_binary16_domain():
+  values=np.concatenate((np.arange(0x7c00,dtype="<u2").view("<f2"),np.asarray((-4.0,math.inf,math.nan),dtype="<f2")))
+  source=UOp.param(1,dtypes.half,(len(values),))
+  for reciprocal,divisions in ((False,7),(True,8)):
+    def operation(i:UOp) -> UOp:
+      value=source.index(i).load().sqrt()
+      return value.reciprocal() if reciprocal else value
+    image=_lower_uop_program(_program(dtypes.half,operation,len(values)))
+    assert image is not None and sum(op.ew_cfg==_EW_CFG[Ops.FDIV] for op in _ew_ops(image))==divisions
+    with np.errstate(all="ignore"):
+      expected=np.sqrt(values)
+      expected=(np.float16(1)/expected).astype("<f2") if reciprocal else expected
+      actual=np.frombuffer(_execute_raw_dynamic_image(image,values.nbytes,values.tobytes()),dtype="<f2")
+    np.testing.assert_allclose(actual,expected,rtol=5e-3,atol=5e-3,equal_nan=True)
+
+
 def test_quadratic_math_rewrite_requires_one_shared_log_source():
   source, unrelated = UOp.param(1,dtypes.half,(1,)), UOp.param(2,dtypes.half,(1,))
   radical=(source*source+UOp.const(1.0,dtypes.half)).sqrt()
@@ -1731,7 +1749,7 @@ def test_std_mean_outer_selector_commits_two_aligned_output_surfaces():
     image = decode_image(next(u for u in to_program(linear.src[-1].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if u.op is Ops.BINARY).arg)
   commits=tuple(gather for gather in _static_gathers(image) if gather.dst.kind is RKBufferKind.ARG)
   atoms=tuple(gather for gather in _static_gathers(image) if gather.dst_stride==8)
-  assert _cmac(image) is None and len(_ew_ops(image))==90 and [(g.count,g.dst_stride) for g in atoms]==[(16384,8)]*2
+  assert _cmac(image) is None and len(_ew_ops(image))==72 and [(g.count,g.dst_stride) for g in atoms]==[(16384,8)]*2
   assert all(arg.addend%16==0 for op in _ew_ops(image) for arg in (op.lhs,op.rhs))
   assert [(g.count,g.dst_addend) for g in commits] == [(1,0),(1,1)]
   assert not _runtime_gathers(image,False) and not _runtime_gathers(image,True) and not _runtime_gathers(image)
