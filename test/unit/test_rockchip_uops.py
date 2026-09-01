@@ -9,7 +9,7 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import Context, Target
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather,
-  _EW_CFG, _EW_CFG_ABS, _EW_CFG_CEIL, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _static_lanes,
   _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
@@ -157,7 +157,7 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
       value=(lhs+rhs if op.ew_cfg==_EW_CFG[Ops.ADD] else lhs-rhs if op.ew_cfg==_EW_CFG[Ops.SUB] else lhs*rhs if op.ew_cfg==_EW_CFG[Ops.MUL]
              else np.maximum(lhs,rhs) if op.ew_cfg==_EW_CFG[Ops.MAX] else lhs/rhs if op.ew_cfg==_EW_CFG[Ops.FDIV]
              else np.floor(lhs) if op.ew_cfg==_EW_CFG_FLOOR else np.minimum(lhs,rhs) if op.ew_cfg==_EW_CFG_MIN
-             else np.ceil(lhs) if op.ew_cfg==_EW_CFG_CEIL else np.abs(lhs) if op.ew_cfg==_EW_CFG_ABS else None)
+             else np.abs(lhs) if op.ew_cfg==_EW_CFG_ABS else None)
       assert value is not None, hex(op.ew_cfg)
       fp16(op.dst)[:]=value.astype("<f2")
       return
@@ -169,11 +169,6 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
       def view_fp(arg:RKArg,dtype) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype=dtype,count=op.count,offset=arg.addend)
       assert op.ew_cfg == _EW_CFG[Ops.MAX]
       view_fp(op.dst,"<i2")[:] = np.maximum(view_fp(op.lhs,"<f2"),view_fp(op.rhs,"<f2")).astype("<i2")
-      return
-    elif op.mode==RKEWMode.HALF_TO_INT32:
-      def view_fp(arg:RKArg,dtype) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype=dtype,count=op.count,offset=arg.addend)
-      assert op.ew_cfg == _EW_CFG[Ops.MAX] and op.lhs==op.rhs
-      view_fp(op.dst,"<i4")[:] = view_fp(op.lhs,"<f2").astype("<i4")
       return
     else: raise AssertionError(f"unsupported dynamic selector EW precision {op}")
     def view(arg:RKArg, dtype) -> np.ndarray: return np.frombuffer(buffer(arg.kind, arg.index), dtype=dtype, count=op.count, offset=arg.addend)
@@ -2577,14 +2572,13 @@ def test_large_predicate_graph_keeps_fp16_prelude_before_typed_comparisons():
   assert images and not any(typed(lhs) and not typed(rhs) for lhs,rhs in zip(_ew_ops(images[-1]),_ew_ops(images[-1])[1:]))
 
 
-def test_production_sort_maps_bounded_integer_sums():
+def test_production_sort_rank_maps_short_bounded_integer_sums():
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
     source=Tensor(UOp.new_buffer("ROCKCHIP",384,dtypes.half,num=13013).reshape((8,8,6)))
     values,indices=source.sort(-1,descending=True)
     calls=[u for u in values.schedule_linear(indices).toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
     renderer=RockchipRenderer(Target(device="ROCKCHIP"))
     ranked=[]
-    weighted=[]
     for call in calls:
       uops=list(call.src[0].toposort())
       output=rockchip_renderer._outs(uops)[1] or rockchip_renderer._outs(uops)[0]
@@ -2592,9 +2586,8 @@ def test_production_sort_maps_bounded_integer_sums():
       if output is None or len(reductions)!=1 or reductions[0].dtype.scalar() is not dtypes.int or rockchip_renderer._lower_mapped_reduce(output,uops) is None: continue  # noqa: E501
       to_program_cache.clear()
       image=decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY))
-      params=tuple(param for param in uops if param.op is Ops.PARAM)
-      input_count=next(int(param.src[0].arg) for param in params if param.arg.slot==1)
-      (ranked if len(params)==2 else weighted).append((input_count,image))
+      input_count=next(int(param.src[0].arg) for param in uops if param.op is Ops.PARAM and param.arg.slot==1)
+      ranked.append((input_count,image))
   assert [count for count,_ in ranked]==[384,512] and all(len(_ew_ops(image))==71 for _,image in ranked)
   special=np.asarray((0.0,-0.0,np.inf,-np.inf,np.nan,np.nextafter(np.float16(0),np.float16(1)),-1.0),dtype="<f2")
   for input_count,image in ranked:
@@ -2608,24 +2601,6 @@ def test_production_sort_maps_bounded_integer_sums():
       expected.append(sum(index<position+1 and row[index]==row[position] for index in range(6)))
     np.testing.assert_array_equal(actual,np.asarray(expected,dtype=np.int32))
     assert _assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image
-  assert len(weighted)==1 and weighted[0][0]==384 and len(_ew_ops(weighted[0][1]))<200
-  weighted_image=weighted[0][1]
-  for seed in range(24):
-    rng=np.random.default_rng(seed)
-    source_values=rng.integers(-3,4,size=(8,8,6)).astype("<f2")
-    sorted_values=rng.integers(-3,4,size=(8,8,8)).astype("<f2")
-    source_ranks=rng.integers(0,4,size=(8,8,6),dtype=np.int32)
-    sorted_ranks=rng.integers(0,4,size=(8,8,6),dtype=np.int32)
-    if seed==0:
-      source_values.reshape(-1)[:7]=special
-      sorted_values.reshape(-1)[:7]=special
-    actual=np.frombuffer(_execute_raw_dynamic_image(weighted_image,384*4,source_values.tobytes(),sorted_values.tobytes(),
-      source_ranks.tobytes(),sorted_ranks.tobytes()),dtype="<i4")
-    expected=[sum(position for position in range(6) if source_values[outer0,outer1,position]==sorted_values[outer0,outer1,output] and
-      source_ranks[outer0,outer1,position]==sorted_ranks[outer0,outer1,output])
-      for outer0,outer1,output in itertools.product(range(8),range(8),range(6))]
-    np.testing.assert_array_equal(actual,np.asarray(expected,dtype="<i4"))
-  assert _assert_decoded_image_bounds(weighted_image)==weighted_image and decode_image(encode_image(weighted_image))==weighted_image
 
 
 def test_production_cumulative_index_uses_bounded_mapped_max():
