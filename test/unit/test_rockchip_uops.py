@@ -2572,6 +2572,37 @@ def test_large_predicate_graph_keeps_fp16_prelude_before_typed_comparisons():
   assert images and not any(typed(lhs) and not typed(rhs) for lhs,rhs in zip(_ew_ops(images[-1]),_ew_ops(images[-1])[1:]))
 
 
+def test_production_sort_rank_maps_short_bounded_integer_sums():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",384,dtypes.half,num=13013).reshape((8,8,6)))
+    values,indices=source.sort(-1,descending=True)
+    calls=[u for u in values.schedule_linear(indices).toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+    ranked=[]
+    for call in calls:
+      uops=list(call.src[0].toposort())
+      output=rockchip_renderer._outs(uops)[1] or rockchip_renderer._outs(uops)[0]
+      reductions=tuple(node for node in uops if node.op is Ops.REDUCE)
+      if output is None or len(reductions)!=1 or reductions[0].dtype.scalar() is not dtypes.int or rockchip_renderer._lower_mapped_reduce(output,uops) is None: continue  # noqa: E501
+      to_program_cache.clear()
+      image=decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY))
+      input_count=next(int(param.src[0].arg) for param in uops if param.op is Ops.PARAM and param.arg.slot==1)
+      ranked.append((input_count,image))
+  assert [count for count,_ in ranked]==[384,512] and all(len(_ew_ops(image))==71 for _,image in ranked)
+  special=np.asarray((0.0,-0.0,np.inf,-np.inf,np.nan,np.nextafter(np.float16(0),np.float16(1)),-1.0),dtype="<f2")
+  for input_count,image in ranked:
+    width=input_count//64
+    data=np.random.default_rng(input_count).uniform(-4,4,size=input_count).astype("<f2")
+    data[(np.arange(len(special))*37+3)%input_count]=special
+    actual=np.frombuffer(_execute_raw_dynamic_image(image,384*4,data.tobytes()),dtype="<i4")
+    expected=[]
+    for outer0,outer1,position in itertools.product(range(8),range(8),range(6)):
+      row=data[(outer0*8+outer1)*width:(outer0*8+outer1)*width+6]
+      expected.append(sum(index<position+1 and row[index]==row[position] for index in range(6)))
+    np.testing.assert_array_equal(actual,np.asarray(expected,dtype=np.int32))
+    assert _assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image
+
+
 def test_production_cumulative_index_uses_bounded_mapped_max():
   count=512
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
