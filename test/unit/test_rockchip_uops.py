@@ -1919,6 +1919,21 @@ def test_boolean_reductions_are_physically_executed():
       assert decode_image(encode_image(image))==image
 
 
+def test_boolean_arg_extrema_keeps_integer_suffix_together():
+  renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+  for data,fxn,expected in (([False,True],Tensor.argmax,1),([True,False],Tensor.argmin,1)):
+    with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+      source=Tensor(UOp.new_buffer("ROCKCHIP",2,dtypes.bool,num=12043))
+      call=next(u for u in fxn(source).schedule_linear().toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK)
+      uops=list(call.src[0].toposort())
+      output=rockchip_renderer._outs(uops)[1] or rockchip_renderer._outs(uops)[0]
+      assert output is not None and rockchip_renderer._lower_mapped_reduce(output,uops) is None
+      to_program_cache.clear()
+      image=decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY))
+    actual=np.frombuffer(_execute_raw_dynamic_image(image,4,np.asarray(data,dtype=np.uint8).tobytes()),dtype="<i4")
+    np.testing.assert_array_equal(actual,np.asarray([expected],dtype="<i4"))
+
+
 def test_production_large_all_uses_bounded_row_reduction():
   count=1 << 20
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
