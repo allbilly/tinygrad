@@ -2539,7 +2539,7 @@ def test_production_cumulative_index_uses_bounded_mapped_max():
     renderer=RockchipRenderer(Target(device="ROCKCHIP"))
     to_program_cache.clear()
     images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in calls]
-  assert len(images)==2 and len(_ew_ops(images[1]))<100
+  assert len(images)==2 and len(_ew_ops(images[0]))<20 and len(_ew_ops(images[1]))<100
   assert all(_assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image for image in images)
   data=np.random.default_rng(0).uniform(-2,2,size=count).astype("<f2")
   data[:12]=np.asarray((0,-0.0,1,1,-1,-1,np.inf,np.inf,-np.inf,-np.inf,np.nan,2),dtype="<f2")
@@ -2548,6 +2548,31 @@ def test_production_cumulative_index_uses_bounded_mapped_max():
   match=(data[:,None]==running[None,:])&np.triu(np.ones((count,count),dtype=bool))
   expected=count-(match*np.arange(count,0,-1,dtype=np.int32)[:,None]).max(axis=0)
   np.testing.assert_array_equal(actual,expected)
+
+
+def test_production_cumulative_min_maps_negated_max():
+  count=512
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=13012))
+    values,indices=source.cummin(0)
+    calls=[u for u in values.schedule_linear(indices).toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+    to_program_cache.clear()
+    images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in calls]
+  assert len(images)==3 and len(_ew_ops(images[0]))<20 and len(_ew_ops(images[2]))<100
+  assert all(_assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image for image in images)
+  data=np.random.default_rng(1).uniform(-2,2,size=count).astype("<f2")
+  data[:12]=np.asarray((0,-0.0,1,1,-1,-1,np.inf,np.inf,-np.inf,-np.inf,np.nan,2),dtype="<f2")
+  running=np.frombuffer(_execute_raw_dynamic_image(images[0],count*2,data.tobytes()),dtype="<f2")
+  actual_values=np.frombuffer(_execute_raw_dynamic_image(images[1],count*2,running.tobytes()),dtype="<f2")
+  actual_indices=np.frombuffer(_execute_raw_dynamic_image(images[2],count*4,data.tobytes(),running.tobytes()),dtype="<i4")
+  negative=(data*np.float16(-1)).astype("<f2")
+  expected_running=np.maximum.accumulate(negative)
+  np.testing.assert_array_equal(running.view("<u2"),expected_running.view("<u2"))
+  np.testing.assert_array_equal(actual_values.view("<u2"),(expected_running*np.float16(-1)).astype("<f2").view("<u2"))
+  match=(negative[:,None]==running[None,:])&np.triu(np.ones((count,count),dtype=bool))
+  expected_indices=count-(match*np.arange(count,0,-1,dtype=np.int32)[:,None]).max(axis=0)
+  np.testing.assert_array_equal(actual_indices,expected_indices)
 
 
 def test_multiple_output_stores_execute_sequentially():
