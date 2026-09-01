@@ -753,7 +753,7 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("0f41dc6fb5117c80263ffce34c224736edc17d46c850b1994366a1dbc158bdec",1345,120,6),
+  assert records == [("948d5d2336a8d92f38de907046295698dcfa19d61e1cc528048f9cdfa74dbe10",1227,102,6),
                      ("6b4f9c0fc3228c0d4672c2d1a39e3740806fc4c32fe83268e628729698845bda",258,4,0)]
 
 

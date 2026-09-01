@@ -1094,10 +1094,9 @@ class RKContext:
     """Split and classify one physical FP16 value once so composed comparison UOps can reuse it."""
     lo,hi=self._raw(value)
     sign_scale=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))).alu(Ops.MUL,hi.const_like(128)); magnitude=hi.alu(Ops.SUB,sign_scale)
-    clean=hi.alu(Ops.SUB,sign_scale.alu(Ops.MUL,_i16_equal(magnitude,magnitude.const_like(0)).alu(Ops.MUL,_i16_equal(lo,lo.const_like(0)))))
-    exponent=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(123)))
-    mantissa=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(124))).alu(Ops.MAX,_i16_min(lo,lo.const_like(1)))
-    if not ordered: return lo,clean,exponent.alu(Ops.MUL,mantissa)
+    one=magnitude.const_like(1); clean=hi.alu(Ops.SUB,sign_scale.alu(Ops.MUL,one.alu(Ops.SUB,_i16_min(magnitude,one)).alu(Ops.MUL,one.alu(Ops.SUB,_i16_min(lo,one)))))  # noqa: E501
+    nan=_i16_bit(magnitude.alu(Ops.SUB,magnitude.const_like(124)).alu(Ops.ADD,_i16_min(lo,one)))
+    if not ordered: return lo,clean,nan
     sign=_i16_bit(clean.alu(Ops.SUB,clean.const_like(127))); positive=clean.alu(Ops.ADD,clean.const_like(128))
     high_delta=clean.const_like(255).alu(Ops.SUB,clean).alu(Ops.SUB,positive); low_delta=lo.const_like(255).alu(Ops.SUB,lo).alu(Ops.SUB,lo)
     return positive.alu(Ops.ADD,sign.alu(Ops.MUL,high_delta)),lo.alu(Ops.ADD,sign.alu(Ops.MUL,low_delta))
@@ -1253,9 +1252,9 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
 def _finite_int_max_neutrals(root:UOp) -> UOp:
   """Canonicalize finite physical neutrals for FP selectors and exact INT32 MAX arithmetic."""
   if root.op is Ops.MAX: root=root.substitute({u:u.replace(src=(u.src[0],u.src[1].const_like(-65504.0),u.src[2])) for u in root.toposort() if u.op is Ops.WHERE and u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() in (dtypes.half,dtypes.float) and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0.0})  # noqa: E501
-  for maximum in reversed(tuple(u for u in root.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int)):
-    root=root.substitute({maximum:maximum.substitute({u:u.const_like(-2048) for u in maximum.toposort() if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg)==dtypes.int.min})})  # noqa: E501
-  return root
+  nodes=root.toposort()
+  neutrals={u:u.const_like(-2048) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg)==dtypes.int.min}
+  return root.substitute({maximum:maximum.substitute(neutrals) for maximum in reversed(nodes) if maximum.op is Ops.MAX and maximum.dtype.scalar() is dtypes.int})  # noqa: E501
 
 def _fold_static_terms(op:Ops, dtype:DType, terms:list[UOp], balanced:bool) -> UOp:
   while balanced and len(terms)>1: terms=[UOp(op,dtype,src=(terms[i],terms[i+1])) for i in range(0,len(terms)-1,2)]+(terms[-1:] if len(terms)&1 else [])  # noqa: E501
