@@ -478,7 +478,7 @@ def _gate_zero_term(term:UOp) -> UOp:
 def _lower_cmac_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Keep CMAC responsible for separable sums/products; mapped reduction owns every other bounded shape."""
   _,out,rows,out_index,root=output
-  if rows<=0 or out.dtype.scalar() not in (dtypes.half,dtypes.float): return None
+  if rows<=0 or out.dtype.scalar() not in (dtypes.half,dtypes.float) or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])>13*32 for node in root.toposort()): return None  # noqa: E501
   relu_root=_relu_operand(root)
   if relu_root is None and (fp32_root:=_typed_cast_source(root,dtypes.half,dtypes.float)) is not None: relu_root=_relu_operand(fp32_root)
   root=_strip_cast(relu_root if relu_root is not None else root); additive=root.op is Ops.ADD and root.dtype.scalar() is dtypes.float or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD for node in root.toposort())  # noqa: E501

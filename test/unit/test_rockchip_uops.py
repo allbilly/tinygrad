@@ -2528,6 +2528,21 @@ def test_cmac_candidate_filter_keeps_later_valid_layout():
   np.testing.assert_array_equal(physical[np.asarray(_output_gathers(expanded)[0].offsets)],source_values.sum(axis=1,dtype=np.float32))
 
 
+def test_cmac_extent_bound_rejects_before_static_unroll(monkeypatch):
+  def reduction(depth:int):
+    out,source=UOp.param(0,dtypes.half,(1,)),UOp.param(1,dtypes.half,(depth,))
+    axis=UOp.range(depth,0,AxisType.REDUCE)
+    reduced=UOp(Ops.REDUCE,dtypes.float,src=(source.index(axis).load().cast(dtypes.float),axis),arg=(Ops.ADD,0))
+    uops=list(out.index(0).store(reduced.cast(dtypes.half)).sink().toposort())
+    output=rockchip_renderer._outs(uops)[1]
+    assert output is not None
+    return output,uops
+  assert rockchip_renderer._lower_cmac_reduce(*reduction(416)) is not None
+  def forbidden(*_args,**_kwargs): raise AssertionError("oversized CMAC candidate was statically unrolled")
+  monkeypatch.setattr(rockchip_renderer,"_unroll_static_reduces",forbidden)
+  assert rockchip_renderer._lower_cmac_reduce(*reduction(417)) is None
+
+
 def test_large_static_reduce_balances_before_generic_post_uops():
   size = 1025
   out, source = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.half, (size,))
