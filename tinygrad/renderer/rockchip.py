@@ -558,12 +558,12 @@ def _reduce_mapped_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGath
   while size>1: size//=2; count=size*block; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current  # noqa: E501
   return current
 
-def _reduce_boolean_rows(ops:list[RKEWOp], source:RKArg, lanes:int, cfg:int, rows:int) -> RKArg:
+def _reduce_boolean_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGather], source:RKArg, lanes:int, cfg:int, rows:int) -> RKArg:
   """Reduce each dense boolean row in place using exact INT16 carriers."""
-  for row in range(rows):
-    size=lanes//rows; current=source._replace(addend=source.addend+row*size*2)
-    while size>1: left=(size+1)//2; ops.append(RKEWOp(current,current,current._replace(addend=current.addend+left*2),size//2,cfg,mode=RKEWMode.INT16)); size=left  # noqa: E501
-  return source
+  groups=lanes//rows; block=round_up(rows,8); size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*block),)*2)  # noqa: E501
+  bits=size.bit_length()-1; offsets=tuple(row*groups+index if (index:=int(f"{group:0{bits}b}"[::-1],2))<groups and row<rows else -1 for group in range(size) for row in range(block)); gathers.append(RKGather(source,current,len(offsets),offsets=offsets,fill_bits=1 if cfg==_EW_CFG[Ops.MUL] else 0))  # noqa: E501
+  while size>1: size//=2; count=size*block; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,mode=RKEWMode.INT16)); current,target=target,current  # noqa: E501
+  return current
 
 def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Render one canonical mapped reduction, reduce it physically, then compile its dependent scalar suffix."""
@@ -599,9 +599,9 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   if mapped is None or any(isinstance(op,RKCMAC) or isinstance(op,RKGather) and op.index is not None and op.dst.kind is RKBufferKind.ARG for op in mapped.program): return None  # noqa: E501
   direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and len(mapped.scratch)==1 and len(mapped.program)==2 and isinstance(mapped.program[0],RKGather) and isinstance(mapped.program[1],RKEWOp) and mapped.program[1].dst==RKArg(RKBufferKind.ARG,slot) and mapped.program[1].lhs==mapped.program[1].rhs; value_slot=len(mapped.scratch); source=typing_cast(RKEWOp,mapped.program[1]).lhs if direct else RKArg(RKBufferKind.SCRATCH,value_slot); scratch=list(mapped.scratch)+([] if direct else [_scratch_bytes(lanes)])  # noqa: E501
   mapped=_alias_image_args(mapped,{slot:source}); prefix_program=mapped.program[:1] if direct else mapped.program; gathers:list[RKGather]=[]; ops:list[RKEWOp]=[]  # noqa: E501
-  reduced=_reduce_boolean_rows(ops,source,lanes,_EW_CFG[value.arg[0]],rows) if boolean else _reduce_mapped_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,kahan=value.arg[0] is Ops.ADD and product.op is not Ops.LOAD and groups<=4096,barrier=not direct)  # noqa: E501
+  reduced=_reduce_boolean_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],rows) if boolean else _reduce_mapped_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,kahan=value.arg[0] is Ops.ADD and product.op is not Ops.LOAD and groups<=4096,barrier=not direct)  # noqa: E501
   commit:tuple[RKGather|RKEWOp,...]=()
-  if boolean: packed,unit=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(rows),)*2); commit=(RKGather(reduced,packed,rows,offsets=tuple(row*groups for row in range(rows))),RKGather(None,unit,rows,values=(_fp16_bits(1),)),RKEWOp(packed,packed,unit,rows,_EW_CFG[Ops.MUL],mode=RKEWMode.INT16)); reduced=packed  # noqa: E501
+  if boolean: packed,unit=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(rows),)*2); commit=(RKGather(reduced,packed,rows,offsets=tuple(range(rows))),RKGather(None,unit,rows,values=(_fp16_bits(1),)),RKEWOp(packed,packed,unit,rows,_EW_CFG[Ops.MUL],mode=RKEWMode.INT16)); reduced=packed  # noqa: E501
   prefix=RKImage(tuple(scratch),program=prefix_program+tuple(gathers)+tuple(ops)+commit); scalar=UOp.param(slot+1,dtypes.half if boolean else mapped_dtype,(rows,)); replacement=scalar.index(out_index).load().cast(value.dtype); suffix_root=root.substitute({value:replacement})  # noqa: E501
   return None if (suffix:=_lower_uop_program(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()))) is None else _append_inplace_image(prefix,suffix,link=(slot+1,reduced,rows),chain=direct)  # noqa: E501
 

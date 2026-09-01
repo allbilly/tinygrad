@@ -1942,7 +1942,7 @@ def test_production_large_all_uses_bounded_row_reduction():
     renderer=RockchipRenderer(Target(device="ROCKCHIP"))
     to_program_cache.clear()
     images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in calls]
-  assert len(images)==3 and len(_ew_ops(images[1]))<5000
+  assert len(images)==3 and len(_ew_ops(images[1]))<400
   assert all(_assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image for image in images)
   values=np.ones(count,dtype="<f2")
   values[:4]=np.asarray((np.nan,np.inf,-np.inf,np.nextafter(np.float16(0),np.float16(1))),dtype="<f2")
