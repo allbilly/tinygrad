@@ -564,12 +564,14 @@ def test_int32_to_half_gather_chain_rearms_only_into_bounded_fp16():
   out=RKArg(RKBufferKind.ARG,0)
   def convert(arg): return RKEWOp(arg,arg,arg,4,_EW_CFG[Ops.MAX],mode=RKEWMode.INT32_TO_HALF)
   def gather(src,dst): return RKGather(src,dst,4,axes=((1,4,1),))
-  for terminal,expected in ((RKEWMode.BOUNDED,(True,True,False)),(RKEWMode.HALF,(True,False,False))):
+  for terminal,expected in (((RKEWMode.BOUNDED,),(True,True,False)),
+                            ((RKEWMode.BOUNDED,RKEWMode.HALF),(True,True,False)),
+                            ((RKEWMode.HALF,),(True,False,False))):
     program=object.__new__(rockchip_runtime.RockchipProgram)
     program.dev=FakeDevice()
     calls=[]
     program.image=RKImage((64,)*4,(convert(scratch[0]),gather(scratch[0],scratch[1]),convert(scratch[2]),
-      gather(scratch[2],scratch[3]),RKEWOp(out,scratch[1],scratch[3],4,_EW_CFG[Ops.FDIV],mode=terminal)))
+      gather(scratch[2],scratch[3]),*(RKEWOp(out,scratch[1],scratch[3],4,_EW_CFG[Ops.FDIV],mode=mode) for mode in terminal)))
     program._scratch_offsets=(0,4096,8192,12288,16384)
     program._run_ew_ops=lambda _address,ops,rearm=False:calls.append(rearm)
     program(_runtime_memory(8,0x200000))
@@ -678,7 +680,7 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
       op(mode=RKEWMode.INT16_TO_INT32,scratch_args=True),op()),
      (("submit",(31,)),("submit",(31,)),("submit",(32,32,32,18)))),
     ((op(mode=RKEWMode.INT16,scratch_args=True),op()),
-     (("submit",(31,)),("reset",), ("submit",(31,)))),
+     (("submit",(31,)),("submit",(31,)))),
     ((op(),op(count=4,mode=RKEWMode.INT32_TO_HALF,scratch_args=True),op()),
      (("submit",(31,)),("submit",(31,)),("reset",),("submit",(31,)))),
     ((op(),op(mode=RKEWMode.COMPARE),op()),
@@ -2306,7 +2308,7 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   prefix,mapped_coordinate,large_coordinate=large_images[0],large_images[2],large_images[-1]
   assert (len(prefix.scratch),len(_static_gathers(prefix)),len(_ew_ops(prefix)),len(_output_gathers(prefix))) == (27,16,1099,0)
   assert (len(mapped_coordinate.scratch),len(_static_gathers(mapped_coordinate)),len(_ew_ops(mapped_coordinate)),
-          len(_output_gathers(mapped_coordinate))) == (18,16,2586,0)
+          len(_output_gathers(mapped_coordinate))) == (51,52,141,0)
   assert (len(large_coordinate.scratch),len(_static_gathers(large_coordinate)),len(_ew_ops(large_coordinate)),
           len(_output_gathers(large_coordinate))) == (153,147,10451,1)
   values=np.random.default_rng(1001).uniform(-1,1,size=320).astype("<f2")
@@ -2319,6 +2321,35 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   assert hashlib.sha256(_execute_raw_dynamic_image(large_coordinate,240*4,
     np.random.default_rng(1005).uniform(-1,1,size=320).astype("<f2").tobytes(),indices.tobytes())).hexdigest() == \
     "5eb5c4574e3ce639b7e9920d1d6698b5bf2d9110ceab18833a1a76296f5fcd22"
+
+
+def test_int32_selector_images_preserve_full_width_values_and_bounds():
+  count,candidates=5,8
+  out,source=UOp.param(0,dtypes.int,(count,)),UOp.param(1,dtypes.int,(candidates,))
+  lane,axis=UOp.range(count,0),UOp.range(candidates,1,AxisType.REDUCE)
+  different=UOp(Ops.CMPNE,dtypes.bool,src=(source.index(axis).load(),lane.cast(dtypes.int)))
+  term=different.where(UOp.const(0,dtypes.int),UOp.const(1,dtypes.int))
+  reduced=UOp(Ops.REDUCE,dtypes.int,src=(term,axis),arg=(Ops.ADD,0))
+  histogram=_lower_uop_program(list(out.index(lane).store(reduced).end(lane,axis).sink().toposort()))
+  assert histogram is not None and _ew_ops(histogram)[-1].mode is RKEWMode.INT16_TO_INT32
+  values=np.asarray((-2**31,-1,0,1,1,4,2**31-1,5),dtype="<i4")
+  np.testing.assert_array_equal(np.frombuffer(_execute_raw_dynamic_image(histogram,count*4,values.tobytes()),dtype="<i4"),
+                                np.asarray((1,2,0,0,1),dtype="<i4"))
+
+  count,limit=8,4
+  out,source=UOp.param(0,dtypes.int,(count,)),UOp.param(1,dtypes.int,(count,))
+  lane=UOp.range(count,0)
+  loaded=source.index(lane).load()
+  negative=UOp(Ops.CMPLT,dtypes.bool,src=(loaded,loaded.const_like(0)))
+  nonnegative=UOp(Ops.CMPNE,dtypes.bool,src=(negative,UOp.const(True,dtypes.bool)))
+  upper=UOp(Ops.CMPLT,dtypes.bool,src=(loaded,loaded.const_like(limit)))
+  gate=UOp(Ops.AND,dtypes.bool,src=(upper,nonnegative))
+  selected=gate.where(loaded*10+lane.cast(dtypes.int),loaded.const_like(0))
+  lookup=_lower_uop_program(list(out.index(lane).store(selected).end(lane).sink().toposort()))
+  assert lookup is not None and _ew_ops(lookup)[-1].mode is RKEWMode.INT16_TO_INT32
+  values=np.asarray((-2**31,-1,0,1,3,4,2**31-1,2),dtype="<i4")
+  np.testing.assert_array_equal(np.frombuffer(_execute_raw_dynamic_image(lookup,count*4,values.tobytes()),dtype="<i4"),
+                                np.asarray((0,0,2,13,34,0,0,27),dtype="<i4"))
 
 
 def test_normalized_int_prefix_executes_generic_int32_uops():
@@ -2534,7 +2565,7 @@ def test_dynamic_npu_address_composes_exact_bool_total_fill_gate():
     assert decode_image(encode_image(image)) == image
 
 
-def test_bounded_int32_lookup_executes_as_ordinary_uops():
+def test_bounded_int32_lookup_executes_as_exact_selector_uops():
   out, indices = UOp.param(0, dtypes.int, (4,)), UOp.param(1, dtypes.int, (4,))
   lane = UOp.range(4, 0)
   index = indices.index(lane).load()
@@ -2542,7 +2573,7 @@ def test_bounded_int32_lookup_executes_as_ordinary_uops():
   value = valid.where(index+lane*4, UOp.const(0, dtypes.int))
   image = _lower_uop_program(list(out.index(lane).store(value).end(lane).sink().toposort()))
   assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
-  assert any(op.mode==RKEWMode.INT32 for op in _ew_ops(image))
+  assert _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32 and not any(op.mode==RKEWMode.INT32 for op in _ew_ops(image))
   assert decode_image(encode_image(image)) == image
   np.testing.assert_array_equal(_execute_integer_image(image, np.asarray((-1, 0, 2, 6), dtype=np.int32)),
                                 np.asarray((0, 4, 10, 0), dtype=np.int32))

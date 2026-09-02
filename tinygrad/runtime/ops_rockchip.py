@@ -93,7 +93,7 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         next_precision,limit,itemsize,dst_step,src_step=_EW_MODE_INFO[mode]
         if chain and next_precision!=precision and not (mode==M.INT16_TO_INT32 and precision in (0,16)):
-          flush_chain(not next_precision and mode!=M.INT16_TO_INT32 and bool(precision))
+          flush_chain(not next_precision and mode!=M.INT16_TO_INT32 and bool(precision) and precision!=16)
         chain.extend((emit_ew_stage(op,address),) if not limit else self._tile(op,limit,address,itemsize,dst_step,src_step,mode=M.BOUNDED if not chain and mode in (M.HALF,M.BOUNDED) else M.HALF if mode==M.BOUNDED else mode))  # noqa: E501
         precision=next_precision
         if precision==128 and len(chain)>=16: flush_chain()
@@ -162,7 +162,7 @@ class RockchipProgram(Program['RockchipDevice']):
     native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
     if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.mode==RKEWMode.HALF_TO_FLOAT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
     for index,group in enumerate(groups:=tuple(tuple(items) for _,items in itertools.groupby(self.image.program[cursor:],type))):
-      rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (all(isinstance(op,RKEWOp) and op.mode==RKEWMode.BOUNDED for op in groups[index+2]) or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
+      rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (isinstance(next_op:=groups[index+2][0],RKEWOp) and next_op.mode==RKEWMode.BOUNDED or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
       if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
       elif isinstance(current,RKEWOp): self._run_ew_ops(address,group,rearm)  # type: ignore[arg-type]
       else:

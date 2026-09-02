@@ -552,9 +552,99 @@ def _lower_one_hot_gather(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   valid=functools.reduce(lambda x,y:x.alu(Ops.AND,y),tuple(selected.alu(Ops.CMPLT,selected.const_like(0)).alu(Ops.CMPNE,UOp.const(True,dtypes.bool)).alu(Ops.AND,selected.alu(Ops.CMPLT,selected.const_like(int(axis.src[0].arg)))) for axis,selected in selections.items())); index=graph_rewrite(source.src[0].src[1].substitute(selections,walk=True),sym); direct=source.src[0].replace(src=(source.src[0].src[0],index)).load(body.src[2],valid); replacement=root.substitute({value:direct})  # noqa: E501
   return _lower_uop_program(list(store.replace(src=(store.src[0],replacement)).sink().toposort()),vectorize_reductions=False)
 
+def _lower_int_equality_count(output:RKOutput, uops:list[UOp]) -> RKImage|None:
+  """Count exact INT32 candidates equal to each bounded output lane without repeating candidate arithmetic."""
+  _,out,count,out_index,root=output
+  if out.dtype.scalar() is not dtypes.int or not 1<=count<=_FP16_EXACT_INTEGER or root.op is not Ops.REDUCE or not isinstance(root.arg,tuple) or root.arg[0] is not Ops.ADD or len(root.src)!=2: return None  # noqa: E501
+  body,axis=root.src
+  if not axis.src or axis.src[0].op is not Ops.CONST or not 1<=(candidates:=int(axis.src[0].arg))<=_FP16_EXACT_INTEGER or body.op is not Ops.WHERE: return None  # noqa: E501
+  condition,zero,one=body.src
+  if condition.op is not Ops.CMPNE or zero.op is not Ops.CONST or int(zero.arg)!=0 or one.op is not Ops.CONST or int(one.arg)!=1: return None
+  pair=next(((candidate,lane) for candidate,lane in (condition.src,condition.src[::-1]) if _strip_cast(lane).key==out_index.key),None)
+  ranges=() if pair is None else tuple(node for node in pair[0].toposort() if node.op in (Ops.RANGE,Ops.SPECIAL))
+  if pair is None or pair[0].dtype.scalar() is not dtypes.int or set(ranges)!={axis}: return None
+  candidate=pair[0]; lane=UOp.range(candidates,1+max((node.arg[0] for node in uops if node.op is Ops.RANGE and isinstance(node.arg,tuple)),default=-1),dtype=dtypes.int)  # noqa: E501
+  slot=1+max((node.arg.slot for node in uops if node.op is Ops.PARAM),default=out.arg.slot); fake=UOp.param(slot,dtypes.int,(candidates,))
+  try:
+    if _static_values(out_index,out_index,count,int)!=tuple(range(count)): return None
+    candidate_image=_lower_uop_program(list(fake.index(lane).store(candidate.substitute({axis:lane},walk=True)).end(lane).sink().toposort()))
+  except (RuntimeError,ValueError,OverflowError): return None
+  if candidate_image is None: return None
+  size=1<<(candidates-1).bit_length(); target=RKArg(RKBufferKind.SCRATCH,len(candidate_image.scratch))
+  candidate_image=_alias_image_args(candidate_image._replace(scratch=candidate_image.scratch+(size*4,)),{slot:target}); split=next((index for index,op in enumerate(candidate_image.program) if not isinstance(op,RKGather)),len(candidate_image.program))  # noqa: E501
+  if any(not isinstance(op,RKGather) for op in candidate_image.program[:split]) or any(not isinstance(op,RKEWOp) for op in candidate_image.program[split:]): return None  # noqa: E501
+  scratch=list(candidate_image.scratch); candidate_preloads=list(typing_cast(tuple[RKGather,...],candidate_image.program[:split])); preloads:list[RKGather]=[]; ops:list[RKEWOp]=list(typing_cast(tuple[RKEWOp,...],candidate_image.program[split:])); cut=len(ops)  # noqa: E501
+  def alloc(amount:int,addend:int=0) -> RKArg:
+    scratch.append(max(64,amount)); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1,addend)
+  def emit(lhs:RKArg,rhs:RKArg,lanes:int,cfg:int,dst:RKArg|None=None) -> RKArg:
+    if dst is None: dst=alloc(lanes*2)
+    ops.append(RKEWOp(dst,lhs,rhs,lanes,cfg,mode=RKEWMode.INT16)); return dst
+  block=math.ceil(count/32)*32; limit=1<<((_MAX_EW_ELEMS_FP16//block).bit_length()-1); accumulator=None
+  for start in range(0,candidates,limit):
+    rows=min(limit,candidates-start); chunk_size=1<<(rows-1).bit_length(); lanes=chunk_size*block
+    unit,match=alloc(lanes*2),alloc(lanes*2)
+    preloads.extend((RKGather(None,unit,lanes,values=(1,)),RKGather(None,match,lanes,values=tuple(1 if index//block<rows else 0 for index in range(lanes)))))  # noqa: E501
+    for byte in range(4):
+      dynamic,static,difference,equal=(alloc(lanes*2) for _ in range(4))
+      preloads.extend((RKGather(target,dynamic,lanes,base=start*4+byte,axes=((block,chunk_size,4),),dst_stride=2,itemsize=1),RKGather(None,static,lanes,values=tuple(((index%block)>>(byte*8))&0xff if index%block<count else 0 for index in range(lanes)))))  # noqa: E501
+      emit(dynamic,static,lanes,_EW_CFG[Ops.SUB],difference); emit(difference,difference,lanes,_EW_CFG_ABS,difference); emit(difference,unit,lanes,_EW_CFG_MIN,difference); emit(unit,difference,lanes,_EW_CFG[Ops.SUB],equal); emit(match,equal,lanes,_EW_CFG[Ops.MUL],match)  # noqa: E501
+    active=chunk_size//2
+    while active: emit(match,match._replace(addend=active*block*2),active*block,_EW_CFG[Ops.ADD],match); active//=2
+    accumulator=match if accumulator is None else emit(accumulator,match,count,_EW_CFG[Ops.ADD],accumulator)
+  if accumulator is None: return None
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG,out.arg.slot),accumulator,accumulator,count,_EW_CFG[Ops.MAX],mode=RKEWMode.INT16_TO_INT32))
+  image=_reuse_linear_scratch(RKImage(tuple(scratch),tuple(candidate_preloads)+tuple(ops[:cut])+tuple(preloads)+tuple(ops[cut:])))
+  try: _validate_image(image)
+  except ValueError: return None
+  return image
+
+def _lower_bounded_int_lookup(output:RKOutput) -> RKImage|None:
+  """Select a static INT16-valued row by an exact, range-gated runtime INT32 index."""
+  _,out,count,out_index,root=output
+  if out.dtype.scalar() is not dtypes.int or not 1<=count<=_FP16_EXACT_INTEGER or root.op is not Ops.WHERE or len(root.src)!=3 or root.src[2].op is not Ops.CONST or int(root.src[2].arg)!=0: return None  # noqa: E501
+  gate,value=root.src[:2]
+  if gate.op is not Ops.AND or len(gate.src)!=2: return None
+  upper=next((term for term in gate.src if term.op is Ops.CMPLT and term.src[1].op is Ops.CONST and 0<int(term.src[1].arg)<=_FP16_EXACT_INTEGER),None)
+  if upper is None: return None
+  source,limit=upper.src[0],int(upper.src[1].arg); nonnegative=next((term for term in gate.src if term is not upper),None)
+  if nonnegative is None or nonnegative.op is not Ops.CMPNE or not any(mark.op is Ops.CONST and mark.dtype.scalar() is dtypes.bool and bool(mark.arg) for mark in nonnegative.src): return None  # noqa: E501
+  negative=next((term for term in nonnegative.src if term.op is Ops.CMPLT),None)
+  if negative is None or negative.src[0].key!=source.key or negative.src[1].op is not Ops.CONST or int(negative.src[1].arg)!=0: return None
+  if source.op is not Ops.LOAD or tuple(node for node in root.toposort() if node.op is Ops.LOAD)!=(source,): return None
+  try:
+    plan=_typed_load_plan(source,dtypes.int,out_index,count,require_offsets=True)
+    if plan is None or plan.gather.src is None or plan.gather.offsets!=tuple(range(count)): return None
+    rows=tuple(_static_values(out_index,value.substitute({source:source.const_like(candidate)},walk=True),count,int) for candidate in range(limit))
+  except (RuntimeError,ValueError,OverflowError): return None
+  if any(not -32768<=item<=32767 for row in rows for item in row): return None
+  scratch:list[int]=[]; preloads:list[RKGather]=[]; ops:list[RKEWOp]=[]
+  def alloc(amount:int,addend:int=0) -> RKArg:
+    scratch.append(max(64,amount)); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1,addend)
+  def emit(lhs:RKArg,rhs:RKArg,lanes:int,cfg:int,dst:RKArg|None=None) -> RKArg:
+    if dst is None: dst=alloc(lanes*2)
+    ops.append(RKEWOp(dst,lhs,rhs,lanes,cfg,mode=RKEWMode.INT16)); return dst
+  block=math.ceil(count/32)*32; chunk_limit=1<<((_MAX_EW_ELEMS_FP16//block).bit_length()-1); accumulator=None
+  for start in range(0,limit,chunk_limit):
+    active_rows=min(chunk_limit,limit-start); size=1<<(active_rows-1).bit_length(); lanes=size*block
+    unit,match,values=alloc(lanes*2),alloc(lanes*2),alloc(lanes*2)
+    preloads.extend((RKGather(None,unit,lanes,values=(1,)),RKGather(None,match,lanes,values=tuple(1 if index//block<active_rows else 0 for index in range(lanes))),RKGather(None,values,lanes,values=tuple(rows[start+index//block][index%block] if index//block<active_rows and index%block<count else 0 for index in range(lanes)))))  # noqa: E501
+    for byte in range(4):
+      dynamic,static,difference,equal=(alloc(lanes*2) for _ in range(4))
+      preloads.extend((RKGather(plan.gather.src,dynamic,lanes,offsets=tuple((index%block)*4+byte if index%block<count else -1 for index in range(lanes)),dst_stride=2,itemsize=1),RKGather(None,static,lanes,values=tuple(((start+index//block)>>(byte*8))&0xff if index//block<active_rows else 0 for index in range(lanes)))))  # noqa: E501
+      emit(dynamic,static,lanes,_EW_CFG[Ops.SUB],difference); emit(difference,difference,lanes,_EW_CFG_ABS,difference); emit(difference,unit,lanes,_EW_CFG_MIN,difference); emit(unit,difference,lanes,_EW_CFG[Ops.SUB],equal); emit(match,equal,lanes,_EW_CFG[Ops.MUL],match)  # noqa: E501
+    emit(values,match,lanes,_EW_CFG[Ops.MUL],values); active=size//2
+    while active: emit(values,values._replace(addend=active*block*2),active*block,_EW_CFG[Ops.ADD],values); active//=2
+    accumulator=values if accumulator is None else emit(accumulator,values,count,_EW_CFG[Ops.ADD],accumulator)
+  if accumulator is None: return None
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG,out.arg.slot),accumulator,accumulator,count,_EW_CFG[Ops.MAX],mode=RKEWMode.INT16_TO_INT32))
+  image=_reuse_linear_scratch(RKImage(tuple(scratch),tuple(preloads)+tuple(ops)))
+  try: _validate_image(image)
+  except ValueError: return None
+  return image
+
 def _lower_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Prefer one dynamic gather or contraction, then map and reduce every remaining bounded reduction on the DPU."""
-  return _lower_one_hot_gather(output,uops) or _lower_cmac_reduce(output,uops) or _lower_mapped_reduce(output,uops)
+  return _lower_int_equality_count(output,uops) or _lower_bounded_int_lookup(output) or _lower_one_hot_gather(output,uops) or _lower_cmac_reduce(output,uops) or _lower_mapped_reduce(output,uops)  # noqa: E501
 
 def _reduce_mapped_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGather], source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, kahan:bool=False, pairwise:bool=False, barrier:bool=True) -> RKArg:  # noqa: E501
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
