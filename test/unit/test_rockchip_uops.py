@@ -2051,13 +2051,13 @@ def _boolean_reduce_program(source_dtype,op:Ops,groups:int=2,width:int=4):
 
 
 def test_boolean_reductions_are_physically_executed():
-  for source_dtype,op in itertools.product((dtypes.half,dtypes.bool),(Ops.MUL,Ops.MAX)):
+  for groups,source_dtype,op in itertools.product((1,2),(dtypes.half,dtypes.bool),(Ops.MUL,Ops.MAX)):
     for width in (1,2,4):
-      image=_lower_uop_program(_boolean_reduce_program(source_dtype,op,width=width))
+      image=_lower_uop_program(_boolean_reduce_program(source_dtype,op,groups=groups,width=width))
       assert image is not None and not _runtime_gathers(image) and not _runtime_gathers(image,False)
       values=([1]*width+[1]*(width-1)+[0]) if op is Ops.MUL else ([0]*width+[0]*(width-1)+[1])
-      source=np.asarray(values,dtype=np.float16 if source_dtype is dtypes.half else np.uint8)
-      assert _execute_raw_dynamic_image(image,2,source.tobytes())==(bytes((1,0)) if op is Ops.MUL else bytes((0,1)))
+      source=np.asarray(values[:groups*width],dtype=np.float16 if source_dtype is dtypes.half else np.uint8)
+      assert _execute_raw_dynamic_image(image,groups,source.tobytes())==(bytes((1,0)) if op is Ops.MUL else bytes((0,1)))[:groups]
       assert decode_image(encode_image(image))==image
 
 
