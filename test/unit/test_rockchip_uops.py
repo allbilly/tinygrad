@@ -1141,7 +1141,7 @@ def test_math_uops_own_multi_stage_recipes():
 def test_sqrt_recipe_covers_the_positive_binary16_domain():
   values=np.concatenate((np.arange(0x7c00,dtype="<u2").view("<f2"),np.asarray((-4.0,math.inf,math.nan),dtype="<f2")))
   source=UOp.param(1,dtypes.half,(len(values),))
-  for reciprocal,divisions in ((False,7),(True,8)):
+  for reciprocal,divisions in ((False,16),(True,17)):
     def operation(i:UOp) -> UOp:
       value=source.index(i).load().sqrt()
       return value.reciprocal() if reciprocal else value
@@ -1863,7 +1863,7 @@ def test_std_mean_outer_selector_commits_two_aligned_output_surfaces():
     image = decode_image(next(u for u in to_program(linear.src[-1].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if u.op is Ops.BINARY).arg)
   commits=tuple(gather for gather in _static_gathers(image) if gather.dst.kind is RKBufferKind.ARG)
   atoms=tuple(gather for gather in _static_gathers(image) if gather.dst_stride==8)
-  assert _cmac(image) is None and len(_ew_ops(image))==72 and [(g.count,g.dst_stride) for g in atoms]==[(16384,8)]*2
+  assert _cmac(image) is None and len(_ew_ops(image))==90 and [(g.count,g.dst_stride) for g in atoms]==[(16384,8)]*2
   assert all(arg.addend%16==0 for op in _ew_ops(image) for arg in (op.lhs,op.rhs))
   assert [(g.count,g.dst_addend) for g in commits] == [(1,0),(1,1)]
   assert not _runtime_gathers(image,False) and not _runtime_gathers(image,True) and not _runtime_gathers(image)

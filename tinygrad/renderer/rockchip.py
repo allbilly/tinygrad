@@ -1421,12 +1421,12 @@ def _dpu_math_base(source:UOp) -> tuple[UOp, UOp, UOp, Callable[[UOp], UOp]]:
   return source, zero, one, _positive_mask if source.op in (Ops.INDEX, Ops.LOAD) else _finite_positive_mask
 
 def _dpu_sqrt(source:UOp) -> UOp|None:
-  """Approximate FP16 sqrt after bounding its exponent range, then use Babylonian iterations on DPU EW."""
-  source,zero,one,_=_dpu_math_base(source)
-  selector=_positive_mask(_half(1/16).alu(Ops.SUB,source)); scale=_half(1/64).alu(Ops.ADD,selector.alu(Ops.MUL,_half(16384-1/64))); correction=_half(8).alu(Ops.ADD,selector.alu(Ops.MUL,_half(1/128-8))); scaled=source.alu(Ops.MUL,scale)  # noqa: E501
-  finite=UOp(Ops.MAX,source.dtype,src=(scaled.alu(Ops.MAX,zero),_half(65504)),arg=_NATIVE_MIN); safe=finite.alu(Ops.MAX,_half(2**-24)); estimate=safe.alu(Ops.MUL,_half(1/8)).alu(Ops.MAX,_half(1/8))  # noqa: E501
-  for _ in range(5): estimate=estimate.alu(Ops.ADD,safe.alu(Ops.FDIV,estimate)).alu(Ops.MUL,_half(0.5))
-  valid=one.alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,source))); return scaled.alu(Ops.FDIV,estimate).alu(Ops.MUL,correction).alu(Ops.ADD,valid.alu(Ops.FDIV,valid).alu(Ops.SUB,one))  # noqa: E501
+  """Approximate FP16 sqrt with range-independent Babylonian iterations on DPU EW."""
+  source, zero, one, _ = _dpu_math_base(source); finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)  # noqa: E501
+  safe = finite.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))
+  estimate = safe.alu(Ops.MAX, one)
+  for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
+  valid = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, source))); return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one))  # noqa: E501
 
 def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float, ...]) -> tuple[UOp,UOp]:
   """Reduce a finite FP16 angle with split constants so large products retain their residual."""
