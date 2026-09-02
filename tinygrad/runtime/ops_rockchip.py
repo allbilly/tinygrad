@@ -51,18 +51,15 @@ class RockchipProgram(Program['RockchipDevice']):
     except TimeoutError as exc:
       self.dev.timeout_retries,self.dev._poisoned=self.dev.timeout_retries+1,True
       raise RuntimeError("RKNPU submit timed out; platform NPU reset or power cycle required") from exc
-    self.dev.submit_count += 1
-    self.dev.task_count += n
+    self.dev.submit_count += 1; self.dev.task_count += n  # noqa: E702
 
   # Submit contiguous FP16 EW tasks as one blocking PC chain, or one stateful DPU/CMAC body with its direct PC tail.
   def _submit_bodies(self, bodies:typing.Iterable[tuple[int, ...]], standalone:bool=False, cmac:bool=False) -> None:
     """Materialize one physical command/task batch while retaining each submission ABI."""
     bodies=tuple(bodies); sizes=tuple(map(len,bodies)); n=len(bodies)  # noqa: E702
     if not sizes or not all(0<s<1<<16 for s in sizes) or standalone and n!=1 or cmac and not standalone: raise ValueError("invalid NPU command body")  # noqa: E501
-    if not standalone and self.dev._pcchain_bodies==bodies and all(name in self.dev._buffers for name in ("cmd","task")): self._submit(self.dev._buffers["cmd"],self.dev._buffers["task"],n); return  # noqa: E501,E702
-    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(round_up(size+tail_size,2) for size in sizes))  # noqa: E501,E702
-    prefix="standalone_" if standalone else ""; cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E702
-    cmd=self.dev._ensure_buffer(f"{prefix}cmd",cmd_size,_CMD_BUF_MIN); task=self.dev._ensure_buffer(f"{prefix}task",n*_TASK_DESC_BYTES,_TASK_BUF_MIN,rk.RKNPU_MEM_KERNEL_MAPPING)  # noqa: E501,E702
+    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(round_up(size+tail_size,2) for size in sizes)); cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E501,E702
+    cmd,task=self.dev._replace_submit_buffers(cmd_size,n*_TASK_DESC_BYTES)
     ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd)  # noqa: E702
     for i,(body,size) in enumerate(zip(bodies,sizes)):
       base=offsets[i]; ctypes.memmove(int(cmd.va_addr)+base*8,(ctypes.c_uint64*size)(*body),size*8)  # noqa: E702
@@ -73,7 +70,6 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(cmd.va_addr)+(base+size)*8,(ctypes.c_uint64*len(tail))(*tail),len(tail)*8)
       desc=rk.struct_rknpu_task(0,0 if cmac else 4,0xd if cmac else 0x18,0x300,0x1ffff,0,size if cmac else size+len(tail),0,base_dma+base*8)  # noqa: E501
       ctypes.memmove(int(task.va_addr)+i*_TASK_DESC_BYTES,ctypes.addressof(desc),_TASK_DESC_BYTES)
-    if not standalone: self.dev._pcchain_bodies=bodies
     if standalone: self.dev.reset_npu()
     try: self._submit(cmd,task,n,standalone=standalone)
     finally:
@@ -182,7 +178,6 @@ class RockchipDevice(Compiled):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count,self.task_count,self.timeout_retries,self._poisoned=0,0,0,False
     self._lock, self._buffers = threading.Lock(), dict[str,HCQBuffer]()
-    self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
     self.reset_npu()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
   def _check_healthy(self):
@@ -194,6 +189,11 @@ class RockchipDevice(Compiled):
       if buf is not None: self._gpu_free(buf)
       return new
     return buf
+  def _replace_submit_buffers(self, cmd_size:int, task_size:int) -> tuple[HCQBuffer,HCQBuffer]:
+    old=tuple(self._buffers.get(name) for name in ("cmd","task")); fresh=(self._gpu_alloc(max(cmd_size,_CMD_BUF_MIN)),self._gpu_alloc(max(task_size,_TASK_BUF_MIN),rk.RKNPU_MEM_KERNEL_MAPPING))  # noqa: E501,E702
+    self._buffers.update(zip(("cmd","task"),fresh))
+    for buf in (x for x in old if x is not None): self._gpu_free(buf)
+    return fresh
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(self._check_healthy() or 4096, (size+4095)&-4096)
     try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl,size=alloc,flags=flags|rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT)  # noqa: E501

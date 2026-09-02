@@ -461,22 +461,31 @@ def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
   assert calls == program.dev.timeout_retries == 1 and program.dev._poisoned
   assert program.dev.submit_count == program.dev.task_count == 0
 
-def test_device_workspace_reuses_grows_and_finalizes_each_role_once():
+def test_device_workspace_reuses_scratch_replaces_submit_pair_and_finalizes():
   device=object.__new__(rockchip_runtime.RockchipDevice)
-  device._buffers,allocated,freed={},[],[]
+  device._buffers,allocated,freed,timeline={},[],[],[]
   def alloc(size,flags=0):
     allocated.append(SimpleNamespace(size=size,flags=flags))
+    timeline.append(("alloc",allocated[-1]))
     return allocated[-1]
-  device._gpu_alloc,device._gpu_free=alloc,freed.append
+  def free(buf):
+    freed.append(buf)
+    timeline.append(("free",buf))
+  device._gpu_alloc,device._gpu_free=alloc,free
   first=device._ensure_buffer("cmd",4,8)
   assert first.size == 8 and device._ensure_buffer("cmd",7,8) is first and freed == []
   second=device._ensure_buffer("cmd",9,8,3)
   scratch=device._ensure_buffer("scratch",2,2)
   assert second is not first and (second.size,second.flags) == (9,3) and freed == [first]
+  before=len(timeline)
+  cmd,task=device._replace_submit_buffers(4,4)
+  assert timeline[before:] == [("alloc",cmd),("alloc",task),("free",second)]
+  assert (cmd.size,cmd.flags,task.size,task.flags) == \
+    (rockchip_runtime._CMD_BUF_MIN,0,rockchip_runtime._TASK_BUF_MIN,rockchip_runtime.rk.RKNPU_MEM_KERNEL_MAPPING)
   device.finalize()
-  assert device._buffers == {} and freed == [first,second,scratch]
+  assert device._buffers == {} and freed == [first,second,cmd,scratch,task]
   device.finalize()
-  assert freed == [first,second,scratch]
+  assert freed == [first,second,cmd,scratch,task]
 
 
 def test_runtime_bounds_risky_and_oversize_pc_chains(monkeypatch):
@@ -538,7 +547,7 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev,program.image=FakeDevice(),RKImage(program=(cmac,))
   cmd, task, submits = memory(8192,0x400000), memory(4096,0x500000), []
-  program.dev._ensure_buffer = lambda attr,*_args,**_kwargs: cmd if "cmd" in attr else task
+  program.dev._replace_submit_buffers = lambda *_args,**_kwargs: (cmd,task)
   program._submit = lambda *args,**kwargs: submits.append((args,kwargs))
   addresses = (0x100000,0x200000,0x300000)
   program._submit_bodies((emit_cmac_stage(cmac,lambda arg:addresses[arg.index]+arg.addend),),True,True)
@@ -2805,7 +2814,7 @@ def test_large_static_reduce_balances_before_generic_post_uops():
   assert depth[expanded] < 64
   image = _lower_uop_program(uops)
   assert image is not None and _cmac(image) is None and _gather_after(image) < len(_ew_ops(image))
-  assert _ew_ops(image)[-1].dst == RKArg(RKBufferKind.ARG, 0)
+  assert _ew_ops(image)[-1].dst == RKArg(RKBufferKind.ARG, 0) and sum(op.submit_barrier for op in _ew_ops(image))==28
 
 
 def test_large_predicate_graph_keeps_fp16_prelude_before_typed_comparisons():
