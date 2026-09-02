@@ -1242,6 +1242,16 @@ def test_static_reduce_uops_are_structurally_executed():
     assert _execute_raw_dynamic_image(image,4,values.tobytes()) == expected.tobytes()
     assert not _runtime_gathers(image) and decode_image(encode_image(image)) == image
 
+def test_production_scatter_product_padding_uses_fp16_one_neutral():
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    base,source,index=(Tensor(UOp.new_buffer("ROCKCHIP",5,dtype,num=12060+i)) for i,dtype in enumerate((dtypes.half,dtypes.half,dtypes.int)))
+    output=base.scatter_reduce(0,index,source,"prod",include_self=False); call=next(u for u in output.schedule_linear().toposort() if u.op is Ops.CALL and u.src[0].op is Ops.SINK)  # noqa: E501,E702
+    image=decode_image(next(u.arg for u in to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if u.op is Ops.BINARY))
+  indices=np.asarray((0,0,2,2,2),dtype="<i4"); values=np.asarray((2,3,4,5,6),dtype="<f2"); initial=np.asarray((7,8,9,10,11),dtype="<f2")  # noqa: E702
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,10,indices.tobytes(),values.tobytes(),initial.tobytes()),dtype="<f2")
+  np.testing.assert_array_equal(actual,np.asarray((6,8,120,10,11),dtype="<f2"))
+  assert any(gather.fill_bits==0x3c00 for gather in _static_gathers(image) if gather.offsets and -1 in gather.offsets)
+
 def test_multi_axis_reduce_routes_cmac_unrolling():
   out, source = UOp.param(0,dtypes.half,(2,)), UOp.param(1,dtypes.half,(12,))
   row,outer,inner = UOp.range(2,0),UOp.range(2,1,AxisType.REDUCE),UOp.range(3,2,AxisType.REDUCE)
