@@ -1128,18 +1128,18 @@ class RKContext:
       return selected if self.out_param.dtype.scalar() is dtypes.int16 else self._convert(u,selected,dtypes.int)
     if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
       dtype = u.dtype.scalar()
-      routes:dict[UOp, list[bool]] = {}
-      def route(node:UOp, active:tuple[bool, ...]) -> None:
+      routes:dict[UOp, np.ndarray] = {}
+      def route(node:UOp, active:np.ndarray) -> None:
         if node.op is Ops.WHERE and _is_static_expr(node.src[0]):
-          selector = tuple(bool(x) for x in _static_values(self.out_index, node.src[0], self.count, int))
-          for child,take in zip(node.src[1:], (selector, tuple(not x for x in selector))):
-            route(child, tuple(live and pick for live,pick in zip(active, take)))
-        else: routes[node] = [old or live for old,live in zip(routes.get(node, [False]*self.count), active)]
-      route(u, (True,)*self.count)
-      expected, itemsize, commits = dtype, dtype.itemsize, []
+          selector = np.asarray(_static_values(self.out_index, node.src[0], self.count, int),dtype=bool)
+          for child,take in zip(node.src[1:], (selector, ~selector)):
+            route(child, active&take)
+        else: routes[node] = active if node not in routes else routes[node]|active
+      route(u, np.ones(self.count,dtype=bool))
+      expected, itemsize, commits, lanes = dtype, dtype.itemsize, [], np.arange(self.count,dtype=np.int64)
       for partial,(leaf,mask) in enumerate(routes.items()):
         value=self._operand(leaf,dtype,dtype is dtypes.half and leaf.op is Ops.LOAD and (param:=_root_param(leaf.src[0])) is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg)<self.count)  # noqa: E501
-        offsets = tuple(value.arg.addend//itemsize+i if take else -1 for i,take in enumerate(mask))
+        offsets = tuple(np.where(mask,lanes+value.arg.addend//itemsize,-1).tolist())
         commits.append(RKGather(value.arg._replace(addend=0),self.out,self.count,offsets=offsets,partial=bool(partial),itemsize=itemsize))
       self.program.extend(commits)
       return self._carrier(self.out,expected)
