@@ -1363,7 +1363,7 @@ def _unwrap_condition(u:UOp) -> UOp:
 
 def _finite_positive_mask(u:UOp) -> UOp:
   """Map finite binary16 values to `u > 0` without the stateful DPU compare path."""
-  magnitude = u.alu(Ops.MAX, UOp.const(0.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half))
+  magnitude = u.alu(Ops.MAX, UOp.const(0.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half))  # noqa: E501
   return UOp(Ops.MAX, magnitude.dtype, src=(magnitude, UOp.const(1.0, dtypes.half)), arg=_NATIVE_MIN)
 
 def _fold_relu_cap(x:UOp) -> UOp|None:
@@ -1434,7 +1434,7 @@ def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float,
   # A second quotient removes the small residual left by the rounded FP16 bulk quotient.
   for _ in range(2):
     quotient=reduced.alu(Ops.MUL,UOp.const(reciprocal_period,half)); magnitude=UOp(Ops.MAX,half,src=(quotient,quotient),arg=_NATIVE_ABS)
-    multiple=_native_same(magnitude.alu(Ops.ADD,UOp.const(0.5,half)),_NATIVE_FLOOR).alu(Ops.MUL,_positive_mask(quotient).alu(Ops.MUL,UOp.const(2.0,half)).alu(Ops.SUB,one))  # noqa: E501
+    multiple=_native_same(magnitude.alu(Ops.ADD,UOp.const(0.5,half)),_NATIVE_FLOOR).alu(Ops.MUL,_finite_positive_mask(quotient).alu(Ops.MUL,UOp.const(2.0,half)).alu(Ops.SUB,one))  # noqa: E501
     reduced,correction=_precise_add_parts([reduced,correction,*(multiple.alu(Ops.MUL,UOp.const(-coefficient,half)) for coefficient in split)])
   return reduced,correction
 
@@ -1447,14 +1447,14 @@ def _dpu_sin(source:UOp) -> UOp:
     source,cosine=(base,True) if base is not None else (_canonical_half_storage(source),False)
   source=source.cast(dtypes.half); one=UOp.const(1.0,dtypes.half); split=(4.0,2.0,0.25,0.03125,2*math.pi-6.28125)
   reduced,reduction_error=_dpu_periodic_reduce(source,1/(2*math.pi),split); invalid=source.alu(Ops.MUL,UOp.const(0.0,dtypes.half))
-  magnitude=UOp(Ops.MAX,dtypes.half,src=(reduced,reduced),arg=_NATIVE_ABS); reflected=_positive_mask(magnitude.alu(Ops.SUB,UOp.const(math.pi/2,dtypes.half)))  # noqa: E501
+  magnitude=UOp(Ops.MAX,dtypes.half,src=(reduced,reduced),arg=_NATIVE_ABS); reflected=_finite_positive_mask(magnitude.alu(Ops.SUB,UOp.const(math.pi/2,dtypes.half)))  # noqa: E501
   pi_minus=UOp.const(3.0,dtypes.half).alu(Ops.SUB,magnitude).alu(Ops.ADD,UOp.const(0.140625,dtypes.half)).alu(Ops.ADD,UOp.const(math.pi-3.140625,dtypes.half)); angle=magnitude.alu(Ops.MUL,one.alu(Ops.SUB,reflected)).alu(Ops.ADD,pi_minus.alu(Ops.MUL,reflected))  # noqa: E501
   if cosine:
-    reduced_sign=one.alu(Ops.SUB,_positive_mask(UOp.const(0.0,dtypes.half).alu(Ops.SUB,reduced)).alu(Ops.MUL,UOp.const(2.0,dtypes.half))); direction=reflected.alu(Ops.MUL,UOp.const(2.0,dtypes.half)).alu(Ops.SUB,one)  # noqa: E501
+    reduced_sign=one.alu(Ops.SUB,_finite_positive_mask(UOp.const(0.0,dtypes.half).alu(Ops.SUB,reduced)).alu(Ops.MUL,UOp.const(2.0,dtypes.half))); direction=reflected.alu(Ops.MUL,UOp.const(2.0,dtypes.half)).alu(Ops.SUB,one)  # noqa: E501
     angle,correction=_precise_add_parts([magnitude,UOp.const(-math.pi/2,dtypes.half),reduction_error.alu(Ops.MUL,reduced_sign),UOp.const(float_to_fp16(math.pi/2)-math.pi/2,dtypes.half)])  # noqa: E501
     angle,correction=angle.alu(Ops.MUL,direction),correction.alu(Ops.MUL,direction)
   square=angle.alu(Ops.MUL,angle); coefficients=(1/362880,-1/5040,1/120,-1/6,1)
-  sign=one.alu(Ops.SUB,(reflected if cosine else _positive_mask(UOp.const(0.0,dtypes.half).alu(Ops.SUB,reduced))).alu(Ops.MUL,UOp.const(2.0,dtypes.half)))  # noqa: E501
+  sign=one.alu(Ops.SUB,(reflected if cosine else _finite_positive_mask(UOp.const(0.0,dtypes.half).alu(Ops.SUB,reduced))).alu(Ops.MUL,UOp.const(2.0,dtypes.half)))  # noqa: E501
   result=angle.alu(Ops.MUL,polyN(square,list(coefficients))); return (result.alu(Ops.ADD,correction) if cosine else result).alu(Ops.MUL,sign).alu(Ops.ADD,invalid)  # noqa: E501
 
 def _dpu_exp2(source:UOp) -> UOp:
@@ -1476,7 +1476,7 @@ def _dpu_exp2(source:UOp) -> UOp:
 
 def _dpu_log2(source:UOp) -> UOp:
   """Approximate FP16 LOG2 without LUTs using threshold exponent extraction and an atanh polynomial."""
-  source, zero, one, mask_fn = _dpu_math_base(source)
+  source, zero, one, _ = _dpu_math_base(source); mask_fn=_finite_positive_mask
   mantissa = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)
   exponent = zero
   for upper,steps in ((True, ((256.0, 8.0), (16.0, 4.0), (4.0, 2.0), (2.0, 1.0))),

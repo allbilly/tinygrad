@@ -75,7 +75,7 @@ class RockchipProgram(Program['RockchipDevice']):
     finally:
       if standalone and not self.dev._poisoned: self.dev.reset_npu()
 
-  def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...]) -> None:
+  def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...], rearm:bool=False) -> None:
     if not ops: return
     M=RKEWMode; program_modes=getattr(self,"_ew_modes",None) or {op.mode for op in ops}  # noqa: E702
     def run_group(group:tuple[RKEWOp, ...], pc_limit:int) -> None:
@@ -83,7 +83,7 @@ class RockchipProgram(Program['RockchipDevice']):
       def flush_chain(reset:bool=False) -> None:
         if not chain: return
         for chunk in itertools.batched(chain,pc_limit): self._submit_bodies(chunk)
-        if reset or precision>=64: self.dev.reset_npu()
+        if reset or precision>=64 and not rearm: self.dev.reset_npu()
         chain.clear()
       for op in group:
         mode=op.mode
@@ -161,16 +161,16 @@ class RockchipProgram(Program['RockchipDevice']):
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
     native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
     if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.mode==RKEWMode.HALF_TO_FLOAT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
-    for _,items in itertools.groupby(self.image.program[cursor:],type):
-      group=tuple(items); current=group[0]  # noqa: E702
-      if isinstance(current,RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
-      elif isinstance(current,RKEWOp): self._run_ew_ops(address,group)  # type: ignore[arg-type]
+    for index,group in enumerate(groups:=tuple(tuple(items) for _,items in itertools.groupby(self.image.program[cursor:],type))):
+      rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (all(isinstance(op,RKEWOp) and op.mode==RKEWMode.BOUNDED for op in groups[index+2]) or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
+      if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
+      elif isinstance(current,RKEWOp): self._run_ew_ops(address,group,rearm)  # type: ignore[arg-type]
       else:
         touched={(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None}  # type: ignore[union-attr]  # noqa: E501
         self.dev._sync_buffers(tuple(buffer(kind,index) for kind,index in touched),rk.RKNPU_MEM_SYNC_FROM_DEVICE)
         apply_gathers(group)  # type: ignore[arg-type]
         self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in group),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # type: ignore[union-attr]  # noqa: E501
-    if ew_ops: self.dev._native_int16 = native_int16
+    if ew_ops: self.dev._native_int16 = ew_ops[-1].mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16)
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):

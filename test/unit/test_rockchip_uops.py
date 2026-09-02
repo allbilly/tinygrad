@@ -535,6 +535,47 @@ def test_numeric_output_program_resets_before_its_first_dpu_stage():
   assert program.dev.resets == 1
 
 
+def test_program_records_only_the_terminal_native_int16_mode():
+  class FakeDevice:
+    _native_int16 = False
+    def __init__(self): self._lock=threading.Lock()
+    def _ensure_buffer(self, *_args): raise AssertionError("scratchless program allocated a workspace")
+    def _sync_buffers(self, _buffers, _flags): pass
+    def reset_npu(self): self._native_int16=False
+  arg=RKArg(RKBufferKind.ARG,0)
+  for modes,expected in (((RKEWMode.INT16,RKEWMode.HALF),False),((RKEWMode.HALF,RKEWMode.INT16),True)):
+    program=object.__new__(rockchip_runtime.RockchipProgram)
+    program.dev=FakeDevice()
+    program.image=RKImage(program=tuple(RKEWOp(arg,arg,arg,1,_EW_CFG[Ops.ADD],mode=mode) for mode in modes))
+    program._scratch_offsets=(0,)
+    program._run_ew_ops=lambda *_args,**_kwargs:None
+    program(arg)
+    assert program.dev._native_int16 is expected
+
+
+def test_int32_to_half_gather_chain_rearms_only_into_bounded_fp16():
+  class FakeDevice:
+    _native_int16 = False
+    def __init__(self): self._lock,self.arena=threading.Lock(),_runtime_memory(16384,0x100000)
+    def _ensure_buffer(self, *_args): return self.arena
+    def _sync_buffers(self, _buffers, _flags): pass
+    def reset_npu(self): raise AssertionError("rearmed conversion reset the NPU")
+  scratch=tuple(RKArg(RKBufferKind.SCRATCH,index) for index in range(4))
+  out=RKArg(RKBufferKind.ARG,0)
+  def convert(arg): return RKEWOp(arg,arg,arg,4,_EW_CFG[Ops.MAX],mode=RKEWMode.INT32_TO_HALF)
+  def gather(src,dst): return RKGather(src,dst,4,axes=((1,4,1),))
+  for terminal,expected in ((RKEWMode.BOUNDED,(True,True,False)),(RKEWMode.HALF,(True,False,False))):
+    program=object.__new__(rockchip_runtime.RockchipProgram)
+    program.dev=FakeDevice()
+    calls=[]
+    program.image=RKImage((64,)*4,(convert(scratch[0]),gather(scratch[0],scratch[1]),convert(scratch[2]),
+      gather(scratch[2],scratch[3]),RKEWOp(out,scratch[1],scratch[3],4,_EW_CFG[Ops.FDIV],mode=terminal)))
+    program._scratch_offsets=(0,4096,8192,12288,16384)
+    program._run_ew_ops=lambda _address,ops,rearm=False:calls.append(rearm)
+    program(_runtime_memory(8,0x200000))
+    assert tuple(calls) == expected
+
+
 def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   class FakeDevice:
     resets, _poisoned = 0, False
@@ -661,6 +702,10 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
       ("standalone",len(tuple(bodies)[0])) if standalone else ("submit",tuple(map(len,bodies))))
     program._run_ew_ops(address,ops)
     assert tuple(events) == expected
+  events=[]
+  conversion=op(count=4,mode=RKEWMode.INT32_TO_HALF,scratch_args=True)
+  program._run_ew_ops(address,(conversion,),True)
+  assert tuple(events) == (("submit",(31,)),)
   with pytest.raises(ValueError,match="invalid RKEWOp sequence"):
     encode_image(RKImage(program=(op(mode=RKEWMode.HALF_TO_FLOAT),op(barrier=True))))
   with pytest.raises(ValueError,match="invalid RKEWOp sequence"):
@@ -1145,6 +1190,7 @@ def test_math_uops_own_multi_stage_recipes():
     image = _lower_uop_program(_program(dtypes.half, lambda i, op=op:UOp(op, dtypes.half, src=(source.index(i).load(),))))
     assert image is not None and len(_ew_ops(image)) > 1
     assert _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG
+    if op is Ops.SIN: assert not any(stage.mode==RKEWMode.COMPARE for stage in _ew_ops(image))
 
 
 def test_sqrt_recipe_covers_the_positive_binary16_domain():
