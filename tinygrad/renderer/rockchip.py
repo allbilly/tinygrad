@@ -815,7 +815,7 @@ class RKContext:
     if not _index_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{}).item()),dtype))
     values = _static_values(self.out_index,u,self.count,_fp16_bits if layout is dtypes.half else int)
     if dtype is dtypes.int and layout is dtypes.int16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
-    encoded = values if layout is dtypes.half else tuple(value&0xffffffff if layout is dtypes.int else _int16_bits(value) for value in values)
+    encoded = values if layout is dtypes.half else tuple(value&0xffffffff if layout is dtypes.int else value&0xffff for value in values)
     return self._slot(self.materialized_slots,encoded,layout)
 
   def _masked_load_default(self, u:UOp, dtype:DType, layout:DType, gate:UOp|None, default:UOp, runtime_address:bool) -> UOp:  # noqa: E501
