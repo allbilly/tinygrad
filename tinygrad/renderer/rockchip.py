@@ -309,7 +309,7 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
   dst,src=dst.astype(np.int64),src.astype(np.int64); values=src if gate is None else np.where(active:=mask[0],src,-1)
   if np.any((src<0)&(gate is None or active)) or np.any(dst<0) or np.any(dst>=count) or not np.all(np.bincount(dst,minlength=count)): raise RuntimeError("RKPLAN_REJECT:gather_index")  # noqa: E501
   offsets=np.full(count,-1,dtype=np.int64); offsets[dst]=values
-  return tuple(int(x) for x in offsets)
+  return tuple(offsets.tolist())
 
 def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None:
   ordered = tuple(sorted(affine[1].items(), key=lambda item:item[1]))
