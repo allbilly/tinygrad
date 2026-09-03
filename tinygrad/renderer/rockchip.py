@@ -1,15 +1,14 @@
 from __future__ import annotations
 # ruff: noqa: E702
 import base64, functools, heapq, io, itertools, math, os, pickle, struct, zlib
-import numpy as np
 from enum import IntEnum
 from typing import Any, Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
 from tinygrad.device import Compiler
-from tinygrad.dtype import DType, dtypes, float_to_fp16
-from tinygrad.helpers import ceildiv, polyN, round_up
+from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
+from tinygrad.helpers import all_same, argsort, ceildiv, polyN, round_up, strides_for_shape
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite, identity_element, python_alu
+from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, identity_element, python_alu
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 
@@ -79,7 +78,9 @@ def _reuse_linear_scratch(image:RKImage) -> RKImage:
     remap[slot] = target
   return _map_image_args(image,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)._replace(scratch=tuple(physical))  # noqa: E501
 
-def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool: return (data:=np.asarray(values)).dtype.kind in "biu" and bool(np.all((-(1<<(bits-1)) if signed else 0)<=data)&np.all(data<(1<<(bits-1) if signed else 1<<bits))) if isinstance(values,tuple) and len(values)>1024 else all(isinstance(x,int) and -(1<<(bits-1)) <= x < 1<<(bits-1) if signed else isinstance(x,int) and 0 <= x < 1<<bits for x in values)  # noqa: E501
+def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
+  low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
+  return all(isinstance(value,int) and low<=value<high for value in values)
 
 def _validate_image(image:RKImage) -> None:
   gathers=tuple(op for op in image.program if isinstance(op,RKGather)); hosts=tuple(op for op in gathers if op.index is not None); static=tuple(op for op in gathers if op.index is None); ew_ops=tuple(op for op in image.program if isinstance(op,RKEWOp)); cmacs=tuple(op for op in image.program if isinstance(op,RKCMAC))  # noqa: E501
@@ -237,21 +238,65 @@ def _static_ranges(u:UOp) -> tuple[UOp, ...]|None:
 def _is_static_expr(u:UOp) -> bool: return _static_ranges(u) is not None
 def _index_ranges(u:UOp) -> list[UOp]: return list(_static_ranges(u) or ())
 
-def _eval_static(u:UOp, env:Mapping[UOp, int|float|bool|np.ndarray], cache:dict[UOp,np.ndarray]|None=None) -> np.ndarray:
-  """Evaluate one static UOp graph with NumPy scalar or lane semantics."""
-  cache={} if cache is None else cache; cache.update({node:np.asarray(value,dtype=np.dtype(node.dtype.scalar().fmt) if node.dtype.scalar().fmt is not None else None) for node,value in env.items()})  # noqa: E501
+RKScalar = int|float|bool
+RKStatic = RKScalar|tuple[RKScalar,...]
+
+def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
+  scalar,commit=dtype.scalar(),truncate.get(dtype.scalar())
+  def lane(value:RKScalar) -> RKScalar:
+    if dtypes.is_int(scalar):
+      bits=scalar.bitsize; integer=int(value)&((1<<bits)-1)
+      return integer-(1<<bits) if not dtypes.is_unsigned(scalar) and integer&(1<<(bits-1)) else integer
+    value=typing_cast(RKScalar,scalar.const(value))
+    return value if commit is None else commit(value)
+  return tuple(map(lane,value)) if isinstance(value,tuple) else lane(value)
+
+def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
+  vectors=tuple(value for value in operands if isinstance(value,tuple))
+  if not vectors: return typing_cast(RKStatic,exec_alu(node.op,node.dtype.scalar(),operands))
+  count=len(vectors[0])
+  if any(len(value)!=count for value in vectors): raise RuntimeError("RKPLAN_REJECT:static_index")
+  expanded=tuple(value if isinstance(value,tuple) else itertools.repeat(value,count) for value in operands)
+  if node.op is Ops.ADD: result=tuple(a+b for a,b in zip(*expanded))
+  elif node.op is Ops.SUB: result=tuple(a-b for a,b in zip(*expanded))
+  elif node.op is Ops.MUL: result=tuple(a*b for a,b in zip(*expanded))
+  elif node.op is Ops.CMPLT: result=tuple(a<b for a,b in zip(*expanded))
+  elif node.op is Ops.CMPNE: result=tuple(a!=b for a,b in zip(*expanded))
+  elif node.op is Ops.AND: result=tuple(a&b for a,b in zip(*expanded))
+  elif node.op is Ops.OR: result=tuple(a|b for a,b in zip(*expanded))
+  elif node.op is Ops.XOR: result=tuple(a^b for a,b in zip(*expanded))
+  elif node.op is Ops.MAX: result=tuple(b if b>a else a for a,b in zip(*expanded))
+  elif node.op is Ops.WHERE: result=tuple(yes if condition else no for condition,yes,no in zip(*expanded))
+  elif node.op is Ops.CDIV: result=tuple(abs(a)//abs(b)*(1,-1)[a*b<0] if b else 0 for a,b in zip(*expanded))
+  elif node.op is Ops.CMOD: result=tuple(a-(abs(a)//abs(b)*(1,-1)[a*b<0] if b else 0)*b for a,b in zip(*expanded))
+  elif node.op is Ops.FLOORDIV: result=tuple(a//b if b else 0 for a,b in zip(*expanded))
+  elif node.op is Ops.FLOORMOD: result=tuple(a-(a//b if b else 0)*b for a,b in zip(*expanded))
+  elif node.op is Ops.RECIPROCAL: result=tuple(1/value if value else math.copysign(math.inf,value) for value in expanded[0])
+  elif node.op is Ops.TRUNC: result=tuple(math.trunc(value) if math.isfinite(value) else value for value in expanded[0])
+  else: result=tuple(python_alu[node.op](*values) for values in zip(*expanded))
+  scalar=node.dtype.scalar()
+  if dtypes.is_bool(scalar) or dtypes.is_int(scalar) and scalar.min<=int(node.vmin)<=int(node.vmax)<=scalar.max: return result
+  return _commit_static(node.dtype,result)
+
+def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None=None) -> RKStatic:
+  """Evaluate only compile-time UOps, committing each intermediate to its scalar dtype."""
+  if _static_ranges(u) is None: raise RuntimeError("RKPLAN_REJECT:non_static_eval")
+  cache={} if cache is None else cache; cache.update((node,_commit_static(node.dtype,value)) for node,value in env.items())
   for node in u.toposort(gate=lambda item:item not in cache):
-    if node.op in (Ops.CONST,Ops.RANGE,Ops.SPECIAL): value=node.arg if node.op is Ops.CONST else env[node]
-    else:
-      values=tuple(cache[source] for source in node.src)
-      if node.op is Ops.CAST: value=values[0]
-      elif node.op in (Ops.WHERE,Ops.MAX): value=np.where(*values) if node.op is Ops.WHERE else np.where(values[1]>values[0],values[1],values[0])
-      elif node.op in (Ops.CDIV,Ops.CMOD,Ops.FLOORDIV,Ops.FLOORMOD):
-        quotient=np.where(values[1],np.abs(values[0])//np.abs(np.where(values[1],values[1],1))*np.where(values[0]*values[1]<0,-1,1),0) if node.op in (Ops.CDIV,Ops.CMOD) else np.where(values[1],values[0]//np.where(values[1],values[1],1),0); value=values[0]-quotient*values[1] if node.op in (Ops.CMOD,Ops.FLOORMOD) else quotient  # noqa: E501
-      elif node.op in (Ops.RECIPROCAL,Ops.TRUNC): value=np.divide(1,values[0]) if node.op is Ops.RECIPROCAL else np.where((truncated:=np.trunc(values[0]))==0,0,truncated)  # noqa: E501
-      else: value=python_alu[node.op](*values)
-    cache[node]=np.asarray(value,dtype=np.dtype(node.dtype.scalar().fmt) if node.dtype.scalar().fmt is not None else None)
+    if node.op is Ops.CONST: value=_commit_static(node.dtype,typing_cast(RKScalar,node.arg))
+    elif node.op is Ops.CAST: value=_commit_static(node.dtype,cache[node.src[0]])
+    else: value=_exec_static(node,tuple(cache[source] for source in node.src))
+    cache[node]=value
   return cache[u]
+
+@functools.lru_cache(maxsize=512)
+def _eval_static_block(u:UOp, axes:tuple[UOp,...], bounds:tuple[int,...], start:int, stop:int) -> RKStatic:
+  if u in axes:
+    stride=strides_for_shape(bounds)[axes.index(u)]; bound=bounds[axes.index(u)]
+    return tuple(0 if bound==1 else lane//stride%bound for lane in range(start,stop))
+  if u.op is Ops.CONST: return _commit_static(u.dtype,typing_cast(RKScalar,u.arg))
+  values=tuple(_eval_static_block(source,axes,bounds,start,stop) for source in u.src)
+  return _commit_static(u.dtype,values[0]) if u.op is Ops.CAST else _exec_static(u,values)
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
 def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
@@ -267,26 +312,38 @@ def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
 def _admit(o,d,v=True)->RKOutput|None: return o if v and o is not None and o[1].dtype.scalar() in (d if isinstance(d,tuple) else (d,)) else None
 def _try(o,d,f,*a,v=True)->RKImage|None: return None if not v or (o:=_admit(o,d)) is None else f(o,*a)
 
-@functools.lru_cache(maxsize=8)
-def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> tuple[np.ndarray,...]:
+@functools.lru_cache(maxsize=2)
+def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> tuple[tuple[RKScalar,...],...]:
   """Enumerate one bounded static lane space and evaluate all requested roots in it."""
   ranges,roots=(_static_ranges(index) or (),(index,*roots)) if isinstance(index,UOp) else (index,roots)
   axes=tuple(dict.fromkeys(node for root in ranges for node in root.toposort() if node.op in (Ops.RANGE,Ops.SPECIAL))) if dependencies else ranges  # noqa: E501
   bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in axes); count=math.prod(bounds)
   if any(bound<0 for bound in bounds) or count>limit: raise RuntimeError("RKPLAN_REJECT:static_index_budget")
   if any((used:=_static_ranges(root)) is None or any(r not in ranges for r in used) for root in roots): raise RuntimeError("RKPLAN_REJECT:static_index")  # noqa: E501
-  env=dict(zip(axes,np.indices(bounds,dtype=np.int64).reshape(len(axes),count))) if axes else {}; cache:dict[UOp,np.ndarray]={}
-  return tuple(np.broadcast_to(_eval_static(root,env,cache),count) for root in roots)
+  output:list[list[RKScalar]]=[[] for _ in roots]
+  for start in range(0,count,4096):
+    stop=min(start+4096,count)
+    for values,root in zip(output,roots):
+      value=_eval_static_block(root,axes,bounds,start,stop); values.extend(value if isinstance(value,tuple) else (value,)*(stop-start))
+  return tuple(tuple(values) for values in output)
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
   dst_lanes,expr_lanes=_static_lanes(out_index,expr)
-  if encode is _fp16_bits:
-    if np.any(np.isfinite(fp_values:=np.asarray(expr_lanes,dtype=np.float64)) & (np.abs(fp_values)>=65520)): raise OverflowError("float too large to pack with e format")  # noqa: E501
-    encoded:np.ndarray=fp_values.astype(np.float16).view(np.uint16)
-  else: encoded=np.asarray(expr_lanes).astype(np.int64)&(0xffff if encode is _int16_bits else -1) if encode in (_int16_bits,int) else np.fromiter((encode(value.item()) for value in expr_lanes),dtype=np.int64,count=len(expr_lanes))  # noqa: E501
-  dst,values=dst_lanes[order:=np.argsort(dst_lanes)],encoded[order]; starts=np.r_[True,dst[1:]!=dst[:-1]]
-  if not np.array_equal(dst[starts],np.arange(count)) or np.any(values[1:][~starts[1:]]!=values[:-1][~starts[1:]]): raise RuntimeError("RKPLAN_REJECT:static_index")  # noqa: E501
-  return tuple(values[starts].tolist())
+  missing=object(); result:list[int|object]=[missing]*count
+  for destination,value in zip(dst_lanes,expr_lanes):
+    dst=int(destination)
+    if not 0<=dst<count: raise RuntimeError("RKPLAN_REJECT:static_index")
+    if encode is _fp16_bits:
+      fp_value=float(value)
+      if math.isfinite(fp_value) and abs(fp_value)>=65520: raise OverflowError("float too large to pack with e format")
+      encoded=_fp16_bits(fp_value)
+    elif encode is _int16_bits: encoded=int(value)&0xffff
+    elif encode is int: encoded=int(value)
+    else: encoded=encode(value)
+    if result[dst] is not missing and result[dst]!=encoded: raise RuntimeError("RKPLAN_REJECT:static_index")
+    result[dst]=encoded
+  if any(value is missing for value in result): raise RuntimeError("RKPLAN_REJECT:static_index")
+  return tuple(typing_cast(int,value) for value in result)
 
 def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int], int]]|None:
   """Represent static address arithmetic as a sum of scaled RANGE or RANGE//constant terms."""
@@ -306,10 +363,13 @@ def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, i
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   dst,src,*mask=_static_lanes(out_index,load_index,*((gate,) if gate is not None else ()))
-  dst,src=dst.astype(np.int64),src.astype(np.int64); values=src if gate is None else np.where(active:=mask[0],src,-1)
-  if np.any((src<0)&(gate is None or active)) or np.any(dst<0) or np.any(dst>=count) or not np.all(np.bincount(dst,minlength=count)): raise RuntimeError("RKPLAN_REJECT:gather_index")  # noqa: E501
-  offsets=np.full(count,-1,dtype=np.int64); offsets[dst]=values
-  return tuple(offsets.tolist())
+  offsets,seen=[-1]*count,[False]*count; active_mask=mask[0] if gate is not None else None
+  for lane,(destination,source) in enumerate(zip(dst,src)):
+    di,si,active=int(destination),int(source),active_mask is None or bool(active_mask[lane])
+    if not 0<=di<count or active and si<0: raise RuntimeError("RKPLAN_REJECT:gather_index")
+    offsets[di],seen[di]=si if active else -1,True
+  if not all(seen): raise RuntimeError("RKPLAN_REJECT:gather_index")
+  return tuple(offsets)
 
 def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None:
   ordered = tuple(sorted(affine[1].items(), key=lambda item:item[1]))
@@ -504,21 +564,27 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
       fp16=out.dtype.scalar() is dtypes.half; cmac=RKCMAC(RKArg(RKBufferKind.SCRATCH,2),lhs.dst,rhs.dst,m,n,groups,fp16,relu_root is not None)
       commit=RKGather(cmac.dst,RKArg(RKBufferKind.ARG,out.arg.slot),rows,axes=((n,m,n*2),(16,n//16,32),(1,16,1)) if fp16 else ((1,rows,1),),itemsize=2 if fp16 else 4)  # noqa: E501
       return RKImage((m*groups*2,n*groups*2,m*n*4),program=(lhs,rhs,cmac,commit))
-  patterns:dict[tuple,np.ndarray]={}
-  def plan_offsets(plan:RKTypedLoadPlan) -> np.ndarray:
-    if (key:=(plan.gather.axes,plan.gather.offsets)) not in patterns: patterns[key]=np.asarray(plan.gather.offsets,dtype=np.int64) if plan.gather.offsets else sum((np.arange(rows,dtype=np.int64)//divisor%limit*stride for divisor,limit,stride in plan.gather.axes),np.zeros(rows,dtype=np.int64))  # noqa: E501
+  patterns:dict[tuple,tuple[int,...]]={}
+  def plan_offsets(plan:RKTypedLoadPlan) -> tuple[int,...]:
+    if (key:=(plan.gather.axes,plan.gather.offsets)) not in patterns: patterns[key]=plan.gather.offsets or tuple(sum((lane//divisor%limit)*stride for divisor,limit,stride in plan.gather.axes) for lane in range(rows))  # noqa: E501
     return patterns[key]
   def align(m:int,n:int,lanes:tuple[int,...]) -> tuple[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float],...]:
-    aligned:list[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float]]=[]; logical=np.asarray(lanes or range(rows),dtype=np.int64).reshape(m,n)  # noqa: E501
+    aligned:list[tuple[RKTypedLoadPlan|None,RKTypedLoadPlan|None,float]]=[]; logical=lanes or tuple(range(rows)); orientations:dict[tuple,tuple[bool,bool]]={}  # noqa: E501
+    def orientation(plan:RKTypedLoadPlan) -> tuple[bool,bool]:
+      key=plan.gather.axes,plan.gather.offsets
+      if key not in orientations:
+        offsets=plan_offsets(plan); grid=tuple(offsets[lane] for lane in logical)
+        orientations[key]=(all(all_same(grid[row*n:(row+1)*n]) for row in range(m)),all(all_same(grid[column::n]) for column in range(n)))  # noqa: E501
+      return orientations[key]
     for lhs,rhs,weight in parsed:
       plans=typing_cast(tuple[RKTypedLoadPlan,...],tuple(plan for plan in (lhs,rhs) if plan is not None))
       if not plans: aligned.append((None,None,weight)); continue
-      row,col=zip(*((bool(np.all((grid:=plan_offsets(plan)[logical])==grid[:,:1])),bool(np.all(grid==grid[:1,:]))) for plan in plans))
+      row,col=zip(*(orientation(plan) for plan in plans))
       order=(0,None) if len(plans)==1 and row[0] else (None,0) if len(plans)==1 and col[0] else (0,1) if len(plans)==2 and row[0] and col[1] else (1,0) if len(plans)==2 and row[1] and col[0] else None  # noqa: E501
       if order is None: return ()
       aligned.append((None if order[0] is None else plans[order[0]],None if order[1] is None else plans[order[1]],weight))
     return tuple(aligned)
-  out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or (); views:list[tuple[int,int,tuple[int,...],tuple[int,...]]]=[(rows,1,(),()),(1,rows,(),())]+[(m,n,lanes,tuple(map(int,np.argsort(lanes)))) for lhs,rhs in ((load_pairs[0],load_pairs[0][::-1]) if load_pairs else ()) for left,right in ((plan_offsets(lhs),plan_offsets(rhs)),) for m,n in ((len(np.unique(left)),len(np.unique(right))),) for lanes in (tuple(map(int,np.lexsort((right,left)))),) if rows>_MAX_GENERIC_UNROLL and m*n==rows]  # noqa: E501
+  out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or (); views:list[tuple[int,int,tuple[int,...],tuple[int,...]]]=[(rows,1,(),()),(1,rows,(),())]+[(m,n,lanes,argsort(lanes)) for lhs,rhs in ((load_pairs[0],load_pairs[0][::-1]) if load_pairs else ()) for left,right in ((plan_offsets(lhs),plan_offsets(rhs)),) for m,n in ((len(set(left)),len(set(right))),) for lanes in (tuple(sorted(range(rows),key=lambda lane:(left[lane],right[lane]))),) if rows>_MAX_GENERIC_UNROLL and m*n==rows]  # noqa: E501
   for _,stride,limit in output_axes:
     m,n=limit,rows//limit; lanes=tuple(high*stride*limit+row*stride+low for row in range(limit) for high in range(rows//stride//limit) for low in range(stride)); outputs=tuple((i//stride%limit)*n+i//(stride*limit)*stride+i%stride for i in range(rows)); views.append((m,n,() if lanes==tuple(range(rows)) else lanes,() if outputs==tuple(range(rows)) else outputs))  # noqa: E501
   candidates=[(m,n,lanes,outputs,aligned,ai,ao) for m,n,lanes,outputs in views for aligned in (align(m,n,lanes),) for ai,ao,_ in (_cmac_layout(n,groups),) if aligned and m<=0x7ff and ai<=13*32 and ao<=0x3fff and m*ai*2<=10*32768 and (m==1 or ai<=12*32)]  # noqa: E501
@@ -902,7 +968,7 @@ class RKContext:
 
   def _static(self, u:UOp) -> UOp:
     dtype, layout = u.dtype.scalar(), self._layout(u.dtype.scalar())
-    if not _index_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{}).item()),dtype))
+    if not _index_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{})),dtype))
     values = _static_values(self.out_index,u,self.count,_fp16_bits if layout is dtypes.half else int)
     if dtype is dtypes.int and layout is dtypes.int16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
     encoded = values if layout is dtypes.half else tuple(value&0xffffffff if layout is dtypes.int else value&0xffff for value in values)
@@ -1218,19 +1284,20 @@ class RKContext:
       return selected if self.out_param.dtype.scalar() is dtypes.int16 else self._convert(u,selected,dtypes.int)
     if u is self.root and u.dtype.scalar() in (dtypes.half, dtypes.int16) and _is_static_expr(u.src[0]):
       dtype = u.dtype.scalar()
-      routes:dict[UOp, np.ndarray] = {}
-      def route(node:UOp, active:np.ndarray) -> None:
+      routes:dict[UOp,list[int]] = {}
+      def route(node:UOp, active:tuple[int,...]) -> None:
         if node.op is Ops.WHERE and _is_static_expr(node.src[0]):
-          selector = np.asarray(_static_values(self.out_index, node.src[0], self.count, int),dtype=bool)
-          for child,take in zip(node.src[1:], (selector, ~selector)):
-            route(child, active&take)
-        else: routes[node] = active if node not in routes else routes[node]|active
-      route(u, np.ones(self.count,dtype=bool))
-      expected, itemsize, commits, lanes = dtype, dtype.itemsize, [], np.arange(self.count,dtype=np.int64)
-      for partial,(leaf,mask) in enumerate(routes.items()):
+          selector=_static_values(self.out_index,node.src[0],self.count,int)
+          route(node.src[1],tuple(lane for lane in active if bool(selector[lane])))
+          route(node.src[2],tuple(lane for lane in active if not bool(selector[lane])))
+        else: routes.setdefault(node,[]).extend(active)
+      route(u,tuple(range(self.count)))
+      expected,itemsize,commits=dtype,dtype.itemsize,[]
+      for partial,(leaf,active) in enumerate(routes.items()):
         value=self._operand(leaf,dtype,dtype is dtypes.half and leaf.op is Ops.LOAD and (param:=_root_param(leaf.src[0])) is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg)<self.count)  # noqa: E501
-        offsets = tuple(np.where(mask,lanes+value.arg.addend//itemsize,-1).tolist())
-        commits.append(RKGather(value.arg._replace(addend=0),self.out,self.count,offsets=offsets,partial=bool(partial),itemsize=itemsize))
+        offsets=[-1]*self.count
+        for lane in active: offsets[lane]=lane+value.arg.addend//itemsize
+        commits.append(RKGather(value.arg._replace(addend=0),self.out,self.count,offsets=tuple(offsets),partial=bool(partial),itemsize=itemsize))
       self.program.extend(commits)
       return self._carrier(self.out,expected)
     for fold in (_fold_where_abs, _fold_ordered_where):
@@ -1371,7 +1438,7 @@ def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
       else: reduced=_fold_static_terms(reduce_op,fold_dtype,terms,reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float or reduce_op is Ops.MAX and u.dtype.scalar() is dtypes.int)  # noqa: E501
       mapped=reduced.cast(u.dtype) if fold_dtype is not u.dtype else reduced
     cache[u] = mapped
-  result=cache[root].substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}).item())) for u in cache[root].toposort() if _is_static_expr(u) and not _index_ranges(u)},walk=True)  # noqa: E501
+  result=cache[root].substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}))) for u in cache[root].toposort() if _is_static_expr(u) and not _index_ranges(u)},walk=True)  # noqa: E501
   return result.substitute({u:u.replace(src=(u.src[0],u.src[1].simplify(),*u.src[2:])) for u in result.toposort() if u.op is Ops.INDEX and len(u.src)>1},walk=True)  # noqa: E501
 
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKImage|None:

@@ -407,7 +407,7 @@ def test_static_vector_values_match_scalar_typed_evaluation():
     for values in itertools.product(range(5),range(4)):
       env=dict(zip((outer,inner),values))
       cache = {}
-      expected[int(rockchip_renderer._eval_static(out_index,env,cache))] = encode(rockchip_renderer._eval_static(expr,env,cache).item())
+      expected[int(rockchip_renderer._eval_static(out_index,env,cache))] = encode(rockchip_renderer._eval_static(expr,env,cache))
     assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
 
 
@@ -435,10 +435,78 @@ def test_uop_is_the_typed_physical_abi():
 
 def _runtime_memory(size:int, dma:int):
   storage=ctypes.create_string_buffer(size)
-  base=SimpleNamespace(va_addr=ctypes.addressof(storage))
-  memory=SimpleNamespace(va_addr=base.va_addr,size=size,meta=SimpleNamespace(dma_addr=dma,obj_addr=dma),base=base,storage=storage)
-  memory.offset=lambda offset,size:SimpleNamespace(va_addr=memory.va_addr+offset,size=size,meta=memory.meta,base=memory.base)
+  memory=rockchip_runtime.HCQBuffer(ctypes.addressof(storage),size,meta=SimpleNamespace(dma_addr=dma,obj_addr=dma),
+                                    view=rockchip_runtime.MMIOInterface(ctypes.addressof(storage),size))
+  memory.storage=storage
   return memory
+
+def _mapped_values(values:np.ndarray, dma:int):
+  memory=_runtime_memory(values.nbytes,dma)
+  ctypes.memmove(memory.va_addr,values.ctypes.data,values.nbytes)
+  return memory
+
+@pytest.mark.parametrize(("itemsize","dtype","values"),((1,"<u1",(3,5,7)),(2,"<u2",(0x1234,0xabcd,9)),
+                                                           (4,"<u4",(0x12345678,0xabcdef01,11))))
+def test_runtime_raw_gathers_preserve_bits_masks_and_overlap(itemsize:int, dtype:str, values:tuple[int,...]):
+  destination=_mapped_values(np.zeros(8,dtype=dtype),0x1000)
+  buffers={(RKBufferKind.ARG,0):destination}
+  def lookup(kind,index): return buffers[kind,index]
+  rockchip_runtime._apply_gathers((RKGather(None,RKArg(RKBufferKind.ARG,0,itemsize),3,values=values,
+    dst_stride=2,dst_addend=1,itemsize=itemsize),),lookup)
+  expected=np.zeros(8,dtype=dtype)
+  expected[[2,4,6]]=values
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),expected)
+
+  source=_mapped_values(np.asarray((10,20,30,40),dtype=dtype),0x2000)
+  destination=_mapped_values(np.full(6,99,dtype=dtype),0x3000)
+  buffers={(RKBufferKind.ARG,1):source,(RKBufferKind.SCRATCH,0):destination}
+  gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),4,offsets=(2,-1,9,0),
+                  fill_bits=7,dst_addend=1,itemsize=itemsize)
+  rockchip_runtime._apply_gathers((gather,),lookup)
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.asarray((99,30,7,7,10,99),dtype=dtype))
+  ctypes.memmove(destination.va_addr,np.full(6,99,dtype=dtype).ctypes.data,destination.size)
+  rockchip_runtime._apply_gathers((gather._replace(partial=True),),lookup)
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.asarray((99,30,99,99,10,99),dtype=dtype))
+
+  source=_mapped_values(np.arange(10,dtype=dtype),0x3500)
+  destination=_mapped_values(np.zeros(10,dtype=dtype),0x3600)
+  buffers={(RKBufferKind.ARG,1):source,(RKBufferKind.ARG,0):destination}
+  strided=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),4,base=1,axes=((1,4,2),),
+                   dst_stride=2,dst_addend=1,itemsize=itemsize)
+  rockchip_runtime._apply_gathers((strided,),lookup)
+  expected=np.zeros(10,dtype=dtype)
+  expected[[1,3,5,7]]=np.asarray((1,3,5,7),dtype=dtype)
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),expected)
+
+  source=_mapped_values(np.arange(40,dtype=dtype),0x3700)
+  destination=_mapped_values(np.zeros(24,dtype=dtype),0x3800)
+  buffers={(RKBufferKind.ARG,1):source,(RKBufferKind.ARG,0):destination}
+  repeated=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),12,base=1,axes=((3,4,2),),itemsize=itemsize)
+  tiled=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),24,axes=((1,2,3),(6,4,10)),itemsize=itemsize)
+  rockchip_runtime._apply_gathers((repeated,),lookup)
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype)[:12],np.repeat((1,3,5,7),3))
+  rockchip_runtime._apply_gathers((tiled,),lookup)
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.tile((0,3),3).tolist()+
+                                np.tile((10,13),3).tolist()+np.tile((20,23),3).tolist()+np.tile((30,33),3).tolist())
+
+  overlap=_mapped_values(np.asarray((1,2,3,4,5,6),dtype=dtype),0x4000)
+  buffers={(RKBufferKind.ARG,2):overlap}
+  contiguous=RKGather(RKArg(RKBufferKind.ARG,2),RKArg(RKBufferKind.ARG,2,itemsize),4,axes=((1,4,1),),itemsize=itemsize)
+  rockchip_runtime._apply_gathers((contiguous,),lookup)
+  np.testing.assert_array_equal(np.frombuffer(overlap.storage,dtype=dtype),np.asarray((1,1,2,3,4,6),dtype=dtype))
+  rotated=RKGather(RKArg(RKBufferKind.ARG,2),RKArg(RKBufferKind.ARG,2),4,offsets=(1,2,3,0),partial=True,itemsize=itemsize)
+  rockchip_runtime._apply_gathers((rotated,),lookup)
+  np.testing.assert_array_equal(np.frombuffer(overlap.storage,dtype=dtype)[:4],np.asarray((1,2,3,1),dtype=dtype))
+
+def test_runtime_index_gather_uses_signed_indices_and_fill_bits():
+  source=_mapped_values(np.asarray((99,10,20,30),dtype="<u1"),0x5000)
+  indices=_mapped_values(np.asarray((99,2,-1,7,0),dtype="<i2"),0x6000)
+  destination=_mapped_values(np.full(4,99,dtype="<u1"),0x7000)
+  buffers={(RKBufferKind.ARG,0):source,(RKBufferKind.ARG,1):indices,(RKBufferKind.SCRATCH,0):destination}
+  gather=RKGather(RKArg(RKBufferKind.ARG,0,1),RKArg(RKBufferKind.SCRATCH,0),4,fill_bits=5,itemsize=1,
+                  index=RKArg(RKBufferKind.ARG,1,2),index_itemsize=2)
+  rockchip_runtime._apply_gathers((gather,),lambda kind,index:buffers[kind,index])
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype="<u1"),np.asarray((30,5,5,10),dtype="<u1"))
 
 
 def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):

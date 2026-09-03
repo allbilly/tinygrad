@@ -1,12 +1,11 @@
 from __future__ import annotations
-import ctypes, itertools, mmap, os, threading, time, typing
-import numpy as np
+import array, ctypes, itertools, mmap, os, threading, time, typing
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, round_up, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
   emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16)
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
+from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
 
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN, _MAX_PC_TASKS = 4, 65536, 16384, 0xfff
 _CMD_PREFETCH_GUARD = mmap.PAGESIZE
@@ -14,6 +13,90 @@ _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000"))
 _MAX_EW_GROUP_OPS = 48
 _EW_MODE_INFO=((128,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(16,_MAX_EW_ELEMS_FP16,2,1,1),(32,_MAX_EW_ELEMS_FP16//2,4,1,1),(0,8,1,4,2),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1))  # noqa: E501
 _TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
+
+_RAW_FORMATS, _INDEX_FORMATS = {1:"B",2:"H",4:"I"}, {2:"h",4:"i"}
+
+def _rk_buffer_view(raw:HCQBuffer, arg:RKArg, fmt:str, itemsize:int) -> MMIOInterface:
+  """Return the same typed suffix that NumPy frombuffer(...)[addend//itemsize:] exposed."""
+  if arg.addend%itemsize: raise RuntimeError("unaligned RKGather")
+  if raw.size%itemsize: raise RuntimeError("mis-sized RKGather view")
+  count,start=raw.size//itemsize,arg.addend//itemsize
+  start=max(0,count+start) if start<0 else min(start,count)
+  return raw.cpu_view().view(offset=start*itemsize,size=(count-start)*itemsize,fmt=fmt)
+
+def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|None:
+  """Snapshot common broadcast/tiled affine gathers into one compact typed payload."""
+  axes,code=gather.axes,_RAW_FORMATS[gather.itemsize]
+  if not axes or gather.base<0 or any(divisor<=0 or limit<=0 or stride<=0 for divisor,limit,stride in axes): return None
+  periods=tuple(divisor*limit for divisor,limit,_ in axes)
+  if gather.count%periods[-1] or any(divisor%period for period,(divisor,_,_) in zip(periods,axes[1:])) or \
+     gather.base+sum((limit-1)*stride for _,limit,stride in axes)>=len(src): return None
+  def block(index:int, base:int) -> array.array:
+    divisor,limit,stride=axes[index]
+    if index==0:
+      samples=array.array(code,src.mv[base:base+limit*stride:stride])
+      if divisor==1: return samples
+      result=array.array(code)
+      for value in samples: result.extend(array.array(code,[value])*divisor)
+      return result
+    result=array.array(code)
+    for value in range(limit): result.extend(block(index-1,base+value*stride)*(divisor//periods[index-1]))
+    return result
+  return block(len(axes)-1,gather.base)*(gather.count//periods[-1])
+
+def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBufferKind,int],HCQBuffer]) -> None:
+  """Apply host-addressed raw-lane movement; all numeric tensor operations remain on the NPU."""
+  for gather in gathers:
+    raw_dst=buffer(gather.dst.kind,gather.dst.index)
+    dst=_rk_buffer_view(raw_dst,gather.dst,_RAW_FORMATS[gather.itemsize],gather.itemsize)
+    if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend:
+      ctypes.memset(int(raw_dst.va_addr),0,raw_dst.size)
+    if gather.values:
+      stop=gather.dst_addend+(gather.count-1)*gather.dst_stride if gather.count else gather.dst_addend
+      if gather.dst_addend<0 or stop>=len(dst): raise IndexError("RKGather destination exceeds buffer")
+      values=array.array(_RAW_FORMATS[gather.itemsize],gather.values)
+      if len(values)==1: values*=gather.count
+      dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=values
+      continue
+    assert gather.src is not None
+    raw_src=buffer(gather.src.kind,gather.src.index)
+    src=_rk_buffer_view(raw_src,gather.src,_RAW_FORMATS[gather.itemsize],gather.itemsize)
+    if gather.index is not None:
+      indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,
+                              _INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
+      if len(indices)<gather.count or len(dst)<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
+      source_indices=tuple(int(indices[lane]) for lane in range(gather.count))
+    else: source_indices=gather.offsets
+    fill=not gather.partial and (bool(gather.offsets) or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
+    if fill:
+      start,stride=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
+      if start<0 or gather.count and start+(gather.count-1)*stride>=len(dst): raise IndexError("RKGather destination exceeds buffer")
+      dst.mv[start:start+gather.count*stride:stride]=array.array(_RAW_FORMATS[gather.itemsize],[gather.fill_bits])*gather.count
+    if gather.index is None and not gather.offsets and gather.count and len(gather.axes)==1 and gather.axes[0][:2]==(1,gather.count):
+      di,si,source_stride=gather.dst_addend,gather.base,gather.axes[0][2]
+      if di>=0 and si>=0 and source_stride>0 and di+(gather.count-1)*gather.dst_stride<len(dst) and \
+         si+(gather.count-1)*source_stride<len(src):
+        if gather.dst_stride==source_stride==1:
+          ctypes.memmove(dst.addr+di*gather.itemsize,src.addr+si*gather.itemsize,gather.count*gather.itemsize)
+        else: dst.mv[di:di+gather.count*gather.dst_stride:gather.dst_stride]=src.mv[si:si+gather.count*source_stride:source_stride]
+        continue
+    if gather.index is None and not gather.offsets and gather.dst_stride==1 and gather.dst_addend>=0 and \
+       gather.dst_addend+gather.count<=len(dst) and (payload:=_regular_gather_payload(gather,src)) is not None:
+      dst.mv[gather.dst_addend:gather.dst_addend+gather.count]=payload
+      continue
+    overlap=src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes
+    pending:list[tuple[int,int]]=[]
+    for lane in range(gather.count):
+      di=lane if gather.index is not None else gather.dst_addend+lane*gather.dst_stride
+      if gather.index is not None: si=source_indices[lane]
+      elif gather.offsets: si=gather.offsets[lane]
+      else:
+        si=gather.base
+        for divisor,limit,stride in gather.axes: si+=(lane//divisor%limit)*stride
+      if 0<=di<len(dst) and 0<=si<len(src):
+        if overlap: pending.append((di,src[si]))
+        else: dst[di]=src[si]
+    for di,value in pending: dst[di]=value
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
@@ -127,34 +210,8 @@ class RockchipProgram(Program['RockchipDevice']):
       if index >= len(scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return scratch[index]
     self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-    linear:dict[int, np.ndarray] = {}
-    def view(arg:RKArg,dtype,itemsize:int) -> np.ndarray:
-      if arg.addend%itemsize: raise RuntimeError("unaligned RKGather")
-      raw=buffer(arg.kind,arg.index)
-      return np.frombuffer(to_mv(int(raw.va_addr),raw.size),dtype=dtype)[arg.addend//itemsize:]
-    def apply_gathers(gathers:tuple[RKGather, ...]) -> None:
-      for gather in gathers:
-        lane_dtype={1:np.uint8,2:np.uint16,4:np.uint32}[gather.itemsize]
-        dst,lanes=view(gather.dst,lane_dtype,gather.itemsize),linear.setdefault(gather.count,np.arange(gather.count,dtype=np.intp))
-        if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: ctypes.memset(int((dest:=buffer(gather.dst.kind,gather.dst.index)).va_addr),0,dest.size)  # noqa: E501
-        dst_index=gather.dst_addend+lanes*gather.dst_stride
-        if gather.values:
-          dst[dst_index]=gather.values[0] if len(gather.values)==1 else gather.values
-          continue
-        assert gather.src is not None
-        src=view(gather.src,lane_dtype,gather.itemsize)
-        if gather.index is not None:
-          source_index=view(gather.index,{2:np.int16,4:np.int32}[gather.index_itemsize],gather.index_itemsize)[:gather.count].astype(np.intp)
-          if len(source_index)!=gather.count or len(dst)<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
-          source_index,dst_index=source_index,lanes
-        else:
-          source_index=np.asarray(gather.offsets,dtype=np.intp) if gather.offsets else np.full(gather.count,gather.base,dtype=np.intp)
-          for divisor,limit,stride in gather.axes: source_index+=(lanes//divisor%limit)*stride
-        valid=(source_index>=0)&(source_index<len(src))&(dst_index>=0)&(dst_index<len(dst))
-        if not gather.partial and (gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH): dst[dst_index]=gather.fill_bits  # noqa: E501
-        dst[dst_index[valid]]=src[source_index[valid]]
     cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather)),len(self.image.program))
-    apply_gathers(self.image.program[:cursor])  # type: ignore[arg-type]
+    _apply_gathers(self.image.program[:cursor],buffer)  # type: ignore[arg-type]
     self.dev._sync_buffers((*bufs,*((arena,) if arena is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(arg:RKArg) -> int: return self._dma(buffer(arg.kind,arg.index))+arg.addend
     start = time.perf_counter()
@@ -168,7 +225,7 @@ class RockchipProgram(Program['RockchipDevice']):
       else:
         touched={(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None}  # type: ignore[union-attr]  # noqa: E501
         self.dev._sync_buffers(tuple(buffer(kind,index) for kind,index in touched),rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-        apply_gathers(group)  # type: ignore[arg-type]
+        _apply_gathers(group,buffer)  # type: ignore[arg-type]
         self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in group),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # type: ignore[union-attr]  # noqa: E501
     if ew_ops: self.dev._native_int16 = ew_ops[-1].mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16)
     return time.perf_counter()-start if wait else None
@@ -205,7 +262,7 @@ class RockchipDevice(Compiled):
       try: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=meta.handle, reserved=0, obj_addr=meta.obj_addr)
       except (OSError, RuntimeError): pass
       raise MemoryError(f"RKNPU GEM mapping failed for {alloc} bytes") from exc
-    return HCQBuffer(mapped, size, meta=meta)
+    return HCQBuffer(mapped,size,meta=meta,view=MMIOInterface(mapped,size))
   def _sync_buffer(self, buf:HCQBuffer, flags:int):
     self._check_healthy() or rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
