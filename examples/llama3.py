@@ -54,14 +54,16 @@ def concat_weights(models, device=None):
     return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
   return {name: convert(name) for name in {name: None for model in models for name in model}}
 
-def load(fn:str):
+def load(fn:str, load_device:str|None=None):
   if fn.endswith('.index.json'):
     with open(fn) as fp: weight_map = json.load(fp)['weight_map']
-    parts = {n: load(str(Path(fn).parent / Path(n).name)) for n in set(weight_map.values())}
+    parts = {n: load(str(Path(fn).parent / Path(n).name), load_device) for n in set(weight_map.values())}
     return {k: parts[n][k] for k, n in weight_map.items()}
   elif fn.endswith(".gguf"):
-    gguf_tensor = Tensor.empty(os.stat(fn).st_size, dtype=dtypes.uint8, device=f"disk:{fn}").to(Device.DEFAULT)
-    return gguf_load(gguf_tensor)[1]
+    # Staging on CPU avoids temporarily copying the complete GGUF container into memory on a small GPU.
+    with Context(DEV=load_device or Device.DEFAULT):
+      gguf_tensor = Tensor.empty(os.stat(fn).st_size, dtype=dtypes.uint8, device=f"disk:{fn}").to(Device.DEFAULT)
+      return gguf_load(gguf_tensor)[1]
   elif fn.endswith(".safetensors"):
     return safe_load(fn)
   else:
@@ -199,7 +201,8 @@ MODEL_PARAMS = {
     "files": 191
   },
 }
-def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
+def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192,
+                      load_weights=True, load_device:str|None=None):
   # build model
   if quantize == "int8": linear, embedding, quantize_embeds = Int8Linear, Int8Embedding, True
   elif quantize == "nf4": linear, embedding, quantize_embeds = NF4Linear(64), nn.Embedding, False
@@ -212,15 +215,17 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
   # load weights
   with WallTimeEvent(BenchEvent.LOAD_WEIGHTS):
     if model_path.is_dir():
-      if (model_path / "model.safetensors.index.json").exists(): weights = load(str(model_path / "model.safetensors.index.json"))
-      elif (model_path / "model.safetensors").exists(): weights = load(str(model_path / "model.safetensors"))
-      else: weights = concat_weights([load(str(model_path / f"consolidated.{i:02d}.pth")) for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
+      if (model_path / "model.safetensors.index.json").exists(): weights = load(str(model_path / "model.safetensors.index.json"), load_device)
+      elif (model_path / "model.safetensors").exists(): weights = load(str(model_path / "model.safetensors"), load_device)
+      else: weights = concat_weights([load(str(model_path / f"consolidated.{i:02d}.pth"), load_device)
+                                     for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
     else:
-      weights = load(str(model_path))
+      weights = load(str(model_path), load_device)
     if "model.embed_tokens.weight" in weights:
       weights = convert_from_huggingface(weights, MODEL_PARAMS[model_size]["args"]["n_layers"], MODEL_PARAMS[model_size]["args"]["n_heads"], MODEL_PARAMS[model_size]["args"]["n_kv_heads"])
     elif "token_embd.weight" in weights:
       weights = convert_from_gguf(weights, MODEL_PARAMS[model_size]["args"]["n_layers"])
+    tied_output = "output.weight" in weights and weights["output.weight"] is weights.get("tok_embeddings.weight")
     weights = fix_bf16(weights)
 
     with Context(BEAM=0):
@@ -229,6 +234,11 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
       elif quantize is not None:
         weights = linear.quantize(weights, device, scale_dtype, quantize_embeds)
         for _,v in weights.items(): v.realize()
+
+      # Do not turn a tied language-model head into a second allocation (501 MiB for Llama 3.2 1B FP16).
+      if tied_output:
+        weights.pop("output.weight", None)
+        weights.pop("output.scale", None)
 
       # shard
       if isinstance(device, tuple):
@@ -244,6 +254,17 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
 
       # replace weights in model
       load_state_dict(model, weights, strict=False, consume=True)
+      if tied_output:
+        model.output.weight.replace(model.tok_embeddings.weight)
+        if hasattr(model.output, "scale") and hasattr(model.tok_embeddings, "scale"):
+          model.output.scale.replace(model.tok_embeddings.scale)
+
+  # A staging device also gives backends without a complete transcendental lowering a concrete RoPE lookup table.
+  if load_device is not None:
+    freqs_cis = model.freqs_cis.contiguous().clone(device=load_device).realize()
+    if isinstance(device, tuple): freqs_cis.shard_(device, axis=None).realize()
+    else: freqs_cis = freqs_cis.to(device).contiguous().realize()
+    model.freqs_cis.replace(freqs_cis)
   return model
 
 # default settings
@@ -280,6 +301,7 @@ if __name__ == "__main__":
   parser.add_argument("--size", choices=["1B", "8B", "70B", "405B"], default="1B", help="Model size")
   parser.add_argument("--shard", type=int, default=1, help="Shard the model across multiple devices")
   parser.add_argument("--quantize", choices=["int8", "nf4", "float16", "fp8"], help="Quantization method")
+  parser.add_argument("--load_device", help="Stage model loading and RoPE precomputation here (use CPU for a low-memory GPU)")
   parser.add_argument("--no_api", action="store_true", help="Disable the api and run a cli test interface")
   parser.add_argument("--host", type=str, default="0.0.0.0", help="Web server bind address")
   parser.add_argument("--port", type=int, default=7776, help="Web server port")
@@ -324,7 +346,7 @@ if __name__ == "__main__":
     return encode_role(role) + tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
 
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
-  model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
+  model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device, load_device=args.load_device)
   param_bytes = sum(x.nbytes() for x in get_parameters(model))
 
   if not args.no_api and not args.benchmark:

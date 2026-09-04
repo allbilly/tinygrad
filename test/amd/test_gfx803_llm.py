@@ -6,6 +6,35 @@ import unittest
 
 
 class TestGFX803LLM(unittest.TestCase):
+  def test_llama3_tied_weights_and_cpu_staging(self):
+    source = """
+from pathlib import Path
+from tinygrad import Device, Tensor, dtypes
+from tinygrad.renderer.isa.gfx803 import AMDASMRenderer
+
+if AMDASMRenderer not in Device['NULL'].renderers: Device['NULL'].renderers.append(AMDASMRenderer)
+import examples.llama3 as llama3
+
+llama3.MODEL_PARAMS['TINY'] = {'args': {'dim': 4, 'n_heads': 1, 'n_kv_heads': 1, 'n_layers': 0,
+  'norm_eps': 1e-5, 'rope_theta': 500000, 'vocab_size': 8, 'hidden_dim': 8}, 'files': 1}
+raw_weights = {
+  'token_embd.weight': Tensor.arange(32).reshape(8, 4).cast(dtypes.half).contiguous().clone(device='CPU').realize(),
+  'output_norm.weight': Tensor.ones(4, dtype=dtypes.half, device='CPU').contiguous().realize(),
+}
+llama3.load = lambda _path, _load_device=None: raw_weights.copy()
+model = llama3.build_transformer(Path('/tmp/tiny.gguf'), model_size='TINY', quantize='float16',
+                                 device=Device.DEFAULT, max_context=4, load_device='CPU')
+assert model.output.weight.uop is model.tok_embeddings.weight.uop
+assert model.freqs_cis.device == Device.DEFAULT
+print('tied weights and CPU staging preserved')
+"""
+    root = pathlib.Path(__file__).parents[2]
+    env = {**os.environ, "DEV":"NULL:AMDASM:gfx803", "NULL_ALLOW_COPYOUT":"1", "FORWARD_ONLY":"1", "DEFAULT_FLOAT":"HALF",
+           "JIT":"0", "DEBUG":"0"}
+    result = subprocess.run([sys.executable, "-c", source], cwd=root, env=env, capture_output=True, text=True, timeout=20)
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    self.assertIn("tied weights and CPU staging preserved", result.stdout)
+
   def test_tiny_half_gpt2_compile(self):
     source = """
 from tinygrad import Device, Tensor, Variable, dtypes
