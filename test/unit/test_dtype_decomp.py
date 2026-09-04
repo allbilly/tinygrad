@@ -1,4 +1,4 @@
-import unittest
+import struct, unittest
 
 from tinygrad.codegen.decomp.dtype import f2f, pm_float_decomp
 from tinygrad.dtype import AddrSpace, dtypes
@@ -11,6 +11,22 @@ class TestFloatDecomp(unittest.TestCase):
     for bits, expected in ((0x0001, 2.0**-24), (0x0091, 145 * 2.0**-24), (0x8091, -145 * 2.0**-24)):
       widened = f2f(UOp.const(dtypes.ushort, bits), dtypes.half, dtypes.float).simplify()
       self.assertEqual((widened.op, widened.dtype, widened.arg), (Ops.CONST, dtypes.float, expected))
+
+  def test_float_to_half_subnormal_rounds_even(self):
+    cases = ((2.0**-25, 0x0000), (struct.unpack('f', struct.pack('I', 0x33000001))[0], 0x0001),
+             (2.0**-24, 0x0001), (3 * 2.0**-25, 0x0002), (5 * 2.0**-25, 0x0002),
+             (1023 * 2.0**-24, 0x03ff), (1023.5 * 2.0**-24, 0x0400), (-2.0**-24, 0x8001))
+    for value, expected in cases:
+      bits = struct.unpack('I', struct.pack('f', value))[0]
+      narrowed = f2f(UOp.const(dtypes.uint, bits), dtypes.float, dtypes.half).simplify()
+      self.assertEqual((narrowed.op, narrowed.dtype, narrowed.arg), (Ops.CONST, dtypes.ushort, expected))
+
+  def test_float_to_half_overflow_rounding_boundary(self):
+    for value, expected in ((65504.0, 0x7bff), (65508.0, 0x7bff), (65519.0, 0x7bff), (65520.0, 0x7c00),
+                            (-65519.0, 0xfbff), (-65520.0, 0xfc00)):
+      bits = struct.unpack('I', struct.pack('f', value))[0]
+      narrowed = f2f(UOp.const(dtypes.uint, bits), dtypes.float, dtypes.half).simplify()
+      self.assertEqual((narrowed.op, narrowed.dtype, narrowed.arg), (Ops.CONST, dtypes.ushort, expected))
 
   def test_after_preserves_emulated_storage_dtype(self):
     rng = UOp.range(4, 0, dtype=dtypes.int)

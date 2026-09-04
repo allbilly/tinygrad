@@ -99,19 +99,32 @@ def f2f(v, fr:DType, to:DType, sat=True):
     v = f2f_clamp(v.bitcast(fr), to, sat).bitcast(f2f_dt[fr])
     sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
     norm = (rne(nosign, fm - tm) - shl(fb - tb, tm)).cast(f2f_dt[to])
-    underflow = (shr(v, fm) & (shl(1, fe) - 1)) < (1 + fb - tb)
+    exp = shr(v, fm) & (shl(1, fe) - 1)
+    underflow = exp < (1 + fb - tb)
+    subnormal = 0
+    if (fr, to) == (dtypes.float, dtypes.half):
+      # A half subnormal is round((1.mantissa) * 2**(exp-126)). Clamp the
+      # variable shift so untaken normal/zero branches cannot produce poison.
+      shift = (exp < 102).where(24, (112 < exp).where(14, 126 - exp))
+      mant = (nosign & (shl(1, fm) - 1)) | shl(1, fm)
+      trunc = mant >> shift
+      halfway, sticky = (mant >> (shift - 1)) & 1, (mant & ((mant.const_like(1) << (shift - 1)) - 1)).ne(0).cast(mant.dtype)
+      subnormal = (exp < 102).where(0, trunc + (halfway & (sticky | (trunc & 1)))).cast(f2f_dt[to])
     nan_mantissa = (shl(1, tm) - 1) if to == dtypes.fp8e4m3 else (shr(nosign, fm - tm) & (shl(1, tm) - 1))
     nan = (sign | nan_mantissa | shl(shl(1, te) - 1, tm)).cast(f2f_dt[to])
-    is_nan = (shr(v, fm) & (shl(1, fe) - 1)).eq(shl(1, fe) - 1)
+    is_nan = exp.eq(shl(1, fe) - 1)
     if to in dtypes.fp8_fnuz: return is_nan.where(shl(1, ts - 1), underflow.where(0, sign.cast(f2f_dt[to]) | norm))
-    return is_nan.where(nan, sign.cast(f2f_dt[to]) | underflow.where(0, norm))
+    return is_nan.where(nan, sign.cast(f2f_dt[to]) | underflow.where(subnormal, norm))
   else: raise NotImplementedError(f"unsupported decomp {fr} -> {to}")
 
 def f2f_clamp(val:UOp, dt:DType, sat=True) -> UOp:
   e, m = dtypes.finfo(dt)
   if dt in dtypes.fp8_fnuz: max_exp, max_man = (1 << e) - 1, (1 << m) - 1
   else: max_exp, max_man = ((1 << e) - 1, (1 << m) - 2) if dt == dtypes.fp8e4m3 else ((1 << e) - 2, (1 << m) - 1)
-  mx = val.const_like(2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m)))
+  mx_val = 2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m))
+  # IEEE round-to-nearest overflows at max-finite plus half an ULP, not at max-finite itself.
+  if dt not in dtypes.fp8s: mx_val += 2.0**(max_exp - exponent_bias(dt) - m - 1)
+  mx = val.const_like(mx_val)
   sat = mx if dt in dtypes.fp8s and sat else val.const_like(float('inf'))
   # FIXME: CMPLT of nan is undefined
   return val.ne(val).where(val, (val < -mx).where(-sat, (mx < val).where(sat, val)))
