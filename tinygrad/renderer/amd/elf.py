@@ -40,12 +40,13 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
       elif val.offset < 106: max_sgpr = max(max_sgpr, val.offset + val.sz)
 
   # ** scan sink for metadata
-  sink, n_bufs, n_vars, lds_size, gids = prg.src[0], 0, 0, 0, set()
+  sink, n_bufs, n_vars, lds_size, gids, lids = prg.src[0], 0, 0, 0, set(), set()
   for u in sink.toposort():
     if u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: n_vars += 1
     elif u.op is Ops.PARAM: n_bufs += 1
     elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL: lds_size += u.max_numel() * u.dtype.itemsize
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
+    elif u.op is Ops.SPECIAL and u.arg.startswith("lidx"): lids.add(int(u.arg[-1]))
   code_bytes = b"".join(inst.to_bytes() for inst in insts)
   arch = next(v for k, v in _arch_map.items() if arch.startswith(k))
   is_gcn3, is_cdna, is_rdna4 = arch == "gcn3", arch == "cdna", arch == "rdna4"
@@ -88,7 +89,8 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
   desc.compute_pgm_rsrc2 = (2 << amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT |
                             int(0 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT |
                             int(1 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Y_SHIFT |
-                            int(2 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT)
+                            int(2 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT |
+                            max(lids, default=0) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_VGPR_WORKITEM_ID_SHIFT)
   desc.kernel_code_properties = (1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT |
                                  (0 if is_gcn3 or is_cdna else 1) << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32_SHIFT)
   if is_cdna and max_accvgpr > 0:

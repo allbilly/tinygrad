@@ -41,22 +41,49 @@ class TestGFX803Encoder(unittest.TestCase):
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
 
+  def test_dynamic_indexing(self):
+    s2, v0 = _reg(dtypes.int32, "s2", 2), _reg(dtypes.int32, "v0", 0)
+    idx, tmp = _reg(dtypes.int32, "v36", 36), _reg(dtypes.int32, "v37", 37)
+    ptr, addr = _reg(dtypes.uint64, "s[6:7]", 6, 8), _reg(dtypes.uint64, "v[4:5]", 4, 8)
+    cases = [
+      (UOp(Ops.INS, dtypes.int32, (s2,), GFX803Ops.V_MOV_B32, idx.tag), ("v_mov_b32_e32 v36, s2",)),
+      (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.int32, 2), v0), GFX803Ops.V_LSHLREV_B32, idx.tag),
+       ("v_lshlrev_b32_e32 v36, 2, v0",)),
+      (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.int32, 1), v0), GFX803Ops.V_ADD_U32, idx.tag),
+       ("v_add_u32_e32 v36, vcc, 1, v0",)),
+      (UOp(Ops.INS, dtypes.int32, (v0, UOp.const(dtypes.int32, 4)), GFX803Ops.V_MUL_LO_U32, tmp.tag),
+       ("v_mul_lo_u32 v37, v0, 4",)),
+      (UOp(Ops.INS, dtypes.uint64, (ptr, idx), GFX803Ops.FLAT_ADDR, addr.tag),
+       ("v_mov_b32_e32 v4, s6", "v_mov_b32_e32 v5, s7", "v_add_u32_e32 v4, vcc, v36, v4",
+        "v_addc_u32_e32 v5, vcc, 0, v5, vcc")),
+    ]
+    for uop, lines in cases:
+      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
 
 class TestGFX803Program(unittest.TestCase):
-  def test_tinygrad_float4_add_elf(self):
-    a = Tensor.empty(4, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    b = Tensor.empty(4, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    ast = (a+b).schedule_linear().src[-1].src[0]
-    program = to_program(ast, AMDASMRenderer(Target("AMD", "ASM", "gfx803")))
-    self.assertEqual([u.op for u in program.src], [Ops.SINK, Ops.LINEAR, Ops.SOURCE, Ops.BINARY])
+  @staticmethod
+  def _add_program(n:int):
+    a = Tensor.empty(n, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    b = Tensor.empty(n, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    return to_program((a+b).schedule_linear().src[-1].src[0], AMDASMRenderer(Target("AMD", "ASM", "gfx803")))
 
+  @staticmethod
+  def _elf(program):
     image, sections, relocs = elf_loader(program.src[-1].arg)
-    self.assertEqual(relocs, [])
     text = next(section for section in sections if section.name == ".text")
     rodata = next(section for section in sections if section.name == ".rodata")
     desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(
       bytes(image[rodata.header.sh_addr:rodata.header.sh_addr+ctypes.sizeof(amdgpu_kd.llvm_amdhsa_kernel_descriptor_t)]))
+    return text, rodata, desc, relocs
 
+  def test_tinygrad_float4_add_elf(self):
+    program = self._add_program(4)
+    self.assertEqual([u.op for u in program.src], [Ops.SINK, Ops.LINEAR, Ops.SOURCE, Ops.BINARY])
+
+    text, rodata, desc, relocs = self._elf(program)
+
+    self.assertEqual(relocs, [])
     self.assertEqual(desc.kernarg_size, 24)
     self.assertEqual(desc.kernel_code_properties, 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT)
     self.assertEqual(rodata.header.sh_addr + desc.kernel_code_entry_byte_offset, text.header.sh_addr)
@@ -68,6 +95,23 @@ class TestGFX803Program(unittest.TestCase):
     self.assertEqual(sum(line.startswith("v_add_f32") for line in code_lines), 4)
     self.assertEqual(sum(line.startswith("flat_load_dword") for line in code_lines), 8)
     self.assertEqual(sum(line.startswith("flat_store_dword") for line in code_lines), 4)
+
+  def test_dynamic_add_elf(self):
+    wgid_x = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT
+    for n, grid, local, uses_wgid, uses_lidx in [(5, (5, 1, 1), (1, 1, 1), True, False),
+                                                  (16, (1, 1, 1), (4, 1, 1), False, True),
+                                                  (1024, (8, 1, 1), (32, 1, 1), True, True)]:
+      with self.subTest(n=n):
+        program = self._add_program(n)
+        text, rodata, desc, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        self.assertEqual(relocs, [])
+        self.assertEqual((program.arg.global_size, program.arg.local_size), (grid, local))
+        self.assertEqual(bool(desc.compute_pgm_rsrc2 & wgid_x), uses_wgid)
+        self.assertEqual(rodata.header.sh_addr + desc.kernel_code_entry_byte_offset, text.header.sh_addr)
+        self.assertEqual(_assembled(*lines), text.content)
+        self.assertEqual(any("s2" in line for line in lines), uses_wgid)
+        self.assertEqual(any(line.startswith(("v_add_u32", "v_lshlrev")) and "v0" in line for line in lines), uses_lidx)
 
 
 if __name__ == "__main__": unittest.main()

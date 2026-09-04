@@ -22,6 +22,9 @@ class GFX803Ops(FastEnum):
   FLAT_ADDR = auto()
   FLAT_LOAD_B32 = auto()
   FLAT_STORE_B32 = auto()
+  V_ADD_U32 = auto()
+  V_LSHLREV_B32 = auto()
+  V_MUL_LO_U32 = auto()
   V_ADD_F32 = auto()
   S_WAITCNT = auto()
   S_ENDPGM = auto()
@@ -40,9 +43,11 @@ class GFX803Instruction:
 # The old linear allocator in this branch does not model overlapping wide
 # registers. Keep 64-bit addresses and scalar values in disjoint VGPR banks.
 KERNARG_PTR = Register("s[0:1]", 0, size=8)
-SGPR64 = tuple(Register(f"s[{i}:{i+1}]", i, size=8) for i in range(2, 32, 2))
-VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(2, 32, 2))
-VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(32, 96))
+WGID = tuple(Register(f"s{i}", i, size=4) for i in range(2, 5))
+WIID = tuple(Register(f"v{i}", i, size=4) for i in range(3))
+SGPR64 = tuple(Register(f"s[{i}:{i+1}]", i, size=8) for i in range(6, 32, 2))
+VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 36, 2))
+VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(36, 100))
 
 
 def _fixed_reg(dtype:DType, reg:Register) -> UOp: return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(reg,))
@@ -51,7 +56,13 @@ def _const_u32(value:int) -> UOp: return UOp.const(dtypes.uint32, value)
 
 def _abi(ctx:IselContext, x:UOp) -> UOp|None:
   if x.tag is True: return None
-  if x.op is Ops.SPECIAL: raise NotImplementedError(f"gfx803 SPECIAL {x.arg!r} is not lowered yet")
+  if x.op is Ops.SPECIAL:
+    dim = int(x.arg[-1])
+    if x.arg.startswith("lidx"): out = _fixed_reg(x.dtype, WIID[dim])
+    elif x.arg.startswith("gidx"):
+      out = UOp(Ops.INS, x.dtype, (_fixed_reg(x.dtype, WGID[dim]),), GFX803Ops.V_MOV_B32)
+    else: raise NotImplementedError(f"gfx803 SPECIAL {x.arg!r} is not lowered yet")
+    return out.after(x.rtag())
 
   offset = sum(8 if u.addrspace is not AddrSpace.ALU else u.dtype.itemsize for u in ctx.func_args[:ctx.func_args.index(x)])
   kernarg = _fixed_reg(dtypes.uint64, KERNARG_PTR)
@@ -62,10 +73,14 @@ def _abi(ctx:IselContext, x:UOp) -> UOp|None:
 
 
 def _global_index(x:UOp, base:UOp, idx:UOp) -> UOp|None:
-  if idx.op is not Ops.CONST: raise NotImplementedError("gfx803 dynamic global addresses are not lowered yet")
-  byte_offset = int(idx.arg) * x.dtype.itemsize
-  if not 0 <= byte_offset <= 0xffffffff: raise OverflowError(f"gfx803 global byte offset out of range: {byte_offset}")
-  return UOp(Ops.INS, dtypes.uint64, (base, _const_u32(byte_offset)), GFX803Ops.FLAT_ADDR)
+  if idx.op is Ops.CONST:
+    byte_offset = int(idx.arg) * x.dtype.itemsize
+    if not 0 <= byte_offset <= 0xffffffff: raise OverflowError(f"gfx803 global byte offset out of range: {byte_offset}")
+    offset = _const_u32(byte_offset)
+  else:
+    shift = x.dtype.itemsize.bit_length() - 1
+    offset = UOp(Ops.SHL, idx.dtype, (idx, UOp.const(idx.dtype, shift))) if shift else idx
+  return UOp(Ops.INS, dtypes.uint64, (base, offset), GFX803Ops.FLAT_ADDR)
 
 
 def _load(x:UOp, addr:UOp) -> UOp|None:
@@ -84,11 +99,32 @@ def _alloc_vreg(ctx:IselContext, x:UOp) -> UOp|None:
   return x.replace(tag=(ctx.vreg(regs),))
 
 
+def _int_add(x:UOp, a:UOp, b:UOp) -> UOp:
+  return UOp(Ops.INS, x.dtype, (b, a) if b.op is Ops.CONST else (a, b), GFX803Ops.V_ADD_U32)
+
+
+def _int_mul(x:UOp, a:UOp, b:UOp) -> UOp:
+  const:UOp
+  value:UOp
+  if a.op is Ops.CONST: const, value = a, b
+  elif b.op is Ops.CONST: const, value = b, a
+  else: return UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MUL_LO_U32)
+  c = int(const.arg)
+  if c > 0 and c & (c - 1) == 0:
+    return UOp(Ops.INS, x.dtype, (UOp.const(x.dtype, c.bit_length() - 1), value), GFX803Ops.V_LSHLREV_B32)
+  if not -16 <= c <= 64: const = UOp(Ops.INS, x.dtype, (const,), GFX803Ops.V_MOV_B32)
+  return UOp(Ops.INS, x.dtype, (value, const), GFX803Ops.V_MUL_LO_U32)
+
+
 pre_isel_matcher = PatternMatcher([])
 isel_matcher = PatternMatcher([
   (UPat((Ops.PARAM, Ops.SPECIAL), name="x"), _abi),
   (UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("idx")), name="x"), _global_index),
   (UPat(Ops.LOAD, src=(UPat.var("addr"),), name="x"), _load),
+  (UPat(Ops.ADD, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_add),
+  (UPat(Ops.MUL, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_mul),
+  (UPat(Ops.SHL, dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"),
+   lambda x,value,shift: UOp(Ops.INS, x.dtype, (shift, value), GFX803Ops.V_LSHLREV_B32)),
   ((UPat.var("a", dtypes.float32) + UPat.var("b", dtypes.float32)).named("x"),
    lambda x,a,b: UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_ADD_F32)),
   (UPat(Ops.STORE, src=(UPat.var("addr"), UPat.var("value")), name="x"), _store),
@@ -130,6 +166,20 @@ def _vop2(op:int, dst:int, src0:int, src1:int) -> int:
   return ((op & 0x3f) << 25) | ((dst & 0xff) << 17) | ((src1 & 0xff) << 9) | (src0 & 0x1ff)
 
 
+def _vop3(op:int, dst:int, src0:int, src1:int) -> tuple[int, int]:
+  return 0xd0000000 | ((op & 0x3ff) << 16) | (dst & 0xff), (src0 & 0x1ff) | ((src1 & 0x1ff) << 9)
+
+
+def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
+  if x.op is Ops.CONST:
+    value = int(x.arg)
+    if 0 <= value <= 64: return 128 + value, ()
+    if -16 <= value < 0: return 192 - value, ()
+    return 255, (value & 0xffffffff,)
+  reg = _physical_reg(x)
+  return (256 + reg.index if reg.name.startswith("v") else reg.index), ()
+
+
 def _encode(x:UOp) -> GFX803Instruction:
   counts = _register_counts(x)
   dst = _physical_reg(x) if x.dtype is not dtypes.void else None
@@ -142,22 +192,30 @@ def _encode(x:UOp) -> GFX803Instruction:
     text = f"s_load_dwordx2 s[{dst.index}:{dst.index+1}], s[{base.index}:{base.index+1}], {int(offset.arg):#x}"
   elif x.arg is GFX803Ops.V_MOV_B32:
     assert dst is not None
-    src = _physical_reg(x.src[0])
-    data = _word(0x7e000200 | (dst.index << 17) | src.index)
-    text = f"v_mov_b32_e32 v{dst.index}, {src.name}"
+    src, literal = _src0(x.src[0])
+    data = _word(0x7e000200 | (dst.index << 17) | src) + b"".join(_word(v) for v in literal)
+    text = f"v_mov_b32_e32 v{dst.index}, {x.src[0].arg if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name}"
   elif x.arg is GFX803Ops.FLAT_ADDR:
     assert dst is not None
     base, offset = _physical_reg(x.src[0]), x.src[1]
-    if offset.op is not Ops.CONST: raise RuntimeError("flat address offset must be constant")
-    off = int(offset.arg)
     words = [0x7e000200 | (dst.index << 17) | base.index,
              0x7e000200 | ((dst.index + 1) << 17) | (base.index + 1)]
     lines = [f"v_mov_b32_e32 v{dst.index}, s{base.index}", f"v_mov_b32_e32 v{dst.index+1}, s{base.index+1}"]
-    if off:
-      if off <= 64: words.append(_vop2(0x19, dst.index, 128 + off, dst.index))
-      else: words.extend((_vop2(0x19, dst.index, 255, dst.index), off))
+    if offset.op is Ops.CONST:
+      off = int(offset.arg)
+      if off:
+        src0, literal = _src0(offset)
+        words.append(_vop2(0x19, dst.index, src0, dst.index))
+        words.extend(literal)
+        words.append(_vop2(0x1c, dst.index + 1, 128, dst.index + 1))
+        lines += [f"v_add_u32_e32 v{dst.index}, vcc, {off:#x}, v{dst.index}",
+                  f"v_addc_u32_e32 v{dst.index+1}, vcc, 0, v{dst.index+1}, vcc"]
+    else:
+      src0, literal = _src0(offset)
+      words.append(_vop2(0x19, dst.index, src0, dst.index))
+      words.extend(literal)
       words.append(_vop2(0x1c, dst.index + 1, 128, dst.index + 1))
-      lines += [f"v_add_u32_e32 v{dst.index}, vcc, {off:#x}, v{dst.index}",
+      lines += [f"v_add_u32_e32 v{dst.index}, vcc, {_physical_reg(offset).name}, v{dst.index}",
                 f"v_addc_u32_e32 v{dst.index+1}, vcc, 0, v{dst.index+1}, vcc"]
     data, text = b"".join(_word(w) for w in words), "\n".join(lines)
   elif x.arg is GFX803Ops.FLAT_LOAD_B32:
@@ -169,6 +227,23 @@ def _encode(x:UOp) -> GFX803Instruction:
     addr, value = _physical_reg(x.src[0]), _physical_reg(x.src[1])
     data = _word(0xdc700000) + _word((value.index << 8) | addr.index)
     text = f"flat_store_dword v[{addr.index}:{addr.index+1}], v{value.index}"
+  elif x.arg in {GFX803Ops.V_ADD_U32, GFX803Ops.V_LSHLREV_B32}:
+    assert dst is not None
+    src0, literal = _src0(x.src[0])
+    src1 = _physical_reg(x.src[1])
+    if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
+    op, mnemonic = (0x19, "v_add_u32_e32") if x.arg is GFX803Ops.V_ADD_U32 else (0x12, "v_lshlrev_b32_e32")
+    data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
+    src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
+    text = f"{mnemonic} v{dst.index}, {'vcc, ' if x.arg is GFX803Ops.V_ADD_U32 else ''}{src0_text}, v{src1.index}"
+  elif x.arg is GFX803Ops.V_MUL_LO_U32:
+    assert dst is not None
+    src0_code, literal0 = _src0(x.src[0])
+    src1_code, literal1 = _src0(x.src[1])
+    if literal0 or literal1: raise RuntimeError("v_mul_lo_u32 does not support literal constants on gfx803")
+    data = b"".join(_word(w) for w in _vop3(0x285, dst.index, src0_code, src1_code))
+    operands = [str(s.arg) if s.op is Ops.CONST else _physical_reg(s).name for s in x.src]
+    text = f"v_mul_lo_u32 v{dst.index}, {operands[0]}, {operands[1]}"
   elif x.arg is GFX803Ops.V_ADD_F32:
     assert dst is not None
     a, b = _physical_reg(x.src[0]), _physical_reg(x.src[1])
