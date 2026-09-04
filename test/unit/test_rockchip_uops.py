@@ -409,6 +409,32 @@ def test_static_vector_values_match_scalar_typed_evaluation():
       cache = {}
       expected[int(rockchip_renderer._eval_static(out_index,env,cache))] = encode(rockchip_renderer._eval_static(expr,env,cache))
     assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
+  dense_bool=rockchip_renderer._static_values(out_index,(outer<3)&(inner!=2),20,int)
+  assert dense_bool==tuple(int(i<3 and j!=2) for i in range(5) for j in range(4)) and all(type(value) is int for value in dense_bool)
+  lane=UOp.range(17,102)
+  divided=rockchip_renderer._static_lanes((lane,),UOp(Ops.CDIV,dtypes.int,src=(lane,lane.const_like(3))),dependencies=False)
+  assert divided==(tuple(i//3 for i in range(17)),)
+
+
+def test_static_vector_commit_matches_scalar_typed_bits():
+  negative_nan=struct.unpack("d",struct.pack("Q",0xfff8000000000001))[0]
+  for dtype,groups in ((dtypes.half,((-0.0,0.0,2**-24,-2**-24,65504.0,math.inf,-math.inf),(negative_nan,65520.0,-65520.0))),
+                       (dtypes.float,((-0.0,0.0,2**-149,-2**-149,1e100,-1e100),(negative_nan,)))):
+    for values in groups:
+      vector=rockchip_renderer._commit_static(dtype,values)
+      scalar=tuple(rockchip_renderer._commit_static(dtype,value) for value in values)
+      vector_bits=b"".join(struct.pack(dtype.fmt,value) for value in vector) if isinstance(vector,tuple) else b""
+      assert vector_bits==b"".join(struct.pack(dtype.fmt,value) for value in scalar)
+
+
+def test_renderer_releases_uop_analysis_caches():
+  lane=UOp.range(4,103)
+  rockchip_renderer._static_lanes((lane,),lane,dependencies=False)
+  assert rockchip_renderer._static_lanes.cache_info().currsize
+  RockchipRenderer(Target(device="ROCKCHIP")).render(_program(dtypes.half,lambda _:UOp.const(0.0,dtypes.half),1))
+  caches=(rockchip_renderer._semantic_loads,rockchip_renderer._static_ranges,rockchip_renderer._eval_static_block,
+          rockchip_renderer._static_lanes,rockchip_renderer._small_gather_offsets,rockchip_renderer._int_info)
+  assert all(cache.cache_info().currsize==0 for cache in caches)
 
 
 def test_index_range_analysis_keeps_first_seen_order_and_hides_range_dependencies():
@@ -1141,7 +1167,7 @@ def test_static_root_where_uses_exact_gathers_and_finite_padding_neutral():
     padded = source.index(i).load(UOp.const(-math.inf, dtypes.half), i < UOp.const(3, dtypes.int))
     return (i < UOp.const(4, dtypes.int)).where(padded, UOp.const(0.0, dtypes.half))
   image = _lower_uop_program(_program(dtypes.half, selected))
-  assert image is not None and not _ew_ops(image) and len(_output_gathers(image)) == 2
+  assert image is not None and not _ew_ops(image) and len(_output_gathers(image)) == 1
   assert any(gather.fill_bits == 0xfbff for gather in _initial_gathers(image))
 
 

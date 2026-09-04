@@ -239,11 +239,11 @@ def _static_ranges(u:UOp) -> tuple[UOp, ...]|None:
 def _is_static_expr(u:UOp) -> bool: return _static_ranges(u) is not None
 def _index_ranges(u:UOp) -> list[UOp]: return list(_static_ranges(u) or ())
 
-RKScalar = int|float|bool
-RKStatic = RKScalar|tuple[RKScalar,...]
+RKScalar = int|float|bool; RKStatic = RKScalar|tuple[RKScalar,...]
 
 def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
   scalar,commit=dtype.scalar(),truncate.get(dtype.scalar())
+  if isinstance(value,tuple) and scalar in (dtypes.half,dtypes.float) and not any(isinstance(item,float) and math.isnan(item) for item in value) and all(not isinstance(item,int) or item.bit_length()<1024 for item in value) and (scalar is dtypes.float or all(not math.isfinite(float(item)) or abs(float(item))<65520 for item in value)): return typing_cast(tuple[RKScalar,...],struct.unpack(f"{len(value)}{scalar.fmt}",struct.pack(f"{len(value)}{scalar.fmt}",*value)))  # noqa: E501
   def lane(value:RKScalar) -> RKScalar: value=typing_cast(RKScalar,scalar.const(value)); return value if commit is None else commit(value)  # noqa: E702
   return tuple(map(lane,value)) if isinstance(value,tuple) else lane(value)
 
@@ -303,7 +303,8 @@ def _static_range_pattern(u:UOp, axis:UOp, count:int) -> tuple[RKScalar,...]|Non
   def tiled(x:UOp) -> tuple[int,int,bool,int]|None: terms=(lambda fn:fn(fn,x))(lambda self,item:self(self,item.src[0])+self(self,item.src[1]) if item.op is Ops.ADD else (item,)); constant=sum(int(term.arg) for term in terms if term.op is Ops.CONST); groups=tuple(filter(None,(axis_group(term) for term in terms))); low=tuple(filter(None,(local_mod(term) for term in terms))); high=tuple(filter(None,(local_high(term) for term in terms))); period,group_count=groups[0] if len(groups)==1 else (0,0); return (period,group_count,bool(high),constant) if len(groups)==len(low)==1 and len(high)<=1 and len(terms)==2+bool(high)+(constant!=0) and low[0]==groups[0] and (not high or high[0]==(period,group_count,period//group_count,group_count)) and period%group_count==0 else None  # noqa: E702,E501
   def tiled_values(x:UOp) -> tuple[int,...]|None: spec=tiled(x); period,groups,full,constant=spec or (0,0,False,0); row=tuple(itertools.chain.from_iterable(tuple(range(group+constant,group+constant+period)) if full else tuple(range(group+constant,group+constant+groups))*(period//groups) for group in range(groups))) if spec is not None and not count%(period*groups) else (); return row*(count//len(row)) if row else None  # noqa: E702,E501
   if u.op is Ops.CMPLT and (period:=axis_mod(u.src[0])) is not None and u.src[1].op is Ops.CONST and 0<=(limit:=int(u.src[1].arg))<=period and count%period==0: return ((True,)*limit+(False,)*(period-limit))*(count//period)  # noqa: E501
-  if u.op is Ops.CMPLT and u.src[1].op is Ops.CONST and (values:=tiled_values(u.src[0])) is not None: return tuple(value<int(u.src[1].arg) for value in values)  # noqa: E501
+  if u.op is Ops.CMPLT and u.src[1].op is Ops.CONST and (values:=tiled_values(u.src[0])) is not None: return tuple(map(operator.gt,itertools.repeat(int(u.src[1].arg)),values))  # noqa: E501
+  if u.op in (Ops.CDIV,Ops.FLOORDIV) and u.src[1].op is Ops.CONST and (divisor:=int(u.src[1].arg))>0 and (u.src[0] is axis or (u.op is Ops.FLOORDIV or u.src[0].vmin>=0) and (numerator:=typing_cast(tuple[int,...]|None,_static_range_pattern(u.src[0],axis,count))) is not None): return tuple(itertools.islice(itertools.chain.from_iterable(itertools.repeat(value,divisor) for value in range((count+divisor-1)//divisor)),count)) if u.src[0] is axis else tuple(map(operator.floordiv,typing_cast(tuple[int,...],numerator),itertools.repeat(divisor)))  # noqa: E501
   if (values:=tiled_values(u)) is not None: return values
   matched=next(((pattern,int(offset.arg)) for base,offset in ((u.src,u.src[::-1]) if u.op is Ops.ADD else ()) if offset.op is Ops.CONST and (pattern:=safe_mod(base)) is not None and count%pattern[0]==0),None)  # noqa: E501
   if matched is not None: (period,limit),addend=matched; return (tuple(range(addend,addend+limit))+(addend,)*(period-limit))*(count//period)  # noqa: E701,E702,E501
@@ -312,8 +313,7 @@ def _static_range_pattern(u:UOp, axis:UOp, count:int) -> tuple[RKScalar,...]|Non
   compared=next((value for value,marker in (u.src,u.src[::-1]) if marker.op is Ops.CONST and bool(marker.arg)),None) if u.op is Ops.CMPNE else None
   if compared is not None and compared.op is Ops.CMPLT and (safe:=safe_mod(compared.src[0])) is not None and (group:=axis_group(compared.src[1]))==(safe[0],safe[1]) and count%(safe[0]*safe[1])==0: period,groups=safe; row=tuple(itertools.chain.from_iterable((False,)*value+(True,)*(groups-value)+((True,)*(period-groups) if value==0 else (False,)*(period-groups)) for value in range(groups))); return row*(count//len(row))  # noqa: E701,E702,E501
   if compared is not None and (nested:=_static_range_pattern(compared,axis,count)) is not None: return tuple(map(operator.not_,nested))
-  if u.op is Ops.AND and (lhs:=_static_range_pattern(u.src[0],axis,count)) is not None and (rhs:=_static_range_pattern(u.src[1],axis,count)) is not None: return tuple(map(operator.and_,lhs,rhs))  # noqa: E501
-  return None
+  return tuple(map(operator.and_,lhs,rhs)) if u.op is Ops.AND and (lhs:=_static_range_pattern(u.src[0],axis,count)) is not None and (rhs:=_static_range_pattern(u.src[1],axis,count)) is not None else None  # noqa: E501
 
 @functools.lru_cache(maxsize=2)
 def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> tuple[tuple[RKScalar,...],...]:
@@ -335,7 +335,7 @@ def _all_same(values:tuple[int,...]) -> bool: return values[0]==values[-1] and v
 def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_static_ranges(out_index) or (); bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges); affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); return ranges if affine is not None and affine[0]==0 and count==math.prod(bounds) and all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None  # noqa: E702,E501
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
-  if encode is int and dtypes.is_int(expr.dtype.scalar()) and (ranges:=_dense_ranges(out_index,count)) is not None: return typing_cast(tuple[int,...],_static_lanes(ranges,expr,dependencies=False)[0])  # noqa: E501
+  if encode is int and (dtypes.is_int(scalar:=expr.dtype.scalar()) or dtypes.is_bool(scalar)) and (ranges:=_dense_ranges(out_index,count)) is not None: values=_static_lanes(ranges,expr,dependencies=False)[0]; return tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else typing_cast(tuple[int,...],values)  # noqa: E702,E501
   dst_lanes,expr_lanes=_static_lanes(out_index,expr)
   missing=object(); result:list[int|object]=[missing]*count
   for destination,value in zip(dst_lanes,expr_lanes):
@@ -346,7 +346,7 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
     if result[dst] is not missing and result[dst]!=encoded: raise RuntimeError("RKPLAN_REJECT:static_index")
     result[dst]=encoded
   if any(value is missing for value in result): raise RuntimeError("RKPLAN_REJECT:static_index")
-  return tuple(typing_cast(int,value) for value in result)
+  return typing_cast(tuple[int,...],tuple(result))
 
 def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int], int]]|None:
   """Represent static address arithmetic as a sum of scaled RANGE or RANGE//constant terms."""
@@ -1297,7 +1297,7 @@ class RKContext:
           selector=_static_values(self.out_index,node.src[0],self.count,int)
           route(node.src[1],tuple(lane for lane in active if bool(selector[lane])))
           route(node.src[2],tuple(lane for lane in active if not bool(selector[lane])))
-        else: routes.setdefault(node,[]).extend(active)
+        elif active: routes.setdefault(node,[]).extend(active)
       route(u,tuple(range(self.count)))
       expected,itemsize,commits=dtype,dtype.itemsize,[]
       for partial,(leaf,active) in enumerate(routes.items()):
@@ -1667,8 +1667,8 @@ class RockchipRenderer(Renderer):
   compiler = RockchipCompiler("rockchip")
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
-    image = _lower_uop_program(uops)
-    if image is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))
+    if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
+    for cache in (_semantic_loads,_static_ranges,_eval_static_block,_static_lanes,_small_gather_offsets,_int_info): cache.cache_clear()
     return base64.b64encode(encode_image(image,validate=False)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
