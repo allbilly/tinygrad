@@ -843,8 +843,81 @@ _VOP1_ENCODINGS:dict[tuple[GFX803Ops, DType|None], tuple[int, str]] = {
 _VOP1_OPS = {op for op, _ in _VOP1_ENCODINGS}
 
 
+_SCRATCH_ENCODINGS:dict[GFX803Ops, tuple[int, str]] = {
+  GFX803Ops.SCRATCH_LOAD_U8:(0x10, "buffer_load_ubyte"), GFX803Ops.SCRATCH_LOAD_S8:(0x11, "buffer_load_sbyte"),
+  GFX803Ops.SCRATCH_LOAD_U16:(0x12, "buffer_load_ushort"), GFX803Ops.SCRATCH_LOAD_S16:(0x13, "buffer_load_sshort"),
+  GFX803Ops.SCRATCH_LOAD_B32:(0x14, "buffer_load_dword"), GFX803Ops.SCRATCH_LOAD_B64:(0x14, "buffer_load_dword"),
+  GFX803Ops.SCRATCH_STORE_B8:(0x18, "buffer_store_byte"), GFX803Ops.SCRATCH_STORE_B16:(0x1a, "buffer_store_short"),
+  GFX803Ops.SCRATCH_STORE_B32:(0x1c, "buffer_store_dword"), GFX803Ops.SCRATCH_STORE_B64:(0x1c, "buffer_store_dword"),
+}
+_SCRATCH_LOADS = {op for op in _SCRATCH_ENCODINGS if "LOAD" in op.name}
+_SCRATCH_STORES = set(_SCRATCH_ENCODINGS) - _SCRATCH_LOADS
+
+_MEMORY_ENCODINGS:dict[GFX803Ops, tuple[int, str]] = {
+  GFX803Ops.FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"), GFX803Ops.FLAT_LOAD_S8:(0xdc440000, "flat_load_sbyte"),
+  GFX803Ops.FLAT_LOAD_U16:(0xdc480000, "flat_load_ushort"), GFX803Ops.FLAT_LOAD_S16:(0xdc4c0000, "flat_load_sshort"),
+  GFX803Ops.FLAT_LOAD_B32:(0xdc500000, "flat_load_dword"), GFX803Ops.FLAT_STORE_B8:(0xdc600000, "flat_store_byte"),
+  GFX803Ops.FLAT_STORE_B16:(0xdc680000, "flat_store_short"), GFX803Ops.FLAT_STORE_B32:(0xdc700000, "flat_store_dword"),
+  GFX803Ops.DS_LOAD_U8:(0xd8740000, "ds_read_u8"), GFX803Ops.DS_LOAD_S8:(0xd8720000, "ds_read_i8"),
+  GFX803Ops.DS_LOAD_U16:(0xd8780000, "ds_read_u16"), GFX803Ops.DS_LOAD_S16:(0xd8760000, "ds_read_i16"),
+  GFX803Ops.DS_LOAD_B32:(0xd86c0000, "ds_read_b32"), GFX803Ops.DS_STORE_B8:(0xd83c0000, "ds_write_b8"),
+  GFX803Ops.DS_STORE_B16:(0xd83e0000, "ds_write_b16"), GFX803Ops.DS_STORE_B32:(0xd81a0000, "ds_write_b32"),
+}
+_GATED_MEMORY_OPS = {op for op in GFX803Ops if op.name.startswith("GATED_FLAT_")}
+_ASYNC_MEMORY_OPS = {GFX803Ops.S_LOAD_B64, *_SCRATCH_ENCODINGS, *_MEMORY_ENCODINGS, *_GATED_MEMORY_OPS}
+
+
 def _typed_encoding(encodings:dict[tuple[GFX803Ops, DType|None], tuple[int, str]], x:UOp) -> tuple[int, str]:
   return encodings.get((x.arg, x.dtype), encodings[(x.arg, None)]) if (x.arg, None) in encodings else encodings[(x.arg, x.dtype)]
+
+
+def _encode_scratch(x:UOp, dst:Register|None) -> tuple[bytes, str]:
+  loading = x.arg in _SCRATCH_LOADS
+  reg, offset = (dst, x.src[0]) if loading else (_physical_reg(x.src[0]), x.src[1])
+  assert reg is not None
+  action = "fill" if loading else "spill"
+  if not reg.name.startswith("v"): raise NotImplementedError(f"gfx803 scalar-register {action}s are not implemented")
+  if offset.op is not Ops.CONST: raise RuntimeError(f"gfx803 scratch {action} offset must be constant")
+  scratch_offset, (opcode, mnemonic) = int(offset.arg), _SCRATCH_ENCODINGS[x.arg]
+  words = 2 if x.arg.name.endswith("_B64") else 1
+  data = b"".join(_mubuf(opcode, scratch_offset + i*4, reg.index + i) for i in range(words))
+  text = "\n".join(f"{mnemonic} v{reg.index+i}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" +
+                   (f" offset:{scratch_offset+i*4}" if scratch_offset+i*4 else "") for i in range(words))
+  return data, text
+
+
+def _encode_memory(x:UOp, dst:Register|None) -> tuple[bytes, str]:
+  opcode, mnemonic = _MEMORY_ENCODINGS[x.arg]
+  addr, loading, flat = _physical_reg(x.src[0]), "LOAD" in x.arg.name, x.arg.name.startswith("FLAT_")
+  if loading:
+    assert dst is not None
+    reg, shift = dst, 24
+  else: reg, shift = _physical_reg(x.src[1]), 8
+  address = f"v[{addr.index}:{addr.index+1}]" if flat else f"v{addr.index}"
+  operands = f"v{reg.index}, {address}" if loading else f"{address}, v{reg.index}"
+  return _word(opcode) + _word((reg.index << shift) | addr.index), f"{mnemonic} {operands}"
+
+
+def _encode_gated_memory(x:UOp, dst:Register|None) -> tuple[bytes, str]:
+  loading = "LOAD" in x.arg.name
+  addr, gate = _physical_reg(x.src[0]), _physical_reg(x.src[-1])
+  if not gate.name.startswith("v"): raise RuntimeError(f"gfx803 {'load' if loading else 'store'} gate must be a VGPR, got {gate}")
+  opcode, mnemonic = _MEMORY_ENCODINGS[GFX803Ops[x.arg.name.removeprefix("GATED_")]]
+  init_data, init_text = b"", []
+  if loading:
+    assert dst is not None
+    reg, shift = dst, 24
+    src, literal, src_text = _raw_src0(x.src[1])
+    # Compare before initializing the destination: the allocator may reuse the dying gate VGPR for dst.
+    init_data = _word(_vop1(0x01, dst.index, src)) + b"".join(_word(v) for v in literal)
+    init_text = [f"v_mov_b32_e32 v{dst.index}, {src_text}"]
+  else: reg, shift = _physical_reg(x.src[1]), 8
+  data = (_word(_vopc(0xcd, 128, gate.index)) + init_data +
+          b"".join(_word(w) for w in (0xbea0206a, opcode, (reg.index << shift) | addr.index, 0xbefe0120)))
+  operands = f"v{reg.index}, v[{addr.index}:{addr.index+1}]" if loading else f"v[{addr.index}:{addr.index+1}], v{reg.index}"
+  text = "\n".join([f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}", *init_text, "s_and_saveexec_b64 s[32:33], vcc",
+                    f"{mnemonic} {operands}", "s_mov_b64 exec, s[32:33]"])
+  return data, text
 
 
 def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
@@ -875,45 +948,8 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     counts = (counts[0], max(counts[1], SCRATCH_RSRC_INDEX + 4), counts[2])
   elif x.arg is GFX803Ops.SCRATCH_TEARDOWN:
     data, text = b"", ""
-  elif x.arg in {GFX803Ops.SCRATCH_LOAD_B32, GFX803Ops.SCRATCH_LOAD_U16, GFX803Ops.SCRATCH_LOAD_S16,
-                  GFX803Ops.SCRATCH_LOAD_U8, GFX803Ops.SCRATCH_LOAD_S8, GFX803Ops.SCRATCH_LOAD_B64}:
-    assert dst is not None
-    if not dst.name.startswith("v"): raise NotImplementedError("gfx803 scalar-register fills are not implemented")
-    if x.src[0].op is not Ops.CONST: raise RuntimeError("gfx803 scratch fill offset must be constant")
-    scratch_offset = int(x.src[0].arg)
-    op, mnemonic = {
-      GFX803Ops.SCRATCH_LOAD_U8:(0x10, "buffer_load_ubyte"), GFX803Ops.SCRATCH_LOAD_S8:(0x11, "buffer_load_sbyte"),
-      GFX803Ops.SCRATCH_LOAD_U16:(0x12, "buffer_load_ushort"), GFX803Ops.SCRATCH_LOAD_S16:(0x13, "buffer_load_sshort"),
-      GFX803Ops.SCRATCH_LOAD_B32:(0x14, "buffer_load_dword"), GFX803Ops.SCRATCH_LOAD_B64:(0x14, "buffer_load_dword"),
-    }[x.arg]
-    if x.arg is GFX803Ops.SCRATCH_LOAD_B64:
-      # GFX8 scratch is dword-interleaved across lanes; wider memory
-      # transactions cross into another lane's private segment.
-      data = _mubuf(op, scratch_offset, dst.index) + _mubuf(op, scratch_offset + 4, dst.index + 1)
-      text = "\n".join(f"{mnemonic} v{dst.index+i}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" +
-                       (f" offset:{scratch_offset+i*4}" if scratch_offset+i*4 else "") for i in range(2))
-    else:
-      data = _mubuf(op, scratch_offset, dst.index)
-      text = f"{mnemonic} v{dst.index}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" + \
-             (f" offset:{scratch_offset}" if scratch_offset else "")
-    counts = (counts[0], max(counts[1], SCRATCH_RSRC_INDEX + 4), counts[2])
-  elif x.arg in {GFX803Ops.SCRATCH_STORE_B32, GFX803Ops.SCRATCH_STORE_B16, GFX803Ops.SCRATCH_STORE_B8, GFX803Ops.SCRATCH_STORE_B64}:
-    value = _physical_reg(x.src[0])
-    if not value.name.startswith("v"): raise NotImplementedError("gfx803 scalar-register spills are not implemented")
-    if x.src[1].op is not Ops.CONST: raise RuntimeError("gfx803 scratch spill offset must be constant")
-    scratch_offset = int(x.src[1].arg)
-    op, mnemonic = {GFX803Ops.SCRATCH_STORE_B8:(0x18, "buffer_store_byte"),
-                    GFX803Ops.SCRATCH_STORE_B16:(0x1a, "buffer_store_short"),
-                    GFX803Ops.SCRATCH_STORE_B32:(0x1c, "buffer_store_dword"),
-                    GFX803Ops.SCRATCH_STORE_B64:(0x1c, "buffer_store_dword")}[x.arg]
-    if x.arg is GFX803Ops.SCRATCH_STORE_B64:
-      data = _mubuf(op, scratch_offset, value.index) + _mubuf(op, scratch_offset + 4, value.index + 1)
-      text = "\n".join(f"{mnemonic} v{value.index+i}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" +
-                       (f" offset:{scratch_offset+i*4}" if scratch_offset+i*4 else "") for i in range(2))
-    else:
-      data = _mubuf(op, scratch_offset, value.index)
-      text = f"{mnemonic} v{value.index}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" + \
-             (f" offset:{scratch_offset}" if scratch_offset else "")
+  elif x.arg in _SCRATCH_ENCODINGS:
+    data, text = _encode_scratch(x, dst)
     counts = (counts[0], max(counts[1], SCRATCH_RSRC_INDEX + 4), counts[2])
   elif x.arg is GFX803Ops.S_LOAD_B64:
     assert dst is not None
@@ -966,74 +1002,11 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       else:
         data = _word(0x7e000200 | (dst.index << 17) | 256 | idx_reg.index)
         text = f"v_mov_b32_e32 v{dst.index}, v{idx_reg.index}"
-  elif x.arg in {GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_S16,
-                  GFX803Ops.FLAT_LOAD_U8, GFX803Ops.FLAT_LOAD_S8}:
-    assert dst is not None
-    addr = _physical_reg(x.src[0])
-    opcode, mnemonic = {GFX803Ops.FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"), GFX803Ops.FLAT_LOAD_S8:(0xdc440000, "flat_load_sbyte"),
-                        GFX803Ops.FLAT_LOAD_U16:(0xdc480000, "flat_load_ushort"),
-                        GFX803Ops.FLAT_LOAD_S16:(0xdc4c0000, "flat_load_sshort"),
-                        GFX803Ops.FLAT_LOAD_B32:(0xdc500000, "flat_load_dword")}[x.arg]
-    data = _word(opcode) + _word((dst.index << 24) | addr.index)
-    text = f"{mnemonic} v{dst.index}, v[{addr.index}:{addr.index+1}]"
-  elif x.arg in {GFX803Ops.GATED_FLAT_LOAD_B32, GFX803Ops.GATED_FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_S16,
-                  GFX803Ops.GATED_FLAT_LOAD_U8, GFX803Ops.GATED_FLAT_LOAD_S8}:
-    assert dst is not None
-    addr, gate = _physical_reg(x.src[0]), _physical_reg(x.src[2])
-    if not gate.name.startswith("v"): raise RuntimeError(f"gfx803 load gate must be a VGPR, got {gate}")
-    src, literal, src_text = _raw_src0(x.src[1])
-    load_opcode, load_mnemonic = {
-      GFX803Ops.GATED_FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"), GFX803Ops.GATED_FLAT_LOAD_S8:(0xdc440000, "flat_load_sbyte"),
-      GFX803Ops.GATED_FLAT_LOAD_U16:(0xdc480000, "flat_load_ushort"),
-      GFX803Ops.GATED_FLAT_LOAD_S16:(0xdc4c0000, "flat_load_sshort"),
-      GFX803Ops.GATED_FLAT_LOAD_B32:(0xdc500000, "flat_load_dword"),
-    }[x.arg]
-    # Compare before initializing the destination: the allocator may reuse the dying gate VGPR for dst.
-    # V_MOV does not modify VCC, so the saved predicate remains valid when gate and dst alias.
-    data = (_word(_vopc(0xcd, 128, gate.index)) + _word(_vop1(0x01, dst.index, src)) +
-            b"".join(_word(v) for v in literal) +
-            b"".join(_word(w) for w in (0xbea0206a, load_opcode, (dst.index << 24) | addr.index, 0xbefe0120)))
-    text = (f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}\n"
-            f"v_mov_b32_e32 v{dst.index}, {src_text}\n"
-            f"s_and_saveexec_b64 s[32:33], vcc\n"
-            f"{load_mnemonic} v{dst.index}, v[{addr.index}:{addr.index+1}]\n"
-            f"s_mov_b64 exec, s[32:33]")
+  elif x.arg in _MEMORY_ENCODINGS:
+    data, text = _encode_memory(x, dst)
+  elif x.arg in _GATED_MEMORY_OPS:
+    data, text = _encode_gated_memory(x, dst)
     counts = (counts[0], max(counts[1], 34), counts[2])
-  elif x.arg in {GFX803Ops.FLAT_STORE_B32, GFX803Ops.FLAT_STORE_B16, GFX803Ops.FLAT_STORE_B8}:
-    addr, value = _physical_reg(x.src[0]), _physical_reg(x.src[1])
-    opcode, mnemonic = {GFX803Ops.FLAT_STORE_B8:(0xdc600000, "flat_store_byte"),
-                        GFX803Ops.FLAT_STORE_B16:(0xdc680000, "flat_store_short"),
-                        GFX803Ops.FLAT_STORE_B32:(0xdc700000, "flat_store_dword")}[x.arg]
-    data = _word(opcode) + _word((value.index << 8) | addr.index)
-    text = f"{mnemonic} v[{addr.index}:{addr.index+1}], v{value.index}"
-  elif x.arg in {GFX803Ops.GATED_FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B16, GFX803Ops.GATED_FLAT_STORE_B8}:
-    addr, value, gate = map(_physical_reg, x.src)
-    if not gate.name.startswith("v"): raise RuntimeError(f"gfx803 store gate must be a VGPR, got {gate}")
-    # s[32:33] is reserved above the scalar allocator's s[6:31] pool.
-    store_opcode, store_mnemonic = {GFX803Ops.GATED_FLAT_STORE_B8:(0xdc600000, "flat_store_byte"),
-                                    GFX803Ops.GATED_FLAT_STORE_B16:(0xdc680000, "flat_store_short"),
-                                    GFX803Ops.GATED_FLAT_STORE_B32:(0xdc700000, "flat_store_dword")}[x.arg]
-    words = [_vopc(0xcd, 128, gate.index), 0xbea0206a, store_opcode, (value.index << 8) | addr.index, 0xbefe0120]
-    data = b"".join(_word(w) for w in words)
-    text = (f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}\n"
-            f"s_and_saveexec_b64 s[32:33], vcc\n"
-            f"{store_mnemonic} v[{addr.index}:{addr.index+1}], v{value.index}\n"
-            f"s_mov_b64 exec, s[32:33]")
-    counts = (counts[0], max(counts[1], 34), counts[2])
-  elif x.arg in {GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_S16, GFX803Ops.DS_LOAD_U8, GFX803Ops.DS_LOAD_S8}:
-    assert dst is not None
-    addr = _physical_reg(x.src[0])
-    opcode, mnemonic = {GFX803Ops.DS_LOAD_U8:(0xd8740000, "ds_read_u8"), GFX803Ops.DS_LOAD_S8:(0xd8720000, "ds_read_i8"),
-                        GFX803Ops.DS_LOAD_U16:(0xd8780000, "ds_read_u16"), GFX803Ops.DS_LOAD_S16:(0xd8760000, "ds_read_i16"),
-                        GFX803Ops.DS_LOAD_B32:(0xd86c0000, "ds_read_b32")}[x.arg]
-    data = _word(opcode) + _word((dst.index << 24) | addr.index)
-    text = f"{mnemonic} v{dst.index}, v{addr.index}"
-  elif x.arg in {GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16, GFX803Ops.DS_STORE_B8}:
-    addr, value = _physical_reg(x.src[0]), _physical_reg(x.src[1])
-    opcode, mnemonic = {GFX803Ops.DS_STORE_B8:(0xd83c0000, "ds_write_b8"), GFX803Ops.DS_STORE_B16:(0xd83e0000, "ds_write_b16"),
-                        GFX803Ops.DS_STORE_B32:(0xd81a0000, "ds_write_b32")}[x.arg]
-    data = _word(opcode) + _word((value.index << 8) | addr.index)
-    text = f"{mnemonic} v{addr.index}, v{value.index}"
   elif x.arg is GFX803Ops.REG_STORE_B32:
     addr = _physical_reg(x.src[0])
     src, literal, src_text = _raw_src0(x.src[1])
@@ -1161,10 +1134,6 @@ class AMDASMRenderer(ISARenderer):
     # Scalar and vector memory operations are asynchronous on GCN3. A full
     # wait after each access is conservative but gives the first backend path
     # unambiguous dependency ordering; later scheduling can coalesce waits.
-    scratch_loads = {GFX803Ops.SCRATCH_LOAD_B32, GFX803Ops.SCRATCH_LOAD_U16, GFX803Ops.SCRATCH_LOAD_S16,
-                     GFX803Ops.SCRATCH_LOAD_U8, GFX803Ops.SCRATCH_LOAD_S8, GFX803Ops.SCRATCH_LOAD_B64}
-    scratch_stores = {GFX803Ops.SCRATCH_STORE_B32, GFX803Ops.SCRATCH_STORE_B16,
-                      GFX803Ops.SCRATCH_STORE_B8, GFX803Ops.SCRATCH_STORE_B64}
     spill_size = max((int(u.src[0].arg) for u in lin.src if u.arg is GFX803Ops.SCRATCH_SETUP), default=0)
     buffer_size = max((int(u.src[2].arg) for u in lin.src if u.arg is GFX803Ops.SCRATCH_BUFFER_META), default=0)
     buffer_base = (spill_size + 7) // 8 * 8
@@ -1174,9 +1143,9 @@ class AMDASMRenderer(ISARenderer):
     for u in lin.src:
       if u.arg is GFX803Ops.SCRATCH_SETUP:
         u, has_setup = u.replace(src=(UOp.const(u.src[0].dtype, total_scratch),)), True
-      elif u.arg in scratch_loads and len(u.src) > 1 and _scratch_buffer_addr(u.src[1]) is not None:
+      elif u.arg in _SCRATCH_LOADS and len(u.src) > 1 and _scratch_buffer_addr(u.src[1]) is not None:
         u = u.replace(src=(UOp.const(dtypes.int32, buffer_base + int(u.src[0].arg)), *u.src[1:]))
-      elif u.arg in scratch_stores and len(u.src) > 2 and _scratch_buffer_addr(u.src[2]) is not None:
+      elif u.arg in _SCRATCH_STORES and len(u.src) > 2 and _scratch_buffer_addr(u.src[2]) is not None:
         u = u.replace(src=(u.src[0], UOp.const(dtypes.int32, buffer_base + int(u.src[1].arg)), *u.src[2:]))
       normalized.append(u)
     if total_scratch and not has_setup:
@@ -1186,16 +1155,7 @@ class AMDASMRenderer(ISARenderer):
     for u in normalized:
       if u.arg is GFX803Ops.DEFINE: continue
       ordered.append(u)
-      if u.arg in {GFX803Ops.S_LOAD_B64, GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_S16,
-                   GFX803Ops.FLAT_LOAD_U8, GFX803Ops.FLAT_LOAD_S8, GFX803Ops.GATED_FLAT_LOAD_B32,
-                   GFX803Ops.GATED_FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_S16,
-                   GFX803Ops.GATED_FLAT_LOAD_U8, GFX803Ops.GATED_FLAT_LOAD_S8,
-                   GFX803Ops.FLAT_STORE_B32, GFX803Ops.FLAT_STORE_B16, GFX803Ops.FLAT_STORE_B8,
-                   GFX803Ops.GATED_FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B16, GFX803Ops.GATED_FLAT_STORE_B8,
-                   GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_S16,
-                   GFX803Ops.DS_LOAD_U8, GFX803Ops.DS_LOAD_S8,
-                   GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16, GFX803Ops.DS_STORE_B8,
-                   *scratch_loads, *scratch_stores}:
+      if u.arg in _ASYNC_MEMORY_OPS:
         ordered.append(UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_WAITCNT))
     labels:dict[str, int] = {}
     pc = 0
