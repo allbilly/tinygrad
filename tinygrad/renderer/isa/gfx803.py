@@ -646,9 +646,26 @@ def _stable_hardsigmoid(x:UOp) -> UOp|None:
   return None
 
 
+def _widen_half_product(a:UOp, b:UOp) -> UOp:
+  # Half reductions already accumulate in float32. Widen before multiplying
+  # too, matching the product precision used by GPU dot/conv contracts.
+  return UOp(Ops.MUL, dtypes.float32, (_half_to_float(a), _half_to_float(b)))
+
+
+def _widen_half_bias_add(a:UOp, b:UOp) -> UOp|None:
+  # Conv bias arrives after a premature float32-to-half cast of the reduction.
+  # Fold it into the wide accumulator and round only the final sum.
+  rounded, bias = (a, b) if a.op is Ops.CAST and a.src[0].dtype is dtypes.float32 else (b, a)
+  if rounded.op is not Ops.CAST or rounded.dtype is not dtypes.half or rounded.src[0].dtype is not dtypes.float32: return None
+  wide_sum = UOp(Ops.ADD, dtypes.float32, (rounded.src[0], _half_to_float(bias)))
+  return UOp(Ops.CAST, dtypes.half, (wide_sum,), dtypes.half)
+
+
 pre_isel_matcher = PatternMatcher([
   (UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float32),
         src=(UPat(Ops.SQRT, src=(UPat.var("value"),)),), name="x"), _rsqrt),
+  (UPat(Ops.CAST, dtypes.float32, src=(UPat(Ops.MUL, dtypes.half, src=(UPat.var("a"), UPat.var("b"))),)), _widen_half_product),
+  (UPat(Ops.ADD, dtypes.half, src=(UPat.var("a"), UPat.var("b"))), _widen_half_bias_add),
   (UPat(Ops.ADD, dtypes.half, name="x"), _stable_hardsigmoid),
 ])
 isel_matcher = PatternMatcher([

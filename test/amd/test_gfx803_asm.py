@@ -479,12 +479,16 @@ class TestGFX803Program(unittest.TestCase):
     b = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
     ma = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
     mb = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    cx = Tensor.empty(1, 2, 3, 3, dtype=dtypes.half, device="NULL").contiguous().realize()
+    cw = Tensor.empty(2, 2, 1, 1, dtype=dtypes.half, device="NULL").contiguous().realize()
+    cb = Tensor.empty(2, dtype=dtypes.half, device="NULL").contiguous().realize()
     cases = {
       "add": (a+b, ("flat_load_ushort", "v_add_f16", "flat_store_short")),
       "int16_roundtrip": (a.cast(dtypes.int16).cast(dtypes.half), ("v_cvt_i16_f16", "v_cvt_f16_i16")),
       "int16_negative": (a.cast(dtypes.int16)<0, ("v_cvt_i16_f16", "v_bfe_i32", "v_cmp_lt_i32")),
       "sum": (a.sum(), ("flat_load_ushort", "v_cvt_f32_f16", "ds_write_b32", "v_add_f32", "v_cvt_f16_f32", "flat_store_short")),
-      "matmul": (ma@mb, ("flat_load_ushort", "v_mul_f16", "ds_write_b32", "v_add_f32", "flat_store_short")),
+      "matmul": (ma@mb, ("flat_load_ushort", "v_cvt_f32_f16", "v_mul_f32", "ds_write_b32", "v_add_f32", "flat_store_short")),
+      "biased_conv": (cx.conv2d(cw, cb), ("v_cvt_f32_f16", "v_mul_f32", "v_add_f32", "v_cvt_f16_f32")),
     }
     for name, (result, expected) in cases.items():
       with self.subTest(name=name):
@@ -495,6 +499,8 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(relocs, [])
         self.assertEqual(_assembled(*lines), text.content)
         for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
+        if name in {"matmul", "biased_conv"}: self.assertFalse(any(line.startswith("v_mul_f16") for line in code_lines))
+        if name == "biased_conv": self.assertFalse(any(line.startswith("v_add_f16") for line in code_lines))
 
   def test_integer_bool_programs_elf(self):
     renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
