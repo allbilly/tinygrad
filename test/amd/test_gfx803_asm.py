@@ -187,6 +187,20 @@ class TestGFX803Encoder(unittest.TestCase):
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
 
+  def test_native_reciprocal_sqrt(self):
+    f32, out_f32 = _reg(dtypes.float32, "v40", 40), _reg(dtypes.float32, "v42", 42)
+    half, out_half = _reg(dtypes.half, "v41", 41), _reg(dtypes.half, "v43", 43)
+    cases = [
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RCP_F32, out_f32.tag), ("v_rcp_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_SQRT_F32, out_f32.tag), ("v_sqrt_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RSQ_F32, out_f32.tag), ("v_rsq_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RCP_F32, out_half.tag), ("v_rcp_f16_e32 v43, v41",)),
+      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_SQRT_F32, out_half.tag), ("v_sqrt_f16_e32 v43, v41",)),
+      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RSQ_F32, out_half.tag), ("v_rsq_f16_e32 v43, v41",)),
+    ]
+    for uop, lines in cases:
+      with self.subTest(op=uop.arg, dtype=uop.dtype): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
 
 class TestGFX803Program(unittest.TestCase):
   @staticmethod
@@ -357,6 +371,25 @@ class TestGFX803Program(unittest.TestCase):
     }
     for name, (result, expected) in cases.items():
       with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, _, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        code_lines = lines[:lines.index("s_endpgm")+1]
+        self.assertEqual(relocs, [])
+        self.assertEqual(_assembled(*lines), text.content)
+        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
+
+  def test_native_reciprocal_sqrt_programs_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    cases = {
+      "rcp_f32": (dtypes.float32, "reciprocal", ("v_rcp_f32",)), "sqrt_f32": (dtypes.float32, "sqrt", ("v_sqrt_f32",)),
+      "rsqrt_f32": (dtypes.float32, "rsqrt", ("v_rsq_f32",)), "rcp_f16": (dtypes.half, "reciprocal", ("v_rcp_f16",)),
+      "sqrt_f16": (dtypes.half, "sqrt", ("v_sqrt_f16",)), "rsqrt_f16": (dtypes.half, "rsqrt", ("v_rsq_f16",)),
+    }
+    for name, (dtype, op, expected) in cases.items():
+      with self.subTest(name=name):
+        source = Tensor.empty(16, dtype=dtype, device="NULL").contiguous().realize()
+        result = getattr(source, op)()
         program = to_program(result.schedule_linear().src[-1].src[0], renderer)
         text, _, _, relocs = self._elf(program)
         lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
