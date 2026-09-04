@@ -107,6 +107,12 @@ class AMDComputeQueue(HWQueue):
 
   def pkt3(self, cmd, *vals): self.q(self.pm4.PACKET3(cmd, len(vals) - 1), *vals)
 
+  def _gfx8_host_managed_barrier(self):
+    # Direct Polaris flushes host writes before ringing the doorbell. Kernel
+    # submissions get gfx_v8_0_emit_mem_sync_compute before the user IB.
+    return self.dev.target[0] == 8 and (self.dev.is_am() or
+      getattr(getattr(self.dev, "compute_queue", None), "submit_ib", None) is not None)
+
   def wreg(self, reg:AMDReg, *args:sint, **kwargs:int):
     if bool(args) == bool(kwargs): raise RuntimeError('One (and only one) of *args or **kwargs must be specified')
     if self.pm4.PACKET3_SET_SH_REG_START <= reg.addr[0] < self.pm4.PACKET3_SET_SH_REG_END:
@@ -198,7 +204,7 @@ class AMDComputeQueue(HWQueue):
 
   def memory_barrier(self):
     # GFX8 compute queues use the full-range ACQUIRE_MEM sequence from gfx_v8_0_emit_mem_sync_compute.
-    if self.dev.target[0] == 8: return self.acquire_mem()
+    if self.dev.target[0] == 8: return self if self._gfx8_host_managed_barrier() else self.acquire_mem()
     pf = '0' if self.nbio.version[:2] != (7, 11) else '1'
     self.wait_reg_mem(reg=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ').addr[0],
                       reg_done=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE').addr[0], value=0xffffffff)
@@ -392,8 +398,7 @@ class AMDComputeQueue(HWQueue):
     # Kernel-backed VI submissions already get gfx_v8_0_emit_mem_sync_compute
     # from AMDGPU_IB_FLAG_EMIT_MEM_SYNC. The passing gfx8 reference path also
     # has no user-IB ACQUIRE_MEM. KFD queues retain the normal barrier.
-    kernel_submit = getattr(getattr(self.dev, "compute_queue", None), "submit_ib", None) is not None
-    if self.dev.target[0] != 8 or not (self.dev.is_am() or kernel_submit): self.acquire_mem(gli=0, gl2=0)
+    if not self._gfx8_host_managed_barrier(): self.acquire_mem(gli=0, gl2=0)
 
     user_regs = []
     if prg.enable_private_segment_sgpr:

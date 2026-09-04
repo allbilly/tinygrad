@@ -63,10 +63,10 @@ class TestPolarisAM(unittest.TestCase):
         self.assertLess(writes.index("regCOMPUTE_START_X"), writes.index("regCOMPUTE_PGM_LO"))
 
   def test_gfx8_kernel_submit_relies_on_kernel_mem_sync(self):
-    for kernel_submit, expect_acquire in ((True, False), (False, True)):
-      with self.subTest(kernel_submit=kernel_submit):
+    for direct, kernel_submit, expect_acquire in ((False, True, False), (True, False, False), (False, False, True)):
+      with self.subTest(direct=direct, kernel_submit=kernel_submit):
         submit_ib = (lambda ib, size: None) if kernel_submit else None
-        dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False, sqtt_enabled=False, xccs=1, tmpring_size=0,
+        dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: direct, sqtt_enabled=False, xccs=1, tmpring_size=0,
                               compute_queue=SimpleNamespace(submit_ib=submit_ib))
         queue = AMDComputeQueue(SimpleNamespace(soc=SimpleNamespace(CS_PARTIAL_FLUSH=0), pm4=pm4_soc15, gc=GFX8GC(), nbio=None))
         queue.dev = dev
@@ -76,6 +76,7 @@ class TestPolarisAM(unittest.TestCase):
         queue.q = lambda *args: None  # type: ignore[method-assign]
         prg = SimpleNamespace(dev=dev, enable_private_segment_sgpr=False, enable_dispatch_ptr=False, prog_addr=0x100000,
                               rsrc1=0, rsrc2=0, rsrc3=0, wave32=False)
+        queue.memory_barrier()
         queue.exec(prg, SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x200000)), (1, 1, 1), (1, 1, 1))
         self.assertEqual(pm4_soc15.PACKET3_ACQUIRE_MEM in packets, expect_acquire)
 
@@ -160,11 +161,11 @@ class TestPolarisAM(unittest.TestCase):
     self.assertTrue(queue._q[1] & pm4_soc15.EOP_TC_ACTION_EN)
     self.assertEqual(queue._q[2], pm4_soc15.DATA_SEL(1))
 
-  def test_gfx8_direct_barrier_matches_linux_compute_sync(self):
+  def test_gfx8_acquire_matches_linux_compute_sync(self):
     queue = AMDComputeQueue.__new__(AMDComputeQueue)
     queue.dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True)
     queue.pm4, queue._q, queue.binded_device = pm4_soc15, [], None
-    queue.memory_barrier()
+    queue.acquire_mem()
     self.assertEqual(len(queue._q), 7)
     self.assertEqual(queue._q[2:4], [0xffffffff, 0xff])
     self.assertEqual(queue._q[4:6], [0, 0])
