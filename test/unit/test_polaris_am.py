@@ -1,8 +1,11 @@
-import unittest
+import ctypes, unittest
 from types import SimpleNamespace
 from tinygrad.codegen.opt import tc
-from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, GFX8GC, _gfx8_props, _kfd_doorbell_params
+from tinygrad.dtype import dtypes
+from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, DRMIface, GFX8GC, _gfx8_props, _kfd_doorbell_params
 from tinygrad.runtime.autogen.am import pm4_soc15
+from tinygrad.runtime.support.hcq import HCQBuffer, MMIOInterface
+from tinygrad.uop.ops import UOp
 from tinygrad.runtime.support.am.polaris import (
   PolarisAMDev, ViMqd, DOORBELL_MEC_RING0, VI_MQD_ALLOC_DWORDS, MQD_HQD_WORD, mmCP_HQD_ACTIVE, mmCP_HQD_PQ_BASE_LO, mmCP_HQD_PQ_BASE_HI,
   mmCP_HQD_PQ_DOORBELL_CONTROL, mmCP_HQD_PQ_RPTR_REPORT_ADDR_LO, mmCP_HQD_PQ_WPTR_POLL_ADDR_LO,
@@ -13,6 +16,7 @@ from tinygrad.runtime.support.am.polaris import (
 class FakeMMIO:
   def __init__(self, nbytes:int, vals=None, offset:int=0):
     self.nbytes, self.vals, self.offset = nbytes, vals if vals is not None else {}, offset
+  def __len__(self): return self.nbytes
   def __getitem__(self, idx): return self.vals.get(self.offset + idx, 0)
   def __setitem__(self, idx, val):
     if isinstance(idx, slice):
@@ -108,6 +112,36 @@ class TestPolarisAM(unittest.TestCase):
     self.assertEqual(desc.put_value, 0)
     self.assertEqual(desc.read_ptr[0], 0)
     self.assertEqual(desc.write_ptr[0], 0)
+
+  def test_gfx8_drm_uses_host_timeline_after_fence(self):
+    submitted, signals = [], []
+    desc = AMDQueueDesc(ring=FakeMMIO(0x1000), read_ptr=FakeMMIO(8), write_ptr=FakeMMIO(8), doorbell=FakeMMIO(8),
+                        submit_ib=lambda ib, size: submitted.append(size), ring_buf=SimpleNamespace())  # type: ignore[arg-type]
+    dev = SimpleNamespace(target=(8, 0, 3), soc=SimpleNamespace(), pm4=pm4_soc15, gc=GFX8GC(), nbio=None, compute_queue=desc,
+                          iface=SimpleNamespace(write_signal=lambda addr, val: signals.append((addr, val))), error_state=None,
+                          is_am=lambda: False, xccs=1)
+    queue = AMDComputeQueue(dev)
+    sig_addr = UOp.variable("sig_addr", 0, 0xffffffffffffffff, dtype=dtypes.uint64)
+    sig_val = UOp.variable("sig_val", 0, 0xffffffff, dtype=dtypes.uint32)
+    signal = SimpleNamespace(value_addr=sig_addr, owner=dev, is_timeline=True)
+    queue.wait(signal, sig_val-1).q(0xc0001000)
+    queue.signal(signal, sig_val).submit(dev, {sig_addr.expr:0x12345000, sig_val.expr:7})
+    self.assertEqual(submitted, [4])
+    self.assertEqual(signals, [(0x12345000, 7)])
+
+    host_only = AMDComputeQueue(dev)
+    host_only.memory_barrier().signal(SimpleNamespace(value_addr=0x12345000, owner=dev, is_timeline=True), 8).submit(dev)
+    self.assertEqual(submitted, [4])
+    self.assertEqual(signals, [(0x12345000, 7), (0x12345000, 8)])
+
+  def test_drm_write_signal_resolves_gpu_va_to_cpu_mapping(self):
+    backing = (ctypes.c_uint64 * 4)()
+    iface = DRMIface.__new__(DRMIface)
+    iface._allocations = {1:HCQBuffer(0x100000, ctypes.sizeof(backing),
+      view=MMIOInterface(ctypes.addressof(backing), ctypes.sizeof(backing)))}
+    iface.write_signal(0x100008, 0x1234)
+    self.assertEqual(backing[1], 0x1234)
+    with self.assertRaisesRegex(RuntimeError, "not CPU mapped"): iface.write_signal(0x200000, 1)
 
   def test_non_kfd_signal_does_not_emit_event(self):
     dev = SimpleNamespace(target=(8, 0, 3), xccs=1, iface=SimpleNamespace(has_queue_events=False), is_am=lambda: False)

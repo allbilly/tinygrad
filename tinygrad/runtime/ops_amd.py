@@ -100,6 +100,7 @@ class AMDComputeQueue(HWQueue):
   def __init__(self, dev:AMDDevice):
     self.dev, self.soc, self.pm4, self.gc, self.nbio = dev, dev.soc, dev.pm4, dev.gc, dev.nbio
     super().__init__()
+    self._host_signals:list[tuple[Any, MMIOInterface]] = []
 
   def __del__(self):
     if self.binded_device is not None:
@@ -107,11 +108,13 @@ class AMDComputeQueue(HWQueue):
 
   def pkt3(self, cmd, *vals): self.q(self.pm4.PACKET3(cmd, len(vals) - 1), *vals)
 
+  def _gfx8_kernel_submit(self):
+    return self.dev.target[0] == 8 and getattr(getattr(self.dev, "compute_queue", None), "submit_ib", None) is not None
+
   def _gfx8_host_managed_barrier(self):
     # Direct Polaris flushes host writes before ringing the doorbell. Kernel
     # submissions get gfx_v8_0_emit_mem_sync_compute before the user IB.
-    return self.dev.target[0] == 8 and (self.dev.is_am() or
-      getattr(getattr(self.dev, "compute_queue", None), "submit_ib", None) is not None)
+    return self.dev.target[0] == 8 and (self.dev.is_am() or self._gfx8_kernel_submit())
 
   def wreg(self, reg:AMDReg, *args:sint, **kwargs:int):
     if bool(args) == bool(kwargs): raise RuntimeError('One (and only one) of *args or **kwargs must be specified')
@@ -461,7 +464,11 @@ class AMDComputeQueue(HWQueue):
     self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
     return self
 
-  def wait(self, signal:AMDSignal, value:sint=0): return self.wait_reg_mem(mem=signal.value_addr, value=value, mask=0xffffffff)
+  def wait(self, signal:AMDSignal, value:sint=0):
+    # The DRM callback waits for the kernel fence before returning, so all
+    # submissions are already host-serialized. This also avoids a bound graph
+    # waiting in-kernel for a kickoff signal that is written after submit.
+    return self if self._gfx8_kernel_submit() else self.wait_reg_mem(mem=signal.value_addr, value=value, mask=0xffffffff)
 
   def timestamp(self, signal:AMDSignal):
     if self.dev.target[0] == 8 and self.dev.is_am(): return self
@@ -478,6 +485,14 @@ class AMDComputeQueue(HWQueue):
   def poll_bit(self, b:HCQBuffer, val:sint, mask:int): return self.wait_reg_mem(val, mask=mask, mem=b.va_addr, op=WAIT_REG_MEM_FUNCTION_EQ)
 
   def signal(self, signal:AMDSignal, value:sint=0):
+    if self._gfx8_kernel_submit():
+      # Resolve symbolic graph signal addresses/values into host staging. The
+      # actual CPU mapping is written only after the kernel fence completes.
+      vals = (ctypes.c_uint64 * 2)()
+      self._host_signals.append((vals, view:=MMIOInterface(ctypes.addressof(vals), ctypes.sizeof(vals), fmt='Q')))
+      self.bind_sints_to_mem(signal.value_addr, value, mem=view, fmt='Q')
+      return self
+
     with self.pred_exec(xcc_mask=0b1):
       # NOTE: this needs an EOP buffer on the queue or it will NULL pointer
       self.release_mem(signal.value_addr, value, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
@@ -515,10 +530,14 @@ class AMDComputeQueue(HWQueue):
       pad = (-(dev.compute_queue.put_value + len(cmds))) & 0xff
       cmds = [*cmds, *([self.pm4.PACKET3(self.pm4.PACKET3_NOP, 0x3fff)] * pad)]
 
-    for i, value in enumerate(cmds): dev.compute_queue.ring[(dev.compute_queue.put_value + i) % len(dev.compute_queue.ring)] = value
-
-    dev.compute_queue.put_value += len(cmds)
-    dev.compute_queue.signal_doorbell(dev)
+    if len(cmds):
+      for i, value in enumerate(cmds): dev.compute_queue.ring[(dev.compute_queue.put_value + i) % len(dev.compute_queue.ring)] = value
+      dev.compute_queue.put_value += len(cmds)
+      dev.compute_queue.signal_doorbell(dev)
+    elif not self._gfx8_kernel_submit(): dev.compute_queue.signal_doorbell(dev)
+    if self._gfx8_kernel_submit():
+      for _, vals in self._host_signals: dev.iface.write_signal(vals[0], vals[1])
+      System.memory_barrier()
 
 class AMDComputeAQLQueue(AMDComputeQueue):
   def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
@@ -1128,6 +1147,13 @@ class DRMIface:
   def map(self, mem):
     if mem.owner is self.dev: return mem
     raise RuntimeError("External mappings are not supported by the AMDGPU DRM interface")
+
+  def write_signal(self, va_addr:int, value:int):
+    for buf in self._allocations.values():
+      if isinstance(buf.va_addr, int) and buf.va_addr <= va_addr and va_addr + 8 <= buf.va_addr + buf.size:
+        buf.cpu_view().view(offset=va_addr-buf.va_addr, size=8, fmt='Q')[0] = value
+        return
+    raise RuntimeError(f"AMDGPU DRM signal address {va_addr:#x} is not CPU mapped")
 
   def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
                    xcc_id=0, idx=0):
