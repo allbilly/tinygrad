@@ -1,3 +1,4 @@
+# flake8: noqa: E702
 from __future__ import annotations
 
 import struct
@@ -12,102 +13,32 @@ from tinygrad.renderer.isa import ISARenderer, IselContext, Register, greg
 from tinygrad.uop import FastEnum
 from tinygrad.uop.ops import GroupOp, Ops, PatternMatcher, UOp, UPat
 
-
 class GFX803Ops(FastEnum):
   # DEFINE is a fixed-register placeholder and FLAT_ADDR expands to multiple
   # real GCN3 instructions. The remaining values map one-to-one to hardware.
-  DEFINE = auto()
-  REG_BUFFER_META = auto()
-  REG_BUFFER = auto()
-  SCRATCH_BUFFER_META = auto()
-  SCRATCH_BUFFER_ADDR = auto()
-  LDS_BUFFER = auto()
-  SCRATCH_SETUP = auto()
-  SCRATCH_TEARDOWN = auto()
-  SCRATCH_LOAD_B32 = auto()
-  SCRATCH_LOAD_U16 = auto()
-  SCRATCH_LOAD_S16 = auto()
-  SCRATCH_LOAD_U8 = auto()
-  SCRATCH_LOAD_S8 = auto()
-  SCRATCH_LOAD_B64 = auto()
-  SCRATCH_STORE_B32 = auto()
-  SCRATCH_STORE_B16 = auto()
-  SCRATCH_STORE_B8 = auto()
-  SCRATCH_STORE_B64 = auto()
-  S_LOAD_B64 = auto()
-  V_MOV_B32 = auto()
-  FLAT_ADDR = auto()
-  LDS_ADDR = auto()
-  FLAT_LOAD_B32 = auto()
-  FLAT_LOAD_U16 = auto()
-  FLAT_LOAD_S16 = auto()
-  FLAT_LOAD_U8 = auto()
-  FLAT_LOAD_S8 = auto()
-  GATED_FLAT_LOAD_B32 = auto()
-  GATED_FLAT_LOAD_U16 = auto()
-  GATED_FLAT_LOAD_S16 = auto()
-  GATED_FLAT_LOAD_U8 = auto()
-  GATED_FLAT_LOAD_S8 = auto()
-  FLAT_STORE_B32 = auto()
-  FLAT_STORE_B16 = auto()
-  FLAT_STORE_B8 = auto()
-  GATED_FLAT_STORE_B32 = auto()
-  GATED_FLAT_STORE_B16 = auto()
-  GATED_FLAT_STORE_B8 = auto()
-  DS_LOAD_B32 = auto()
-  DS_LOAD_U16 = auto()
-  DS_LOAD_S16 = auto()
-  DS_LOAD_U8 = auto()
-  DS_LOAD_S8 = auto()
-  DS_STORE_B32 = auto()
-  DS_STORE_B16 = auto()
-  DS_STORE_B8 = auto()
-  REG_STORE_B32 = auto()
-  V_ADD_U32 = auto()
-  V_LSHLREV_B32 = auto()
-  V_LSHRREV_B32 = auto()
-  V_ASHRREV_I32 = auto()
-  V_AND_B32 = auto()
-  V_OR_B32 = auto()
-  V_XOR_B32 = auto()
-  V_MUL_LO_U32 = auto()
-  V_MUL_HI_U32 = auto()
-  V_BFE_I32 = auto()
-  V_BFE_U32 = auto()
-  V_ADD_F32 = auto()
-  V_MUL_F32 = auto()
-  V_MAX_F32 = auto()
-  V_MAX_I32 = auto()
-  V_MAX_U32 = auto()
-  V_CVT_F32_F16 = auto()
-  V_CVT_F16_F32 = auto()
-  V_CVT_F32_I32 = auto()
-  V_CVT_F32_U32 = auto()
-  V_CVT_I32_F32 = auto()
-  V_CVT_U32_F32 = auto()
-  V_CVT_I16_F16 = auto()
-  V_CVT_U16_F16 = auto()
-  V_CVT_F16_I16 = auto()
-  V_CVT_F16_U16 = auto()
-  V_TRUNC = auto()
-  V_RCP_F32 = auto()
-  V_RCP_IFLAG_F32 = auto()
-  V_SQRT_F32 = auto()
-  V_RSQ_F32 = auto()
-  V_EXP2_F32 = auto()
-  V_LOG2_F32 = auto()
-  V_SIN = auto()
-  V_CMPLT = auto()
-  V_CMPEQ = auto()
-  V_CMPNE = auto()
-  V_CNDMASK_B32 = auto()
-  V_CMP_GT_U32 = auto()
-  S_WAITCNT = auto()
-  S_BARRIER = auto()
-  LABEL = auto()
-  S_CBRANCH_VCCNZ = auto()
-  S_ENDPGM = auto()
-
+  DEFINE = auto(); REG_BUFFER_META = auto(); REG_BUFFER = auto(); SCRATCH_BUFFER_META = auto(); SCRATCH_BUFFER_ADDR = auto()
+  LDS_BUFFER = auto(); SCRATCH_SETUP = auto(); SCRATCH_TEARDOWN = auto()
+  SCRATCH_LOAD_B32 = auto(); SCRATCH_LOAD_U16 = auto(); SCRATCH_LOAD_S16 = auto(); SCRATCH_LOAD_U8 = auto()
+  SCRATCH_LOAD_S8 = auto(); SCRATCH_LOAD_B64 = auto(); SCRATCH_STORE_B32 = auto(); SCRATCH_STORE_B16 = auto()
+  SCRATCH_STORE_B8 = auto(); SCRATCH_STORE_B64 = auto()
+  S_LOAD_B64 = auto(); V_MOV_B32 = auto(); FLAT_ADDR = auto(); LDS_ADDR = auto()
+  FLAT_LOAD_B32 = auto(); FLAT_LOAD_U16 = auto(); FLAT_LOAD_S16 = auto(); FLAT_LOAD_U8 = auto(); FLAT_LOAD_S8 = auto()
+  GATED_FLAT_LOAD_B32 = auto(); GATED_FLAT_LOAD_U16 = auto(); GATED_FLAT_LOAD_S16 = auto()
+  GATED_FLAT_LOAD_U8 = auto(); GATED_FLAT_LOAD_S8 = auto()
+  FLAT_STORE_B32 = auto(); FLAT_STORE_B16 = auto(); FLAT_STORE_B8 = auto()
+  GATED_FLAT_STORE_B32 = auto(); GATED_FLAT_STORE_B16 = auto(); GATED_FLAT_STORE_B8 = auto()
+  DS_LOAD_B32 = auto(); DS_LOAD_U16 = auto(); DS_LOAD_S16 = auto(); DS_LOAD_U8 = auto(); DS_LOAD_S8 = auto()
+  DS_STORE_B32 = auto(); DS_STORE_B16 = auto(); DS_STORE_B8 = auto(); REG_STORE_B32 = auto()
+  V_ADD_U32 = auto(); V_LSHLREV_B32 = auto(); V_LSHRREV_B32 = auto(); V_ASHRREV_I32 = auto()
+  V_AND_B32 = auto(); V_OR_B32 = auto(); V_XOR_B32 = auto(); V_MUL_LO_U32 = auto(); V_MUL_HI_U32 = auto()
+  V_BFE_I32 = auto(); V_BFE_U32 = auto(); V_ADD_F32 = auto(); V_MUL_F32 = auto(); V_MAX_F32 = auto()
+  V_MAX_I32 = auto(); V_MAX_U32 = auto(); V_CVT_F32_F16 = auto(); V_CVT_F16_F32 = auto()
+  V_CVT_F32_I32 = auto(); V_CVT_F32_U32 = auto(); V_CVT_I32_F32 = auto(); V_CVT_U32_F32 = auto()
+  V_CVT_I16_F16 = auto(); V_CVT_U16_F16 = auto(); V_CVT_F16_I16 = auto(); V_CVT_F16_U16 = auto()
+  V_TRUNC = auto(); V_RCP_F32 = auto(); V_RCP_IFLAG_F32 = auto(); V_SQRT_F32 = auto(); V_RSQ_F32 = auto()
+  V_EXP2_F32 = auto(); V_LOG2_F32 = auto(); V_SIN = auto(); V_CMPLT = auto(); V_CMPEQ = auto(); V_CMPNE = auto()
+  V_CNDMASK_B32 = auto(); V_CMP_GT_U32 = auto(); S_WAITCNT = auto(); S_BARRIER = auto(); LABEL = auto()
+  S_CBRANCH_VCCNZ = auto(); S_ENDPGM = auto()
 
 @dataclass(frozen=True)
 class GFX803Instruction:
@@ -119,7 +50,6 @@ class GFX803Instruction:
 
   def to_bytes(self) -> bytes: return self.data
   def __str__(self) -> str: return self.text
-
 
 # The old linear allocator in this branch does not model overlapping wide
 # registers. Keep 64-bit addresses and scalar values in disjoint VGPR banks.
@@ -136,15 +66,12 @@ REG_BUFFER_BASE = 224
 REG_BUFFER_COUNT = 256 - REG_BUFFER_BASE
 SCRATCH_RSRC_INDEX = 36
 
-
 def _fixed_reg(dtype:DType, reg:Register) -> UOp: return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(reg,))
 def _const_u32(value:int) -> UOp: return UOp.const(dtypes.uint32, value)
-
 
 def _reg_buffer_offset(ctx:IselContext, x:UOp) -> int:
   buffers = sorted((u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG), key=lambda u: int(u.arg.slot))
   return sum(int(u.src[0].arg) for u in buffers[:buffers.index(x)])
-
 
 def _reg_buffer_scratch_layout(ctx:IselContext) -> tuple[dict[UOp, int], int]:
   offsets:dict[UOp, int] = {}
@@ -156,10 +83,8 @@ def _reg_buffer_scratch_layout(ctx:IselContext) -> tuple[dict[UOp, int], int]:
     cursor += int(buf.src[0].arg) * buf.dtype.itemsize
   return offsets, cursor
 
-
 def _reg_buffers_use_scratch(ctx:IselContext) -> bool:
   return sum(int(u.src[0].arg) for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG) > REG_BUFFER_COUNT
-
 
 def _abi(ctx:IselContext, x:UOp) -> UOp|None:
   if x.tag is True: return None
@@ -181,7 +106,6 @@ def _abi(ctx:IselContext, x:UOp) -> UOp|None:
   # index arithmetic; pointer arguments keep the full loaded pair.
   value = UOp(Ops.INS, x.dtype, (load,), GFX803Ops.V_MOV_B32) if x.addrspace is AddrSpace.ALU else load
   return value.after(x.rtag())
-
 
 def _global_index(ctx:IselContext, x:UOp, base:UOp, idx:UOp) -> UOp|None:
   deps:tuple[UOp, ...] = ()
@@ -229,7 +153,6 @@ def _global_index(ctx:IselContext, x:UOp, base:UOp, idx:UOp) -> UOp|None:
     offset = UOp(Ops.SHL, idx.dtype, (idx, UOp.const(idx.dtype, shift))) if shift else idx
   return UOp(Ops.INS, dtypes.uint64, (base, offset), GFX803Ops.FLAT_ADDR)
 
-
 def _indexed_addrspace(addr:UOp) -> AddrSpace|None:
   root = addr
   while root.op is Ops.AFTER: root = root.src[0]
@@ -243,11 +166,9 @@ def _indexed_addrspace(addr:UOp) -> AddrSpace|None:
   if root.op is Ops.INS and root.arg is GFX803Ops.LDS_BUFFER: return AddrSpace.LOCAL
   return None
 
-
 def _scratch_buffer_addr(addr:UOp) -> UOp|None:
   while addr.op is Ops.AFTER: addr = addr.src[0]
   return addr if addr.op is Ops.INS and addr.arg is GFX803Ops.SCRATCH_BUFFER_ADDR else None
-
 
 def _scratch_buffer_offset(ctx:IselContext, addr:UOp) -> int|None:
   while addr.op is Ops.AFTER: addr = addr.src[0]
@@ -266,7 +187,6 @@ def _scratch_buffer_offset(ctx:IselContext, addr:UOp) -> int|None:
   if not 0 <= elem < size: raise RuntimeError(f"unsupported gfx803 scratch buffer shape/index: {size=}, {elem=}")
   return byte_offset + elem * addr.dtype.itemsize
 
-
 def _scratch_load_op(dtype:DType) -> GFX803Ops:
   if dtype.itemsize == 8: return GFX803Ops.SCRATCH_LOAD_B64
   if dtype is dtypes.int8: return GFX803Ops.SCRATCH_LOAD_S8
@@ -275,13 +195,11 @@ def _scratch_load_op(dtype:DType) -> GFX803Ops:
   if dtype.itemsize == 2: return GFX803Ops.SCRATCH_LOAD_U16
   return GFX803Ops.SCRATCH_LOAD_B32
 
-
 def _scratch_store_op(dtype:DType) -> GFX803Ops:
   if dtype.itemsize == 8: return GFX803Ops.SCRATCH_STORE_B64
   if dtype.itemsize == 1: return GFX803Ops.SCRATCH_STORE_B8
   if dtype.itemsize == 2: return GFX803Ops.SCRATCH_STORE_B16
   return GFX803Ops.SCRATCH_STORE_B32
-
 
 def _load(ctx:IselContext, x:UOp, addr:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp|None:
   if x.dtype not in (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32):
@@ -307,7 +225,6 @@ def _load(ctx:IselContext, x:UOp, addr:UOp, alt:UOp|None=None, gate:UOp|None=Non
     op = gated if gate is not None else plain
   return UOp(Ops.INS, x.dtype, (addr, *((alt, gate) if gate is not None else ())), op)
 
-
 def _store(ctx:IselContext, x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
   if value.dtype not in (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32):
     raise NotImplementedError(f"gfx803 store dtype {value.dtype} is not lowered yet")
@@ -331,7 +248,6 @@ def _store(ctx:IselContext, x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> U
   return UOp(Ops.INS, dtypes.void, (addr, value, *((gate,) if gate is not None else ())),
              store_op)
 
-
 def _buffer(ctx:IselContext, x:UOp) -> UOp:
   if x.addrspace is AddrSpace.REG:
     offset = _reg_buffer_offset(ctx, x)
@@ -344,18 +260,14 @@ def _buffer(ctx:IselContext, x:UOp) -> UOp:
     return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, x.arg.slot), x.src[0]), GFX803Ops.LDS_BUFFER, True)
   raise RuntimeError(f"unexpected gfx803 buffer address space {x.addrspace}")
 
-
 def _range(ctx:IselContext, x:UOp) -> UOp|None:
   return x.replace(tag=(ctx.vreg(VGPR32),)) if not isinstance(x.tag, tuple) else None
 
-
 def _barrier(x:UOp) -> UOp: return UOp(Ops.INS, dtypes.void, x.src, GFX803Ops.S_BARRIER)
-
 
 def _stack_adjust(x:UOp, base:UOp, size:UOp) -> UOp|None:
   if greg(base) != SCRATCH_PTR or size.op is not Ops.CONST: return None
   return UOp(Ops.INS, dtypes.void, (size,), GFX803Ops.SCRATCH_SETUP if x.op is Ops.SUB else GFX803Ops.SCRATCH_TEARDOWN)
-
 
 def _alloc_vreg(ctx:IselContext, x:UOp) -> UOp|None:
   if x.dtype is dtypes.void or x.arg in {GFX803Ops.REG_BUFFER_META, GFX803Ops.REG_BUFFER, GFX803Ops.SCRATCH_BUFFER_META,
@@ -364,18 +276,14 @@ def _alloc_vreg(ctx:IselContext, x:UOp) -> UOp|None:
   regs = SGPR64 if x.arg is GFX803Ops.S_LOAD_B64 else VGPR64 if x.arg is GFX803Ops.FLAT_ADDR else VGPR32
   return x.replace(tag=(ctx.vreg(regs),))
 
-
 def _bfe(value:UOp, dtype:DType, width:int, signed:bool) -> UOp:
   return UOp(Ops.INS, dtype, (value, _const_u32(0), _const_u32(width)), GFX803Ops.V_BFE_I32 if signed else GFX803Ops.V_BFE_U32)
-
 
 def _normalize_int(value:UOp, dtype:DType) -> UOp:
   return value if dtype is dtypes.bool or dtype.itemsize == 4 else _bfe(value, dtype, dtype.bitsize, dtype in dtypes.sints)
 
-
 def _int_add(x:UOp, a:UOp, b:UOp) -> UOp:
   return _normalize_int(UOp(Ops.INS, x.dtype, (b, a) if b.op is Ops.CONST else (a, b), GFX803Ops.V_ADD_U32), x.dtype)
-
 
 def _int_mul(x:UOp, a:UOp, b:UOp) -> UOp:
   const:UOp
@@ -392,19 +300,16 @@ def _int_mul(x:UOp, a:UOp, b:UOp) -> UOp:
       result = UOp(Ops.INS, x.dtype, (value, const), GFX803Ops.V_MUL_LO_U32)
   return _normalize_int(result, x.dtype)
 
-
 def _bitwise(x:UOp, a:UOp, b:UOp) -> UOp:
   if b.op is Ops.CONST: a, b = b, a
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
   result = UOp(Ops.INS, x.dtype, (a, b), {Ops.AND:GFX803Ops.V_AND_B32, Ops.OR:GFX803Ops.V_OR_B32, Ops.XOR:GFX803Ops.V_XOR_B32}[x.op])
   return _normalize_int(result, x.dtype)
 
-
 def _bitcast(x:UOp, value:UOp) -> UOp|None:
   if x.dtype.itemsize != value.dtype.itemsize or x.dtype.itemsize > 4: return None
   moved = UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
   return _normalize_int(moved, x.dtype) if x.dtype in (*dtypes.int8s, *dtypes.int16s) else moved
-
 
 def _shift(x:UOp, value:UOp, shift:UOp) -> UOp:
   if value.op is Ops.CONST: value = UOp(Ops.INS, value.dtype, (value,), GFX803Ops.V_MOV_B32)
@@ -412,28 +317,22 @@ def _shift(x:UOp, value:UOp, shift:UOp) -> UOp:
        GFX803Ops.V_ASHRREV_I32 if x.dtype in dtypes.sints else GFX803Ops.V_LSHRREV_B32
   return _normalize_int(UOp(Ops.INS, x.dtype, (shift, value), op), x.dtype)
 
-
 def _isel_cast(dtype:DType, value:UOp) -> UOp:
   ret = _cast(UOp(Ops.CAST, dtype, (value,)), value)
   if ret is None: raise NotImplementedError(f"gfx803 internal cast from {value.dtype} to {dtype} is not lowered")
   return ret
 
-
 def _uint_add(a:UOp, b:UOp) -> UOp:
   return _int_add(UOp(Ops.ADD, dtypes.uint32, (a, b)), a, b)
-
 
 def _uint_mul(a:UOp, b:UOp) -> UOp:
   return _int_mul(UOp(Ops.MUL, dtypes.uint32, (a, b)), a, b)
 
-
 def _uint_neg(value:UOp) -> UOp:
   return _uint_mul(value, UOp.const(dtypes.uint32, 0xffffffff))
 
-
 def _uint_sub(a:UOp, b:UOp) -> UOp:
   return _uint_add(a, _uint_neg(b))
-
 
 def _uint_divmod(dividend:UOp, divisor:UOp) -> tuple[UOp, UOp]:
   # This is the reciprocal estimate and two-correction sequence emitted by
@@ -457,7 +356,6 @@ def _uint_divmod(dividend:UOp, divisor:UOp) -> tuple[UOp, UOp]:
     remainder = _where(UOp(Ops.WHERE, dtypes.uint32, (below, remainder, next_remainder)), below, remainder, next_remainder)
   return quotient, remainder
 
-
 def _int_divmod(x:UOp, a:UOp, b:UOp) -> UOp:
   unsigned = x.dtype in dtypes.uints
   dividend, divisor = _isel_cast(dtypes.uint32, a), _isel_cast(dtypes.uint32, b)
@@ -480,7 +378,6 @@ def _int_divmod(x:UOp, a:UOp, b:UOp) -> UOp:
     value = _where(UOp(Ops.WHERE, dtypes.uint32, (a_negative, negative_remainder, remainder)), a_negative, negative_remainder, remainder)
   return _isel_cast(x.dtype, value)
 
-
 def _float_unary(x:UOp, value:UOp) -> UOp:
   if x.op is Ops.SIN:
     # V_SIN consumes turns, not radians, and has a finite input interval. Do
@@ -501,10 +398,8 @@ def _float_unary(x:UOp, value:UOp) -> UOp:
     return UOp(Ops.INS, dtypes.half, (result,), GFX803Ops.V_CVT_F16_F32)
   return UOp(Ops.INS, x.dtype, (value,), op)
 
-
 def _rsqrt(x:UOp, value:UOp) -> UOp:
   return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_RSQ_F32)
-
 
 def _half_to_float(value:UOp) -> UOp:
   if value.dtype is dtypes.float32: return value
@@ -516,7 +411,6 @@ def _half_to_float(value:UOp) -> UOp:
     return UOp(Ops.WHERE, dtypes.float32, (value.src[0], _half_to_float(value.src[1]), _half_to_float(value.src[2])), value.arg)
   if value.op is Ops.CONST: value = UOp(Ops.INS, dtypes.half, (value,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, dtypes.float32, (value,), GFX803Ops.V_CVT_F32_F16)
-
 
 def _float_bin(x:UOp, a:UOp, b:UOp, ins:GFX803Ops) -> UOp:
   # a / b arrives as a * reciprocal(b). Keeping the reciprocal in half can
@@ -536,23 +430,19 @@ def _float_bin(x:UOp, a:UOp, b:UOp, ins:GFX803Ops) -> UOp:
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (a, b), ins)
 
-
 def _int_max(x:UOp, a:UOp, b:UOp) -> UOp:
   if b.op is Ops.CONST: a, b = b, a
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MAX_I32 if x.dtype in dtypes.sints else GFX803Ops.V_MAX_U32)
 
-
 def _cmp(x:UOp, a:UOp, b:UOp) -> UOp:
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (a, b), {Ops.CMPLT:GFX803Ops.V_CMPLT, Ops.CMPEQ:GFX803Ops.V_CMPEQ, Ops.CMPNE:GFX803Ops.V_CMPNE}[x.op])
-
 
 def _where(x:UOp, cond:UOp, true_value:UOp, false_value:UOp) -> UOp:
   if true_value.op is Ops.CONST: true_value = UOp(Ops.INS, true_value.dtype, (true_value,), GFX803Ops.V_MOV_B32)
   if false_value.op is Ops.CONST: false_value = UOp(Ops.INS, false_value.dtype, (false_value,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (cond, true_value, false_value), GFX803Ops.V_CNDMASK_B32)
-
 
 def _cast(x:UOp, value:UOp) -> UOp|None:
   if x.dtype is dtypes.bool:
@@ -603,14 +493,11 @@ def _cast(x:UOp, value:UOp) -> UOp|None:
     return UOp(Ops.INS, x.dtype, (widened,), op)
   return None
 
-
 def _unsupported_elementwise(x:UOp):
   raise NotImplementedError(f"gfx803 {x.op.name} {x.dtype} from {tuple(s.dtype for s in x.src)} is not lowered yet")
 
-
 def _is_const(x:UOp, value:float) -> bool:
   return x.op is Ops.CONST and x.arg == value
-
 
 def _relu_input(x:UOp) -> UOp|None:
   if x.op is not Ops.WHERE or len(x.src) != 3: return None
@@ -618,13 +505,11 @@ def _relu_input(x:UOp) -> UOp|None:
   if cond.op is not Ops.CMPLT or len(cond.src) != 2: return None
   return true_value if cond.src[1] is true_value and _is_const(cond.src[0], 0) and _is_const(false_value, 0) else None
 
-
 def _add_without_const(x:UOp, value:float) -> UOp|None:
   if x.op is not Ops.ADD or len(x.src) != 2: return None
   if _is_const(x.src[0], value): return x.src[1]
   if _is_const(x.src[1], value): return x.src[0]
   return None
-
 
 def _stable_hardsigmoid(x:UOp) -> UOp|None:
   # hardsigmoid is optimized into relu(y) - relu(y-1). Subtracting two
@@ -645,12 +530,10 @@ def _stable_hardsigmoid(x:UOp) -> UOp|None:
     return UOp(Ops.WHERE, x.dtype, (below, zero, UOp(Ops.WHERE, x.dtype, (above, one, y))))
   return None
 
-
 def _widen_half_product(a:UOp, b:UOp) -> UOp:
   # Half reductions already accumulate in float32. Widen before multiplying
   # too, matching the product precision used by GPU dot/conv contracts.
   return UOp(Ops.MUL, dtypes.float32, (_half_to_float(a), _half_to_float(b)))
-
 
 def _widen_half_bias_add(a:UOp, b:UOp) -> UOp|None:
   # Conv bias arrives after a premature float32-to-half cast of the reduction.
@@ -659,7 +542,6 @@ def _widen_half_bias_add(a:UOp, b:UOp) -> UOp|None:
   if rounded.op is not Ops.CAST or rounded.dtype is not dtypes.half or rounded.src[0].dtype is not dtypes.float32: return None
   wide_sum = UOp(Ops.ADD, dtypes.float32, (rounded.src[0], _half_to_float(bias)))
   return UOp(Ops.CAST, dtypes.half, (wide_sum,), dtypes.half)
-
 
 pre_isel_matcher = PatternMatcher([
   (UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float32),
@@ -702,17 +584,14 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.INS, name="x"), _alloc_vreg),
 ])
 
-
 def _finish(x:UOp) -> tuple[UOp, list[UOp]]:
   return x, [UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_ENDPGM)]
-
 
 def _lower_range(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   label = ".LOOP_" + "_".join(str(v) for v in x.arg[:-1])
   acc = UOp(Ops.INS, x.dtype, (UOp.const(x.dtype, 0),), GFX803Ops.V_MOV_B32, x.tag)
   ctx.loop_label[acc], ctx.locals[acc] = label, x.src[0]
   return acc, [acc, UOp(Ops.INS, dtypes.void, arg=GFX803Ops.LABEL, tag=label)]
-
 
 def _lower_end(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   acc = x.src[-1]
@@ -721,7 +600,6 @@ def _lower_end(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
   branch = UOp(Ops.INS, dtypes.void, (cmp,), GFX803Ops.S_CBRANCH_VCCNZ, ctx.loop_label[acc])
   return inc, [inc, cmp, branch]
 
-
 post_regalloc_matcher = PatternMatcher([
   (UPat(Ops.SINK, name="x"), _finish),
   (UPat(Ops.RANGE, name="x"), _lower_range),
@@ -729,12 +607,10 @@ post_regalloc_matcher = PatternMatcher([
   (UPat(GroupOp.All - {Ops.INS}, name="x"), lambda x: (x, [])),
 ])
 
-
 def _physical_reg(x:UOp) -> Register:
   reg = greg(x)
   if not isinstance(reg, Register): raise RuntimeError(f"expected physical register for {x.op}, got {reg!r}")
   return reg
-
 
 def _register_counts(x:UOp) -> tuple[int, int, int]:
   vgprs = sgprs = 0
@@ -746,40 +622,31 @@ def _register_counts(x:UOp) -> tuple[int, int, int]:
     elif reg.name.startswith("s"): sgprs = max(sgprs, count)
   return vgprs, sgprs, 0
 
-
 def _word(value:int) -> bytes: return struct.pack("<I", value & 0xffffffff)
-
 
 def _vop1(op:int, dst:int, src0:int) -> int:
   return 0x7e000000 | ((dst & 0xff) << 17) | ((op & 0xff) << 9) | (src0 & 0x1ff)
 
-
 def _vop2(op:int, dst:int, src0:int, src1:int) -> int:
   return ((op & 0x3f) << 25) | ((dst & 0xff) << 17) | ((src1 & 0xff) << 9) | (src0 & 0x1ff)
-
 
 def _vop3(op:int, dst:int, src0:int, src1:int) -> tuple[int, int]:
   return 0xd0000000 | ((op & 0x3ff) << 16) | (dst & 0xff), (src0 & 0x1ff) | ((src1 & 0x1ff) << 9)
 
-
 def _vop3_3(op:int, dst:int, src0:int, src1:int, src2:int) -> tuple[int, int]:
   return _vop3(op, dst, src0, src1)[0], (src0 & 0x1ff) | ((src1 & 0x1ff) << 9) | ((src2 & 0x1ff) << 18)
 
-
 def _vopc(op:int, src0:int, src1:int) -> int:
   return 0x7c000000 | ((op & 0xff) << 17) | ((src1 & 0xff) << 9) | (src0 & 0x1ff)
-
 
 def _mubuf(op:int, offset:int, vdata:int, srsrc:int=SCRATCH_RSRC_INDEX) -> bytes:
   if not 0 <= offset <= 0xfff: raise OverflowError(f"gfx803 scratch byte offset out of range: {offset}")
   if srsrc % 4: raise ValueError(f"gfx803 buffer resource must start on four SGPRs: s{srsrc}")
   return _word(0xe0000000 | ((op & 0x7f) << 18) | offset) + _word(0x80000000 | ((srsrc // 4) << 16) | (vdata << 8))
 
-
 def _half_bits(value:float) -> int:
   try: return struct.unpack("<H", struct.pack("<e", value))[0]
   except OverflowError: return 0x7c00 if value > 0 else 0xfc00
-
 
 def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
   if x.op is Ops.CONST:
@@ -803,7 +670,6 @@ def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
   reg = _physical_reg(x)
   return (256 + reg.index if reg.name.startswith("v") else reg.index), ()
 
-
 def _raw_src0(x:UOp) -> tuple[int, tuple[int, ...], str]:
   if x.op is Ops.CONST and x.dtype is dtypes.half:
     value = _half_bits(float(x.arg))
@@ -811,7 +677,6 @@ def _raw_src0(x:UOp) -> tuple[int, tuple[int, ...], str]:
     return src, literal, str(value) if not literal else f"{value:#x}"
   src, literal = _src0(x)
   return src, literal, str(x.arg) if x.op is Ops.CONST else _physical_reg(x).name
-
 
 _VOP2_ENCODINGS:dict[tuple[GFX803Ops, DType|None], tuple[int, str]] = {
   (GFX803Ops.V_ADD_U32, None):(0x19, "v_add_u32_e32"), (GFX803Ops.V_LSHLREV_B32, None):(0x12, "v_lshlrev_b32_e32"),
@@ -842,7 +707,6 @@ _VOP1_ENCODINGS:dict[tuple[GFX803Ops, DType|None], tuple[int, str]] = {
 }
 _VOP1_OPS = {op for op, _ in _VOP1_ENCODINGS}
 
-
 _SCRATCH_ENCODINGS:dict[GFX803Ops, tuple[int, str]] = {
   GFX803Ops.SCRATCH_LOAD_U8:(0x10, "buffer_load_ubyte"), GFX803Ops.SCRATCH_LOAD_S8:(0x11, "buffer_load_sbyte"),
   GFX803Ops.SCRATCH_LOAD_U16:(0x12, "buffer_load_ushort"), GFX803Ops.SCRATCH_LOAD_S16:(0x13, "buffer_load_sshort"),
@@ -866,10 +730,8 @@ _MEMORY_ENCODINGS:dict[GFX803Ops, tuple[int, str]] = {
 _GATED_MEMORY_OPS = {op for op in GFX803Ops if op.name.startswith("GATED_FLAT_")}
 _ASYNC_MEMORY_OPS = {GFX803Ops.S_LOAD_B64, *_SCRATCH_ENCODINGS, *_MEMORY_ENCODINGS, *_GATED_MEMORY_OPS}
 
-
 def _typed_encoding(encodings:dict[tuple[GFX803Ops, DType|None], tuple[int, str]], x:UOp) -> tuple[int, str]:
   return encodings.get((x.arg, x.dtype), encodings[(x.arg, None)]) if (x.arg, None) in encodings else encodings[(x.arg, x.dtype)]
-
 
 def _encode_scratch(x:UOp, dst:Register|None) -> tuple[bytes, str]:
   loading = x.arg in _SCRATCH_LOADS
@@ -885,7 +747,6 @@ def _encode_scratch(x:UOp, dst:Register|None) -> tuple[bytes, str]:
                    (f" offset:{scratch_offset+i*4}" if scratch_offset+i*4 else "") for i in range(words))
   return data, text
 
-
 def _encode_memory(x:UOp, dst:Register|None) -> tuple[bytes, str]:
   opcode, mnemonic = _MEMORY_ENCODINGS[x.arg]
   addr, loading, flat = _physical_reg(x.src[0]), "LOAD" in x.arg.name, x.arg.name.startswith("FLAT_")
@@ -896,7 +757,6 @@ def _encode_memory(x:UOp, dst:Register|None) -> tuple[bytes, str]:
   address = f"v[{addr.index}:{addr.index+1}]" if flat else f"v{addr.index}"
   operands = f"v{reg.index}, {address}" if loading else f"{address}, v{reg.index}"
   return _word(opcode) + _word((reg.index << shift) | addr.index), f"{mnemonic} {operands}"
-
 
 def _encode_gated_memory(x:UOp, dst:Register|None) -> tuple[bytes, str]:
   loading = "LOAD" in x.arg.name
@@ -918,7 +778,6 @@ def _encode_gated_memory(x:UOp, dst:Register|None) -> tuple[bytes, str]:
   text = "\n".join([f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}", *init_text, "s_and_saveexec_b64 s[32:33], vcc",
                     f"{mnemonic} {operands}", "s_mov_b64 exec, s[32:33]"])
   return data, text
-
 
 def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
   counts = _register_counts(x)
@@ -1093,7 +952,6 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     data, text = _word(0xbf810000), "s_endpgm"
   else: raise RuntimeError(f"cannot encode gfx803 instruction {x.arg}")
   return GFX803Instruction(data, text, counts, lds_size, scratch_size)
-
 
 class AMDASMRenderer(ISARenderer):
   device = "AMD"
