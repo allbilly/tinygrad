@@ -72,14 +72,48 @@ class TestGFX803Encoder(unittest.TestCase):
       (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 0), b), GFX803Ops.V_MAX_F32, out.tag),
        ("v_max_f32_e32 v39, 0, v37",)),
       (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPLT, cond.tag),
-       ("v_mov_b32_e32 v38, 1", "v_cmp_lt_f32_e32 vcc, v36, v37", "v_cndmask_b32_e32 v38, 0, v38, vcc")),
+       ("v_cmp_lt_f32_e32 vcc, v36, v37", "v_cndmask_b32_e64 v38, 0, 1, vcc")),
       (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPNE, cond.tag),
-       ("v_mov_b32_e32 v38, 1", "v_cmp_neq_f32_e32 vcc, v36, v37", "v_cndmask_b32_e32 v38, 0, v38, vcc")),
+       ("v_cmp_neq_f32_e32 vcc, v36, v37", "v_cndmask_b32_e64 v38, 0, 1, vcc")),
       (UOp(Ops.INS, dtypes.float32, (cond, a, b), GFX803Ops.V_CNDMASK_B32, out.tag),
        ("v_cmp_ne_u32_e32 vcc, 0, v38", "v_cndmask_b32_e32 v39, v37, v36, vcc")),
     ]
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
+    # The destination may alias a dying input. The compare must read v36
+    # before materializing its boolean result back into v36.
+    aliased = UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPNE, a.tag)
+    self.assertEqual(_encode(aliased).to_bytes(), _assembled(
+      "v_cmp_neq_f32_e32 vcc, v36, v37", "v_cndmask_b32_e64 v36, 0, 1, vcc"))
+
+  def test_lds_loop_and_gated_store(self):
+    idx, lds_addr = _reg(dtypes.int32, "v36", 36), _reg(dtypes.uint32, "v37", 37)
+    value, loaded, gate = _reg(dtypes.float32, "v38", 38), _reg(dtypes.float32, "v39", 39), _reg(dtypes.bool, "v40", 40)
+    global_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8)
+    lds = UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.int32, 0), UOp.const(dtypes.int32, 16)), GFX803Ops.LDS_BUFFER, True)
+
+    lds_inst = _encode(lds)
+    self.assertEqual(lds_inst.lds_size, 64)
+    self.assertEqual(lds_inst.to_bytes(), _assembled("s_mov_b32 m0, -1"))
+    cases = [
+      (UOp(Ops.INS, dtypes.uint32, (idx, UOp.const(dtypes.int32, 2), lds), GFX803Ops.LDS_ADDR, lds_addr.tag),
+       ("v_lshlrev_b32_e32 v37, 2, v36",), 0),
+      (UOp(Ops.INS, dtypes.float32, (lds_addr,), GFX803Ops.DS_LOAD_B32, loaded.tag),
+       ("ds_read_b32 v39, v37",), 0),
+      (UOp(Ops.INS, dtypes.void, (lds_addr, value), GFX803Ops.DS_STORE_B32),
+       ("ds_write_b32 v37, v38",), 0),
+      (UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_BARRIER), ("s_barrier",), 0),
+      (UOp(Ops.INS, dtypes.void, (UOp.const(dtypes.int32, 16), idx), GFX803Ops.V_CMP_GT_U32),
+       ("v_cmp_gt_u32_e32 vcc, 16, v36",), 0),
+      (UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_CBRANCH_VCCNZ, tag=".LOOP"),
+       ("s_cbranch_vccnz -10",), -10),
+      (UOp(Ops.INS, dtypes.void, (global_addr, value, gate), GFX803Ops.GATED_FLAT_STORE_B32),
+       ("v_cmp_ne_u32_e32 vcc, 0, v40", "s_and_saveexec_b64 s[32:33], vcc",
+        "flat_store_dword v[4:5], v38", "s_mov_b64 exec, s[32:33]"), 0),
+    ]
+    for uop, lines, branch_offset in cases:
+      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop, branch_offset).to_bytes(), _assembled(*lines))
 
 
 class TestGFX803Program(unittest.TestCase):
@@ -165,6 +199,34 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(_assembled(*lines), text.content)
         self.assertEqual(sum(line.startswith("v_mul_f32") for line in lines), n)
         self.assertEqual(sum(line.startswith("v_add_f32") for line in lines), n-1)
+
+  def test_grouped_reduction_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    x = Tensor.empty(2, 16, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    a = Tensor.empty(16, 16, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    b = Tensor.empty(16, 16, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    for name, result, grid in (("sum", x.sum(axis=1), (2, 1, 1)), ("matmul", a@b, (16, 16, 1))):
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, desc, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        code_lines = lines[:lines.index("s_endpgm")+1]
+        branch = next(line for line in code_lines if line.startswith("s_cbranch_vccnz"))
+        branch_offset = int(branch.rsplit(" ", 1)[1])
+        branch_offset -= 0x10000 if branch_offset & 0x8000 else 0
+
+        self.assertEqual(relocs, [])
+        self.assertEqual((program.arg.global_size, program.arg.local_size), (grid, (16, 1, 1)))
+        self.assertEqual(desc.group_segment_fixed_size, 64)
+        self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 4)  # s[32:33] makes 40 allocated SGPRs.
+        self.assertEqual(_assembled(*lines), text.content)
+        self.assertEqual(branch_offset, -10)
+        self.assertEqual(sum(line == "s_mov_b32 m0, -1" for line in code_lines), 1)
+        self.assertEqual(sum(line.startswith("ds_write_b32") for line in code_lines), 1)
+        self.assertEqual(sum(line.startswith("ds_read_b32") for line in code_lines), 1)
+        self.assertEqual(sum(line == "s_barrier" for line in code_lines), 1)
+        self.assertEqual(sum(line.startswith("s_and_saveexec_b64") for line in code_lines), 1)
+        self.assertEqual(sum(line.startswith("flat_store_dword") for line in code_lines), 1)
 
 
 if __name__ == "__main__": unittest.main()

@@ -47,6 +47,7 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
     elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL: lds_size += u.max_numel() * u.dtype.itemsize
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
     elif u.op is Ops.SPECIAL and u.arg.startswith("lidx"): lids.add(int(u.arg[-1]))
+  lds_size = max(lds_size, sum(getattr(inst, "lds_size", 0) for inst in insts))
   code_bytes = b"".join(inst.to_bytes() for inst in insts)
   arch = next(v for k, v in _arch_map.items() if arch.startswith(k))
   is_gcn3, is_cdna, is_rdna4 = arch == "gcn3", arch == "cdna", arch == "rdna4"
