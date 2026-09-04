@@ -492,7 +492,7 @@ class ElementwiseMixin(CreationMixin):
     ```
     """
     if self.is_floating_point(): return ((math.pi/2)-self.cast(least_upper_dtype(self.dtype, dtypes.float32))).sin().cast(self.dtype)
-    return self.cast(dtypes.float).cos()
+    return self.cast(dtypes.default_float).cos()
 
   def exp(self) -> Self:
     """
