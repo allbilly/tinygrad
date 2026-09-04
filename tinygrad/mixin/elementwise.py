@@ -633,9 +633,10 @@ class ElementwiseMixin(CreationMixin):
     ```
     """
     other = self.ufix(other)
-    is_finite_close = self.isfinite() & other.isfinite() & ((self - other).abs() <= atol + rtol * other.abs())
-    is_infinite_close = (self.isinf() | other.isinf()) & self.eq(other)
-    is_nan_close = (self.isnan() & other.isnan()) & equal_nan
+    lhs, rhs = self.contiguous(), other.contiguous()
+    is_finite_close = lhs.isfinite() & rhs.isfinite() & ((lhs - rhs).abs() <= atol + rtol * rhs.abs())
+    is_infinite_close = (lhs.isinf() | rhs.isinf()) & lhs.eq(rhs)
+    is_nan_close = (lhs.isnan() & rhs.isnan()) & equal_nan
     return is_finite_close | is_infinite_close | is_nan_close
 
   def ceil(self) -> Self:

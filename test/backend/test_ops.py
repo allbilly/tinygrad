@@ -1606,6 +1606,12 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3, 4, 5, 6)], lambda x: x.isclose(x + 1e-9, rtol=0.01), forward_only=True)
     helper_test_op(None, lambda x,y: x.isclose(y), vals=[[1e-7, 1e-8, 1e-9], [0.0, 0.0, 0.0]], forward_only=True)
 
+  def test_isclose_emulated_half_rounding(self):
+    tx, x = torch.tensor([0.05, -0.05], dtype=torch.float16), Tensor([0.05, -0.05], dtype=dtypes.half)
+    teps, eps = torch.tensor(1e-6, dtype=torch.float16), Tensor(1e-6, dtype=dtypes.half)
+    with Context(EMULATED_DTYPES="half"):
+      helper_test_op([], lambda: tx.isclose(tx + teps), lambda: x.isclose(x + eps), forward_only=True)
+
   def test_isclose_edge_cases(self):
     for a in [math.inf, -math.inf, math.nan, 0.0]:
       for b in [math.inf, -math.inf, math.nan, 0.0]:
