@@ -63,9 +63,9 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
   # CDNA: total VGPRs = regular VGPRs + AccVGPRs, each rounded to granularity of 4
   accum_offset = round_up(max_vgpr, 4) if max_accvgpr > 0 else 0
   if is_gcn3:
-    # GFX6-8 allocate VGPRs in groups of 4 and SGPRs in groups of 8. Keep the
-    # proven Polaris minimum of 16 SGPRs, which also leaves room for VCC.
-    next_free_vgpr, next_free_sgpr = round_up(max(max_vgpr, 1), 4), round_up(max(max_sgpr, 16), 8)
+    # GFX8 reserves two SGPR pairs above the explicitly used registers for FLAT_SCRATCH and VCC.
+    # LLVM's default .amdhsa_reserve_flat_scratch/.amdhsa_reserve_vcc behavior makes the same reservation.
+    next_free_vgpr, next_free_sgpr = round_up(max(max_vgpr, 1), 4), round_up(max(max_sgpr + 4, 16), 8)
     vgpr_granule, sgpr_granule = next_free_vgpr // 4 - 1, next_free_sgpr // 8 - 1
   else:
     next_free_vgpr = round_up(accum_offset + max_accvgpr, 8) if max_accvgpr > 0 else round_up(max_vgpr, 8)

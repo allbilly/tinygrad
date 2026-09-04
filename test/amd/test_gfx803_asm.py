@@ -245,6 +245,19 @@ class TestGFX803Program(unittest.TestCase):
     self.assertEqual(sum(line.startswith("flat_load_dword") for line in code_lines), 8)
     self.assertEqual(sum(line.startswith("flat_store_dword") for line in code_lines), 4)
 
+  def test_five_buffer_sgpr_reservation(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    inputs = [Tensor.empty(64, dtype=dtypes.float32, device="NULL").contiguous().realize() for _ in range(4)]
+    program = to_program(sum(inputs[1:], start=inputs[0]).schedule_linear().src[-1].src[0], renderer)
+    text, _, desc, relocs = self._elf(program)
+    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+
+    self.assertEqual(relocs, [])
+    self.assertEqual(desc.kernarg_size, 40)
+    self.assertTrue(any(line.startswith("s_load_dwordx2 s[14:15]") for line in lines))
+    self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 2)  # 16 explicit + 4 implicit SGPRs round up to 24.
+    self.assertEqual(_assembled(*lines), text.content)
+
   def test_dynamic_add_elf(self):
     wgid_x = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT
     for n, grid, local, uses_wgid, uses_lidx in [(5, (5, 1, 1), (1, 1, 1), True, False),
