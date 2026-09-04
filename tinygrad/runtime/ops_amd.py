@@ -63,7 +63,7 @@ class GFX8GC:
     self.regCOMPUTE_START_X = reg('regCOMPUTE_START_X', 0x2e04)
     self.regCOMPUTE_PGM_LO = reg('regCOMPUTE_PGM_LO', 0x2e0c)
     self.regCOMPUTE_PGM_RSRC1 = reg('regCOMPUTE_PGM_RSRC1', 0x2e12)
-    self.regCOMPUTE_RESOURCE_LIMITS = reg('regCOMPUTE_RESOURCE_LIMITS', 0x2e15, {'waves_per_sh':(0,5)})
+    self.regCOMPUTE_RESOURCE_LIMITS = reg('regCOMPUTE_RESOURCE_LIMITS', 0x2e15, {'waves_per_sh':(0,9)})
     # GFX8 has no COMPUTE_PGM_RSRC3. 0x2e16 is COMPUTE_STATIC_THREAD_MGMT_SE0;
     # writing the descriptor's reserved rsrc3 value there disables that shader engine.
     self.regCOMPUTE_STATIC_THREAD_MGMT_SE0 = reg('regCOMPUTE_STATIC_THREAD_MGMT_SE0', 0x2e16)
@@ -71,6 +71,14 @@ class GFX8GC:
     self.regCOMPUTE_USER_DATA_0 = reg('regCOMPUTE_USER_DATA_0', 0x2e40)
     self.regCOMPUTE_DISPATCH_INITIATOR = reg('regCOMPUTE_DISPATCH_INITIATOR', 0,
                                              {'compute_shader_en':(0,0), 'force_start_at_000':(2,2)})
+
+def _gfx8_props(cu_count:int=32, se_count:int=4, sh_per_se:int=1, cu_per_sh:int=9) -> dict[str, int]:
+  if min(cu_count, se_count, sh_per_se, cu_per_sh) <= 0: raise RuntimeError("invalid GFX8 topology")
+  # GCN3/Polaris has four SIMD16s per CU. cu_count is the active (post-harvest)
+  # count while cu_per_sh and the SE/SH dimensions describe the physical topology.
+  return {'cu_per_simd_array':cu_per_sh, 'simd_count':cu_count * 4, 'simd_per_cu':4,
+    'array_count':se_count * sh_per_se, 'max_slots_scratch_cu':32, 'max_waves_per_simd':10,
+    'simd_arrays_per_engine':sh_per_se, 'lds_size_in_kb':64, 'num_xcc':1, 'gfx_target_version':80003}
 
 def _kfd_doorbell_params(queue, gfx_target_version:int) -> tuple[int, int, int]:
   if gfx_target_version == 80003:
@@ -1047,9 +1055,7 @@ class DRMIface:
     # Polaris10 has no ip_discovery sysfs tree. These are the kernel driver's
     # IP versions and match the legacy packet/register definitions used below.
     self.ip_versions = {am.GC_HWIP:(8,0,3), am.SDMA0_HWIP:(3,0,0), am.NBIF_HWIP:(5,0,0)}
-    self.props = {'cu_per_simd_array':8, 'simd_count':64, 'simd_per_cu':2, 'array_count':4,
-      'max_slots_scratch_cu':32, 'max_waves_per_simd':10, 'simd_arrays_per_engine':2,
-      'lds_size_in_kb':64, 'num_xcc':1, 'gfx_target_version':80003}
+    self.props = _gfx8_props(info.cu_active_number, info.num_shader_engines, info.num_shader_arrays_per_engine, info.num_cu_per_sh)
 
     # Keep GFX8 allocations in the same low aperture used by the passing
     # libdrm reference. GEM_VA maps our chosen non-overlapping addresses.
@@ -1206,11 +1212,8 @@ class PCIIface(PCIIfaceBase):
   def _compute_props(self):
     self.ip_versions = self.dev_impl.ip_ver
     if isinstance(self.dev_impl, PolarisAMDev):
-      # Polaris10 has four shader arrays with eight CUs each. Each CU has four
-      # SIMD16s, represented in KFD's legacy topology as two SIMD pairs.
-      self.props = {'cu_per_simd_array':8, 'simd_count':64, 'simd_per_cu':2, 'array_count':4,
-        'max_slots_scratch_cu':32, 'max_waves_per_simd':10, 'simd_arrays_per_engine':2,
-        'lds_size_in_kb':64, 'num_xcc':1, 'gfx_target_version':80003}
+      # RX570 Polaris10: four SEs, one SH per SE, 9 physical CUs per SH and 32 active CUs.
+      self.props = _gfx8_props()
       return
 
     gfxver = int(f"{self.dev_impl.ip_ver[am.GC_HWIP][0]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][1]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][2]:02d}")

@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 from tinygrad.codegen.opt import tc
-from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, GFX8GC, _kfd_doorbell_params
+from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, GFX8GC, _gfx8_props, _kfd_doorbell_params
 from tinygrad.runtime.autogen.am import pm4_soc15
 from tinygrad.runtime.support.am.polaris import (
   PolarisAMDev, ViMqd, DOORBELL_MEC_RING0, VI_MQD_ALLOC_DWORDS, MQD_HQD_WORD, mmCP_HQD_ACTIVE, mmCP_HQD_PQ_BASE_LO, mmCP_HQD_PQ_BASE_HI,
@@ -37,6 +37,13 @@ class FakePCI:
 class TestPolarisAM(unittest.TestCase):
   def test_gfx803_has_no_tensor_cores(self):
     self.assertEqual(tc.get_amd("gfx803"), [])
+
+  def test_gfx8_topology_matches_kernel(self):
+    props = _gfx8_props(cu_count=32, se_count=4, sh_per_se=1, cu_per_sh=9)
+    self.assertEqual((props['simd_count'], props['simd_per_cu']), (128, 4))
+    self.assertEqual((props['array_count'], props['simd_arrays_per_engine']), (4, 1))
+    self.assertEqual(props['cu_per_simd_array'], 9)
+    self.assertEqual(GFX8GC().regCOMPUTE_RESOURCE_LIMITS.fields['waves_per_sh'], (0, 9))
 
   def test_gfx8_dispatch_does_not_disable_shader_engine_zero(self):
     dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True, sqtt_enabled=False, xccs=1)
