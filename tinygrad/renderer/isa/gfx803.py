@@ -19,7 +19,21 @@ class GFX803Ops(FastEnum):
   DEFINE = auto()
   REG_BUFFER_META = auto()
   REG_BUFFER = auto()
+  SCRATCH_BUFFER_META = auto()
+  SCRATCH_BUFFER_ADDR = auto()
   LDS_BUFFER = auto()
+  SCRATCH_SETUP = auto()
+  SCRATCH_TEARDOWN = auto()
+  SCRATCH_LOAD_B32 = auto()
+  SCRATCH_LOAD_U16 = auto()
+  SCRATCH_LOAD_S16 = auto()
+  SCRATCH_LOAD_U8 = auto()
+  SCRATCH_LOAD_S8 = auto()
+  SCRATCH_LOAD_B64 = auto()
+  SCRATCH_STORE_B32 = auto()
+  SCRATCH_STORE_B16 = auto()
+  SCRATCH_STORE_B8 = auto()
+  SCRATCH_STORE_B64 = auto()
   S_LOAD_B64 = auto()
   V_MOV_B32 = auto()
   FLAT_ADDR = auto()
@@ -101,6 +115,7 @@ class GFX803Instruction:
   text: str
   register_counts: tuple[int, int, int]
   lds_size: int = 0
+  scratch_size: int = 0
 
   def to_bytes(self) -> bytes: return self.data
   def __str__(self) -> str: return self.text
@@ -111,6 +126,7 @@ class GFX803Instruction:
 KERNARG_PTR = Register("s[0:1]", 0, size=8)
 WGID = tuple(Register(f"s{i}", i, size=4) for i in range(2, 5))
 WIID = tuple(Register(f"v{i}", i, size=4) for i in range(3))
+SCRATCH_PTR = Register("v3", 3, size=4)
 SGPR64 = tuple(Register(f"s[{i}:{i+1}]", i, size=8) for i in range(6, 32, 2))
 # Broadcasts and masked indexing keep many 64-bit flat addresses live at once.
 # Keep 40 address pairs disjoint from scalar values because this allocator does not model pair overlap.
@@ -118,6 +134,7 @@ VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 84, 2))
 VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(84, 224))
 REG_BUFFER_BASE = 224
 REG_BUFFER_COUNT = 256 - REG_BUFFER_BASE
+SCRATCH_RSRC_INDEX = 36
 
 
 def _fixed_reg(dtype:DType, reg:Register) -> UOp: return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(reg,))
@@ -127,6 +144,21 @@ def _const_u32(value:int) -> UOp: return UOp.const(dtypes.uint32, value)
 def _reg_buffer_offset(ctx:IselContext, x:UOp) -> int:
   buffers = sorted((u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG), key=lambda u: int(u.arg.slot))
   return sum(int(u.src[0].arg) for u in buffers[:buffers.index(x)])
+
+
+def _reg_buffer_scratch_layout(ctx:IselContext) -> tuple[dict[UOp, int], int]:
+  offsets:dict[UOp, int] = {}
+  cursor = 0
+  for buf in sorted((u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG), key=lambda u: int(u.arg.slot)):
+    align = min(buf.dtype.itemsize, 8)
+    cursor += (-cursor) % align
+    offsets[buf] = cursor
+    cursor += int(buf.src[0].arg) * buf.dtype.itemsize
+  return offsets, cursor
+
+
+def _reg_buffers_use_scratch(ctx:IselContext) -> bool:
+  return sum(int(u.src[0].arg) for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG) > REG_BUFFER_COUNT
 
 
 def _abi(ctx:IselContext, x:UOp) -> UOp|None:
@@ -157,10 +189,24 @@ def _global_index(ctx:IselContext, x:UOp, base:UOp, idx:UOp) -> UOp|None:
   while root.op is Ops.AFTER:
     deps += root.src[1:]
     root = root.src[0]
+  # INDEX can be selected before its BUFFER source. Make the fixed-register vs
+  # private-scratch decision here too instead of relying on BUFFER selection.
+  if root.op is Ops.BUFFER and root.addrspace is AddrSpace.REG and _reg_buffers_use_scratch(ctx):
+    offsets, total = _reg_buffer_scratch_layout(ctx)
+    root = UOp(Ops.INS, root.dtype, (UOp.const(dtypes.int32, offsets[root]), root.src[0], UOp.const(dtypes.int32, total)),
+               GFX803Ops.SCRATCH_BUFFER_META, True)
   is_reg_buffer = (root.op is Ops.INS and root.arg is GFX803Ops.REG_BUFFER_META) or \
                   (root.op is Ops.BUFFER and root.addrspace is AddrSpace.REG)
+  is_scratch_buffer = root.op is Ops.INS and root.arg is GFX803Ops.SCRATCH_BUFFER_META
   is_lds_buffer = (root.op is Ops.INS and root.arg is GFX803Ops.LDS_BUFFER) or \
                   (root.op is Ops.BUFFER and root.addrspace is AddrSpace.LOCAL)
+  if is_scratch_buffer:
+    if idx.op is not Ops.CONST: raise NotImplementedError("gfx803 indirect scratch-buffer indexing is not implemented")
+    byte_offset, size = int(root.src[0].arg), int(root.src[1].arg)
+    elem = int(idx.arg)
+    if not 0 <= elem < size: raise RuntimeError(f"unsupported gfx803 scratch buffer shape/index: {size=}, {elem=}")
+    ref = UOp(Ops.INS, x.dtype, (root, UOp.const(dtypes.int32, byte_offset + elem * x.dtype.itemsize)), GFX803Ops.SCRATCH_BUFFER_ADDR)
+    return ref.after(*deps)
   if is_reg_buffer:
     if idx.op is not Ops.CONST: raise NotImplementedError("gfx803 indirect register-buffer indexing is not implemented")
     reg_offset = int(root.src[0].arg) if root.op is Ops.INS else _reg_buffer_offset(ctx, root)
@@ -198,9 +244,51 @@ def _indexed_addrspace(addr:UOp) -> AddrSpace|None:
   return None
 
 
-def _load(x:UOp, addr:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp|None:
+def _scratch_buffer_addr(addr:UOp) -> UOp|None:
+  while addr.op is Ops.AFTER: addr = addr.src[0]
+  return addr if addr.op is Ops.INS and addr.arg is GFX803Ops.SCRATCH_BUFFER_ADDR else None
+
+
+def _scratch_buffer_offset(ctx:IselContext, addr:UOp) -> int|None:
+  while addr.op is Ops.AFTER: addr = addr.src[0]
+  if addr.op is Ops.INS and addr.arg is GFX803Ops.SCRATCH_BUFFER_ADDR: return int(addr.src[1].arg)
+  if addr.op is not Ops.INDEX: return None
+  root = addr.src[0]
+  while root.op is Ops.AFTER: root = root.src[0]
+  if root.op is Ops.INS and root.arg is GFX803Ops.SCRATCH_BUFFER_META:
+    byte_offset, size = int(root.src[0].arg), int(root.src[1].arg)
+  elif root.op is Ops.BUFFER and root.addrspace is AddrSpace.REG and _reg_buffers_use_scratch(ctx):
+    offsets, _ = _reg_buffer_scratch_layout(ctx)
+    byte_offset, size = offsets[root], int(root.src[0].arg)
+  else: return None
+  if addr.src[1].op is not Ops.CONST: raise NotImplementedError("gfx803 indirect scratch-buffer indexing is not implemented")
+  elem = int(addr.src[1].arg)
+  if not 0 <= elem < size: raise RuntimeError(f"unsupported gfx803 scratch buffer shape/index: {size=}, {elem=}")
+  return byte_offset + elem * addr.dtype.itemsize
+
+
+def _scratch_load_op(dtype:DType) -> GFX803Ops:
+  if dtype.itemsize == 8: return GFX803Ops.SCRATCH_LOAD_B64
+  if dtype is dtypes.int8: return GFX803Ops.SCRATCH_LOAD_S8
+  if dtype.itemsize == 1: return GFX803Ops.SCRATCH_LOAD_U8
+  if dtype is dtypes.int16: return GFX803Ops.SCRATCH_LOAD_S16
+  if dtype.itemsize == 2: return GFX803Ops.SCRATCH_LOAD_U16
+  return GFX803Ops.SCRATCH_LOAD_B32
+
+
+def _scratch_store_op(dtype:DType) -> GFX803Ops:
+  if dtype.itemsize == 8: return GFX803Ops.SCRATCH_STORE_B64
+  if dtype.itemsize == 1: return GFX803Ops.SCRATCH_STORE_B8
+  if dtype.itemsize == 2: return GFX803Ops.SCRATCH_STORE_B16
+  return GFX803Ops.SCRATCH_STORE_B32
+
+
+def _load(ctx:IselContext, x:UOp, addr:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp|None:
   if x.dtype not in (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32):
     raise NotImplementedError(f"gfx803 load dtype {x.dtype} is not lowered yet")
+  if (scratch_offset:=_scratch_buffer_offset(ctx, addr)) is not None:
+    if gate is not None: raise NotImplementedError("gfx803 gated scratch-buffer loads are not implemented")
+    return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, scratch_offset), addr), _scratch_load_op(x.dtype))
   if (addrspace:=_indexed_addrspace(addr)) is AddrSpace.REG:
     if gate is not None: raise NotImplementedError("gfx803 gated register loads are not implemented")
     return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.V_MOV_B32)
@@ -220,10 +308,13 @@ def _load(x:UOp, addr:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp|None:
   return UOp(Ops.INS, x.dtype, (addr, *((alt, gate) if gate is not None else ())), op)
 
 
-def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
+def _store(ctx:IselContext, x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
   if value.dtype not in (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32):
     raise NotImplementedError(f"gfx803 store dtype {value.dtype} is not lowered yet")
   if value.op is Ops.CONST: value = UOp(Ops.INS, value.dtype, (value,), GFX803Ops.V_MOV_B32)
+  if (scratch_offset:=_scratch_buffer_offset(ctx, addr)) is not None:
+    if gate is not None: raise NotImplementedError("gfx803 gated scratch-buffer stores are not implemented")
+    return UOp(Ops.INS, dtypes.void, (value, UOp.const(dtypes.int32, scratch_offset), addr), _scratch_store_op(value.dtype))
   if (addrspace:=_indexed_addrspace(addr)) is AddrSpace.REG:
     if gate is not None: raise NotImplementedError("gfx803 gated register stores are not implemented")
     return UOp(Ops.INS, dtypes.void, (addr, value), GFX803Ops.REG_STORE_B32)
@@ -244,8 +335,10 @@ def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
 def _buffer(ctx:IselContext, x:UOp) -> UOp:
   if x.addrspace is AddrSpace.REG:
     offset = _reg_buffer_offset(ctx, x)
-    if offset + int(x.src[0].arg) > REG_BUFFER_COUNT:
-      raise RuntimeError(f"gfx803 register buffers require {offset + int(x.src[0].arg)} VGPRs, only {REG_BUFFER_COUNT} are reserved")
+    if _reg_buffers_use_scratch(ctx):
+      offsets, total = _reg_buffer_scratch_layout(ctx)
+      return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, offsets[x]), x.src[0], UOp.const(dtypes.int32, total)),
+                 GFX803Ops.SCRATCH_BUFFER_META, True)
     return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, offset), x.src[0]), GFX803Ops.REG_BUFFER_META, True)
   if x.addrspace is AddrSpace.LOCAL:
     return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, x.arg.slot), x.src[0]), GFX803Ops.LDS_BUFFER, True)
@@ -259,8 +352,14 @@ def _range(ctx:IselContext, x:UOp) -> UOp|None:
 def _barrier(x:UOp) -> UOp: return UOp(Ops.INS, dtypes.void, x.src, GFX803Ops.S_BARRIER)
 
 
+def _stack_adjust(x:UOp, base:UOp, size:UOp) -> UOp|None:
+  if greg(base) != SCRATCH_PTR or size.op is not Ops.CONST: return None
+  return UOp(Ops.INS, dtypes.void, (size,), GFX803Ops.SCRATCH_SETUP if x.op is Ops.SUB else GFX803Ops.SCRATCH_TEARDOWN)
+
+
 def _alloc_vreg(ctx:IselContext, x:UOp) -> UOp|None:
-  if x.dtype is dtypes.void or x.arg in {GFX803Ops.REG_BUFFER_META, GFX803Ops.REG_BUFFER, GFX803Ops.LDS_BUFFER} or \
+  if x.dtype is dtypes.void or x.arg in {GFX803Ops.REG_BUFFER_META, GFX803Ops.REG_BUFFER, GFX803Ops.SCRATCH_BUFFER_META,
+                                        GFX803Ops.SCRATCH_BUFFER_ADDR, GFX803Ops.LDS_BUFFER} or \
      (isinstance(x.tag, tuple) and isinstance(x.tag[0], Register)): return None
   regs = SGPR64 if x.arg is GFX803Ops.S_LOAD_B64 else VGPR64 if x.arg is GFX803Ops.FLAT_ADDR else VGPR32
   return x.replace(tag=(ctx.vreg(regs),))
@@ -481,6 +580,7 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.BUFFER, name="x"), _buffer),
   (UPat(Ops.RANGE, name="x"), _range),
   (UPat(Ops.BARRIER, name="x"), _barrier),
+  (UPat((Ops.ADD, Ops.SUB), src=(UPat.var("base"), UPat.var("size")), name="x"), _stack_adjust),
   (UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("idx")), name="x"), _global_index),
   (UPat(Ops.LOAD, src=(UPat.var("addr"), UPat.var("alt"), UPat.var("gate")), name="x"), _load),
   (UPat(Ops.LOAD, src=(UPat.var("addr"),), name="x"), _load),
@@ -577,6 +677,12 @@ def _vopc(op:int, src0:int, src1:int) -> int:
   return 0x7c000000 | ((op & 0xff) << 17) | ((src1 & 0xff) << 9) | (src0 & 0x1ff)
 
 
+def _mubuf(op:int, offset:int, vdata:int, srsrc:int=SCRATCH_RSRC_INDEX) -> bytes:
+  if not 0 <= offset <= 0xfff: raise OverflowError(f"gfx803 scratch byte offset out of range: {offset}")
+  if srsrc % 4: raise ValueError(f"gfx803 buffer resource must start on four SGPRs: s{srsrc}")
+  return _word(0xe0000000 | ((op & 0x7f) << 18) | offset) + _word(0x80000000 | ((srsrc // 4) << 16) | (vdata << 8))
+
+
 def _half_bits(value:float) -> int:
   try: return struct.unpack("<H", struct.pack("<e", value))[0]
   except OverflowError: return 0x7c00 if value > 0 else 0xfc00
@@ -617,16 +723,71 @@ def _raw_src0(x:UOp) -> tuple[int, tuple[int, ...], str]:
 def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
   counts = _register_counts(x)
   dst = _physical_reg(x) if x.dtype is not dtypes.void and x.arg not in \
-    {GFX803Ops.REG_BUFFER_META, GFX803Ops.LDS_BUFFER} else None
+    {GFX803Ops.REG_BUFFER_META, GFX803Ops.SCRATCH_BUFFER_META, GFX803Ops.SCRATCH_BUFFER_ADDR, GFX803Ops.LDS_BUFFER} else None
 
-  lds_size = 0
-  if x.arg in {GFX803Ops.REG_BUFFER_META, GFX803Ops.REG_BUFFER}:
+  lds_size = scratch_size = 0
+  if x.arg in {GFX803Ops.REG_BUFFER_META, GFX803Ops.REG_BUFFER, GFX803Ops.SCRATCH_BUFFER_META, GFX803Ops.SCRATCH_BUFFER_ADDR}:
     data, text = b"", ""
   elif x.arg is GFX803Ops.LDS_BUFFER:
     lds_size = int(x.src[1].arg) * x.dtype.itemsize
     # GFX8 uses M0 as the LDS aperture bound. Its launch value is undefined,
     # so every kernel touching LDS must initialize it before the first DS op.
     data, text = _word(0xbefc00c1), "s_mov_b32 m0, -1"
+  elif x.arg is GFX803Ops.SCRATCH_SETUP:
+    if x.src[0].op is not Ops.CONST or (scratch_size:=int(x.src[0].arg)) <= 0:
+      raise RuntimeError("gfx803 scratch frame size must be a positive constant")
+    # Enabling scratch shifts the incoming ABI to s[0:3]=resource, s[4:5]=kernarg,
+    # s[6:8]=WGIDs and s9=private-segment wave byte offset. Preserve the
+    # renderer's normal body ABI and keep the resource above its scalar pool
+    # and the s[32:33] EXEC-save pair used by gated memory operations.
+    words = [0x80000900, 0x82018001, 0xbea40100, 0xbea60102, 0xbe800104, 0xbe820006, 0xbe830007, 0xbe840008]
+    lines = ["s_add_u32 s0, s0, s9", "s_addc_u32 s1, s1, 0",
+             "s_mov_b64 s[36:37], s[0:1]", "s_mov_b64 s[38:39], s[2:3]",
+             "s_mov_b64 s[0:1], s[4:5]", "s_mov_b32 s2, s6", "s_mov_b32 s3, s7", "s_mov_b32 s4, s8"]
+    data, text = b"".join(_word(w) for w in words), "\n".join(lines)
+    counts = (counts[0], max(counts[1], SCRATCH_RSRC_INDEX + 4), counts[2])
+  elif x.arg is GFX803Ops.SCRATCH_TEARDOWN:
+    data, text = b"", ""
+  elif x.arg in {GFX803Ops.SCRATCH_LOAD_B32, GFX803Ops.SCRATCH_LOAD_U16, GFX803Ops.SCRATCH_LOAD_S16,
+                  GFX803Ops.SCRATCH_LOAD_U8, GFX803Ops.SCRATCH_LOAD_S8, GFX803Ops.SCRATCH_LOAD_B64}:
+    assert dst is not None
+    if not dst.name.startswith("v"): raise NotImplementedError("gfx803 scalar-register fills are not implemented")
+    if x.src[0].op is not Ops.CONST: raise RuntimeError("gfx803 scratch fill offset must be constant")
+    scratch_offset = int(x.src[0].arg)
+    op, mnemonic = {
+      GFX803Ops.SCRATCH_LOAD_U8:(0x10, "buffer_load_ubyte"), GFX803Ops.SCRATCH_LOAD_S8:(0x11, "buffer_load_sbyte"),
+      GFX803Ops.SCRATCH_LOAD_U16:(0x12, "buffer_load_ushort"), GFX803Ops.SCRATCH_LOAD_S16:(0x13, "buffer_load_sshort"),
+      GFX803Ops.SCRATCH_LOAD_B32:(0x14, "buffer_load_dword"), GFX803Ops.SCRATCH_LOAD_B64:(0x14, "buffer_load_dword"),
+    }[x.arg]
+    if x.arg is GFX803Ops.SCRATCH_LOAD_B64:
+      # GFX8 scratch is dword-interleaved across lanes; wider memory
+      # transactions cross into another lane's private segment.
+      data = _mubuf(op, scratch_offset, dst.index) + _mubuf(op, scratch_offset + 4, dst.index + 1)
+      text = "\n".join(f"{mnemonic} v{dst.index+i}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" +
+                       (f" offset:{scratch_offset+i*4}" if scratch_offset+i*4 else "") for i in range(2))
+    else:
+      data = _mubuf(op, scratch_offset, dst.index)
+      text = f"{mnemonic} v{dst.index}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" + \
+             (f" offset:{scratch_offset}" if scratch_offset else "")
+    counts = (counts[0], max(counts[1], SCRATCH_RSRC_INDEX + 4), counts[2])
+  elif x.arg in {GFX803Ops.SCRATCH_STORE_B32, GFX803Ops.SCRATCH_STORE_B16, GFX803Ops.SCRATCH_STORE_B8, GFX803Ops.SCRATCH_STORE_B64}:
+    value = _physical_reg(x.src[0])
+    if not value.name.startswith("v"): raise NotImplementedError("gfx803 scalar-register spills are not implemented")
+    if x.src[1].op is not Ops.CONST: raise RuntimeError("gfx803 scratch spill offset must be constant")
+    scratch_offset = int(x.src[1].arg)
+    op, mnemonic = {GFX803Ops.SCRATCH_STORE_B8:(0x18, "buffer_store_byte"),
+                    GFX803Ops.SCRATCH_STORE_B16:(0x1a, "buffer_store_short"),
+                    GFX803Ops.SCRATCH_STORE_B32:(0x1c, "buffer_store_dword"),
+                    GFX803Ops.SCRATCH_STORE_B64:(0x1c, "buffer_store_dword")}[x.arg]
+    if x.arg is GFX803Ops.SCRATCH_STORE_B64:
+      data = _mubuf(op, scratch_offset, value.index) + _mubuf(op, scratch_offset + 4, value.index + 1)
+      text = "\n".join(f"{mnemonic} v{value.index+i}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" +
+                       (f" offset:{scratch_offset+i*4}" if scratch_offset+i*4 else "") for i in range(2))
+    else:
+      data = _mubuf(op, scratch_offset, value.index)
+      text = f"{mnemonic} v{value.index}, off, s[{SCRATCH_RSRC_INDEX}:{SCRATCH_RSRC_INDEX+3}], 0" + \
+             (f" offset:{scratch_offset}" if scratch_offset else "")
+    counts = (counts[0], max(counts[1], SCRATCH_RSRC_INDEX + 4), counts[2])
   elif x.arg is GFX803Ops.S_LOAD_B64:
     assert dst is not None
     base, offset = _physical_reg(x.src[0]), x.src[1]
@@ -894,7 +1055,7 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
   elif x.arg is GFX803Ops.S_ENDPGM:
     data, text = _word(0xbf810000), "s_endpgm"
   else: raise RuntimeError(f"cannot encode gfx803 instruction {x.arg}")
-  return GFX803Instruction(data, text, counts, lds_size)
+  return GFX803Instruction(data, text, counts, lds_size, scratch_size)
 
 
 class AMDASMRenderer(ISARenderer):
@@ -916,9 +1077,16 @@ class AMDASMRenderer(ISARenderer):
 
   def supported_dtypes(self):
     return {dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32}
-  def stack_pointer(self) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
-  def spill(self, disp:UOp, x:UOp) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
-  def fill(self, disp:UOp, x:UOp, reg:Register) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
+  def stack_pointer(self) -> UOp: return _fixed_reg(dtypes.uint32, SCRATCH_PTR)
+  def spill(self, disp:UOp, x:UOp) -> UOp:
+    reg = _physical_reg(x)
+    if not reg.name.startswith("v"): raise NotImplementedError("gfx803 scalar-register spills are not implemented")
+    op = _scratch_store_op(dtypes.uint64 if reg.size == 8 else x.dtype)
+    return UOp(Ops.INS, dtypes.void, (x, disp), op)
+  def fill(self, disp:UOp, x:UOp, reg:Register) -> UOp:
+    if not reg.name.startswith("v"): raise NotImplementedError("gfx803 scalar-register fills are not implemented")
+    op = _scratch_load_op(dtypes.uint64 if reg.size == 8 else x.dtype)
+    return UOp(Ops.INS, x.dtype, (disp,), op, (reg,))
   def copy(self, x:UOp, reg:Register) -> UOp:
     return UOp(Ops.INS, x.dtype, (x,), GFX803Ops.V_MOV_B32, (reg,))
 
@@ -929,8 +1097,29 @@ class AMDASMRenderer(ISARenderer):
     # Scalar and vector memory operations are asynchronous on GCN3. A full
     # wait after each access is conservative but gives the first backend path
     # unambiguous dependency ordering; later scheduling can coalesce waits.
-    ordered:list[UOp] = []
+    scratch_loads = {GFX803Ops.SCRATCH_LOAD_B32, GFX803Ops.SCRATCH_LOAD_U16, GFX803Ops.SCRATCH_LOAD_S16,
+                     GFX803Ops.SCRATCH_LOAD_U8, GFX803Ops.SCRATCH_LOAD_S8, GFX803Ops.SCRATCH_LOAD_B64}
+    scratch_stores = {GFX803Ops.SCRATCH_STORE_B32, GFX803Ops.SCRATCH_STORE_B16,
+                      GFX803Ops.SCRATCH_STORE_B8, GFX803Ops.SCRATCH_STORE_B64}
+    spill_size = max((int(u.src[0].arg) for u in lin.src if u.arg is GFX803Ops.SCRATCH_SETUP), default=0)
+    buffer_size = max((int(u.src[2].arg) for u in lin.src if u.arg is GFX803Ops.SCRATCH_BUFFER_META), default=0)
+    buffer_base = (spill_size + 7) // 8 * 8
+    total_scratch = buffer_base + buffer_size
+    normalized:list[UOp] = []
+    has_setup = False
     for u in lin.src:
+      if u.arg is GFX803Ops.SCRATCH_SETUP:
+        u, has_setup = u.replace(src=(UOp.const(u.src[0].dtype, total_scratch),)), True
+      elif u.arg in scratch_loads and len(u.src) > 1 and _scratch_buffer_addr(u.src[1]) is not None:
+        u = u.replace(src=(UOp.const(dtypes.int32, buffer_base + int(u.src[0].arg)), *u.src[1:]))
+      elif u.arg in scratch_stores and len(u.src) > 2 and _scratch_buffer_addr(u.src[2]) is not None:
+        u = u.replace(src=(u.src[0], UOp.const(dtypes.int32, buffer_base + int(u.src[1].arg)), *u.src[2:]))
+      normalized.append(u)
+    if total_scratch and not has_setup:
+      normalized.insert(0, UOp(Ops.INS, dtypes.void, (UOp.const(dtypes.uint32, total_scratch),), GFX803Ops.SCRATCH_SETUP))
+
+    ordered:list[UOp] = []
+    for u in normalized:
       if u.arg is GFX803Ops.DEFINE: continue
       ordered.append(u)
       if u.arg in {GFX803Ops.S_LOAD_B64, GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_S16,
@@ -941,7 +1130,8 @@ class AMDASMRenderer(ISARenderer):
                    GFX803Ops.GATED_FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B16, GFX803Ops.GATED_FLAT_STORE_B8,
                    GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_S16,
                    GFX803Ops.DS_LOAD_U8, GFX803Ops.DS_LOAD_S8,
-                   GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16, GFX803Ops.DS_STORE_B8}:
+                   GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16, GFX803Ops.DS_STORE_B8,
+                   *scratch_loads, *scratch_stores}:
         ordered.append(UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_WAITCNT))
     labels:dict[str, int] = {}
     pc = 0

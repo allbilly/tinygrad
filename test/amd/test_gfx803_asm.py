@@ -41,6 +41,41 @@ class TestGFX803Encoder(unittest.TestCase):
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
 
+  def test_private_scratch(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    setup = UOp(Ops.INS, dtypes.void, (UOp.const(dtypes.uint32, 144),), GFX803Ops.SCRATCH_SETUP)
+    setup_inst = _encode(setup)
+    setup_lines = (
+      "s_add_u32 s0, s0, s9", "s_addc_u32 s1, s1, 0",
+      "s_mov_b64 s[36:37], s[0:1]", "s_mov_b64 s[38:39], s[2:3]", "s_mov_b64 s[0:1], s[4:5]",
+      "s_mov_b32 s2, s6", "s_mov_b32 s3, s7", "s_mov_b32 s4, s8",
+    )
+    self.assertEqual(setup_inst.scratch_size, 144)
+    self.assertEqual(setup_inst.to_bytes(), _assembled(*setup_lines))
+
+    cases = [
+      (dtypes.uint64, Register("v[4:5]", 4, size=8), 8, "buffer_store_dwordx2 v[4:5]", "buffer_load_dwordx2 v[4:5]"),
+      (dtypes.float32, Register("v84", 84, size=4), 4, "buffer_store_dword v84", "buffer_load_dword v84"),
+      (dtypes.half, Register("v85", 85, size=4), 2, "buffer_store_short v85", "buffer_load_ushort v85"),
+      (dtypes.int16, Register("v86", 86, size=4), 6, "buffer_store_short v86", "buffer_load_sshort v86"),
+      (dtypes.uint8, Register("v87", 87, size=4), 1, "buffer_store_byte v87", "buffer_load_ubyte v87"),
+      (dtypes.int8, Register("v88", 88, size=4), 3, "buffer_store_byte v88", "buffer_load_sbyte v88"),
+    ]
+    for dtype, reg, offset, store_text, load_text in cases:
+      with self.subTest(dtype=dtype):
+        value = _reg(dtype, reg.name, reg.index, reg.size)
+        disp = UOp.const(dtypes.int32, offset)
+        store, load = renderer.spill(disp, value), renderer.fill(disp, value, reg)
+        suffix = f", off, s[36:39], 0 offset:{offset}"
+        if dtype is dtypes.uint64:
+          self.assertEqual(_encode(store).to_bytes(), _assembled(
+            "buffer_store_dword v4, off, s[36:39], 0 offset:8", "buffer_store_dword v5, off, s[36:39], 0 offset:12"))
+          self.assertEqual(_encode(load).to_bytes(), _assembled(
+            "buffer_load_dword v4, off, s[36:39], 0 offset:8", "buffer_load_dword v5, off, s[36:39], 0 offset:12"))
+        else:
+          self.assertEqual(_encode(store).to_bytes(), _assembled(store_text + suffix))
+          self.assertEqual(_encode(load).to_bytes(), _assembled(load_text + suffix))
+
   def test_dynamic_indexing(self):
     s2, v0 = _reg(dtypes.int32, "s2", 2), _reg(dtypes.int32, "v0", 0)
     idx, tmp = _reg(dtypes.int32, "v36", 36), _reg(dtypes.int32, "v37", 37)
@@ -301,6 +336,52 @@ class TestGFX803Program(unittest.TestCase):
       text, _, _, relocs = self._elf(program)
       self.assertEqual(relocs, [])
       self.assertEqual(_assembled(*llvm_disasm(text.content, "gfx803", "+wavefrontsize64")), text.content)
+
+  def test_private_scratch_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    source = Tensor.empty(1, 1, 5, 5, 5, dtype=dtypes.half, device="NULL").contiguous().realize()
+    sink = source.pad((1, 2, 3, 4, 1, 2), mode="replicate").contiguous().schedule_linear().src[-1].src[0]
+    program = to_program(sink, renderer)
+    text, _, desc, relocs = self._elf(program)
+    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+
+    scratch = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT_SHIFT
+    all_wgids = sum(1 << shift for shift in (amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT,
+                                             amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Y_SHIFT,
+                                             amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT))
+    private_rsrc = 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER_SHIFT
+    kernarg = 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT
+    self.assertEqual(relocs, [])
+    self.assertGreater(desc.private_segment_fixed_size, 0)
+    self.assertEqual(desc.compute_pgm_rsrc2 & scratch, scratch)
+    self.assertEqual((desc.compute_pgm_rsrc2 >> amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT) & 0x1f, 6)
+    self.assertEqual(desc.compute_pgm_rsrc2 & all_wgids, all_wgids)
+    self.assertEqual(desc.kernel_code_properties, private_rsrc | kernarg)
+    self.assertEqual(lines[:8], [
+      "s_add_u32 s0, s0, s9", "s_addc_u32 s1, s1, 0",
+      "s_mov_b64 s[36:37], s[0:1]", "s_mov_b64 s[38:39], s[2:3]", "s_mov_b64 s[0:1], s[4:5]",
+      "s_mov_b32 s2, s6", "s_mov_b32 s3, s7", "s_mov_b32 s4, s8",
+    ])
+    self.assertTrue(any(line.startswith("buffer_store_dword") for line in lines))
+    self.assertTrue(any(line.startswith("buffer_load_dword") for line in lines))
+    self.assertFalse(any(line.startswith(("buffer_store_dwordx2", "buffer_load_dwordx2")) for line in lines))
+    self.assertEqual(_assembled(*lines), text.content)
+
+  def test_private_register_buffer_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    source = Tensor.empty(1, 1, 5, 5, dtype=dtypes.half, device="NULL").contiguous().realize()
+    sink = source.max_pool2d(kernel_size=(3, 3), padding=1, return_indices=True)[1].schedule_linear().src[-1].src[0]
+    program = to_program(sink, renderer)
+    text, _, desc, relocs = self._elf(program)
+    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+
+    self.assertEqual(relocs, [])
+    self.assertTrue(any(u.arg is GFX803Ops.SCRATCH_BUFFER_META for u in program.src[1].src))
+    self.assertEqual(desc.private_segment_fixed_size, 36 * dtypes.int32.itemsize)
+    self.assertTrue(any(line.startswith("buffer_store_dword") for line in lines))
+    self.assertTrue(any(line.startswith("buffer_load_dword") for line in lines))
+    self.assertIn("buffer_store_dword v84, off, s[36:39], 0 offset:140", lines)
+    self.assertEqual(_assembled(*lines), text.content)
 
   def test_dynamic_add_elf(self):
     wgid_x = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT

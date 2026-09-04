@@ -48,6 +48,7 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
     elif u.op is Ops.SPECIAL and u.arg.startswith("lidx"): lids.add(int(u.arg[-1]))
   lds_size = max(lds_size, sum(getattr(inst, "lds_size", 0) for inst in insts))
+  scratch_size = max((getattr(inst, "scratch_size", 0) for inst in insts), default=0)
   code_bytes = b"".join(inst.to_bytes() for inst in insts)
   arch = next(v for k, v in _arch_map.items() if arch.startswith(k))
   is_gcn3, is_cdna, is_rdna4 = arch == "gcn3", arch == "cdna", arch == "rdna4"
@@ -75,6 +76,7 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
     sgpr_granule = max(0, ceildiv(next_free_sgpr + 6, 8) - 1) if is_cdna else 0
   desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t()
   desc.group_segment_fixed_size = lds_size
+  desc.private_segment_fixed_size = scratch_size
   desc.kernarg_size = n_bufs * 8 + n_vars * 4
   desc.kernel_code_entry_byte_offset = -len(text)
 
@@ -87,12 +89,15 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
                             (0 if is_rdna4 else 1) << amdgpu_kd.COMPUTE_PGM_RSRC1_GFX6_GFX11_ENABLE_DX10_CLAMP_SHIFT |
                             (0 if is_rdna4 else 1) << amdgpu_kd.COMPUTE_PGM_RSRC1_GFX6_GFX11_ENABLE_IEEE_MODE_SHIFT |
                             (0 if is_gcn3 or is_cdna else 1) << amdgpu_kd.COMPUTE_PGM_RSRC1_GFX10_PLUS_MEM_ORDERED_SHIFT)
-  desc.compute_pgm_rsrc2 = (2 << amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT |
-                            int(0 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT |
-                            int(1 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Y_SHIFT |
-                            int(2 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT |
+  uses_gfx8_scratch = is_gcn3 and scratch_size > 0
+  desc.compute_pgm_rsrc2 = (int(uses_gfx8_scratch) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT_SHIFT |
+                            (6 if uses_gfx8_scratch else 2) << amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT |
+                            int(uses_gfx8_scratch or 0 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT |
+                            int(uses_gfx8_scratch or 1 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Y_SHIFT |
+                            int(uses_gfx8_scratch or 2 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT |
                             max(lids, default=0) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_VGPR_WORKITEM_ID_SHIFT)
-  desc.kernel_code_properties = (1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT |
+  desc.kernel_code_properties = (int(uses_gfx8_scratch) << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER_SHIFT |
+                                 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT |
                                  (0 if is_gcn3 or is_cdna else 1) << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32_SHIFT)
   if is_cdna and max_accvgpr > 0:
     desc.compute_pgm_rsrc3 = max(0, accum_offset // 4 - 1) << amdgpu_kd.COMPUTE_PGM_RSRC3_GFX90A_ACCUM_OFFSET_SHIFT
