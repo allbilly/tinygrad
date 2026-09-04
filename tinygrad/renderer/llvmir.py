@@ -216,6 +216,11 @@ pm_gfx803_mixed_precision = PatternMatcher([
   (UPat(Ops.CAST, dtypes.float, src=(UPat(Ops.MUL, dtypes.half, src=(UPat.var("a"), UPat.var("b"))),)),
    lambda a,b: a.cast(dtypes.float) * b.cast(dtypes.float)),
 ])
+pm_gfx803_strict_fdiv = PatternMatcher([
+  # Fast reciprocal division can place exact integer quotients below the boundary, breaking a following trunc/floor.
+  (UPat(Ops.FDIV, name="x"), lambda ctx,x:
+   f"  {ctx[x]} = fdiv {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
+])
 class AMDLLVMRenderer(LLVMRenderer):
   has_local = True
   shared_max = HIPRenderer.shared_max
@@ -267,7 +272,9 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
     from tinygrad.runtime.support.compiler_llvm import AMDLLVMCompiler
     self.compiler, self.tensor_cores, self.is_cdna = AMDLLVMCompiler(target.arch), tc.get_amd(target.arch), HIPRenderer.is_cdna(target.arch)
     self.string_rewrite += PatternMatcher([(UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, cdna=self.is_cdna: render_wmma_amd(ctx, wmma, cdna))])
-    if target.arch == "gfx803": self.extra_matcher += pm_gfx803_mixed_precision
+    if target.arch == "gfx803":
+      self.extra_matcher += pm_gfx803_mixed_precision
+      self.string_rewrite = pm_gfx803_strict_fdiv + self.string_rewrite
     if self.is_cdna:
       self.extra_matcher += PatternMatcher([
         (UPat(Ops.WMMA, name="x", dtype=dtypes.float),

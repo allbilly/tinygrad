@@ -26,6 +26,15 @@ class TestAMDLLVMRewrites(unittest.TestCase):
     self.assertEqual((widened.op, widened.dtype), (Ops.MUL, dtypes.float))
     self.assertEqual([(x.op, x.dtype, x.src[0]) for x in widened.src], [(Ops.CAST, dtypes.float, a), (Ops.CAST, dtypes.float, b)])
 
+  def test_gfx803_uses_strict_float_division(self):
+    a, b = UOp.const(dtypes.float, 6.0), UOp.const(dtypes.float, 3.0)
+    div = a.alu(Ops.FDIV, b)
+    ctx = {a:"%a", b:"%b", div:"%div"}
+    gfx803 = AMDLLVMRenderer(Target("AMD", arch="gfx803")).string_rewrite.rewrite(div, ctx)
+    gfx900 = AMDLLVMRenderer(Target("AMD", arch="gfx900")).string_rewrite.rewrite(div, ctx)
+    self.assertEqual(gfx803, "  %div = fdiv float %a, %b")
+    self.assertIn("fdiv nsz arcp contract afn", gfx900)
+
 
 if __name__ == '__main__':
   unittest.main()
