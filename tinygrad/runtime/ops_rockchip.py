@@ -134,7 +134,7 @@ class RockchipProgram(Program['RockchipDevice']):
     except TimeoutError as exc:
       self.dev.timeout_retries,self.dev._poisoned=self.dev.timeout_retries+1,True
       raise RuntimeError("RKNPU submit timed out; platform NPU reset or power cycle required") from exc
-    self.dev.submit_count += 1; self.dev.task_count += n  # noqa: E702
+    self.dev._npu_clean=False; self.dev.submit_count += 1; self.dev.task_count += n  # noqa: E702
 
   # Submit contiguous FP16 EW tasks as one blocking PC chain, or one stateful DPU/CMAC body with its direct PC tail.
   def _submit_bodies(self, bodies:typing.Iterable[tuple[int, ...]], standalone:bool=False, cmac:bool=False) -> None:
@@ -152,7 +152,7 @@ class RockchipProgram(Program['RockchipDevice']):
       tail=(_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),) if standalone else (_pc(rk.TARGET_PC_REG,rk.REG_PC_BASE_ADDRESS,next_addr),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS,next_amount),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18))  # noqa: E501
       words.extend(tail); descs.append(rk.struct_rknpu_task(0,0 if cmac else 4,0xd if cmac else 0x18,0x300,0x1ffff,0,size if cmac else size+len(tail),0,base_dma+base*8))  # noqa: E501,E702
     ctypes.memmove(int(cmd.va_addr),words.buffer_info()[0],len(words)*8); packed_tasks=(rk.struct_rknpu_task*n)(*descs); ctypes.memmove(int(task.va_addr),ctypes.addressof(packed_tasks),n*_TASK_DESC_BYTES)  # noqa: E501,E702
-    if standalone: self.dev.reset_npu()
+    if standalone and not getattr(self.dev,"_npu_clean",False): self.dev.reset_npu()
     try: self._submit(cmd,task,n,standalone=standalone)
     finally:
       if standalone and not self.dev._poisoned: self.dev.reset_npu()
@@ -274,7 +274,7 @@ class RockchipDevice(Compiled):
     if not self._poisoned: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
   def reset_npu(self):
     self._check_healthy() or rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
-    self._native_int16 = False
+    self._native_int16,self._npu_clean=False,True
   def finalize(self):
     for buf in self._buffers.values(): self._gpu_free(buf)
     self._buffers.clear()

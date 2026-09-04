@@ -679,8 +679,8 @@ def test_int32_to_half_gather_chain_rearms_only_into_bounded_fp16():
 
 def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   class FakeDevice:
-    resets, _poisoned = 0, False
-    def reset_npu(self): self.resets += 1
+    resets, _poisoned, _npu_clean = 0, False, True
+    def reset_npu(self): self.resets += 1; self._npu_clean=True  # noqa: E702
   def memory(size, dma):
     storage = ctypes.create_string_buffer(size)
     base = SimpleNamespace(va_addr=ctypes.addressof(storage))
@@ -690,7 +690,8 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   program.dev,program.image=FakeDevice(),RKImage(program=(cmac,))
   cmd, task, submits = memory(8192,0x400000), memory(4096,0x500000), []
   program.dev._replace_submit_buffers = lambda *_args,**_kwargs: (cmd,task)
-  program._submit = lambda *args,**kwargs: submits.append((args,kwargs))
+  def submit(*args,**kwargs): submits.append((args,kwargs)); program.dev._npu_clean=False  # noqa: E702
+  program._submit = submit
   addresses = (0x100000,0x200000,0x300000)
   program._submit_bodies((emit_cmac_stage(cmac,lambda arg:addresses[arg.index]+arg.addend),),True,True)
   commands = tuple((ctypes.c_uint64*49).from_address(cmd.va_addr))
@@ -701,14 +702,14 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
     rockchip_runtime._pc(rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0xd))
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (0,0xd,0x300,0x1ffff,45)
-  assert program.dev.resets == 2 and len(submits) == 1 and submits[0][1] == {"standalone":True}
+  assert program.dev.resets == 1 and len(submits) == 1 and submits[0][1] == {"standalone":True}
   body = (1,2,3)
   program._submit_bodies((body,),True)
   assert tuple((ctypes.c_uint64*4).from_address(cmd.va_addr)) == body+(rockchip_runtime._pc(
     rockchip_runtime.rk.TARGET_PC,rockchip_runtime.rk.REG_PC_OPERATION_ENABLE,0x18),)
   desc = rockchip_runtime.rk.struct_rknpu_task.from_address(task.va_addr)
   assert (desc.op_idx,desc.enable_mask,desc.int_mask,desc.int_clear,desc.regcfg_amount) == (4,0x18,0x300,0x1ffff,4)
-  assert program.dev.resets == 4 and len(submits) == 2 and submits[1][1] == {"standalone":True}
+  assert program.dev.resets == 2 and len(submits) == 2 and submits[1][1] == {"standalone":True}
   program._submit_bodies(((1,2),(3,4,5)))
   def tail(address,amount):
     return (rockchip_runtime._pc(rockchip_runtime.rk.TARGET_PC_REG,rockchip_runtime.rk.REG_PC_BASE_ADDRESS,address),
@@ -717,7 +718,7 @@ def test_cmac_runtime_keeps_the_45_qword_body_and_four_qword_tail_separate():
   commands=tuple((ctypes.c_uint64*14).from_address(cmd.va_addr)); descs=(rockchip_runtime.rk.struct_rknpu_task*2).from_address(task.va_addr)  # noqa: E702
   assert commands == (1,2)+tail(0x400030,3)+(3,4,5)+tail(0x400070,0)+(0,)
   assert tuple((desc.regcfg_amount,desc.regcmd_addr) for desc in descs)==((6,0x400000),(7,0x400030))
-  assert program.dev.resets == 4 and len(submits) == 3 and submits[-1][1] == {"standalone":False}
+  assert program.dev.resets == 2 and len(submits) == 3 and submits[-1][1] == {"standalone":False}
 
 
 def test_mixed_cmac_runtime_runs_fixed_stage_before_ew_epilogue():
