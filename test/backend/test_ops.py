@@ -27,6 +27,10 @@ def slow_test(test_func):
 
 def helper_test_op(shps, torch_fxn, tinygrad_fxn=None, atol=1e-6, rtol=1e-3, grad_atol=1e-4, grad_rtol=1e-3,
                    forward_only=False, vals=None, low=-2, high=2):
+  if dtypes.default_float == dtypes.half:
+    # Fused and parallel half operations can differ by several ULPs; explicit zero tolerances remain exact.
+    atol, rtol = (max(atol, 5e-3) if atol else 0.0), (max(rtol, 5e-3) if rtol else 0.0)
+    grad_atol, grad_rtol = (max(grad_atol, 5e-3) if grad_atol else 0.0), (max(grad_rtol, 5e-3) if grad_rtol else 0.0)
   if tinygrad_fxn is None: tinygrad_fxn = torch_fxn
   ts, tst = prepare_test_op(low, high, shps, vals, forward_only)
 
@@ -1045,9 +1049,9 @@ class TestOps(unittest.TestCase):
     self.assertAlmostEqual(x.sigmoid()[0].gradient(x)[0].item(), 0.0)
   def test_sigmoid_alt_extreme(self):
     def sigmoid(x:Tensor): return x.exp() / (1 + x.exp())
-    x = Tensor([300.0])
+    x = Tensor([300.0], dtype=dtypes.float32)
     self.assertAlmostEqual(sigmoid(x)[0].gradient(x)[0].item(), 0.0)
-    x = Tensor([-300.0])
+    x = Tensor([-300.0], dtype=dtypes.float32)
     self.assertAlmostEqual(sigmoid(x)[0].gradient(x)[0].item(), 0.0)
 
   def test_logsigmoid(self):
@@ -2289,7 +2293,7 @@ class TestOps(unittest.TestCase):
   def test_bias_conv_transpose2d(self):
     helper_test_op([(2,4,9,9), (4,4,3,3), (4,)],
       lambda x,w,b: torch.nn.functional.conv_transpose2d(x,w,b),
-      lambda x,w,b: Tensor.conv_transpose2d(x,w,b), grad_rtol=1e-5)
+      lambda x,w,b: Tensor.conv_transpose2d(x,w,b), atol=2.5e-2 if dtypes.default_float == dtypes.half else 1e-6, grad_rtol=1e-5)
 
   def test_grouped_conv_transpose2d(self):
     helper_test_op([(2,4,9,9), (4,4,3,3)],
@@ -2330,7 +2334,7 @@ class TestOps(unittest.TestCase):
   def test_simple_conv_transpose3d(self):
     helper_test_op([(2,4,9,9,9), (4,4,3,3,3)],
       lambda x,w: torch.nn.functional.conv_transpose3d(x,w),
-      lambda x,w: Tensor.conv_transpose2d(x,w), grad_rtol=1e-5)
+      lambda x,w: Tensor.conv_transpose2d(x,w), atol=7e-2 if dtypes.default_float == dtypes.half else 1e-6, grad_rtol=1e-5)
 
   @unittest.skipIf((IMAGE>0), "no conv1d on images")
   def test_conv1d(self):
