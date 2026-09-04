@@ -514,6 +514,7 @@ def _cmp(x:UOp, a:UOp, b:UOp) -> UOp:
 
 def _where(x:UOp, cond:UOp, true_value:UOp, false_value:UOp) -> UOp:
   if true_value.op is Ops.CONST: true_value = UOp(Ops.INS, true_value.dtype, (true_value,), GFX803Ops.V_MOV_B32)
+  if false_value.op is Ops.CONST: false_value = UOp(Ops.INS, false_value.dtype, (false_value,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (cond, true_value, false_value), GFX803Ops.V_CNDMASK_B32)
 
 
@@ -1029,14 +1030,13 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     data = b"".join(_word(w) for w in words)
   elif x.arg is GFX803Ops.V_CNDMASK_B32:
     assert dst is not None
-    cond, true_value, false_value = _physical_reg(x.src[0]), _physical_reg(x.src[1]), x.src[2]
-    if not cond.name.startswith("v") or not true_value.name.startswith("v"):
-      raise RuntimeError(f"v_cndmask inputs must be VGPRs, got {cond} and {true_value}")
-    false_src, literal, false_text = _raw_src0(false_value)
-    words = [_vopc(0xcd, 128, cond.index), _vop2(0x00, dst.index, false_src, true_value.index), *literal]
+    cond, true_value, false_value = map(_physical_reg, x.src)
+    if not all(value.name.startswith("v") for value in (cond, true_value, false_value)):
+      raise RuntimeError(f"v_cndmask inputs must be VGPRs, got {cond}, {true_value} and {false_value}")
+    words = [_vopc(0xcd, 128, cond.index), _vop2(0x00, dst.index, 256 + false_value.index, true_value.index)]
     data = b"".join(_word(w) for w in words)
     text = (f"v_cmp_ne_u32_e32 vcc, 0, v{cond.index}\n"
-            f"v_cndmask_b32_e32 v{dst.index}, {false_text}, v{true_value.index}, vcc")
+            f"v_cndmask_b32_e32 v{dst.index}, v{false_value.index}, v{true_value.index}, vcc")
   elif x.arg is GFX803Ops.V_CMP_GT_U32:
     src0, literal = _src0(x.src[0])
     src1 = _physical_reg(x.src[1])

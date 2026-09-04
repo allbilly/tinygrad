@@ -383,6 +383,19 @@ class TestGFX803Program(unittest.TestCase):
     self.assertIn("buffer_store_dword v84, off, s[36:39], 0 offset:140", lines)
     self.assertEqual(_assembled(*lines), text.content)
 
+  def test_half_select_constants_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    source = Tensor.empty(3, dtype=dtypes.half, device="NULL").contiguous().realize()
+    program = to_program(source.sign().schedule_linear().src[-1].src[0], renderer)
+    text, _, _, relocs = self._elf(program)
+    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+
+    self.assertEqual(relocs, [])
+    self.assertTrue(any(line.startswith("v_mov_b32_e32") and "0x3c00" in line for line in lines))
+    self.assertTrue(any(line.startswith("v_cndmask_b32_e32") for line in lines))
+    self.assertFalse(any(line.startswith("v_cndmask_b32_e32") and "0x" in line for line in lines))
+    self.assertEqual(_assembled(*lines), text.content)
+
   def test_dynamic_add_elf(self):
     wgid_x = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT
     for n, grid, local, uses_wgid, uses_lidx in [(5, (5, 1, 1), (1, 1, 1), True, False),
