@@ -501,7 +501,24 @@ def _rsqrt(x:UOp, value:UOp) -> UOp:
   return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_RSQ_F32)
 
 
+def _half_to_float(value:UOp) -> UOp:
+  if value.op is Ops.CONST: value = UOp(Ops.INS, dtypes.half, (value,), GFX803Ops.V_MOV_B32)
+  return UOp(Ops.INS, dtypes.float32, (value,), GFX803Ops.V_CVT_F32_F16)
+
+
 def _float_bin(x:UOp, a:UOp, b:UOp, ins:GFX803Ops) -> UOp:
+  # a / b arrives as a * reciprocal(b). Keeping the reciprocal in half can
+  # overflow even when the quotient is representable, so fuse it in float32.
+  if x.dtype is dtypes.half and ins is GFX803Ops.V_MUL_F32:
+    def is_reciprocal(v:UOp) -> bool:
+      return v.op is Ops.RECIPROCAL or (v.op is Ops.INS and v.arg is GFX803Ops.V_RCP_F32)
+    reciprocal = b if is_reciprocal(b) else a if is_reciprocal(a) else None
+    if reciprocal is not None:
+      numerator = a if reciprocal is b else b
+      wide_numerator, wide_denominator = _half_to_float(numerator), _half_to_float(reciprocal.src[0])
+      wide_reciprocal = UOp(Ops.INS, dtypes.float32, (wide_denominator,), GFX803Ops.V_RCP_F32)
+      quotient = UOp(Ops.INS, dtypes.float32, (wide_numerator, wide_reciprocal), GFX803Ops.V_MUL_F32)
+      return UOp(Ops.INS, dtypes.half, (quotient,), GFX803Ops.V_CVT_F16_F32)
   if b.op is Ops.CONST: a, b = b, a
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (a, b), ins)

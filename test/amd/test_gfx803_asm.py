@@ -580,6 +580,20 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(_assembled(*lines), text.content)
         for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
 
+  def test_half_division_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    numerator = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    denominator = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    program = to_program((numerator/denominator).schedule_linear().src[-1].src[0], renderer)
+    text, _, _, relocs = self._elf(program)
+    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+    code_lines = lines[:lines.index("s_endpgm")+1]
+    self.assertEqual(relocs, [])
+    self.assertEqual(_assembled(*lines), text.content)
+    for mnemonic in ("v_cvt_f32_f16", "v_rcp_f32", "v_mul_f32", "v_cvt_f16_f32"):
+      self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
+    self.assertFalse(any(line.startswith(("v_rcp_f16", "v_mul_f16")) for line in code_lines))
+
   def test_integer_max_reductions_elf(self):
     renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
     cases = {
