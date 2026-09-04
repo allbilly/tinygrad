@@ -84,6 +84,29 @@ class TestPolarisAM(unittest.TestCase):
         queue.exec(prg, SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x200000)), (1, 1, 1), (1, 1, 1))
         self.assertEqual(pm4_soc15.PACKET3_ACQUIRE_MEM in packets, expect_acquire)
 
+  def test_gfx8_drm_dispatch_ib_matches_reference_packet_shape(self):
+    dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False, sqtt_enabled=False, xccs=1, tmpring_size=0x800400,
+                          soc=SimpleNamespace(CS_PARTIAL_FLUSH=7), pm4=pm4_soc15, gc=GFX8GC(), nbio=None,
+                          compute_queue=SimpleNamespace(submit_ib=lambda ib, size: None))
+    queue = AMDComputeQueue(dev)
+    signal = SimpleNamespace(value_addr=0x100000, owner=dev, is_timeline=True)
+    prg = SimpleNamespace(dev=dev, enable_private_segment_sgpr=False, private_segment_size=0, enable_dispatch_ptr=False,
+                          prog_addr=0x200000, rsrc1=0x000f0043, rsrc2=0x0000000c, rsrc3=0, wave32=False)
+    args = SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x300000))
+    queue.wait(signal, 0).memory_barrier().exec(prg, args, (1, 1, 1), (1, 1, 1)).signal(signal, 1)
+
+    packets, off = [], 0
+    while off < len(queue._q):
+      header = queue._q[off]
+      packets.append(((header >> 8) & 0xff, header))
+      off += ((header >> 16) & 0x3fff) + 2
+    self.assertEqual(off, len(queue._q))
+    self.assertEqual([op for op, _ in packets],
+      [pm4_soc15.PACKET3_SET_SH_REG] * 6 + [pm4_soc15.PACKET3_DISPATCH_DIRECT, pm4_soc15.PACKET3_EVENT_WRITE])
+    self.assertTrue(packets[-2][1] & 2)  # DISPATCH_DIRECT is a GFX8 compute packet.
+    self.assertEqual(len(queue._q), 33)
+    self.assertEqual(len(queue._host_signals), 1)
+
   def test_gfx8_dispatch_programs_private_scratch(self):
     scratch = SimpleNamespace(va_addr=0x123456789000, size=8 << 20)
     dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False, sqtt_enabled=False, xccs=1,
