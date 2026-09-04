@@ -521,6 +521,7 @@ class TestTensorUOpCreation(unittest.TestCase):
     self.assertIs(Tensor.arange(5, 10, 2).uop, UOp.arange(5, 10, 2))
   def test_linspace(self):
     self.assertIs(Tensor.linspace(0, 10, 5).uop, UOp.linspace(0, 10, 5))
+    self.assertIs(Tensor.linspace(0, 10, 5, dtype=dtypes.half).uop, UOp.linspace(0, 10, 5, dtype=dtypes.half))
   def test_linspace_one_step(self):
     self.assertIs(Tensor.linspace(5, 10, 1).uop, UOp.linspace(5, 10, 1))
   def test_eye(self):

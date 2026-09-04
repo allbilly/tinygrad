@@ -6,7 +6,7 @@ from tinygrad.mixin.movement import MovementMixin
 from tinygrad.mixin.reduce import ReduceMixin
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import _broadcast_shape, resolve, smax, smin, identity_element
-from tinygrad.dtype import ConstType, DType, DTypeLike, Invalid, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype
+from tinygrad.dtype import ConstType, DType, DTypeLike, Invalid, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype, truncate
 from tinygrad.helpers import all_int, argfix, argsort, ceildiv, flatten, flat_to_grouped, fully_flatten, get_shape, make_tuple, merge_dicts, prod
 from tinygrad.helpers import resolve_pool_pads, round_up, IMAGE, FLOAT16, WINO
 
@@ -209,6 +209,15 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if steps < 0: raise ValueError("number of steps must be non-negative")
     if (dtype := to_dtype(dtype or dtypes.default_float)) == dtypes.bool: raise ValueError("linspace with bool dtype is not supported")
     if steps == 1: return cls.full((1,), start, dtype=dtype, buffer=False)
+    if dtype == dtypes.half and steps > 1:
+      # Match half scalar arithmetic: round the endpoints, difference, divisor, step, and product before the final add/subtract.
+      start, stop = truncate[dtype](start), truncate[dtype](stop)
+      step = truncate[dtype](truncate[dtype](stop - start) / truncate[dtype](steps - 1))
+      int_idx = cls.arange(steps)
+      idx = int_idx.cast(dtype)
+      if steps > 2049: idx = cls._wrap_uop(idx._uop.alu(Ops.CONTIGUOUS))  # first non-exact, non-negative half integer is 2049
+      offsets = cls._wrap_uop((idx * step)._uop.alu(Ops.CONTIGUOUS))
+      return (int_idx < steps // 2).where(start + offsets, stop - offsets.flip(0)).cast(dtype)
     return (start + cls.arange(steps, dtype=dtypes.default_float) * ((stop - start) / (steps - 1))).cast(dtype)
 
   @classmethod
