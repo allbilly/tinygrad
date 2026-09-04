@@ -263,8 +263,8 @@ def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
   return _commit_static(node.dtype,result)
 
 def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None=None) -> RKStatic:
-  """Evaluate only compile-time UOps, committing each intermediate to its scalar dtype."""
-  if _static_ranges(u) is None: raise RuntimeError("RKPLAN_REJECT:non_static_eval")
+  """Evaluate compiler-bound UOps, committing each intermediate to its scalar dtype."""
+  if any(node.op not in _STATIC_OPS for node in u.toposort(gate=lambda item:item not in env)): raise RuntimeError("RKPLAN_REJECT:non_static_eval")
   cache={} if cache is None else cache; cache.update((node,_commit_static(node.dtype,value)) for node,value in env.items())
   for node in u.toposort(gate=lambda item:item not in cache):
     value=_commit_static(node.dtype,typing_cast(RKScalar,node.arg)) if node.op is Ops.CONST else _commit_static(node.dtype,cache[node.src[0]]) if node.op is Ops.CAST else _exec_static(node,tuple(cache[source] for source in node.src))  # noqa: E501
@@ -713,7 +713,10 @@ def _lower_bounded_int_lookup(output:RKOutput) -> RKImage|None:
   try:
     plan=_typed_load_plan(source,dtypes.int,out_index,count,require_offsets=True)
     if plan is None or plan.gather.src is None or plan.gather.offsets!=tuple(range(count)): return None
-    rows=tuple(_static_values(out_index,value.substitute({source:source.const_like(candidate)},walk=True),count,int) for candidate in range(limit))
+    static_value=not any(node.op in (Ops.RANGE,Ops.SPECIAL) for node in value.toposort(gate=lambda item:item is not source))
+    rows=(tuple((int(candidate),)*count for candidate in typing_cast(tuple[RKScalar,...],_eval_static(value,{source:tuple(range(limit))})))
+      if static_value else tuple(_static_values(out_index,value.substitute({source:source.const_like(candidate)},walk=True),count,int)
+                                 for candidate in range(limit)))
   except (RuntimeError,ValueError,OverflowError): return None
   if any(not -32768<=item<=32767 for row in rows for item in row): return None
   scratch:list[int]=[]; preloads:list[RKGather]=[]; ops:list[RKEWOp]=[]

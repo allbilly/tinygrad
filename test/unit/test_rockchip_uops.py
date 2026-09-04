@@ -418,6 +418,14 @@ def test_static_vector_values_match_scalar_typed_evaluation():
   assert divided==(tuple(i//3 for i in range(17)),)
 
 
+def test_static_evaluation_requires_explicit_runtime_binding():
+  lane=UOp.range(3,104)
+  load=UOp.param(0,dtypes.int,(3,)).index(lane).load()
+  expression=load*3+5
+  with pytest.raises(RuntimeError,match="non_static_eval"): rockchip_renderer._eval_static(expression,{})
+  assert rockchip_renderer._eval_static(expression,{load:(-2,0,7)})==(-1,5,26)
+
+
 def test_static_vector_commit_matches_scalar_typed_bits():
   negative_nan=struct.unpack("d",struct.pack("Q",0xfff8000000000001))[0]
   for dtype,groups in ((dtypes.half,((-0.0,0.0,2**-24,-2**-24,65504.0,math.inf,-math.inf),(negative_nan,65520.0,-65520.0))),
