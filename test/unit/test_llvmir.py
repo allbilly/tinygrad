@@ -1,6 +1,7 @@
 import math, unittest
 from tinygrad.dtype import dtypes
-from tinygrad.renderer.llvmir import lconst, pm_gfx803_mixed_precision
+from tinygrad.helpers import Target
+from tinygrad.renderer.llvmir import AMDLLVMRenderer, lconst, pm_gfx803_mixed_precision
 from tinygrad.uop.ops import Ops, UOp
 
 
@@ -13,6 +14,10 @@ class TestLLVMIRConstants(unittest.TestCase):
 
 
 class TestAMDLLVMRewrites(unittest.TestCase):
+  def test_gfx803_emulates_half(self):
+    self.assertNotIn(dtypes.half, AMDLLVMRenderer(Target("AMD", arch="gfx803")).supported_dtypes())
+    self.assertIn(dtypes.half, AMDLLVMRenderer(Target("AMD", arch="gfx900")).supported_dtypes())
+
   def test_gfx803_widens_mixed_precision_multiply(self):
     a, b = UOp.const(dtypes.half, 1.5), UOp.const(dtypes.half, 2.5)
     widened = pm_gfx803_mixed_precision.rewrite(UOp(Ops.CAST, dtypes.float, (UOp(Ops.MUL, dtypes.half, (a, b)),)))
