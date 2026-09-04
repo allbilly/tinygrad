@@ -52,8 +52,8 @@ KERNARG_PTR = Register("s[0:1]", 0, size=8)
 WGID = tuple(Register(f"s{i}", i, size=4) for i in range(2, 5))
 WIID = tuple(Register(f"v{i}", i, size=4) for i in range(3))
 SGPR64 = tuple(Register(f"s[{i}:{i+1}]", i, size=8) for i in range(6, 32, 2))
-VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 36, 2))
-VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(36, 100))
+VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 68, 2))
+VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(68, 256))
 
 
 def _fixed_reg(dtype:DType, reg:Register) -> UOp: return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(reg,))

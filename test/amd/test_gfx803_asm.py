@@ -152,5 +152,19 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(_assembled(*lines), text.content)
         for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in lines), mnemonic)
 
+  def test_small_matmul_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    for n in (2, 4, 8):
+      with self.subTest(n=n):
+        a = Tensor.empty(n, n, dtype=dtypes.float32, device="NULL").contiguous().realize()
+        b = Tensor.empty(n, n, dtype=dtypes.float32, device="NULL").contiguous().realize()
+        program = to_program((a@b).schedule_linear().src[-1].src[0], renderer)
+        text, _, _, _ = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        self.assertEqual((program.arg.global_size, program.arg.local_size), ((1, 1, 1), (n, n, 1)))
+        self.assertEqual(_assembled(*lines), text.content)
+        self.assertEqual(sum(line.startswith("v_mul_f32") for line in lines), n)
+        self.assertEqual(sum(line.startswith("v_add_f32") for line in lines), n-1)
+
 
 if __name__ == "__main__": unittest.main()
