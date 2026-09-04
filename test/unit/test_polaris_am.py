@@ -46,7 +46,7 @@ class TestPolarisAM(unittest.TestCase):
     self.assertEqual(GFX8GC().regCOMPUTE_RESOURCE_LIMITS.fields['waves_per_sh'], (0, 9))
 
   def test_gfx8_dispatch_does_not_disable_shader_engine_zero(self):
-    dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True, sqtt_enabled=False, xccs=1)
+    dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True, sqtt_enabled=False, xccs=1, tmpring_size=0x800400)
     queue = AMDComputeQueue(SimpleNamespace(soc=SimpleNamespace(CS_PARTIAL_FLUSH=0), pm4=pm4_soc15, gc=GFX8GC(), nbio=None))
     queue.dev = dev
     writes = []
@@ -57,6 +57,23 @@ class TestPolarisAM(unittest.TestCase):
     queue.exec(prg, SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x200000)), (1, 1, 1), (1, 1, 1))
     self.assertNotIn("regCOMPUTE_STATIC_THREAD_MGMT_SE0", writes)
     self.assertNotIn("regCOMPUTE_PGM_RSRC3", writes)
+
+  def test_gfx8_dispatch_programs_private_scratch(self):
+    scratch = SimpleNamespace(va_addr=0x123456789000, size=8 << 20)
+    dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False, sqtt_enabled=False, xccs=1,
+                          tmpring_size=0x800400, scratch=scratch)
+    queue = AMDComputeQueue(SimpleNamespace(soc=SimpleNamespace(CS_PARTIAL_FLUSH=0), pm4=pm4_soc15, gc=GFX8GC(), nbio=None))
+    queue.dev = dev
+    writes = {}
+    queue.wreg = lambda reg, *args, **kwargs: writes.setdefault(reg.name, (args, kwargs))  # type: ignore[method-assign]
+    queue.q = queue.pkt3 = lambda *args: None  # type: ignore[method-assign]
+    prg = SimpleNamespace(dev=dev, enable_private_segment_sgpr=True, private_segment_size=120, enable_dispatch_ptr=False,
+                          prog_addr=0x100000, rsrc1=0, rsrc2=1, rsrc3=0, wave32=False)
+    queue.exec(prg, SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x200000)), (1, 1, 1), (1, 1, 1))
+    self.assertEqual(writes['regCOMPUTE_TMPRING_SIZE'][0], (0x800400,))
+    scratch_desc = writes['regCOMPUTE_USER_DATA_0'][0][:4]
+    self.assertEqual(scratch_desc[:3], (0x56789000, 0x80001234, 8 << 20))
+    self.assertTrue(scratch_desc[3] & (1 << 23))  # ADD_TID_ENABLE
 
   def test_drm_submit_callback_reuses_ring(self):
     submitted = []

@@ -405,7 +405,7 @@ class AMDComputeQueue(HWQueue):
         rsrc3 = hsa.union_SQ_BUF_RSRC_WORD3_bitfields(DST_SEL_X=hsa.SQ_SEL_X, DST_SEL_Y=hsa.SQ_SEL_Y, DST_SEL_Z=hsa.SQ_SEL_Z,
           DST_SEL_W=hsa.SQ_SEL_W, NUM_FORMAT=hsa.BUF_NUM_FORMAT_UINT, DATA_FORMAT=hsa.BUF_DATA_FORMAT_32,
           ELEMENT_SIZE=1, INDEX_STRIDE=3, ADD_TID_ENABLE=1, TYPE=hsa.SQ_RSRC_BUF)
-        user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, int.from_bytes(rsrc3, 'little')]
+        user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, prg.dev.scratch.size, int.from_bytes(rsrc3, 'little')]
       else:
         user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x20c14000]
 
@@ -430,7 +430,7 @@ class AMDComputeQueue(HWQueue):
     self.wreg(self.gc.regCOMPUTE_PGM_LO, *data64_le(prg.prog_addr >> 8))
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, prg.rsrc1, prg.rsrc2)
     if self.dev.target[0] > 8: self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
-    self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, 0 if prg.dev.target[0] == 8 else prg.dev.tmpring_size)
+    self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, prg.dev.tmpring_size)
 
     # this is what llvm refers to as "architected flat scratch"
     if self.dev.target[0] > 8:
