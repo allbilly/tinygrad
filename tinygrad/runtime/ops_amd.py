@@ -389,9 +389,11 @@ class AMDComputeQueue(HWQueue):
     self.bind_args_state(args_state)
 
     # The direct VI VMID0 path uses UC GART mappings and CPU-side barriers.
-    # Its ACQUIRE_MEM hangs before DISPATCH, while the gfx8 reference path does
-    # not emit this packet. KFD queues retain the normal barrier.
-    if self.dev.target[0] != 8 or not self.dev.is_am(): self.acquire_mem(gli=0, gl2=0)
+    # Kernel-backed VI submissions already get gfx_v8_0_emit_mem_sync_compute
+    # from AMDGPU_IB_FLAG_EMIT_MEM_SYNC. The passing gfx8 reference path also
+    # has no user-IB ACQUIRE_MEM. KFD queues retain the normal barrier.
+    kernel_submit = getattr(getattr(self.dev, "compute_queue", None), "submit_ib", None) is not None
+    if self.dev.target[0] != 8 or not (self.dev.is_am() or kernel_submit): self.acquire_mem(gli=0, gl2=0)
 
     user_regs = []
     if prg.enable_private_segment_sgpr:

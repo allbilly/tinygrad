@@ -62,6 +62,23 @@ class TestPolarisAM(unittest.TestCase):
         self.assertEqual(writes.count("regCOMPUTE_START_X"), 1)
         self.assertLess(writes.index("regCOMPUTE_START_X"), writes.index("regCOMPUTE_PGM_LO"))
 
+  def test_gfx8_kernel_submit_relies_on_kernel_mem_sync(self):
+    for kernel_submit, expect_acquire in ((True, False), (False, True)):
+      with self.subTest(kernel_submit=kernel_submit):
+        submit_ib = (lambda ib, size: None) if kernel_submit else None
+        dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False, sqtt_enabled=False, xccs=1, tmpring_size=0,
+                              compute_queue=SimpleNamespace(submit_ib=submit_ib))
+        queue = AMDComputeQueue(SimpleNamespace(soc=SimpleNamespace(CS_PARTIAL_FLUSH=0), pm4=pm4_soc15, gc=GFX8GC(), nbio=None))
+        queue.dev = dev
+        packets = []
+        queue.wreg = lambda *args, **kwargs: None  # type: ignore[method-assign]
+        queue.pkt3 = lambda cmd, *args: packets.append(cmd)  # type: ignore[method-assign]
+        queue.q = lambda *args: None  # type: ignore[method-assign]
+        prg = SimpleNamespace(dev=dev, enable_private_segment_sgpr=False, enable_dispatch_ptr=False, prog_addr=0x100000,
+                              rsrc1=0, rsrc2=0, rsrc3=0, wave32=False)
+        queue.exec(prg, SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x200000)), (1, 1, 1), (1, 1, 1))
+        self.assertEqual(pm4_soc15.PACKET3_ACQUIRE_MEM in packets, expect_acquire)
+
   def test_gfx8_dispatch_programs_private_scratch(self):
     scratch = SimpleNamespace(va_addr=0x123456789000, size=8 << 20)
     dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False, sqtt_enabled=False, xccs=1,
