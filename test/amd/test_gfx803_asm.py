@@ -179,6 +179,7 @@ class TestGFX803Encoder(unittest.TestCase):
       (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 3), b), GFX803Ops.V_OR_B32, out.tag),
        ("v_or_b32_e32 v42, 3, v41",)),
       (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_XOR_B32, out.tag), ("v_xor_b32_e32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_MUL_HI_U32, out.tag), ("v_mul_hi_u32 v42, v40, v41",)),
       (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 8), b), GFX803Ops.V_LSHRREV_B32, out.tag),
        ("v_lshrrev_b32_e32 v42, 8, v41",)),
       (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.uint32, 8), signed), GFX803Ops.V_ASHRREV_I32, signed.tag),
@@ -194,6 +195,7 @@ class TestGFX803Encoder(unittest.TestCase):
     half, out_half = _reg(dtypes.half, "v41", 41), _reg(dtypes.half, "v43", 43)
     cases = [
       (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RCP_F32, out_f32.tag), ("v_rcp_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RCP_IFLAG_F32, out_f32.tag), ("v_rcp_iflag_f32_e32 v42, v40",)),
       (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_SQRT_F32, out_f32.tag), ("v_sqrt_f32_e32 v42, v40",)),
       (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RSQ_F32, out_f32.tag), ("v_rsq_f32_e32 v42, v40",)),
       (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RCP_F32, out_half.tag), ("v_rcp_f16_e32 v43, v41",)),
@@ -344,10 +346,15 @@ class TestGFX803Program(unittest.TestCase):
   def test_integer_bool_programs_elf(self):
     renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
     i32 = Tensor.empty(16, dtype=dtypes.int32, device="NULL").contiguous().realize()
+    i32_divisor = Tensor.empty(16, dtype=dtypes.int32, device="NULL").contiguous().realize()
+    u32 = Tensor.empty(16, dtype=dtypes.uint32, device="NULL").contiguous().realize()
+    u32_divisor = Tensor.empty(16, dtype=dtypes.uint32, device="NULL").contiguous().realize()
     half = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
     boolean = Tensor.empty(16, dtype=dtypes.bool, device="NULL").contiguous().realize()
     cases = {
       "int_add": (i32+2, ("flat_load_dword", "v_add_u32", "flat_store_dword")),
+      "uint_div": (u32.div(u32_divisor, rounding_mode="trunc"), ("v_cvt_f32_u32", "v_rcp_iflag_f32", "v_mul_hi_u32")),
+      "int_mod": (i32.fmod(i32_divisor), ("v_cmp_lt_i32", "v_mul_hi_u32")),
       "half_compare": (half<0, ("flat_load_ushort", "v_cmp_lt_f16", "flat_store_byte")),
       "bool_to_uint": (boolean.cast(dtypes.uint32), ("flat_load_ubyte", "v_mov_b32", "flat_store_dword")),
       "int_to_float": (i32.float(), ("flat_load_dword", "v_cvt_f32_i32", "flat_store_dword")),

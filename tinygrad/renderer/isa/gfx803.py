@@ -51,6 +51,7 @@ class GFX803Ops(FastEnum):
   V_OR_B32 = auto()
   V_XOR_B32 = auto()
   V_MUL_LO_U32 = auto()
+  V_MUL_HI_U32 = auto()
   V_ADD_F32 = auto()
   V_MUL_F32 = auto()
   V_MAX_F32 = auto()
@@ -63,6 +64,7 @@ class GFX803Ops(FastEnum):
   V_CVT_I32_F32 = auto()
   V_CVT_U32_F32 = auto()
   V_RCP_F32 = auto()
+  V_RCP_IFLAG_F32 = auto()
   V_SQRT_F32 = auto()
   V_RSQ_F32 = auto()
   V_EXP2_F32 = auto()
@@ -121,7 +123,11 @@ def _abi(ctx:IselContext, x:UOp) -> UOp|None:
   load = UOp(Ops.INS, dtypes.uint64, (kernarg, _const_u32(offset)), GFX803Ops.S_LOAD_B64)
   # Keep the PARAM reachable for ELF kernarg metadata and preserve its place in
   # the schedule. The True tag prevents instruction selection from revisiting it.
-  return load.after(x.rtag())
+  # Scalar kernargs arrive in SGPRs, while the current integer selector expects
+  # varying ALU values in VGPRs. Broadcast the low dword before using one in
+  # index arithmetic; pointer arguments keep the full loaded pair.
+  value = UOp(Ops.INS, x.dtype, (load,), GFX803Ops.V_MOV_B32) if x.addrspace is AddrSpace.ALU else load
+  return value.after(x.rtag())
 
 
 def _global_index(x:UOp, base:UOp, idx:UOp) -> UOp|None:
@@ -266,6 +272,74 @@ def _shift(x:UOp, value:UOp, shift:UOp) -> UOp:
   return UOp(Ops.INS, x.dtype, (shift, value), op)
 
 
+def _isel_cast(dtype:DType, value:UOp) -> UOp:
+  ret = _cast(UOp(Ops.CAST, dtype, (value,)), value)
+  if ret is None: raise NotImplementedError(f"gfx803 internal cast from {value.dtype} to {dtype} is not lowered")
+  return ret
+
+
+def _uint_add(a:UOp, b:UOp) -> UOp:
+  return _int_add(UOp(Ops.ADD, dtypes.uint32, (a, b)), a, b)
+
+
+def _uint_mul(a:UOp, b:UOp) -> UOp:
+  return _int_mul(UOp(Ops.MUL, dtypes.uint32, (a, b)), a, b)
+
+
+def _uint_neg(value:UOp) -> UOp:
+  return _uint_mul(value, UOp.const(dtypes.uint32, 0xffffffff))
+
+
+def _uint_sub(a:UOp, b:UOp) -> UOp:
+  return _uint_add(a, _uint_neg(b))
+
+
+def _uint_divmod(dividend:UOp, divisor:UOp) -> tuple[UOp, UOp]:
+  # This is the reciprocal estimate and two-correction sequence emitted by
+  # LLVM for GCN udiv/urem. The multiply-high steps retain all 32 bits, unlike
+  # converting the dividend itself to float.
+  divisor_f = _isel_cast(dtypes.float32, divisor)
+  reciprocal_f = UOp(Ops.INS, dtypes.float32, (divisor_f,), GFX803Ops.V_RCP_IFLAG_F32)
+  scaled_f = _float_bin(UOp(Ops.MUL, dtypes.float32, (reciprocal_f, UOp.const(dtypes.float32, 4294966784.0))),
+                        reciprocal_f, UOp.const(dtypes.float32, 4294966784.0), GFX803Ops.V_MUL_F32)
+  reciprocal = _isel_cast(dtypes.uint32, scaled_f)
+  correction = UOp(Ops.INS, dtypes.uint32, (reciprocal, _uint_mul(_uint_neg(divisor), reciprocal)), GFX803Ops.V_MUL_HI_U32)
+  reciprocal = _uint_add(reciprocal, correction)
+  quotient = UOp(Ops.INS, dtypes.uint32, (dividend, reciprocal), GFX803Ops.V_MUL_HI_U32)
+  remainder = _uint_sub(dividend, _uint_mul(quotient, divisor))
+
+  for _ in range(2):
+    below = _cmp(UOp(Ops.CMPLT, dtypes.bool, (remainder, divisor)), remainder, divisor)
+    next_quotient = _uint_add(quotient, UOp.const(dtypes.uint32, 1))
+    next_remainder = _uint_sub(remainder, divisor)
+    quotient = _where(UOp(Ops.WHERE, dtypes.uint32, (below, quotient, next_quotient)), below, quotient, next_quotient)
+    remainder = _where(UOp(Ops.WHERE, dtypes.uint32, (below, remainder, next_remainder)), below, remainder, next_remainder)
+  return quotient, remainder
+
+
+def _int_divmod(x:UOp, a:UOp, b:UOp) -> UOp:
+  unsigned = x.dtype in dtypes.uints
+  dividend, divisor = _isel_cast(dtypes.uint32, a), _isel_cast(dtypes.uint32, b)
+  if not unsigned:
+    a_negative = _cmp(UOp(Ops.CMPLT, dtypes.bool, (a, UOp.const(x.dtype, 0))), a, UOp.const(x.dtype, 0))
+    b_negative = _cmp(UOp(Ops.CMPLT, dtypes.bool, (b, UOp.const(x.dtype, 0))), b, UOp.const(x.dtype, 0))
+    neg_dividend, neg_divisor = _uint_neg(dividend), _uint_neg(divisor)
+    dividend = _where(UOp(Ops.WHERE, dtypes.uint32, (a_negative, neg_dividend, dividend)), a_negative, neg_dividend, dividend)
+    divisor = _where(UOp(Ops.WHERE, dtypes.uint32, (b_negative, neg_divisor, divisor)), b_negative, neg_divisor, divisor)
+
+  quotient, remainder = _uint_divmod(dividend, divisor)
+  if unsigned: return quotient if x.op is Ops.CDIV else remainder
+
+  if x.op is Ops.CDIV:
+    negative = _bitwise(UOp(Ops.XOR, dtypes.bool, (a_negative, b_negative)), a_negative, b_negative)
+    negative_quotient = _uint_neg(quotient)
+    value = _where(UOp(Ops.WHERE, dtypes.uint32, (negative, negative_quotient, quotient)), negative, negative_quotient, quotient)
+  else:
+    negative_remainder = _uint_neg(remainder)
+    value = _where(UOp(Ops.WHERE, dtypes.uint32, (a_negative, negative_remainder, remainder)), a_negative, negative_remainder, remainder)
+  return _isel_cast(x.dtype, value)
+
+
 def _float_unary(x:UOp, value:UOp) -> UOp:
   op = {Ops.RECIPROCAL:GFX803Ops.V_RCP_F32, Ops.SQRT:GFX803Ops.V_SQRT_F32,
         Ops.EXP2:GFX803Ops.V_EXP2_F32, Ops.LOG2:GFX803Ops.V_LOG2_F32}[x.op]
@@ -345,6 +419,7 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat.var("addr"),), name="x"), _load),
   (UPat(Ops.ADD, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_add),
   (UPat(Ops.MUL, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_mul),
+  (UPat((Ops.CDIV, Ops.CMOD), dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_divmod),
   (UPat((Ops.SHL, Ops.SHR), dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"), _shift),
   (UPat((Ops.AND, Ops.OR, Ops.XOR), (dtypes.bool, *dtypes.int32s), src=(UPat.var("a"), UPat.var("b")), name="x"), _bitwise),
   (UPat((Ops.RECIPROCAL, Ops.SQRT, Ops.EXP2, Ops.LOG2), (dtypes.half, dtypes.float32),
@@ -448,6 +523,9 @@ def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
     value = int(x.arg)
     if 0 <= value <= 64: return 128 + value, ()
     if -16 <= value < 0: return 192 - value, ()
+    # Unsigned UOps keep their normalized 32-bit value, but GCN's inline
+    # negative constants are bit-identical and avoid an extra literal dword.
+    if 0xfffffff0 <= value <= 0xffffffff: return 192 - (value - (1 << 32)), ()
     return 255, (value & 0xffffffff,)
   reg = _physical_reg(x)
   return (256 + reg.index if reg.name.startswith("v") else reg.index), ()
@@ -607,14 +685,16 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     text = f"{mnemonic} v{dst.index}, {'vcc, ' if x.arg is GFX803Ops.V_ADD_U32 else ''}{src0_text}, v{src1.index}"
-  elif x.arg is GFX803Ops.V_MUL_LO_U32:
+  elif x.arg in {GFX803Ops.V_MUL_LO_U32, GFX803Ops.V_MUL_HI_U32}:
     assert dst is not None
     src0_code, literal0 = _src0(x.src[0])
     src1_code, literal1 = _src0(x.src[1])
-    if literal0 or literal1: raise RuntimeError("v_mul_lo_u32 does not support literal constants on gfx803")
-    data = b"".join(_word(w) for w in _vop3(0x285, dst.index, src0_code, src1_code))
+    if literal0 or literal1: raise RuntimeError(f"{x.arg} does not support literal constants on gfx803")
+    opcode = 0x285 if x.arg is GFX803Ops.V_MUL_LO_U32 else 0x286
+    mnemonic = "v_mul_lo_u32" if x.arg is GFX803Ops.V_MUL_LO_U32 else "v_mul_hi_u32"
+    data = b"".join(_word(w) for w in _vop3(opcode, dst.index, src0_code, src1_code))
     operands = [str(s.arg) if s.op is Ops.CONST else _physical_reg(s).name for s in x.src]
-    text = f"v_mul_lo_u32 v{dst.index}, {operands[0]}, {operands[1]}"
+    text = f"{mnemonic} v{dst.index}, {operands[0]}, {operands[1]}"
   elif x.arg in {GFX803Ops.V_ADD_F32, GFX803Ops.V_MUL_F32, GFX803Ops.V_MAX_F32}:
     assert dst is not None
     src0, literal = _src0(x.src[0])
@@ -648,10 +728,13 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       GFX803Ops.V_CVT_I32_F32:(0x08, "v_cvt_i32_f32_e32"), GFX803Ops.V_CVT_U32_F32:(0x07, "v_cvt_u32_f32_e32"),
     }[x.arg]
     data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
-  elif x.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_SQRT_F32, GFX803Ops.V_RSQ_F32, GFX803Ops.V_EXP2_F32, GFX803Ops.V_LOG2_F32}:
+  elif x.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_RCP_IFLAG_F32, GFX803Ops.V_SQRT_F32, GFX803Ops.V_RSQ_F32,
+                  GFX803Ops.V_EXP2_F32, GFX803Ops.V_LOG2_F32}:
     assert dst is not None
     src_reg = _physical_reg(x.src[0])
-    if x.dtype is dtypes.half:
+    if x.arg is GFX803Ops.V_RCP_IFLAG_F32:
+      op, mnemonic = 0x23, "v_rcp_iflag_f32_e32"
+    elif x.dtype is dtypes.half:
       op, mnemonic = {GFX803Ops.V_RCP_F32:(0x3d, "v_rcp_f16_e32"), GFX803Ops.V_SQRT_F32:(0x3e, "v_sqrt_f16_e32"),
                       GFX803Ops.V_RSQ_F32:(0x3f, "v_rsq_f16_e32"), GFX803Ops.V_EXP2_F32:(0x41, "v_exp_f16_e32"),
                       GFX803Ops.V_LOG2_F32:(0x40, "v_log_f16_e32")}[x.arg]
@@ -721,7 +804,10 @@ class AMDASMRenderer(ISARenderer):
   pre_isel_matcher, isel_matcher = pre_isel_matcher, isel_matcher
   pre_regalloc_matcher = None
   post_regalloc_matcher = post_regalloc_matcher
-  code_for_op = {op:lambda: None for op in (Ops.SQRT, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2)}
+  # Advertising the native bit operations also enables tinygrad's constant
+  # integer divide/modulo strength reduction before instruction selection.
+  code_for_op = {op:lambda: None for op in
+                 (Ops.AND, Ops.SHL, Ops.SHR, Ops.SQRT, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2)}
 
   def __init__(self, target:Target):
     if target.arch != "gfx803": raise RuntimeError(f"AMDASMRenderer only supports gfx803, got {target.arch}")
