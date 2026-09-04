@@ -152,7 +152,7 @@ class TestGFX803Encoder(unittest.TestCase):
     cases = [
       (UOp(Ops.INS, dtypes.bool, (addr,), GFX803Ops.FLAT_LOAD_U8, boolean.tag), ("flat_load_ubyte v44, v[4:5]",)),
       (UOp(Ops.INS, dtypes.half, (addr, UOp.const(dtypes.half, 0), gate), GFX803Ops.GATED_FLAT_LOAD_U16, half.tag),
-       ("v_mov_b32_e32 v43, 0", "v_cmp_ne_u32_e32 vcc, 0, v46", "s_and_saveexec_b64 s[32:33], vcc",
+       ("v_cmp_ne_u32_e32 vcc, 0, v46", "v_mov_b32_e32 v43, 0", "s_and_saveexec_b64 s[32:33], vcc",
         "flat_load_ushort v43, v[4:5]", "s_mov_b64 exec, s[32:33]")),
       (UOp(Ops.INS, dtypes.void, (addr, boolean), GFX803Ops.FLAT_STORE_B8), ("flat_store_byte v[4:5], v44",)),
       (UOp(Ops.INS, dtypes.bool, (lds_addr,), GFX803Ops.DS_LOAD_U8, boolean.tag), ("ds_read_u8 v44, v45",)),
@@ -170,6 +170,12 @@ class TestGFX803Encoder(unittest.TestCase):
     ]
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
+    # The destination may alias a dying gate. Preserve its predicate in VCC before writing the fallback value.
+    aliased_gate = UOp(Ops.INS, dtypes.half, (addr, UOp.const(dtypes.half, 0), gate), GFX803Ops.GATED_FLAT_LOAD_U16, gate.tag)
+    self.assertEqual(_encode(aliased_gate).to_bytes(), _assembled(
+      "v_cmp_ne_u32_e32 vcc, 0, v46", "v_mov_b32_e32 v46, 0", "s_and_saveexec_b64 s[32:33], vcc",
+      "flat_load_ushort v46, v[4:5]", "s_mov_b64 exec, s[32:33]"))
 
   def test_bitwise_and_shifts(self):
     a, b, out = (_reg(dtypes.uint32, f"v{i}", i) for i in (40, 41, 42))

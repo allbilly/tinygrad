@@ -626,11 +626,13 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       GFX803Ops.GATED_FLAT_LOAD_U16:(0xdc480000, "flat_load_ushort"),
       GFX803Ops.GATED_FLAT_LOAD_B32:(0xdc500000, "flat_load_dword"),
     }[x.arg]
-    data = (_word(_vop1(0x01, dst.index, src)) + b"".join(_word(v) for v in literal) +
-            b"".join(_word(w) for w in (_vopc(0xcd, 128, gate.index), 0xbea0206a, load_opcode,
-                                           (dst.index << 24) | addr.index, 0xbefe0120)))
-    text = (f"v_mov_b32_e32 v{dst.index}, {src_text}\n"
-            f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}\n"
+    # Compare before initializing the destination: the allocator may reuse the dying gate VGPR for dst.
+    # V_MOV does not modify VCC, so the saved predicate remains valid when gate and dst alias.
+    data = (_word(_vopc(0xcd, 128, gate.index)) + _word(_vop1(0x01, dst.index, src)) +
+            b"".join(_word(v) for v in literal) +
+            b"".join(_word(w) for w in (0xbea0206a, load_opcode, (dst.index << 24) | addr.index, 0xbefe0120)))
+    text = (f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}\n"
+            f"v_mov_b32_e32 v{dst.index}, {src_text}\n"
             f"s_and_saveexec_b64 s[32:33], vcc\n"
             f"{load_mnemonic} v{dst.index}, v[{addr.index}:{addr.index+1}]\n"
             f"s_mov_b64 exec, s[32:33]")
