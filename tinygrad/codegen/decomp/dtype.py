@@ -81,7 +81,7 @@ def rne(v: UOp, s) -> UOp: return shr(v, s) + ((shr(v, s - 1) & 1) & ((v & ((1 <
 
 def f2f(v, fr:DType, to:DType, sat=True):
   fs, fb, (fe, fm), ts, tb, (te, tm) = fr.bitsize, exponent_bias(fr), dtypes.finfo(fr), to.bitsize, exponent_bias(to), dtypes.finfo(to)
-  # NB: denormals are zero!
+  # NB: denormals are zero except for half -> float, which Polaris uses to preserve half inputs while emulating its arithmetic in float.
   if fe <= te and fm < tm:
     sign, nosign = shl((v & shl(1, fs-1)).cast(f2f_dt[to]), ts - fs), (v & (shl(1, fs-1) - 1)).cast(f2f_dt[to])
     exp, norm = shr(nosign, fm), shl(nosign, tm - fm) + shl(tb - fb, tm)
@@ -92,7 +92,9 @@ def f2f(v, fr:DType, to:DType, sat=True):
       return fnuz_nan.where(qnan, sign | exp.eq(0).where(0, norm)).bitcast(to)
     # fp8e4m3 has only one nan
     is_nan = (nosign.eq(shl(1, fm + fe) - 1) if fr == dtypes.fp8e4m3 else exp.eq(shl(1, fe) - 1))
-    return (sign | exp.eq(0).where(0, is_nan.where(nan, norm))).bitcast(to)
+    subnormal = (nosign & (shl(1, fm) - 1)).cast(to).mul(2.0 ** (1 - fb - fm)).bitcast(f2f_dt[to]) \
+      if (fr, to) == (dtypes.half, dtypes.float) else 0
+    return (sign | exp.eq(0).where(subnormal, is_nan.where(nan, norm))).bitcast(to)
   elif fe >= te and fm > tm:
     v = f2f_clamp(v.bitcast(fr), to, sat).bitcast(f2f_dt[fr])
     sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
