@@ -483,9 +483,15 @@ def _int_divmod(x:UOp, a:UOp, b:UOp) -> UOp:
 
 def _float_unary(x:UOp, value:UOp) -> UOp:
   if x.op is Ops.SIN:
-    turns = _float_bin(UOp(Ops.MUL, x.dtype, (value, UOp.const(x.dtype, 1 / (2 * 3.141592653589793)))),
-                       value, UOp.const(x.dtype, 1 / (2 * 3.141592653589793)), GFX803Ops.V_MUL_F32)
-    return UOp(Ops.INS, x.dtype, (turns,), GFX803Ops.V_SIN)
+    # V_SIN consumes turns, not radians, and has a finite input interval. Do
+    # range reduction in float32 so all finite half inputs stay in range.
+    wide = UOp(Ops.INS, dtypes.float32, (value,), GFX803Ops.V_CVT_F32_F16) if x.dtype is dtypes.half else value
+    turns = _float_bin(UOp(Ops.MUL, dtypes.float32), wide, UOp.const(dtypes.float32, 1 / (2 * 3.141592653589793)), GFX803Ops.V_MUL_F32)
+    whole = UOp(Ops.INS, dtypes.float32, (turns,), GFX803Ops.V_TRUNC)
+    negative_whole = _float_bin(UOp(Ops.MUL, dtypes.float32), UOp.const(dtypes.float32, -1), whole, GFX803Ops.V_MUL_F32)
+    reduced = _float_bin(UOp(Ops.ADD, dtypes.float32), turns, negative_whole, GFX803Ops.V_ADD_F32)
+    result = UOp(Ops.INS, dtypes.float32, (reduced,), GFX803Ops.V_SIN)
+    return UOp(Ops.INS, dtypes.half, (result,), GFX803Ops.V_CVT_F16_F32) if x.dtype is dtypes.half else result
   op = {Ops.RECIPROCAL:GFX803Ops.V_RCP_F32, Ops.SQRT:GFX803Ops.V_SQRT_F32,
         Ops.EXP2:GFX803Ops.V_EXP2_F32, Ops.LOG2:GFX803Ops.V_LOG2_F32, Ops.TRUNC:GFX803Ops.V_TRUNC}[x.op]
   return UOp(Ops.INS, x.dtype, (value,), op)

@@ -564,7 +564,8 @@ class TestGFX803Program(unittest.TestCase):
       "sqrt_f16": (dtypes.half, "sqrt", ("v_sqrt_f16",)), "rsqrt_f16": (dtypes.half, "rsqrt", ("v_rsq_f16",)),
       "exp2_f32": (dtypes.float32, "exp2", ("v_exp_f32",)), "log2_f32": (dtypes.float32, "log2", ("v_log_f32",)),
       "exp2_f16": (dtypes.half, "exp2", ("v_exp_f16",)), "log2_f16": (dtypes.half, "log2", ("v_log_f16",)),
-      "sin_f32": (dtypes.float32, "sin", ("v_mul_f32", "v_sin_f32")), "sin_f16": (dtypes.half, "sin", ("v_mul_f16", "v_sin_f16")),
+      "sin_f32": (dtypes.float32, "sin", ("v_mul_f32", "v_trunc_f32", "v_sin_f32")),
+      "sin_f16": (dtypes.half, "sin", ("v_cvt_f32_f16", "v_trunc_f32", "v_sin_f32", "v_cvt_f16_f32")),
       "trunc_f32": (dtypes.float32, "trunc", ("v_trunc_f32",)), "trunc_f16": (dtypes.half, "trunc", ("v_trunc_f16",)),
     }
     for name, (dtype, op, expected) in cases.items():
