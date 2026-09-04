@@ -70,6 +70,18 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
       start,stride=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
       if start<0 or gather.count and start+(gather.count-1)*stride>=dst_limit: raise IndexError("RKGather destination exceeds buffer")
       dst.mv[start:start+gather.count*stride:stride]=array.array(_RAW_FORMATS[gather.itemsize],[gather.fill_bits])*gather.count
+    if gather.index is None and gather.offsets and gather.partial and not overlap and gather.dst_stride==1 and gather.dst_addend>=0 and gather.dst_addend+gather.count<=dst_limit:  # noqa: E501
+      runs:list[tuple[int,int,int]]=[]; begin=first=-1  # noqa: E702
+      for lane,source in enumerate(gather.offsets):
+        if 0<=source<src_limit and (begin<0 or source==gather.offsets[lane-1]+1):
+          if begin<0: begin,first=lane,source
+        else:
+          runs.extend(((begin,first,lane-begin),) if begin>=0 else ()); begin,first=(lane,source) if 0<=source<src_limit else (-1,-1)  # noqa: E702,E501
+        if len(runs)>2048: break
+      else:
+        if begin>=0: runs.append((begin,first,gather.count-begin))
+        for lane,source,count in runs: ctypes.memmove(dst.addr+(gather.dst_addend+lane)*gather.itemsize,src.addr+source*gather.itemsize,count*gather.itemsize)  # noqa: E501
+        continue
     if gather.index is None and gather.offsets and not overlap and gather.dst_addend>=0 and gather.dst_addend+(gather.count-1)*gather.dst_stride<dst_limit:  # noqa: E501
       if (valid:=min(gather.offsets)>=0 and max(gather.offsets)<src_limit) and gather.count>1 or not gather.partial:
         packed=array.array(_RAW_FORMATS[gather.itemsize],operator.itemgetter(*gather.offsets)(src.mv) if valid and gather.count>1 else (src.mv[index] if 0<=index<src_limit else gather.fill_bits for index in gather.offsets)); dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=packed; continue  # noqa: E702,E501
