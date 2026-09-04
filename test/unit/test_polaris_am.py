@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from tinygrad.codegen.opt import tc
 from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, _kfd_doorbell_params
 from tinygrad.runtime.autogen.am import pm4_soc15
 from tinygrad.runtime.support.am.polaris import (
@@ -34,6 +35,9 @@ class FakePCI:
   def map_bar(self, bar, fmt='B'): return self.bars[bar]
 
 class TestPolarisAM(unittest.TestCase):
+  def test_gfx803_has_no_tensor_cores(self):
+    self.assertEqual(tc.get_amd("gfx803"), [])
+
   def test_drm_submit_callback_reuses_ring(self):
     submitted = []
     ring_buf = SimpleNamespace()
