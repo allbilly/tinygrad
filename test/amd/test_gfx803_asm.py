@@ -123,6 +123,8 @@ class TestGFX803Encoder(unittest.TestCase):
     cases = [
       (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, 2.5),), GFX803Ops.V_MOV_B32, out.tag),
        ("v_mov_b32_e32 v42, 0x4100",)),
+      (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, -2147483648),), GFX803Ops.V_MOV_B32, out.tag),
+       ("v_mov_b32_e32 v42, 0xfc00",)),
       (UOp(Ops.INS, dtypes.half, (addr,), GFX803Ops.FLAT_LOAD_U16, out.tag),
        ("flat_load_ushort v42, v[4:5]",)),
       (UOp(Ops.INS, dtypes.void, (addr, out), GFX803Ops.FLAT_STORE_B16),

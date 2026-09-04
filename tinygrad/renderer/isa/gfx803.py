@@ -575,11 +575,16 @@ def _vopc(op:int, src0:int, src1:int) -> int:
   return 0x7c000000 | ((op & 0xff) << 17) | ((src1 & 0xff) << 9) | (src0 & 0x1ff)
 
 
+def _half_bits(value:float) -> int:
+  try: return struct.unpack("<H", struct.pack("<e", value))[0]
+  except OverflowError: return 0x7c00 if value > 0 else 0xfc00
+
+
 def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
   if x.op is Ops.CONST:
     if dtypes.is_float(x.dtype):
       if x.dtype is dtypes.half:
-        value = struct.unpack("<H", struct.pack("<e", float(x.arg)))[0]
+        value = _half_bits(float(x.arg))
         inline = {0x0000:128, 0x3800:240, 0xb800:241, 0x3c00:242, 0xbc00:243,
                   0x4000:244, 0xc000:245, 0x4400:246, 0xc400:247, 0x3118:248}
         return (inline[value], ()) if value in inline else (255, (value,))
@@ -600,7 +605,7 @@ def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
 
 def _raw_src0(x:UOp) -> tuple[int, tuple[int, ...], str]:
   if x.op is Ops.CONST and x.dtype is dtypes.half:
-    value = struct.unpack("<H", struct.pack("<e", float(x.arg)))[0]
+    value = _half_bits(float(x.arg))
     src, literal = _src0(UOp.const(dtypes.uint32, value))
     return src, literal, str(value) if not literal else f"{value:#x}"
   src, literal = _src0(x)
