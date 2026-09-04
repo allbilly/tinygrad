@@ -7,6 +7,10 @@ from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.renderer.nir import NIRRenderer
 
+# Keep factory-created PyTorch references aligned with tinygrad when this suite
+# is intentionally run with DEFAULT_FLOAT=HALF.
+if dtypes.default_float == dtypes.half: torch.set_default_dtype(torch.float16)
+
 TINY_BACKEND = getenv("TINY_BACKEND")
 if TINY_BACKEND:
   import tinygrad.nn.torch # noqa: F401 # pylint: disable=unused-import
@@ -906,7 +910,7 @@ class TestOps(unittest.TestCase):
   @unittest.skipIf(DEV.renderer == "NAK", "MUFU.SIN is not accurate enough")
   def test_cos(self):
     helper_test_op([(45,65)], lambda x: x.cos())
-    helper_test_op([], lambda: torch.tensor(2.0).cos(), lambda: Tensor(2).cos(), forward_only=True)
+    helper_test_op([], lambda: torch.tensor(2).cos(), lambda: Tensor(2).cos(), forward_only=True)
     helper_test_op([()], lambda x: x.cos())
     if not ((DEV.interface.startswith("MOCK") and Device.DEFAULT == "NV") or Device.DEFAULT == "WEBGPU"):
       helper_test_op(None, lambda x: x.cos(), vals=[[math.nan, math.inf, -math.inf, 0.0]])
@@ -1511,7 +1515,7 @@ class TestOps(unittest.TestCase):
     self.helper_test_exception([()], lambda x: x.sum((1,)), expected=IndexError)
 
   def test_sum_dtype_arg(self):
-    helper_test_op([(45,3)], lambda x: x.sum(), lambda x: x.sum(dtype=dtypes.float32))
+    helper_test_op([(45,3)], lambda x: x.sum(dtype=torch.float32), lambda x: x.sum(dtype=dtypes.float32))
     if dtypes.float64 in Device[Device.DEFAULT].renderer.supported_dtypes():
       helper_test_op([(45,3)], lambda x: x.sum(dtype=torch.float64), lambda x: x.sum(dtype=dtypes.float64))
 
@@ -2859,7 +2863,7 @@ class TestOps(unittest.TestCase):
     with self.assertRaises(ValueError):
       Tensor.stack((Tensor([1, 2]), Tensor([3, 4])), Tensor([5, 6]))
 
-    np.testing.assert_allclose(Tensor.stack(Tensor(3.14), Tensor(3.14)).numpy(), np.array([3.14, 3.14]))
+    np.testing.assert_allclose(Tensor.stack(Tensor(3.14), Tensor(3.14)).numpy(), np.array([3.14, 3.14], dtype=_to_np_dtype(dtypes.default_float)))
 
   def test_stack_max(self):
     helper_test_op(None, lambda x, y: torch.stack((x, y)).max(axis=0)[0], lambda x, y: Tensor.stack(x, y).max(axis=0), vals=[[1.], [2.]])
