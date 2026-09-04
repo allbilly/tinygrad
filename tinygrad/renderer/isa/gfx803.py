@@ -63,6 +63,8 @@ class GFX803Ops(FastEnum):
   V_RCP_F32 = auto()
   V_SQRT_F32 = auto()
   V_RSQ_F32 = auto()
+  V_EXP2_F32 = auto()
+  V_LOG2_F32 = auto()
   V_CMPLT = auto()
   V_CMPEQ = auto()
   V_CMPNE = auto()
@@ -258,7 +260,9 @@ def _shift(x:UOp, value:UOp, shift:UOp) -> UOp:
 
 
 def _float_unary(x:UOp, value:UOp) -> UOp:
-  return UOp(Ops.INS, x.dtype, (value,), {Ops.RECIPROCAL:GFX803Ops.V_RCP_F32, Ops.SQRT:GFX803Ops.V_SQRT_F32}[x.op])
+  op = {Ops.RECIPROCAL:GFX803Ops.V_RCP_F32, Ops.SQRT:GFX803Ops.V_SQRT_F32,
+        Ops.EXP2:GFX803Ops.V_EXP2_F32, Ops.LOG2:GFX803Ops.V_LOG2_F32}[x.op]
+  return UOp(Ops.INS, x.dtype, (value,), op)
 
 
 def _rsqrt(x:UOp, value:UOp) -> UOp:
@@ -330,7 +334,8 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.MUL, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_mul),
   (UPat((Ops.SHL, Ops.SHR), dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"), _shift),
   (UPat((Ops.AND, Ops.OR, Ops.XOR), (dtypes.bool, *dtypes.int32s), src=(UPat.var("a"), UPat.var("b")), name="x"), _bitwise),
-  (UPat((Ops.RECIPROCAL, Ops.SQRT), (dtypes.half, dtypes.float32), src=(UPat.var("value"),), name="x"), _float_unary),
+  (UPat((Ops.RECIPROCAL, Ops.SQRT, Ops.EXP2, Ops.LOG2), (dtypes.half, dtypes.float32),
+        src=(UPat.var("value"),), name="x"), _float_unary),
   ((UPat.var("a", (dtypes.half, dtypes.float32)) + UPat.var("b", (dtypes.half, dtypes.float32))).named("x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_ADD_F32)),
   (UPat(Ops.MUL, (dtypes.half, dtypes.float32), src=(UPat.var("a"), UPat.var("b")), name="x"),
@@ -620,15 +625,17 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       GFX803Ops.V_CVT_I32_F32:(0x08, "v_cvt_i32_f32_e32"), GFX803Ops.V_CVT_U32_F32:(0x07, "v_cvt_u32_f32_e32"),
     }[x.arg]
     data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
-  elif x.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_SQRT_F32, GFX803Ops.V_RSQ_F32}:
+  elif x.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_SQRT_F32, GFX803Ops.V_RSQ_F32, GFX803Ops.V_EXP2_F32, GFX803Ops.V_LOG2_F32}:
     assert dst is not None
     src_reg = _physical_reg(x.src[0])
     if x.dtype is dtypes.half:
       op, mnemonic = {GFX803Ops.V_RCP_F32:(0x3d, "v_rcp_f16_e32"), GFX803Ops.V_SQRT_F32:(0x3e, "v_sqrt_f16_e32"),
-                      GFX803Ops.V_RSQ_F32:(0x3f, "v_rsq_f16_e32")}[x.arg]
+                      GFX803Ops.V_RSQ_F32:(0x3f, "v_rsq_f16_e32"), GFX803Ops.V_EXP2_F32:(0x41, "v_exp_f16_e32"),
+                      GFX803Ops.V_LOG2_F32:(0x40, "v_log_f16_e32")}[x.arg]
     else:
       op, mnemonic = {GFX803Ops.V_RCP_F32:(0x22, "v_rcp_f32_e32"), GFX803Ops.V_SQRT_F32:(0x27, "v_sqrt_f32_e32"),
-                      GFX803Ops.V_RSQ_F32:(0x24, "v_rsq_f32_e32")}[x.arg]
+                      GFX803Ops.V_RSQ_F32:(0x24, "v_rsq_f32_e32"), GFX803Ops.V_EXP2_F32:(0x20, "v_exp_f32_e32"),
+                      GFX803Ops.V_LOG2_F32:(0x21, "v_log_f32_e32")}[x.arg]
     data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
   elif x.arg in {GFX803Ops.V_CMPLT, GFX803Ops.V_CMPEQ, GFX803Ops.V_CMPNE}:
     assert dst is not None
@@ -691,7 +698,7 @@ class AMDASMRenderer(ISARenderer):
   pre_isel_matcher, isel_matcher = pre_isel_matcher, isel_matcher
   pre_regalloc_matcher = None
   post_regalloc_matcher = post_regalloc_matcher
-  code_for_op = {Ops.SQRT: lambda: None, Ops.RECIPROCAL: lambda: None}
+  code_for_op = {op:lambda: None for op in (Ops.SQRT, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2)}
 
   def __init__(self, target:Target):
     if target.arch != "gfx803": raise RuntimeError(f"AMDASMRenderer only supports gfx803, got {target.arch}")

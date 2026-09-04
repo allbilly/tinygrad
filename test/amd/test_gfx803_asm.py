@@ -197,6 +197,10 @@ class TestGFX803Encoder(unittest.TestCase):
       (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RCP_F32, out_half.tag), ("v_rcp_f16_e32 v43, v41",)),
       (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_SQRT_F32, out_half.tag), ("v_sqrt_f16_e32 v43, v41",)),
       (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RSQ_F32, out_half.tag), ("v_rsq_f16_e32 v43, v41",)),
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_EXP2_F32, out_f32.tag), ("v_exp_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_LOG2_F32, out_f32.tag), ("v_log_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_EXP2_F32, out_half.tag), ("v_exp_f16_e32 v43, v41",)),
+      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_LOG2_F32, out_half.tag), ("v_log_f16_e32 v43, v41",)),
     ]
     for uop, lines in cases:
       with self.subTest(op=uop.arg, dtype=uop.dtype): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
@@ -385,6 +389,8 @@ class TestGFX803Program(unittest.TestCase):
       "rcp_f32": (dtypes.float32, "reciprocal", ("v_rcp_f32",)), "sqrt_f32": (dtypes.float32, "sqrt", ("v_sqrt_f32",)),
       "rsqrt_f32": (dtypes.float32, "rsqrt", ("v_rsq_f32",)), "rcp_f16": (dtypes.half, "reciprocal", ("v_rcp_f16",)),
       "sqrt_f16": (dtypes.half, "sqrt", ("v_sqrt_f16",)), "rsqrt_f16": (dtypes.half, "rsqrt", ("v_rsq_f16",)),
+      "exp2_f32": (dtypes.float32, "exp2", ("v_exp_f32",)), "log2_f32": (dtypes.float32, "log2", ("v_log_f32",)),
+      "exp2_f16": (dtypes.half, "exp2", ("v_exp_f16",)), "log2_f16": (dtypes.half, "log2", ("v_log_f16",)),
     }
     for name, (dtype, op, expected) in cases.items():
       with self.subTest(name=name):
