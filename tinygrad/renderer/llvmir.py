@@ -211,6 +211,11 @@ code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{c
                      "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
 # https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html#llvm-ir-intrinsics
 llvm_intrinsics = {Ops.SQRT: "sqrt", Ops.LOG2: "log2", Ops.EXP2: "exp2"}
+pm_gfx803_mixed_precision = PatternMatcher([
+  # gfx803 rounds a native f16 product before a following f32 accumulation. Widen the operands so dot/conv keep the expected f32 product.
+  (UPat(Ops.CAST, dtypes.float, src=(UPat(Ops.MUL, dtypes.half, src=(UPat.var("a"), UPat.var("b"))),)),
+   lambda a,b: a.cast(dtypes.float) * b.cast(dtypes.float)),
+])
 class AMDLLVMRenderer(LLVMRenderer):
   has_local = True
   shared_max = HIPRenderer.shared_max
@@ -262,6 +267,7 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
     from tinygrad.runtime.support.compiler_llvm import AMDLLVMCompiler
     self.compiler, self.tensor_cores, self.is_cdna = AMDLLVMCompiler(target.arch), tc.get_amd(target.arch), HIPRenderer.is_cdna(target.arch)
     self.string_rewrite += PatternMatcher([(UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, cdna=self.is_cdna: render_wmma_amd(ctx, wmma, cdna))])
+    if target.arch == "gfx803": self.extra_matcher += pm_gfx803_mixed_precision
     if self.is_cdna:
       self.extra_matcher += PatternMatcher([
         (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
