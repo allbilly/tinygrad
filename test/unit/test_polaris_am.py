@@ -158,6 +158,23 @@ class TestPolarisAM(unittest.TestCase):
     self.assertEqual(submitted, [4])
     self.assertEqual(signals, [(0x12345000, 7), (0x12345000, 8)])
 
+  def test_gfx8_drm_uses_host_timestamps_around_fence(self):
+    events = []
+    desc = AMDQueueDesc(ring=FakeMMIO(0x1000), read_ptr=FakeMMIO(8), write_ptr=FakeMMIO(8), doorbell=FakeMMIO(8),
+                        submit_ib=lambda ib, size: events.append(("submit", size)), ring_buf=SimpleNamespace())  # type: ignore[arg-type]
+    iface = SimpleNamespace(write_signal=lambda addr, val: events.append(("write", addr, val)))
+    dev = SimpleNamespace(target=(8, 0, 3), soc=SimpleNamespace(), pm4=pm4_soc15, gc=GFX8GC(), nbio=None, compute_queue=desc,
+                          iface=iface, error_state=None, is_am=lambda: False, xccs=1)
+    queue = AMDComputeQueue(dev)
+    start, end = SimpleNamespace(timestamp_addr=0x100008), SimpleNamespace(timestamp_addr=0x100018)
+    timeline = SimpleNamespace(value_addr=0x100000, owner=dev, is_timeline=True)
+    queue.timestamp(start).pkt3(pm4_soc15.PACKET3_NOP, 0)
+    queue.timestamp(end).signal(timeline, 4).submit(dev)
+    self.assertEqual([x[0] for x in events], ["write", "submit", "write", "write"])
+    self.assertEqual([x[1] for x in events if x[0] == "write"], [0x100008, 0x100018, 0x100000])
+    self.assertLessEqual(events[0][2], events[2][2])
+    self.assertEqual(events[-1][2], 4)
+
   def test_drm_write_signal_resolves_gpu_va_to_cpu_mapping(self):
     backing = (ctypes.c_uint64 * 4)()
     iface = DRMIface.__new__(DRMIface)

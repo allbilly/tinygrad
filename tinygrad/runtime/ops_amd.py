@@ -101,6 +101,7 @@ class AMDComputeQueue(HWQueue):
     self.dev, self.soc, self.pm4, self.gc, self.nbio = dev, dev.soc, dev.pm4, dev.gc, dev.nbio
     super().__init__()
     self._host_signals:list[tuple[Any, MMIOInterface]] = []
+    self._host_timestamps:list[tuple[Any, MMIOInterface, int]] = []
 
   def __del__(self):
     if self.binded_device is not None:
@@ -471,6 +472,11 @@ class AMDComputeQueue(HWQueue):
     return self if self._gfx8_kernel_submit() else self.wait_reg_mem(mem=signal.value_addr, value=value, mask=0xffffffff)
 
   def timestamp(self, signal:AMDSignal):
+    if self._gfx8_kernel_submit():
+      vals = (ctypes.c_uint64 * 1)()
+      self._host_timestamps.append((vals, view:=MMIOInterface(ctypes.addressof(vals), ctypes.sizeof(vals), fmt='Q'), len(self._q)))
+      self.bind_sints_to_mem(signal.timestamp_addr, mem=view, fmt='Q')
+      return self
     if self.dev.target[0] == 8 and self.dev.is_am(): return self
     with self.pred_exec(xcc_mask=0b1):
       self.release_mem(cache_flush=False) # ensure all prior writes are done
@@ -530,12 +536,19 @@ class AMDComputeQueue(HWQueue):
       pad = (-(dev.compute_queue.put_value + len(cmds))) & 0xff
       cmds = [*cmds, *([self.pm4.PACKET3(self.pm4.PACKET3_NOP, 0x3fff)] * pad)]
 
+    if self._gfx8_kernel_submit():
+      start_tick = time.perf_counter_ns() // 10  # AMDSignal timestamps use a 100 MHz clock.
+      for _, vals, qoff in self._host_timestamps:
+        if qoff == 0: dev.iface.write_signal(vals[0], start_tick)
     if len(cmds):
       for i, value in enumerate(cmds): dev.compute_queue.ring[(dev.compute_queue.put_value + i) % len(dev.compute_queue.ring)] = value
       dev.compute_queue.put_value += len(cmds)
       dev.compute_queue.signal_doorbell(dev)
     elif not self._gfx8_kernel_submit(): dev.compute_queue.signal_doorbell(dev)
     if self._gfx8_kernel_submit():
+      end_tick = time.perf_counter_ns() // 10
+      for _, vals, qoff in self._host_timestamps:
+        if qoff != 0: dev.iface.write_signal(vals[0], end_tick)
       for _, vals in self._host_signals: dev.iface.write_signal(vals[0], vals[1])
       System.memory_barrier()
 
