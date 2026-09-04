@@ -494,6 +494,11 @@ def _float_unary(x:UOp, value:UOp) -> UOp:
     return UOp(Ops.INS, dtypes.half, (result,), GFX803Ops.V_CVT_F16_F32) if x.dtype is dtypes.half else result
   op = {Ops.RECIPROCAL:GFX803Ops.V_RCP_F32, Ops.SQRT:GFX803Ops.V_SQRT_F32,
         Ops.EXP2:GFX803Ops.V_EXP2_F32, Ops.LOG2:GFX803Ops.V_LOG2_F32, Ops.TRUNC:GFX803Ops.V_TRUNC}[x.op]
+  # asinh/acosh lower to log2(x + sqrt(x*x +/- 1)). Keep that composite
+  # argument wide so finite half inputs cannot overflow in the square.
+  if x.dtype is dtypes.half and x.op is Ops.LOG2 and value.op is Ops.ADD:
+    result = UOp(Ops.INS, dtypes.float32, (_half_to_float(value),), op)
+    return UOp(Ops.INS, dtypes.half, (result,), GFX803Ops.V_CVT_F16_F32)
   return UOp(Ops.INS, x.dtype, (value,), op)
 
 
@@ -502,6 +507,13 @@ def _rsqrt(x:UOp, value:UOp) -> UOp:
 
 
 def _half_to_float(value:UOp) -> UOp:
+  if value.dtype is dtypes.float32: return value
+  if value.op in {Ops.ADD, Ops.MUL, Ops.MAX}:
+    return UOp(value.op, dtypes.float32, tuple(_half_to_float(src) for src in value.src), value.arg)
+  if value.op in {Ops.RECIPROCAL, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.TRUNC}:
+    return UOp(value.op, dtypes.float32, (_half_to_float(value.src[0]),), value.arg)
+  if value.op is Ops.WHERE:
+    return UOp(Ops.WHERE, dtypes.float32, (value.src[0], _half_to_float(value.src[1]), _half_to_float(value.src[2])), value.arg)
   if value.op is Ops.CONST: value = UOp(Ops.INS, dtypes.half, (value,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, dtypes.float32, (value,), GFX803Ops.V_CVT_F32_F16)
 
@@ -510,14 +522,15 @@ def _float_bin(x:UOp, a:UOp, b:UOp, ins:GFX803Ops) -> UOp:
   # a / b arrives as a * reciprocal(b). Keeping the reciprocal in half can
   # overflow even when the quotient is representable, so fuse it in float32.
   if x.dtype is dtypes.half and ins is GFX803Ops.V_MUL_F32:
-    def is_reciprocal(v:UOp) -> bool:
-      return v.op is Ops.RECIPROCAL or (v.op is Ops.INS and v.arg is GFX803Ops.V_RCP_F32)
-    reciprocal = b if is_reciprocal(b) else a if is_reciprocal(a) else None
-    if reciprocal is not None:
-      numerator = a if reciprocal is b else b
-      wide_numerator, wide_denominator = _half_to_float(numerator), _half_to_float(reciprocal.src[0])
-      wide_reciprocal = UOp(Ops.INS, dtypes.float32, (wide_denominator,), GFX803Ops.V_RCP_F32)
-      quotient = UOp(Ops.INS, dtypes.float32, (wide_numerator, wide_reciprocal), GFX803Ops.V_MUL_F32)
+    def is_inverse(v:UOp) -> bool:
+      return v.op is Ops.RECIPROCAL or (v.op is Ops.INS and v.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_RSQ_F32})
+    inverse = b if is_inverse(b) else a if is_inverse(a) else None
+    if inverse is not None:
+      numerator = a if inverse is b else b
+      inverse_op = GFX803Ops.V_RSQ_F32 if inverse.op is Ops.INS and inverse.arg is GFX803Ops.V_RSQ_F32 else GFX803Ops.V_RCP_F32
+      wide_numerator, wide_denominator = _half_to_float(numerator), _half_to_float(inverse.src[0])
+      wide_inverse = UOp(Ops.INS, dtypes.float32, (wide_denominator,), inverse_op)
+      quotient = UOp(Ops.INS, dtypes.float32, (wide_numerator, wide_inverse), GFX803Ops.V_MUL_F32)
       return UOp(Ops.INS, dtypes.half, (quotient,), GFX803Ops.V_CVT_F16_F32)
   if b.op is Ops.CONST: a, b = b, a
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)

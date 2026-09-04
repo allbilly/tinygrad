@@ -594,6 +594,23 @@ class TestGFX803Program(unittest.TestCase):
       self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
     self.assertFalse(any(line.startswith(("v_rcp_f16", "v_mul_f16")) for line in code_lines))
 
+  def test_half_composite_transcendentals_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    source = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    for name, result, expected in (
+      ("atan", source.atan(), ("v_rsq_f32",)),
+      ("asinh", source.asinh(), ("v_sqrt_f32", "v_log_f32")),
+      ("acosh", source.acosh(), ("v_sqrt_f32", "v_log_f32")),
+    ):
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, _, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        code_lines = lines[:lines.index("s_endpgm")+1]
+        self.assertEqual(relocs, [])
+        self.assertEqual(_assembled(*lines), text.content)
+        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
+
   def test_integer_max_reductions_elf(self):
     renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
     cases = {
