@@ -118,6 +118,7 @@ class TestGFX803Encoder(unittest.TestCase):
   def test_half_memory_alu_and_casts(self):
     a, b, out = (_reg(dtypes.half, f"v{i}", i) for i in (40, 41, 42))
     out_float, gate = _reg(dtypes.float32, "v43", 43), _reg(dtypes.bool, "v44", 44)
+    signed_short, unsigned_short = _reg(dtypes.int16, "v46", 46), _reg(dtypes.uint16, "v47", 47)
     addr, lds_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8), _reg(dtypes.uint32, "v45", 45)
     cases = [
       (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, 2.5),), GFX803Ops.V_MOV_B32, out.tag),
@@ -135,6 +136,12 @@ class TestGFX803Encoder(unittest.TestCase):
        ("v_add_f16_e32 v42, 2.5, v41",)),
       (UOp(Ops.INS, dtypes.float32, (a,), GFX803Ops.V_CVT_F32_F16, out_float.tag), ("v_cvt_f32_f16_e32 v43, v40",)),
       (UOp(Ops.INS, dtypes.half, (out_float,), GFX803Ops.V_CVT_F16_F32, out.tag), ("v_cvt_f16_f32_e32 v42, v43",)),
+      (UOp(Ops.INS, dtypes.int16, (a,), GFX803Ops.V_CVT_I16_F16, signed_short.tag), ("v_cvt_i16_f16_e32 v46, v40",)),
+      (UOp(Ops.INS, dtypes.uint16, (a,), GFX803Ops.V_CVT_U16_F16, unsigned_short.tag), ("v_cvt_u16_f16_e32 v47, v40",)),
+      (UOp(Ops.INS, dtypes.half, (signed_short,), GFX803Ops.V_CVT_F16_I16, out.tag), ("v_cvt_f16_i16_e32 v42, v46",)),
+      (UOp(Ops.INS, dtypes.half, (unsigned_short,), GFX803Ops.V_CVT_F16_U16, out.tag), ("v_cvt_f16_u16_e32 v42, v47",)),
+      (UOp(Ops.INS, dtypes.half, (a,), GFX803Ops.V_TRUNC, out.tag), ("v_trunc_f16_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.float32, (out_float,), GFX803Ops.V_TRUNC, out_float.tag), ("v_trunc_f32_e32 v43, v43",)),
       (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPLT, gate.tag),
        ("v_cmp_lt_f16_e32 vcc, v40, v41", "v_cndmask_b32_e64 v44, 0, 1, vcc")),
       (UOp(Ops.INS, dtypes.void, (addr, out, gate), GFX803Ops.GATED_FLAT_STORE_B16),
@@ -180,12 +187,15 @@ class TestGFX803Encoder(unittest.TestCase):
   def test_bitwise_and_shifts(self):
     a, b, out = (_reg(dtypes.uint32, f"v{i}", i) for i in (40, 41, 42))
     signed = _reg(dtypes.int32, "v43", 43)
+    signed_short, extended = _reg(dtypes.int16, "v44", 44), _reg(dtypes.int32, "v45", 45)
     cases = [
       (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_AND_B32, out.tag), ("v_and_b32_e32 v42, v40, v41",)),
       (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 3), b), GFX803Ops.V_OR_B32, out.tag),
        ("v_or_b32_e32 v42, 3, v41",)),
       (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_XOR_B32, out.tag), ("v_xor_b32_e32 v42, v40, v41",)),
       (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_MUL_HI_U32, out.tag), ("v_mul_hi_u32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.int32, (signed_short, UOp.const(dtypes.uint32, 0), UOp.const(dtypes.uint32, 16)),
+           GFX803Ops.V_BFE_I32, extended.tag), ("v_bfe_i32 v45, v44, 0, 16",)),
       (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 8), b), GFX803Ops.V_LSHRREV_B32, out.tag),
        ("v_lshrrev_b32_e32 v42, 8, v41",)),
       (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.uint32, 8), signed), GFX803Ops.V_ASHRREV_I32, signed.tag),
@@ -211,6 +221,8 @@ class TestGFX803Encoder(unittest.TestCase):
       (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_LOG2_F32, out_f32.tag), ("v_log_f32_e32 v42, v40",)),
       (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_EXP2_F32, out_half.tag), ("v_exp_f16_e32 v43, v41",)),
       (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_LOG2_F32, out_half.tag), ("v_log_f16_e32 v43, v41",)),
+      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_SIN, out_f32.tag), ("v_sin_f32_e32 v42, v40",)),
+      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_SIN, out_half.tag), ("v_sin_f16_e32 v43, v41",)),
     ]
     for uop, lines in cases:
       with self.subTest(op=uop.arg, dtype=uop.dtype): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
@@ -349,6 +361,7 @@ class TestGFX803Program(unittest.TestCase):
     mb = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
     cases = {
       "add": (a+b, ("flat_load_ushort", "v_add_f16", "flat_store_short")),
+      "int16_roundtrip": (a.cast(dtypes.int16).cast(dtypes.half), ("v_cvt_i16_f16", "v_cvt_f16_i16")),
       "sum": (a.sum(), ("flat_load_ushort", "v_cvt_f32_f16", "ds_write_b32", "v_add_f32", "v_cvt_f16_f32", "flat_store_short")),
       "matmul": (ma@mb, ("flat_load_ushort", "v_mul_f16", "ds_write_b32", "v_add_f32", "flat_store_short")),
     }
@@ -419,6 +432,8 @@ class TestGFX803Program(unittest.TestCase):
       "sqrt_f16": (dtypes.half, "sqrt", ("v_sqrt_f16",)), "rsqrt_f16": (dtypes.half, "rsqrt", ("v_rsq_f16",)),
       "exp2_f32": (dtypes.float32, "exp2", ("v_exp_f32",)), "log2_f32": (dtypes.float32, "log2", ("v_log_f32",)),
       "exp2_f16": (dtypes.half, "exp2", ("v_exp_f16",)), "log2_f16": (dtypes.half, "log2", ("v_log_f16",)),
+      "sin_f32": (dtypes.float32, "sin", ("v_mul_f32", "v_sin_f32")), "sin_f16": (dtypes.half, "sin", ("v_mul_f16", "v_sin_f16")),
+      "trunc_f32": (dtypes.float32, "trunc", ("v_trunc_f32",)), "trunc_f16": (dtypes.half, "trunc", ("v_trunc_f16",)),
     }
     for name, (dtype, op, expected) in cases.items():
       with self.subTest(name=name):

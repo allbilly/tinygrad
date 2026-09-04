@@ -52,6 +52,8 @@ class GFX803Ops(FastEnum):
   V_XOR_B32 = auto()
   V_MUL_LO_U32 = auto()
   V_MUL_HI_U32 = auto()
+  V_BFE_I32 = auto()
+  V_BFE_U32 = auto()
   V_ADD_F32 = auto()
   V_MUL_F32 = auto()
   V_MAX_F32 = auto()
@@ -63,12 +65,18 @@ class GFX803Ops(FastEnum):
   V_CVT_F32_U32 = auto()
   V_CVT_I32_F32 = auto()
   V_CVT_U32_F32 = auto()
+  V_CVT_I16_F16 = auto()
+  V_CVT_U16_F16 = auto()
+  V_CVT_F16_I16 = auto()
+  V_CVT_F16_U16 = auto()
+  V_TRUNC = auto()
   V_RCP_F32 = auto()
   V_RCP_IFLAG_F32 = auto()
   V_SQRT_F32 = auto()
   V_RSQ_F32 = auto()
   V_EXP2_F32 = auto()
   V_LOG2_F32 = auto()
+  V_SIN = auto()
   V_CMPLT = auto()
   V_CMPEQ = auto()
   V_CMPNE = auto()
@@ -269,6 +277,11 @@ def _bitwise(x:UOp, a:UOp, b:UOp) -> UOp:
   return UOp(Ops.INS, x.dtype, (a, b), {Ops.AND:GFX803Ops.V_AND_B32, Ops.OR:GFX803Ops.V_OR_B32, Ops.XOR:GFX803Ops.V_XOR_B32}[x.op])
 
 
+def _bitcast(x:UOp, value:UOp) -> UOp|None:
+  if x.dtype.itemsize != value.dtype.itemsize or x.dtype.itemsize > 4: return None
+  return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
+
+
 def _shift(x:UOp, value:UOp, shift:UOp) -> UOp:
   if value.op is Ops.CONST: value = UOp(Ops.INS, value.dtype, (value,), GFX803Ops.V_MOV_B32)
   op = GFX803Ops.V_LSHLREV_B32 if x.op is Ops.SHL else \
@@ -345,8 +358,12 @@ def _int_divmod(x:UOp, a:UOp, b:UOp) -> UOp:
 
 
 def _float_unary(x:UOp, value:UOp) -> UOp:
+  if x.op is Ops.SIN:
+    turns = _float_bin(UOp(Ops.MUL, x.dtype, (value, UOp.const(x.dtype, 1 / (2 * 3.141592653589793)))),
+                       value, UOp.const(x.dtype, 1 / (2 * 3.141592653589793)), GFX803Ops.V_MUL_F32)
+    return UOp(Ops.INS, x.dtype, (turns,), GFX803Ops.V_SIN)
   op = {Ops.RECIPROCAL:GFX803Ops.V_RCP_F32, Ops.SQRT:GFX803Ops.V_SQRT_F32,
-        Ops.EXP2:GFX803Ops.V_EXP2_F32, Ops.LOG2:GFX803Ops.V_LOG2_F32}[x.op]
+        Ops.EXP2:GFX803Ops.V_EXP2_F32, Ops.LOG2:GFX803Ops.V_LOG2_F32, Ops.TRUNC:GFX803Ops.V_TRUNC}[x.op]
   return UOp(Ops.INS, x.dtype, (value,), op)
 
 
@@ -394,6 +411,15 @@ def _cast(x:UOp, value:UOp) -> UOp|None:
   if value.dtype is dtypes.float32 and x.dtype in (dtypes.int32, dtypes.uint32):
     op = GFX803Ops.V_CVT_I32_F32 if x.dtype is dtypes.int32 else GFX803Ops.V_CVT_U32_F32
     return UOp(Ops.INS, x.dtype, (value,), op)
+  if value.dtype is dtypes.half and x.dtype in (dtypes.int16, dtypes.uint16):
+    op = GFX803Ops.V_CVT_I16_F16 if x.dtype is dtypes.int16 else GFX803Ops.V_CVT_U16_F16
+    return UOp(Ops.INS, x.dtype, (value,), op)
+  if x.dtype is dtypes.half and value.dtype in (dtypes.int16, dtypes.uint16):
+    op = GFX803Ops.V_CVT_F16_I16 if value.dtype is dtypes.int16 else GFX803Ops.V_CVT_F16_U16
+    return UOp(Ops.INS, x.dtype, (value,), op)
+  if value.dtype in (dtypes.int16, dtypes.uint16) and x.dtype in (dtypes.int32, dtypes.uint32):
+    op = GFX803Ops.V_BFE_I32 if value.dtype is dtypes.int16 else GFX803Ops.V_BFE_U32
+    return UOp(Ops.INS, x.dtype, (value, _const_u32(0), _const_u32(16)), op)
   if x.dtype is dtypes.half and value.dtype in (dtypes.bool, dtypes.int32, dtypes.uint32):
     op = GFX803Ops.V_CVT_F32_I32 if value.dtype is dtypes.int32 else GFX803Ops.V_CVT_F32_U32
     widened = UOp(Ops.INS, dtypes.float32, (value,), op)
@@ -426,7 +452,8 @@ isel_matcher = PatternMatcher([
   (UPat((Ops.CDIV, Ops.CMOD), dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_divmod),
   (UPat((Ops.SHL, Ops.SHR), dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"), _shift),
   (UPat((Ops.AND, Ops.OR, Ops.XOR), (dtypes.bool, *dtypes.int32s), src=(UPat.var("a"), UPat.var("b")), name="x"), _bitwise),
-  (UPat((Ops.RECIPROCAL, Ops.SQRT, Ops.EXP2, Ops.LOG2), (dtypes.half, dtypes.float32),
+  (UPat(Ops.BITCAST, src=(UPat.var("value"),), name="x"), _bitcast),
+  (UPat((Ops.RECIPROCAL, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.TRUNC, Ops.SIN), (dtypes.half, dtypes.float32),
         src=(UPat.var("value"),), name="x"), _float_unary),
   ((UPat.var("a", (dtypes.half, dtypes.float32)) + UPat.var("b", (dtypes.half, dtypes.float32))).named("x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_ADD_F32)),
@@ -518,11 +545,11 @@ def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
       if x.dtype is dtypes.half:
         value = struct.unpack("<H", struct.pack("<e", float(x.arg)))[0]
         inline = {0x0000:128, 0x3800:240, 0xb800:241, 0x3c00:242, 0xbc00:243,
-                  0x4000:244, 0xc000:245, 0x4400:246, 0xc400:247}
+                  0x4000:244, 0xc000:245, 0x4400:246, 0xc400:247, 0x3118:248}
         return (inline[value], ()) if value in inline else (255, (value,))
       value = struct.unpack("<I", struct.pack("<f", float(x.arg)))[0]
       inline = {0x00000000:128, 0x3f000000:240, 0xbf000000:241, 0x3f800000:242, 0xbf800000:243,
-                0x40000000:244, 0xc0000000:245, 0x40800000:246, 0xc0800000:247}
+                0x40000000:244, 0xc0000000:245, 0x40800000:246, 0xc0800000:247, 0x3e22f983:248}
       return (inline[value], ()) if value in inline else (255, (value,))
     value = int(x.arg)
     if 0 <= value <= 64: return 128 + value, ()
@@ -701,6 +728,14 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     data = b"".join(_word(w) for w in _vop3(opcode, dst.index, src0_code, src1_code))
     operands = [str(s.arg) if s.op is Ops.CONST else _physical_reg(s).name for s in x.src]
     text = f"{mnemonic} v{dst.index}, {operands[0]}, {operands[1]}"
+  elif x.arg in {GFX803Ops.V_BFE_I32, GFX803Ops.V_BFE_U32}:
+    assert dst is not None
+    srcs = [_src0(source) for source in x.src]
+    if any(literal for _, literal in srcs): raise RuntimeError(f"{x.arg} does not support literal constants on gfx803")
+    opcode, mnemonic = (0x1c9, "v_bfe_i32") if x.arg is GFX803Ops.V_BFE_I32 else (0x1c8, "v_bfe_u32")
+    data = b"".join(_word(w) for w in _vop3_3(opcode, dst.index, *(source for source, _ in srcs)))
+    operands = [str(source.arg) if source.op is Ops.CONST else _physical_reg(source).name for source in x.src]
+    text = f"{mnemonic} v{dst.index}, {', '.join(operands)}"
   elif x.arg in {GFX803Ops.V_ADD_F32, GFX803Ops.V_MUL_F32, GFX803Ops.V_MAX_F32}:
     assert dst is not None
     src0, literal = _src0(x.src[0])
@@ -725,14 +760,22 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     text = f"{mnemonic} v{dst.index}, {src0_text}, v{src1.index}"
   elif x.arg in {GFX803Ops.V_CVT_F32_F16, GFX803Ops.V_CVT_F16_F32, GFX803Ops.V_CVT_F32_I32, GFX803Ops.V_CVT_F32_U32,
-                  GFX803Ops.V_CVT_I32_F32, GFX803Ops.V_CVT_U32_F32}:
+                  GFX803Ops.V_CVT_I32_F32, GFX803Ops.V_CVT_U32_F32, GFX803Ops.V_CVT_I16_F16, GFX803Ops.V_CVT_U16_F16,
+                  GFX803Ops.V_CVT_F16_I16, GFX803Ops.V_CVT_F16_U16}:
     assert dst is not None
     src_reg = _physical_reg(x.src[0])
     op, mnemonic = {
       GFX803Ops.V_CVT_F32_F16:(0x0b, "v_cvt_f32_f16_e32"), GFX803Ops.V_CVT_F16_F32:(0x0a, "v_cvt_f16_f32_e32"),
       GFX803Ops.V_CVT_F32_I32:(0x05, "v_cvt_f32_i32_e32"), GFX803Ops.V_CVT_F32_U32:(0x06, "v_cvt_f32_u32_e32"),
       GFX803Ops.V_CVT_I32_F32:(0x08, "v_cvt_i32_f32_e32"), GFX803Ops.V_CVT_U32_F32:(0x07, "v_cvt_u32_f32_e32"),
+      GFX803Ops.V_CVT_I16_F16:(0x3c, "v_cvt_i16_f16_e32"), GFX803Ops.V_CVT_U16_F16:(0x3b, "v_cvt_u16_f16_e32"),
+      GFX803Ops.V_CVT_F16_I16:(0x3a, "v_cvt_f16_i16_e32"), GFX803Ops.V_CVT_F16_U16:(0x39, "v_cvt_f16_u16_e32"),
     }[x.arg]
+    data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
+  elif x.arg is GFX803Ops.V_TRUNC:
+    assert dst is not None
+    src_reg = _physical_reg(x.src[0])
+    op, mnemonic = (0x46, "v_trunc_f16_e32") if x.dtype is dtypes.half else (0x1c, "v_trunc_f32_e32")
     data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
   elif x.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_RCP_IFLAG_F32, GFX803Ops.V_SQRT_F32, GFX803Ops.V_RSQ_F32,
                   GFX803Ops.V_EXP2_F32, GFX803Ops.V_LOG2_F32}:
@@ -748,6 +791,11 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       op, mnemonic = {GFX803Ops.V_RCP_F32:(0x22, "v_rcp_f32_e32"), GFX803Ops.V_SQRT_F32:(0x27, "v_sqrt_f32_e32"),
                       GFX803Ops.V_RSQ_F32:(0x24, "v_rsq_f32_e32"), GFX803Ops.V_EXP2_F32:(0x20, "v_exp_f32_e32"),
                       GFX803Ops.V_LOG2_F32:(0x21, "v_log_f32_e32")}[x.arg]
+    data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
+  elif x.arg is GFX803Ops.V_SIN:
+    assert dst is not None
+    src_reg = _physical_reg(x.src[0])
+    op, mnemonic = (0x49, "v_sin_f16_e32") if x.dtype is dtypes.half else (0x29, "v_sin_f32_e32")
     data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
   elif x.arg in {GFX803Ops.V_CMPLT, GFX803Ops.V_CMPEQ, GFX803Ops.V_CMPNE}:
     assert dst is not None
@@ -813,7 +861,7 @@ class AMDASMRenderer(ISARenderer):
   # Advertising the native bit operations also enables tinygrad's constant
   # integer divide/modulo strength reduction before instruction selection.
   code_for_op = {op:lambda: None for op in
-                 (Ops.AND, Ops.SHL, Ops.SHR, Ops.SQRT, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2)}
+                 (Ops.AND, Ops.SHL, Ops.SHR, Ops.SQRT, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.TRUNC, Ops.SIN)}
 
   def __init__(self, target:Target):
     if target.arch != "gfx803": raise RuntimeError(f"AMDASMRenderer only supports gfx803, got {target.arch}")
