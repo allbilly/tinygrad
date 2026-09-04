@@ -64,7 +64,9 @@ class GFX8GC:
     self.regCOMPUTE_PGM_LO = reg('regCOMPUTE_PGM_LO', 0x2e0c)
     self.regCOMPUTE_PGM_RSRC1 = reg('regCOMPUTE_PGM_RSRC1', 0x2e12)
     self.regCOMPUTE_RESOURCE_LIMITS = reg('regCOMPUTE_RESOURCE_LIMITS', 0x2e15, {'waves_per_sh':(0,5)})
-    self.regCOMPUTE_PGM_RSRC3 = reg('regCOMPUTE_PGM_RSRC3', 0x2e16)
+    # GFX8 has no COMPUTE_PGM_RSRC3. 0x2e16 is COMPUTE_STATIC_THREAD_MGMT_SE0;
+    # writing the descriptor's reserved rsrc3 value there disables that shader engine.
+    self.regCOMPUTE_STATIC_THREAD_MGMT_SE0 = reg('regCOMPUTE_STATIC_THREAD_MGMT_SE0', 0x2e16)
     self.regCOMPUTE_TMPRING_SIZE = reg('regCOMPUTE_TMPRING_SIZE', 0x2e18)
     self.regCOMPUTE_USER_DATA_0 = reg('regCOMPUTE_USER_DATA_0', 0x2e40)
     self.regCOMPUTE_DISPATCH_INITIATOR = reg('regCOMPUTE_DISPATCH_INITIATOR', 0,
@@ -419,7 +421,7 @@ class AMDComputeQueue(HWQueue):
 
     self.wreg(self.gc.regCOMPUTE_PGM_LO, *data64_le(prg.prog_addr >> 8))
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, prg.rsrc1, prg.rsrc2)
-    self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
+    if self.dev.target[0] > 8: self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
     self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, 0 if prg.dev.target[0] == 8 else prg.dev.tmpring_size)
 
     # this is what llvm refers to as "architected flat scratch"

@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 from tinygrad.codegen.opt import tc
-from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, _kfd_doorbell_params
+from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, GFX8GC, _kfd_doorbell_params
 from tinygrad.runtime.autogen.am import pm4_soc15
 from tinygrad.runtime.support.am.polaris import (
   PolarisAMDev, ViMqd, DOORBELL_MEC_RING0, VI_MQD_ALLOC_DWORDS, MQD_HQD_WORD, mmCP_HQD_ACTIVE, mmCP_HQD_PQ_BASE_LO, mmCP_HQD_PQ_BASE_HI,
@@ -37,6 +37,19 @@ class FakePCI:
 class TestPolarisAM(unittest.TestCase):
   def test_gfx803_has_no_tensor_cores(self):
     self.assertEqual(tc.get_amd("gfx803"), [])
+
+  def test_gfx8_dispatch_does_not_disable_shader_engine_zero(self):
+    dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True, sqtt_enabled=False, xccs=1)
+    queue = AMDComputeQueue(SimpleNamespace(soc=SimpleNamespace(CS_PARTIAL_FLUSH=0), pm4=pm4_soc15, gc=GFX8GC(), nbio=None))
+    queue.dev = dev
+    writes = []
+    queue.wreg = lambda reg, *args, **kwargs: writes.append(reg.name)  # type: ignore[method-assign]
+    queue.q = queue.pkt3 = lambda *args: None  # type: ignore[method-assign]
+    prg = SimpleNamespace(dev=dev, enable_private_segment_sgpr=False, enable_dispatch_ptr=False, prog_addr=0x100000,
+                          rsrc1=0, rsrc2=0, rsrc3=0, wave32=False)
+    queue.exec(prg, SimpleNamespace(bind_data=[], buf=SimpleNamespace(va_addr=0x200000)), (1, 1, 1), (1, 1, 1))
+    self.assertNotIn("regCOMPUTE_STATIC_THREAD_MGMT_SE0", writes)
+    self.assertNotIn("regCOMPUTE_PGM_RSRC3", writes)
 
   def test_drm_submit_callback_reuses_ring(self):
     submitted = []
