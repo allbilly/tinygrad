@@ -813,6 +813,40 @@ def _raw_src0(x:UOp) -> tuple[int, tuple[int, ...], str]:
   return src, literal, str(x.arg) if x.op is Ops.CONST else _physical_reg(x).name
 
 
+_VOP2_ENCODINGS:dict[tuple[GFX803Ops, DType|None], tuple[int, str]] = {
+  (GFX803Ops.V_ADD_U32, None):(0x19, "v_add_u32_e32"), (GFX803Ops.V_LSHLREV_B32, None):(0x12, "v_lshlrev_b32_e32"),
+  (GFX803Ops.V_LSHRREV_B32, None):(0x10, "v_lshrrev_b32_e32"), (GFX803Ops.V_ASHRREV_I32, None):(0x11, "v_ashrrev_i32_e32"),
+  (GFX803Ops.V_AND_B32, None):(0x13, "v_and_b32_e32"), (GFX803Ops.V_OR_B32, None):(0x14, "v_or_b32_e32"),
+  (GFX803Ops.V_XOR_B32, None):(0x15, "v_xor_b32_e32"), (GFX803Ops.V_MAX_I32, None):(0x0d, "v_max_i32_e32"),
+  (GFX803Ops.V_MAX_U32, None):(0x0f, "v_max_u32_e32"),
+  (GFX803Ops.V_ADD_F32, dtypes.half):(0x1f, "v_add_f16_e32"), (GFX803Ops.V_ADD_F32, dtypes.float32):(0x01, "v_add_f32_e32"),
+  (GFX803Ops.V_MUL_F32, dtypes.half):(0x22, "v_mul_f16_e32"), (GFX803Ops.V_MUL_F32, dtypes.float32):(0x05, "v_mul_f32_e32"),
+  (GFX803Ops.V_MAX_F32, dtypes.half):(0x2d, "v_max_f16_e32"), (GFX803Ops.V_MAX_F32, dtypes.float32):(0x0b, "v_max_f32_e32"),
+}
+_VOP2_OPS = {op for op, _ in _VOP2_ENCODINGS}
+
+_VOP1_ENCODINGS:dict[tuple[GFX803Ops, DType|None], tuple[int, str]] = {
+  (GFX803Ops.V_CVT_F32_F16, None):(0x0b, "v_cvt_f32_f16_e32"), (GFX803Ops.V_CVT_F16_F32, None):(0x0a, "v_cvt_f16_f32_e32"),
+  (GFX803Ops.V_CVT_F32_I32, None):(0x05, "v_cvt_f32_i32_e32"), (GFX803Ops.V_CVT_F32_U32, None):(0x06, "v_cvt_f32_u32_e32"),
+  (GFX803Ops.V_CVT_I32_F32, None):(0x08, "v_cvt_i32_f32_e32"), (GFX803Ops.V_CVT_U32_F32, None):(0x07, "v_cvt_u32_f32_e32"),
+  (GFX803Ops.V_CVT_I16_F16, None):(0x3c, "v_cvt_i16_f16_e32"), (GFX803Ops.V_CVT_U16_F16, None):(0x3b, "v_cvt_u16_f16_e32"),
+  (GFX803Ops.V_CVT_F16_I16, None):(0x3a, "v_cvt_f16_i16_e32"), (GFX803Ops.V_CVT_F16_U16, None):(0x39, "v_cvt_f16_u16_e32"),
+  (GFX803Ops.V_TRUNC, dtypes.half):(0x46, "v_trunc_f16_e32"), (GFX803Ops.V_TRUNC, dtypes.float32):(0x1c, "v_trunc_f32_e32"),
+  (GFX803Ops.V_RCP_F32, dtypes.half):(0x3d, "v_rcp_f16_e32"), (GFX803Ops.V_RCP_F32, dtypes.float32):(0x22, "v_rcp_f32_e32"),
+  (GFX803Ops.V_RCP_IFLAG_F32, None):(0x23, "v_rcp_iflag_f32_e32"),
+  (GFX803Ops.V_SQRT_F32, dtypes.half):(0x3e, "v_sqrt_f16_e32"), (GFX803Ops.V_SQRT_F32, dtypes.float32):(0x27, "v_sqrt_f32_e32"),
+  (GFX803Ops.V_RSQ_F32, dtypes.half):(0x3f, "v_rsq_f16_e32"), (GFX803Ops.V_RSQ_F32, dtypes.float32):(0x24, "v_rsq_f32_e32"),
+  (GFX803Ops.V_EXP2_F32, dtypes.half):(0x41, "v_exp_f16_e32"), (GFX803Ops.V_EXP2_F32, dtypes.float32):(0x20, "v_exp_f32_e32"),
+  (GFX803Ops.V_LOG2_F32, dtypes.half):(0x40, "v_log_f16_e32"), (GFX803Ops.V_LOG2_F32, dtypes.float32):(0x21, "v_log_f32_e32"),
+  (GFX803Ops.V_SIN, dtypes.half):(0x49, "v_sin_f16_e32"), (GFX803Ops.V_SIN, dtypes.float32):(0x29, "v_sin_f32_e32"),
+}
+_VOP1_OPS = {op for op, _ in _VOP1_ENCODINGS}
+
+
+def _typed_encoding(encodings:dict[tuple[GFX803Ops, DType|None], tuple[int, str]], x:UOp) -> tuple[int, str]:
+  return encodings.get((x.arg, x.dtype), encodings[(x.arg, None)]) if (x.arg, None) in encodings else encodings[(x.arg, x.dtype)]
+
+
 def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
   counts = _register_counts(x)
   dst = _physical_reg(x) if x.dtype is not dtypes.void and x.arg not in \
@@ -1005,18 +1039,12 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     src, literal, src_text = _raw_src0(x.src[1])
     data = _word(_vop1(0x01, addr.index, src)) + b"".join(_word(v) for v in literal)
     text = f"v_mov_b32_e32 v{addr.index}, {src_text}"
-  elif x.arg in {GFX803Ops.V_ADD_U32, GFX803Ops.V_LSHLREV_B32, GFX803Ops.V_LSHRREV_B32, GFX803Ops.V_ASHRREV_I32,
-                  GFX803Ops.V_AND_B32, GFX803Ops.V_OR_B32, GFX803Ops.V_XOR_B32}:
+  elif x.arg in _VOP2_OPS:
     assert dst is not None
     src0, literal = _src0(x.src[0])
     src1 = _physical_reg(x.src[1])
     if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
-    op, mnemonic = {
-      GFX803Ops.V_ADD_U32:(0x19, "v_add_u32_e32"), GFX803Ops.V_LSHLREV_B32:(0x12, "v_lshlrev_b32_e32"),
-      GFX803Ops.V_LSHRREV_B32:(0x10, "v_lshrrev_b32_e32"), GFX803Ops.V_ASHRREV_I32:(0x11, "v_ashrrev_i32_e32"),
-      GFX803Ops.V_AND_B32:(0x13, "v_and_b32_e32"), GFX803Ops.V_OR_B32:(0x14, "v_or_b32_e32"),
-      GFX803Ops.V_XOR_B32:(0x15, "v_xor_b32_e32"),
-    }[x.arg]
+    op, mnemonic = _typed_encoding(_VOP2_ENCODINGS, x)
     data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     text = f"{mnemonic} v{dst.index}, {'vcc, ' if x.arg is GFX803Ops.V_ADD_U32 else ''}{src0_text}, v{src1.index}"
@@ -1038,66 +1066,10 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     data = b"".join(_word(w) for w in _vop3_3(opcode, dst.index, *(source for source, _ in srcs)))
     operands = [str(source.arg) if source.op is Ops.CONST else _physical_reg(source).name for source in x.src]
     text = f"{mnemonic} v{dst.index}, {', '.join(operands)}"
-  elif x.arg in {GFX803Ops.V_ADD_F32, GFX803Ops.V_MUL_F32, GFX803Ops.V_MAX_F32}:
-    assert dst is not None
-    src0, literal = _src0(x.src[0])
-    src1 = _physical_reg(x.src[1])
-    if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
-    if x.dtype is dtypes.half:
-      op, mnemonic = {GFX803Ops.V_ADD_F32:(0x1f, "v_add_f16_e32"), GFX803Ops.V_MUL_F32:(0x22, "v_mul_f16_e32"),
-                      GFX803Ops.V_MAX_F32:(0x2d, "v_max_f16_e32")}[x.arg]
-    else:
-      op, mnemonic = {GFX803Ops.V_ADD_F32:(0x01, "v_add_f32_e32"), GFX803Ops.V_MUL_F32:(0x05, "v_mul_f32_e32"),
-                      GFX803Ops.V_MAX_F32:(0x0b, "v_max_f32_e32")}[x.arg]
-    data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
-    src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
-    text = f"{mnemonic} v{dst.index}, {src0_text}, v{src1.index}"
-  elif x.arg in {GFX803Ops.V_MAX_I32, GFX803Ops.V_MAX_U32}:
-    assert dst is not None
-    src0, literal = _src0(x.src[0])
-    src1 = _physical_reg(x.src[1])
-    if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
-    op, mnemonic = (0x0d, "v_max_i32_e32") if x.arg is GFX803Ops.V_MAX_I32 else (0x0f, "v_max_u32_e32")
-    data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
-    src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
-    text = f"{mnemonic} v{dst.index}, {src0_text}, v{src1.index}"
-  elif x.arg in {GFX803Ops.V_CVT_F32_F16, GFX803Ops.V_CVT_F16_F32, GFX803Ops.V_CVT_F32_I32, GFX803Ops.V_CVT_F32_U32,
-                  GFX803Ops.V_CVT_I32_F32, GFX803Ops.V_CVT_U32_F32, GFX803Ops.V_CVT_I16_F16, GFX803Ops.V_CVT_U16_F16,
-                  GFX803Ops.V_CVT_F16_I16, GFX803Ops.V_CVT_F16_U16}:
+  elif x.arg in _VOP1_OPS:
     assert dst is not None
     src_reg = _physical_reg(x.src[0])
-    op, mnemonic = {
-      GFX803Ops.V_CVT_F32_F16:(0x0b, "v_cvt_f32_f16_e32"), GFX803Ops.V_CVT_F16_F32:(0x0a, "v_cvt_f16_f32_e32"),
-      GFX803Ops.V_CVT_F32_I32:(0x05, "v_cvt_f32_i32_e32"), GFX803Ops.V_CVT_F32_U32:(0x06, "v_cvt_f32_u32_e32"),
-      GFX803Ops.V_CVT_I32_F32:(0x08, "v_cvt_i32_f32_e32"), GFX803Ops.V_CVT_U32_F32:(0x07, "v_cvt_u32_f32_e32"),
-      GFX803Ops.V_CVT_I16_F16:(0x3c, "v_cvt_i16_f16_e32"), GFX803Ops.V_CVT_U16_F16:(0x3b, "v_cvt_u16_f16_e32"),
-      GFX803Ops.V_CVT_F16_I16:(0x3a, "v_cvt_f16_i16_e32"), GFX803Ops.V_CVT_F16_U16:(0x39, "v_cvt_f16_u16_e32"),
-    }[x.arg]
-    data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
-  elif x.arg is GFX803Ops.V_TRUNC:
-    assert dst is not None
-    src_reg = _physical_reg(x.src[0])
-    op, mnemonic = (0x46, "v_trunc_f16_e32") if x.dtype is dtypes.half else (0x1c, "v_trunc_f32_e32")
-    data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
-  elif x.arg in {GFX803Ops.V_RCP_F32, GFX803Ops.V_RCP_IFLAG_F32, GFX803Ops.V_SQRT_F32, GFX803Ops.V_RSQ_F32,
-                  GFX803Ops.V_EXP2_F32, GFX803Ops.V_LOG2_F32}:
-    assert dst is not None
-    src_reg = _physical_reg(x.src[0])
-    if x.arg is GFX803Ops.V_RCP_IFLAG_F32:
-      op, mnemonic = 0x23, "v_rcp_iflag_f32_e32"
-    elif x.dtype is dtypes.half:
-      op, mnemonic = {GFX803Ops.V_RCP_F32:(0x3d, "v_rcp_f16_e32"), GFX803Ops.V_SQRT_F32:(0x3e, "v_sqrt_f16_e32"),
-                      GFX803Ops.V_RSQ_F32:(0x3f, "v_rsq_f16_e32"), GFX803Ops.V_EXP2_F32:(0x41, "v_exp_f16_e32"),
-                      GFX803Ops.V_LOG2_F32:(0x40, "v_log_f16_e32")}[x.arg]
-    else:
-      op, mnemonic = {GFX803Ops.V_RCP_F32:(0x22, "v_rcp_f32_e32"), GFX803Ops.V_SQRT_F32:(0x27, "v_sqrt_f32_e32"),
-                      GFX803Ops.V_RSQ_F32:(0x24, "v_rsq_f32_e32"), GFX803Ops.V_EXP2_F32:(0x20, "v_exp_f32_e32"),
-                      GFX803Ops.V_LOG2_F32:(0x21, "v_log_f32_e32")}[x.arg]
-    data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
-  elif x.arg is GFX803Ops.V_SIN:
-    assert dst is not None
-    src_reg = _physical_reg(x.src[0])
-    op, mnemonic = (0x49, "v_sin_f16_e32") if x.dtype is dtypes.half else (0x29, "v_sin_f32_e32")
+    op, mnemonic = _typed_encoding(_VOP1_ENCODINGS, x)
     data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
   elif x.arg in {GFX803Ops.V_CMPLT, GFX803Ops.V_CMPEQ, GFX803Ops.V_CMPNE}:
     assert dst is not None
