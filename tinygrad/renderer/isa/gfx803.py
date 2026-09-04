@@ -26,10 +26,14 @@ class GFX803Ops(FastEnum):
   LDS_ADDR = auto()
   FLAT_LOAD_B32 = auto()
   FLAT_LOAD_U16 = auto()
+  FLAT_LOAD_S16 = auto()
   FLAT_LOAD_U8 = auto()
+  FLAT_LOAD_S8 = auto()
   GATED_FLAT_LOAD_B32 = auto()
   GATED_FLAT_LOAD_U16 = auto()
+  GATED_FLAT_LOAD_S16 = auto()
   GATED_FLAT_LOAD_U8 = auto()
+  GATED_FLAT_LOAD_S8 = auto()
   FLAT_STORE_B32 = auto()
   FLAT_STORE_B16 = auto()
   FLAT_STORE_B8 = auto()
@@ -38,7 +42,9 @@ class GFX803Ops(FastEnum):
   GATED_FLAT_STORE_B8 = auto()
   DS_LOAD_B32 = auto()
   DS_LOAD_U16 = auto()
+  DS_LOAD_S16 = auto()
   DS_LOAD_U8 = auto()
+  DS_LOAD_S8 = auto()
   DS_STORE_B32 = auto()
   DS_STORE_B16 = auto()
   DS_STORE_B8 = auto()
@@ -191,25 +197,29 @@ def _indexed_addrspace(addr:UOp) -> AddrSpace|None:
 
 
 def _load(x:UOp, addr:UOp, alt:UOp|None=None, gate:UOp|None=None) -> UOp|None:
-  if x.dtype not in (dtypes.bool, dtypes.half, dtypes.float32, dtypes.int32, dtypes.uint32):
+  if x.dtype not in (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32):
     raise NotImplementedError(f"gfx803 load dtype {x.dtype} is not lowered yet")
   if (addrspace:=_indexed_addrspace(addr)) is AddrSpace.REG:
     if gate is not None: raise NotImplementedError("gfx803 gated register loads are not implemented")
     return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.V_MOV_B32)
   if addrspace is AddrSpace.LOCAL:
     if gate is not None: raise NotImplementedError("gfx803 gated LDS loads are not implemented")
-    op = GFX803Ops.DS_LOAD_U8 if x.dtype is dtypes.bool else GFX803Ops.DS_LOAD_U16 if x.dtype is dtypes.half else GFX803Ops.DS_LOAD_B32
+    op = GFX803Ops.DS_LOAD_U8 if x.dtype in (dtypes.bool, dtypes.uint8) else \
+         GFX803Ops.DS_LOAD_S8 if x.dtype is dtypes.int8 else \
+         GFX803Ops.DS_LOAD_U16 if x.dtype in (dtypes.half, dtypes.uint16) else \
+         GFX803Ops.DS_LOAD_S16 if x.dtype is dtypes.int16 else GFX803Ops.DS_LOAD_B32
   else:
-    op = GFX803Ops.GATED_FLAT_LOAD_U8 if gate is not None and x.dtype is dtypes.bool else \
-         GFX803Ops.GATED_FLAT_LOAD_U16 if gate is not None and x.dtype is dtypes.half else \
-         GFX803Ops.GATED_FLAT_LOAD_B32 if gate is not None else \
-         GFX803Ops.FLAT_LOAD_U8 if x.dtype is dtypes.bool else \
-         GFX803Ops.FLAT_LOAD_U16 if x.dtype is dtypes.half else GFX803Ops.FLAT_LOAD_B32
+    plain, gated = (GFX803Ops.FLAT_LOAD_U8, GFX803Ops.GATED_FLAT_LOAD_U8) if x.dtype in (dtypes.bool, dtypes.uint8) else \
+                   (GFX803Ops.FLAT_LOAD_S8, GFX803Ops.GATED_FLAT_LOAD_S8) if x.dtype is dtypes.int8 else \
+                   (GFX803Ops.FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_U16) if x.dtype in (dtypes.half, dtypes.uint16) else \
+                   (GFX803Ops.FLAT_LOAD_S16, GFX803Ops.GATED_FLAT_LOAD_S16) if x.dtype is dtypes.int16 else \
+                   (GFX803Ops.FLAT_LOAD_B32, GFX803Ops.GATED_FLAT_LOAD_B32)
+    op = gated if gate is not None else plain
   return UOp(Ops.INS, x.dtype, (addr, *((alt, gate) if gate is not None else ())), op)
 
 
 def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
-  if value.dtype not in (dtypes.bool, dtypes.half, dtypes.float32, dtypes.int32, dtypes.uint32):
+  if value.dtype not in (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32):
     raise NotImplementedError(f"gfx803 store dtype {value.dtype} is not lowered yet")
   if value.op is Ops.CONST: value = UOp(Ops.INS, value.dtype, (value,), GFX803Ops.V_MOV_B32)
   if (addrspace:=_indexed_addrspace(addr)) is AddrSpace.REG:
@@ -217,14 +227,14 @@ def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
     return UOp(Ops.INS, dtypes.void, (addr, value), GFX803Ops.REG_STORE_B32)
   if addrspace is AddrSpace.LOCAL:
     if gate is not None: raise NotImplementedError("gfx803 gated LDS stores are not implemented")
-    store_op = GFX803Ops.DS_STORE_B8 if value.dtype is dtypes.bool else \
-               GFX803Ops.DS_STORE_B16 if value.dtype is dtypes.half else GFX803Ops.DS_STORE_B32
+    store_op = GFX803Ops.DS_STORE_B8 if value.dtype in (dtypes.bool, *dtypes.int8s) else \
+               GFX803Ops.DS_STORE_B16 if value.dtype in (*dtypes.int16s, dtypes.half) else GFX803Ops.DS_STORE_B32
     return UOp(Ops.INS, dtypes.void, (addr, value), store_op)
-  store_op = GFX803Ops.GATED_FLAT_STORE_B8 if gate is not None and value.dtype is dtypes.bool else \
-             GFX803Ops.GATED_FLAT_STORE_B16 if gate is not None and value.dtype is dtypes.half else \
+  store_op = GFX803Ops.GATED_FLAT_STORE_B8 if gate is not None and value.dtype in (dtypes.bool, *dtypes.int8s) else \
+             GFX803Ops.GATED_FLAT_STORE_B16 if gate is not None and value.dtype in (*dtypes.int16s, dtypes.half) else \
              GFX803Ops.GATED_FLAT_STORE_B32 if gate is not None else \
-             GFX803Ops.FLAT_STORE_B8 if value.dtype is dtypes.bool else \
-             GFX803Ops.FLAT_STORE_B16 if value.dtype is dtypes.half else GFX803Ops.FLAT_STORE_B32
+             GFX803Ops.FLAT_STORE_B8 if value.dtype in (dtypes.bool, *dtypes.int8s) else \
+             GFX803Ops.FLAT_STORE_B16 if value.dtype in (*dtypes.int16s, dtypes.half) else GFX803Ops.FLAT_STORE_B32
   return UOp(Ops.INS, dtypes.void, (addr, value, *((gate,) if gate is not None else ())),
              store_op)
 
@@ -254,8 +264,16 @@ def _alloc_vreg(ctx:IselContext, x:UOp) -> UOp|None:
   return x.replace(tag=(ctx.vreg(regs),))
 
 
+def _bfe(value:UOp, dtype:DType, width:int, signed:bool) -> UOp:
+  return UOp(Ops.INS, dtype, (value, _const_u32(0), _const_u32(width)), GFX803Ops.V_BFE_I32 if signed else GFX803Ops.V_BFE_U32)
+
+
+def _normalize_int(value:UOp, dtype:DType) -> UOp:
+  return value if dtype is dtypes.bool or dtype.itemsize == 4 else _bfe(value, dtype, dtype.bitsize, dtype in dtypes.sints)
+
+
 def _int_add(x:UOp, a:UOp, b:UOp) -> UOp:
-  return UOp(Ops.INS, x.dtype, (b, a) if b.op is Ops.CONST else (a, b), GFX803Ops.V_ADD_U32)
+  return _normalize_int(UOp(Ops.INS, x.dtype, (b, a) if b.op is Ops.CONST else (a, b), GFX803Ops.V_ADD_U32), x.dtype)
 
 
 def _int_mul(x:UOp, a:UOp, b:UOp) -> UOp:
@@ -263,30 +281,35 @@ def _int_mul(x:UOp, a:UOp, b:UOp) -> UOp:
   value:UOp
   if a.op is Ops.CONST: const, value = a, b
   elif b.op is Ops.CONST: const, value = b, a
-  else: return UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MUL_LO_U32)
-  c = int(const.arg)
-  if c > 0 and c & (c - 1) == 0:
-    return UOp(Ops.INS, x.dtype, (UOp.const(x.dtype, c.bit_length() - 1), value), GFX803Ops.V_LSHLREV_B32)
-  if not -16 <= c <= 64: const = UOp(Ops.INS, x.dtype, (const,), GFX803Ops.V_MOV_B32)
-  return UOp(Ops.INS, x.dtype, (value, const), GFX803Ops.V_MUL_LO_U32)
+  else: result = UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MUL_LO_U32)
+  if a.op is Ops.CONST or b.op is Ops.CONST:
+    c = int(const.arg)
+    if c > 0 and c & (c - 1) == 0:
+      result = UOp(Ops.INS, x.dtype, (UOp.const(x.dtype, c.bit_length() - 1), value), GFX803Ops.V_LSHLREV_B32)
+    else:
+      if not -16 <= c <= 64: const = UOp(Ops.INS, x.dtype, (const,), GFX803Ops.V_MOV_B32)
+      result = UOp(Ops.INS, x.dtype, (value, const), GFX803Ops.V_MUL_LO_U32)
+  return _normalize_int(result, x.dtype)
 
 
 def _bitwise(x:UOp, a:UOp, b:UOp) -> UOp:
   if b.op is Ops.CONST: a, b = b, a
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
-  return UOp(Ops.INS, x.dtype, (a, b), {Ops.AND:GFX803Ops.V_AND_B32, Ops.OR:GFX803Ops.V_OR_B32, Ops.XOR:GFX803Ops.V_XOR_B32}[x.op])
+  result = UOp(Ops.INS, x.dtype, (a, b), {Ops.AND:GFX803Ops.V_AND_B32, Ops.OR:GFX803Ops.V_OR_B32, Ops.XOR:GFX803Ops.V_XOR_B32}[x.op])
+  return _normalize_int(result, x.dtype)
 
 
 def _bitcast(x:UOp, value:UOp) -> UOp|None:
   if x.dtype.itemsize != value.dtype.itemsize or x.dtype.itemsize > 4: return None
-  return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
+  moved = UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
+  return _normalize_int(moved, x.dtype) if x.dtype in (*dtypes.int8s, *dtypes.int16s) else moved
 
 
 def _shift(x:UOp, value:UOp, shift:UOp) -> UOp:
   if value.op is Ops.CONST: value = UOp(Ops.INS, value.dtype, (value,), GFX803Ops.V_MOV_B32)
   op = GFX803Ops.V_LSHLREV_B32 if x.op is Ops.SHL else \
-       GFX803Ops.V_ASHRREV_I32 if x.dtype is dtypes.int32 else GFX803Ops.V_LSHRREV_B32
-  return UOp(Ops.INS, x.dtype, (shift, value), op)
+       GFX803Ops.V_ASHRREV_I32 if x.dtype in dtypes.sints else GFX803Ops.V_LSHRREV_B32
+  return _normalize_int(UOp(Ops.INS, x.dtype, (shift, value), op), x.dtype)
 
 
 def _isel_cast(dtype:DType, value:UOp) -> UOp:
@@ -380,7 +403,7 @@ def _float_bin(x:UOp, a:UOp, b:UOp, ins:GFX803Ops) -> UOp:
 def _int_max(x:UOp, a:UOp, b:UOp) -> UOp:
   if b.op is Ops.CONST: a, b = b, a
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
-  return UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MAX_I32 if x.dtype is dtypes.int32 else GFX803Ops.V_MAX_U32)
+  return UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MAX_I32 if x.dtype in dtypes.sints else GFX803Ops.V_MAX_U32)
 
 
 def _cmp(x:UOp, a:UOp, b:UOp) -> UOp:
@@ -397,10 +420,16 @@ def _cast(x:UOp, value:UOp) -> UOp|None:
   if x.dtype is dtypes.bool:
     zero = UOp(Ops.INS, value.dtype, (UOp.const(value.dtype, 0),), GFX803Ops.V_MOV_B32)
     return UOp(Ops.INS, x.dtype, (value, zero), GFX803Ops.V_CMPNE)
-  if value.dtype is dtypes.bool and x.dtype in (dtypes.int32, dtypes.uint32):
+  if value.dtype is dtypes.bool and x.dtype in (*dtypes.int8s, *dtypes.int16s, *dtypes.int32s):
     return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
-  if value.dtype in (dtypes.int32, dtypes.uint32) and x.dtype in (dtypes.int32, dtypes.uint32):
-    return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
+  if value.dtype in (*dtypes.int8s, *dtypes.int16s, *dtypes.int32s) and x.dtype in (*dtypes.int8s, *dtypes.int16s, *dtypes.int32s):
+    if value.dtype.itemsize == x.dtype.itemsize == 4: return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_MOV_B32)
+    widening = x.dtype.itemsize > value.dtype.itemsize
+    if not widening: return _bfe(value, x.dtype, x.dtype.bitsize, x.dtype in dtypes.sints)
+    widened = _bfe(value, x.dtype, value.dtype.bitsize, value.dtype in dtypes.sints)
+    # A negative signed source widened into a still-narrow unsigned destination wraps at the destination width.
+    return _bfe(widened, x.dtype, x.dtype.bitsize, False) \
+      if value.dtype in dtypes.sints and x.dtype in dtypes.uints and x.dtype.itemsize < 4 else widened
   if value.dtype is dtypes.half and x.dtype is dtypes.float32:
     return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_CVT_F32_F16)
   if value.dtype is dtypes.float32 and x.dtype is dtypes.half:
@@ -408,18 +437,24 @@ def _cast(x:UOp, value:UOp) -> UOp|None:
   if x.dtype is dtypes.float32 and value.dtype in (dtypes.bool, dtypes.int32, dtypes.uint32):
     op = GFX803Ops.V_CVT_F32_I32 if value.dtype is dtypes.int32 else GFX803Ops.V_CVT_F32_U32
     return UOp(Ops.INS, x.dtype, (value,), op)
-  if value.dtype is dtypes.float32 and x.dtype in (dtypes.int32, dtypes.uint32):
-    op = GFX803Ops.V_CVT_I32_F32 if x.dtype is dtypes.int32 else GFX803Ops.V_CVT_U32_F32
+  if value.dtype is dtypes.float32 and x.dtype in (*dtypes.int8s, *dtypes.int16s, *dtypes.int32s):
+    wide_dtype = dtypes.int32 if x.dtype in dtypes.sints else dtypes.uint32
+    op = GFX803Ops.V_CVT_I32_F32 if wide_dtype is dtypes.int32 else GFX803Ops.V_CVT_U32_F32
+    wide = UOp(Ops.INS, wide_dtype, (value,), op)
+    return wide if x.dtype is wide_dtype else _bfe(wide, x.dtype, x.dtype.bitsize, x.dtype in dtypes.sints)
+  if value.dtype is dtypes.half and x.dtype in (*dtypes.int8s, *dtypes.int16s):
+    wide_dtype = dtypes.int16 if x.dtype in dtypes.sints else dtypes.uint16
+    op = GFX803Ops.V_CVT_I16_F16 if wide_dtype is dtypes.int16 else GFX803Ops.V_CVT_U16_F16
+    wide = UOp(Ops.INS, wide_dtype, (value,), op)
+    return _normalize_int(wide, x.dtype)
+  if x.dtype is dtypes.float32 and value.dtype in (*dtypes.int8s, *dtypes.int16s):
+    wide_dtype = dtypes.int32 if value.dtype in dtypes.sints else dtypes.uint32
+    wide = _bfe(value, wide_dtype, value.dtype.bitsize, value.dtype in dtypes.sints)
+    op = GFX803Ops.V_CVT_F32_I32 if wide_dtype is dtypes.int32 else GFX803Ops.V_CVT_F32_U32
+    return UOp(Ops.INS, x.dtype, (wide,), op)
+  if x.dtype is dtypes.half and value.dtype in (*dtypes.int8s, *dtypes.int16s):
+    op = GFX803Ops.V_CVT_F16_I16 if value.dtype in dtypes.sints else GFX803Ops.V_CVT_F16_U16
     return UOp(Ops.INS, x.dtype, (value,), op)
-  if value.dtype is dtypes.half and x.dtype in (dtypes.int16, dtypes.uint16):
-    op = GFX803Ops.V_CVT_I16_F16 if x.dtype is dtypes.int16 else GFX803Ops.V_CVT_U16_F16
-    return UOp(Ops.INS, x.dtype, (value,), op)
-  if x.dtype is dtypes.half and value.dtype in (dtypes.int16, dtypes.uint16):
-    op = GFX803Ops.V_CVT_F16_I16 if value.dtype is dtypes.int16 else GFX803Ops.V_CVT_F16_U16
-    return UOp(Ops.INS, x.dtype, (value,), op)
-  if value.dtype in (dtypes.int16, dtypes.uint16) and x.dtype in (dtypes.int32, dtypes.uint32):
-    op = GFX803Ops.V_BFE_I32 if value.dtype is dtypes.int16 else GFX803Ops.V_BFE_U32
-    return UOp(Ops.INS, x.dtype, (value, _const_u32(0), _const_u32(16)), op)
   if x.dtype is dtypes.half and value.dtype in (dtypes.bool, dtypes.int32, dtypes.uint32):
     op = GFX803Ops.V_CVT_F32_I32 if value.dtype is dtypes.int32 else GFX803Ops.V_CVT_F32_U32
     widened = UOp(Ops.INS, dtypes.float32, (value,), op)
@@ -447,11 +482,12 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("idx")), name="x"), _global_index),
   (UPat(Ops.LOAD, src=(UPat.var("addr"), UPat.var("alt"), UPat.var("gate")), name="x"), _load),
   (UPat(Ops.LOAD, src=(UPat.var("addr"),), name="x"), _load),
-  (UPat(Ops.ADD, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_add),
-  (UPat(Ops.MUL, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_mul),
-  (UPat((Ops.CDIV, Ops.CMOD), dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_divmod),
-  (UPat((Ops.SHL, Ops.SHR), dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"), _shift),
-  (UPat((Ops.AND, Ops.OR, Ops.XOR), (dtypes.bool, *dtypes.int32s), src=(UPat.var("a"), UPat.var("b")), name="x"), _bitwise),
+  (UPat(Ops.ADD, dtypes.int8s+dtypes.int16s+dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_add),
+  (UPat(Ops.MUL, dtypes.int8s+dtypes.int16s+dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_mul),
+  (UPat((Ops.CDIV, Ops.CMOD), dtypes.int8s+dtypes.int16s+dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_divmod),
+  (UPat((Ops.SHL, Ops.SHR), dtypes.int8s+dtypes.int16s+dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"), _shift),
+  (UPat((Ops.AND, Ops.OR, Ops.XOR), (dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s),
+        src=(UPat.var("a"), UPat.var("b")), name="x"), _bitwise),
   (UPat(Ops.BITCAST, src=(UPat.var("value"),), name="x"), _bitcast),
   (UPat((Ops.RECIPROCAL, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.TRUNC, Ops.SIN), (dtypes.half, dtypes.float32),
         src=(UPat.var("value"),), name="x"), _float_unary),
@@ -461,7 +497,7 @@ isel_matcher = PatternMatcher([
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_MUL_F32)),
   (UPat(Ops.MAX, (dtypes.half, dtypes.float32), src=(UPat.var("a"), UPat.var("b")), name="x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_MAX_F32)),
-  (UPat(Ops.MAX, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_max),
+  (UPat(Ops.MAX, dtypes.int8s+dtypes.int16s+dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_max),
   (UPat((Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE), dtypes.bool, src=(UPat.var("a"), UPat.var("b")), name="x"), _cmp),
   (UPat(Ops.WHERE, src=(UPat.var("cond"), UPat.var("true_value"), UPat.var("false_value")), name="x"), _where),
   (UPat(Ops.CAST, src=(UPat.var("value"),), name="x"), _cast),
@@ -635,22 +671,26 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       else:
         data = _word(0x7e000200 | (dst.index << 17) | 256 | idx_reg.index)
         text = f"v_mov_b32_e32 v{dst.index}, v{idx_reg.index}"
-  elif x.arg in {GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_U8}:
+  elif x.arg in {GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_S16,
+                  GFX803Ops.FLAT_LOAD_U8, GFX803Ops.FLAT_LOAD_S8}:
     assert dst is not None
     addr = _physical_reg(x.src[0])
-    opcode, mnemonic = {GFX803Ops.FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"),
+    opcode, mnemonic = {GFX803Ops.FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"), GFX803Ops.FLAT_LOAD_S8:(0xdc440000, "flat_load_sbyte"),
                         GFX803Ops.FLAT_LOAD_U16:(0xdc480000, "flat_load_ushort"),
+                        GFX803Ops.FLAT_LOAD_S16:(0xdc4c0000, "flat_load_sshort"),
                         GFX803Ops.FLAT_LOAD_B32:(0xdc500000, "flat_load_dword")}[x.arg]
     data = _word(opcode) + _word((dst.index << 24) | addr.index)
     text = f"{mnemonic} v{dst.index}, v[{addr.index}:{addr.index+1}]"
-  elif x.arg in {GFX803Ops.GATED_FLAT_LOAD_B32, GFX803Ops.GATED_FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_U8}:
+  elif x.arg in {GFX803Ops.GATED_FLAT_LOAD_B32, GFX803Ops.GATED_FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_S16,
+                  GFX803Ops.GATED_FLAT_LOAD_U8, GFX803Ops.GATED_FLAT_LOAD_S8}:
     assert dst is not None
     addr, gate = _physical_reg(x.src[0]), _physical_reg(x.src[2])
     if not gate.name.startswith("v"): raise RuntimeError(f"gfx803 load gate must be a VGPR, got {gate}")
     src, literal, src_text = _raw_src0(x.src[1])
     load_opcode, load_mnemonic = {
-      GFX803Ops.GATED_FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"),
+      GFX803Ops.GATED_FLAT_LOAD_U8:(0xdc400000, "flat_load_ubyte"), GFX803Ops.GATED_FLAT_LOAD_S8:(0xdc440000, "flat_load_sbyte"),
       GFX803Ops.GATED_FLAT_LOAD_U16:(0xdc480000, "flat_load_ushort"),
+      GFX803Ops.GATED_FLAT_LOAD_S16:(0xdc4c0000, "flat_load_sshort"),
       GFX803Ops.GATED_FLAT_LOAD_B32:(0xdc500000, "flat_load_dword"),
     }[x.arg]
     # Compare before initializing the destination: the allocator may reuse the dying gate VGPR for dst.
@@ -685,10 +725,11 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
             f"{store_mnemonic} v[{addr.index}:{addr.index+1}], v{value.index}\n"
             f"s_mov_b64 exec, s[32:33]")
     counts = (counts[0], max(counts[1], 34), counts[2])
-  elif x.arg in {GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_U8}:
+  elif x.arg in {GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_S16, GFX803Ops.DS_LOAD_U8, GFX803Ops.DS_LOAD_S8}:
     assert dst is not None
     addr = _physical_reg(x.src[0])
-    opcode, mnemonic = {GFX803Ops.DS_LOAD_U8:(0xd8740000, "ds_read_u8"), GFX803Ops.DS_LOAD_U16:(0xd8780000, "ds_read_u16"),
+    opcode, mnemonic = {GFX803Ops.DS_LOAD_U8:(0xd8740000, "ds_read_u8"), GFX803Ops.DS_LOAD_S8:(0xd8720000, "ds_read_i8"),
+                        GFX803Ops.DS_LOAD_U16:(0xd8780000, "ds_read_u16"), GFX803Ops.DS_LOAD_S16:(0xd8760000, "ds_read_i16"),
                         GFX803Ops.DS_LOAD_B32:(0xd86c0000, "ds_read_b32")}[x.arg]
     data = _word(opcode) + _word((dst.index << 24) | addr.index)
     text = f"{mnemonic} v{dst.index}, v{addr.index}"
@@ -802,20 +843,19 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     src0, literal = _src0(x.src[0])
     src1 = _physical_reg(x.src[1])
     if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
-    cmp_code = {
-      GFX803Ops.V_CMPLT:{dtypes.half:0x21, dtypes.float32:0x41, dtypes.int32:0xc1, dtypes.uint32:0xc9, dtypes.bool:0xc9},
-      GFX803Ops.V_CMPEQ:{dtypes.half:0x22, dtypes.float32:0x42, dtypes.int32:0xc2, dtypes.uint32:0xca, dtypes.bool:0xca},
-      GFX803Ops.V_CMPNE:{dtypes.half:0x2d, dtypes.float32:0x4d, dtypes.int32:0xc5, dtypes.uint32:0xcd, dtypes.bool:0xcd},
-    }[x.arg][x.src[0].dtype]
-    suffix = "f16" if x.src[0].dtype is dtypes.half else "f32" if x.src[0].dtype is dtypes.float32 else \
-             "i32" if x.src[0].dtype is dtypes.int32 else "u32"
+    src_dtype = x.src[0].dtype
+    kind = "f16" if src_dtype is dtypes.half else "f32" if src_dtype is dtypes.float32 else "i32" if src_dtype in dtypes.sints else "u32"
+    cmp_code = {GFX803Ops.V_CMPLT:{"f16":0x21, "f32":0x41, "i32":0xc1, "u32":0xc9},
+                GFX803Ops.V_CMPEQ:{"f16":0x22, "f32":0x42, "i32":0xc2, "u32":0xca},
+                GFX803Ops.V_CMPNE:{"f16":0x2d, "f32":0x4d, "i32":0xc5, "u32":0xcd}}[x.arg][kind]
+    suffix = kind
     # Materializing true into dst before the compare is not alias-safe: the
     # allocator may legally reuse a dying compare input for dst. VOP3 accepts
     # inline constants in both data positions, so only write dst after VCC is set.
     words = [_vopc(cmp_code, src0, src1.index), *literal, *_vop3_3(0x100, dst.index, 128, 129, 106)]
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     cmp_name = ({GFX803Ops.V_CMPLT:"lt", GFX803Ops.V_CMPEQ:"eq"}.get(x.arg) or
-                ("neq" if x.src[0].dtype in (dtypes.half, dtypes.float32) else "ne"))
+                ("neq" if src_dtype in (dtypes.half, dtypes.float32) else "ne"))
     text = (f"v_cmp_{cmp_name}_{suffix}_e32 vcc, {src0_text}, v{src1.index}\n"
             f"v_cndmask_b32_e64 v{dst.index}, 0, 1, vcc")
     data = b"".join(_word(w) for w in words)
@@ -867,7 +907,8 @@ class AMDASMRenderer(ISARenderer):
     if target.arch != "gfx803": raise RuntimeError(f"AMDASMRenderer only supports gfx803, got {target.arch}")
     super().__init__(target)
 
-  def supported_dtypes(self): return {dtypes.half, dtypes.float32, dtypes.int32, dtypes.uint32, dtypes.bool}
+  def supported_dtypes(self):
+    return {dtypes.bool, *dtypes.int8s, *dtypes.int16s, *dtypes.int32s, dtypes.half, dtypes.float32}
   def stack_pointer(self) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
   def spill(self, disp:UOp, x:UOp) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
   def fill(self, disp:UOp, x:UOp, reg:Register) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
@@ -885,11 +926,14 @@ class AMDASMRenderer(ISARenderer):
     for u in lin.src:
       if u.arg is GFX803Ops.DEFINE: continue
       ordered.append(u)
-      if u.arg in {GFX803Ops.S_LOAD_B64, GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_U8,
-                   GFX803Ops.GATED_FLAT_LOAD_B32, GFX803Ops.GATED_FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_U8,
+      if u.arg in {GFX803Ops.S_LOAD_B64, GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16, GFX803Ops.FLAT_LOAD_S16,
+                   GFX803Ops.FLAT_LOAD_U8, GFX803Ops.FLAT_LOAD_S8, GFX803Ops.GATED_FLAT_LOAD_B32,
+                   GFX803Ops.GATED_FLAT_LOAD_U16, GFX803Ops.GATED_FLAT_LOAD_S16,
+                   GFX803Ops.GATED_FLAT_LOAD_U8, GFX803Ops.GATED_FLAT_LOAD_S8,
                    GFX803Ops.FLAT_STORE_B32, GFX803Ops.FLAT_STORE_B16, GFX803Ops.FLAT_STORE_B8,
                    GFX803Ops.GATED_FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B16, GFX803Ops.GATED_FLAT_STORE_B8,
-                   GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_U8,
+                   GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_LOAD_S16,
+                   GFX803Ops.DS_LOAD_U8, GFX803Ops.DS_LOAD_S8,
                    GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16, GFX803Ops.DS_STORE_B8}:
         ordered.append(UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_WAITCNT))
     labels:dict[str, int] = {}
