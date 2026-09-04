@@ -19,8 +19,9 @@ def ldt(dt:DType, count=1, ptr=False):
 def lconst(x, dtype:DType):
   if dtype in dtypes.floats:
     if dtype in dtypes.fp8s: return float_to_fp8(x, dtype)
+    x = truncate[dtype](x)
     if math.isinf(x) or math.isnan(x): return "0x%02X%02X%02X%02X%02X%02X%02X%02X" % tuple(struct.pack("d",x)[::-1])
-    return truncate[dtype](x)
+    return x
   return int(x)
 
 def lcast(input_type:DType, output_type:DType):
