@@ -108,6 +108,11 @@ def _fixed_reg(dtype:DType, reg:Register) -> UOp: return UOp(Ops.INS, dtype, arg
 def _const_u32(value:int) -> UOp: return UOp.const(dtypes.uint32, value)
 
 
+def _reg_buffer_offset(ctx:IselContext, x:UOp) -> int:
+  buffers = sorted((u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG), key=lambda u: int(u.arg.slot))
+  return sum(int(u.src[0].arg) for u in buffers[:buffers.index(x)])
+
+
 def _abi(ctx:IselContext, x:UOp) -> UOp|None:
   if x.tag is True: return None
   if x.op is Ops.SPECIAL:
@@ -130,7 +135,7 @@ def _abi(ctx:IselContext, x:UOp) -> UOp|None:
   return value.after(x.rtag())
 
 
-def _global_index(x:UOp, base:UOp, idx:UOp) -> UOp|None:
+def _global_index(ctx:IselContext, x:UOp, base:UOp, idx:UOp) -> UOp|None:
   deps:tuple[UOp, ...] = ()
   root = base
   while root.op is Ops.AFTER:
@@ -142,7 +147,7 @@ def _global_index(x:UOp, base:UOp, idx:UOp) -> UOp|None:
                   (root.op is Ops.BUFFER and root.addrspace is AddrSpace.LOCAL)
   if is_reg_buffer:
     if idx.op is not Ops.CONST: raise NotImplementedError("gfx803 indirect register-buffer indexing is not implemented")
-    reg_offset = int(root.src[0].arg) if root.op is Ops.INS else int(root.arg.slot)
+    reg_offset = int(root.src[0].arg) if root.op is Ops.INS else _reg_buffer_offset(ctx, root)
     size = int(root.src[1].arg) if root.op is Ops.INS else int(root.src[0].arg)
     elem = int(idx.arg)
     if not 0 <= elem < size: raise RuntimeError(f"unsupported gfx803 register buffer shape/index: {size=}, {elem=}")
@@ -218,8 +223,7 @@ def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
 
 def _buffer(ctx:IselContext, x:UOp) -> UOp:
   if x.addrspace is AddrSpace.REG:
-    buffers = sorted((u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG), key=lambda u: int(u.arg.slot))
-    offset = sum(int(u.src[0].arg) for u in buffers[:buffers.index(x)])
+    offset = _reg_buffer_offset(ctx, x)
     if offset + int(x.src[0].arg) > REG_BUFFER_COUNT:
       raise RuntimeError(f"gfx803 register buffers require {offset + int(x.src[0].arg)} VGPRs, only {REG_BUFFER_COUNT} are reserved")
     return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, offset), x.src[0]), GFX803Ops.REG_BUFFER_META, True)
