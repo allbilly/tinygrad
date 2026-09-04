@@ -424,8 +424,8 @@ class AMDComputeQueue(HWQueue):
 
     # Polaris programs dimensions before the PGM/RSRC registers. Programming
     # them afterward can trigger instruction prefetch with incomplete state.
-    gfx8_direct = self.dev.target[0] == 8 and self.dev.is_am()
-    if gfx8_direct: self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *local_size)
+    gfx8 = self.dev.target[0] == 8
+    if gfx8: self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *local_size)
 
     self.wreg(self.gc.regCOMPUTE_PGM_LO, *data64_le(prg.prog_addr >> 8))
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, prg.rsrc1, prg.rsrc2)
@@ -442,7 +442,7 @@ class AMDComputeQueue(HWQueue):
     if self.dev.target[0] > 8: self.wreg(self.gc.regCOMPUTE_RESTART_X, 0, 0, 0)
     self.wreg(self.gc.regCOMPUTE_USER_DATA_0, *user_regs)
     self.wreg(self.gc.regCOMPUTE_RESOURCE_LIMITS, waves_per_sh=getenv("WAVES_PER_SH"))
-    if not gfx8_direct: self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *local_size, *((0, 0) if self.dev.target[0] > 8 else ()))
+    if not gfx8: self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *local_size, 0, 0)
 
     dispatch_header = self.pm4.PACKET3(self.pm4.PACKET3_DISPATCH_DIRECT, 3)
     if prg.dev.target[0] == 8: dispatch_header |= 1 << 1  # PACKET3_SHADER_TYPE_S: compute on GFX8
