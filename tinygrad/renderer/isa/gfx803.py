@@ -608,9 +608,48 @@ def _unsupported_elementwise(x:UOp):
   raise NotImplementedError(f"gfx803 {x.op.name} {x.dtype} from {tuple(s.dtype for s in x.src)} is not lowered yet")
 
 
+def _is_const(x:UOp, value:float) -> bool:
+  return x.op is Ops.CONST and x.arg == value
+
+
+def _relu_input(x:UOp) -> UOp|None:
+  if x.op is not Ops.WHERE or len(x.src) != 3: return None
+  cond, true_value, false_value = x.src
+  if cond.op is not Ops.CMPLT or len(cond.src) != 2: return None
+  return true_value if cond.src[1] is true_value and _is_const(cond.src[0], 0) and _is_const(false_value, 0) else None
+
+
+def _add_without_const(x:UOp, value:float) -> UOp|None:
+  if x.op is not Ops.ADD or len(x.src) != 2: return None
+  if _is_const(x.src[0], value): return x.src[1]
+  if _is_const(x.src[1], value): return x.src[0]
+  return None
+
+
+def _stable_hardsigmoid(x:UOp) -> UOp|None:
+  # hardsigmoid is optimized into relu(y) - relu(y-1). Subtracting two
+  # large half values loses the saturated 1, so recover the equivalent clamp.
+  for positive, negative in (x.src, x.src[::-1]):
+    y = _relu_input(positive)
+    if y is None or negative.op is not Ops.MUL: continue
+    if _is_const(negative.src[0], -1): negated = negative.src[1]
+    elif _is_const(negative.src[1], -1): negated = negative.src[0]
+    else: continue
+    z = _relu_input(negated)
+    if z is None: continue
+    scaled_y, scaled_z = _add_without_const(y, 0.5), _add_without_const(z, -0.5)
+    if scaled_y is None or scaled_y is not scaled_z: continue
+    zero, one = UOp.const(x.dtype, 0), UOp.const(x.dtype, 1)
+    below = UOp(Ops.CMPLT, dtypes.bool, (y, zero))
+    above = UOp(Ops.CMPLT, dtypes.bool, (one, y))
+    return UOp(Ops.WHERE, x.dtype, (below, zero, UOp(Ops.WHERE, x.dtype, (above, one, y))))
+  return None
+
+
 pre_isel_matcher = PatternMatcher([
   (UPat(Ops.RECIPROCAL, (dtypes.half, dtypes.float32),
         src=(UPat(Ops.SQRT, src=(UPat.var("value"),)),), name="x"), _rsqrt),
+  (UPat(Ops.ADD, dtypes.half, name="x"), _stable_hardsigmoid),
 ])
 isel_matcher = PatternMatcher([
   (UPat((Ops.PARAM, Ops.SPECIAL), name="x"), _abi),

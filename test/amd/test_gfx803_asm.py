@@ -611,6 +611,18 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(_assembled(*lines), text.content)
         for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
 
+  def test_half_hardsigmoid_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    source = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    program = to_program(source.hardsigmoid().schedule_linear().src[-1].src[0], renderer)
+    text, _, _, relocs = self._elf(program)
+    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+    code_lines = lines[:lines.index("s_endpgm")+1]
+    self.assertEqual(relocs, [])
+    self.assertEqual(_assembled(*lines), text.content)
+    self.assertTrue(any(line.startswith("v_cndmask_b32") for line in code_lines))
+    self.assertFalse(any(line.startswith("v_mul_f16") and "-1" in line for line in code_lines))
+
   def test_integer_max_reductions_elf(self):
     renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
     cases = {
