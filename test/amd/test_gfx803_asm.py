@@ -151,6 +151,9 @@ class TestGFX803Encoder(unittest.TestCase):
     addr, lds_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8), _reg(dtypes.uint32, "v45", 45)
     cases = [
       (UOp(Ops.INS, dtypes.bool, (addr,), GFX803Ops.FLAT_LOAD_U8, boolean.tag), ("flat_load_ubyte v44, v[4:5]",)),
+      (UOp(Ops.INS, dtypes.half, (addr, UOp.const(dtypes.half, 0), gate), GFX803Ops.GATED_FLAT_LOAD_U16, half.tag),
+       ("v_mov_b32_e32 v43, 0", "v_cmp_ne_u32_e32 vcc, 0, v46", "s_and_saveexec_b64 s[32:33], vcc",
+        "flat_load_ushort v43, v[4:5]", "s_mov_b64 exec, s[32:33]")),
       (UOp(Ops.INS, dtypes.void, (addr, boolean), GFX803Ops.FLAT_STORE_B8), ("flat_store_byte v[4:5], v44",)),
       (UOp(Ops.INS, dtypes.bool, (lds_addr,), GFX803Ops.DS_LOAD_U8, boolean.tag), ("ds_read_u8 v44, v45",)),
       (UOp(Ops.INS, dtypes.void, (lds_addr, boolean), GFX803Ops.DS_STORE_B8), ("ds_write_b8 v45, v44",)),
@@ -164,6 +167,22 @@ class TestGFX803Encoder(unittest.TestCase):
       (UOp(Ops.INS, dtypes.void, (addr, boolean, gate), GFX803Ops.GATED_FLAT_STORE_B8),
        ("v_cmp_ne_u32_e32 vcc, 0, v46", "s_and_saveexec_b64 s[32:33], vcc",
         "flat_store_byte v[4:5], v44", "s_mov_b64 exec, s[32:33]")),
+    ]
+    for uop, lines in cases:
+      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
+  def test_bitwise_and_shifts(self):
+    a, b, out = (_reg(dtypes.uint32, f"v{i}", i) for i in (40, 41, 42))
+    signed = _reg(dtypes.int32, "v43", 43)
+    cases = [
+      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_AND_B32, out.tag), ("v_and_b32_e32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 3), b), GFX803Ops.V_OR_B32, out.tag),
+       ("v_or_b32_e32 v42, 3, v41",)),
+      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_XOR_B32, out.tag), ("v_xor_b32_e32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 8), b), GFX803Ops.V_LSHRREV_B32, out.tag),
+       ("v_lshrrev_b32_e32 v42, 8, v41",)),
+      (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.uint32, 8), signed), GFX803Ops.V_ASHRREV_I32, signed.tag),
+       ("v_ashrrev_i32_e32 v43, 8, v43",)),
     ]
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
@@ -312,6 +331,29 @@ class TestGFX803Program(unittest.TestCase):
       "half_compare": (half<0, ("flat_load_ushort", "v_cmp_lt_f16", "flat_store_byte")),
       "bool_to_uint": (boolean.cast(dtypes.uint32), ("flat_load_ubyte", "v_mov_b32", "flat_store_dword")),
       "int_to_float": (i32.float(), ("flat_load_dword", "v_cvt_f32_i32", "flat_store_dword")),
+    }
+    for name, (result, expected) in cases.items():
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, _, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        code_lines = lines[:lines.index("s_endpgm")+1]
+        self.assertEqual(relocs, [])
+        self.assertEqual(_assembled(*lines), text.content)
+        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
+
+  def test_bitwise_programs_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    i32 = Tensor.empty(16, dtype=dtypes.int32, device="NULL").contiguous().realize()
+    u32 = Tensor.empty(16, dtype=dtypes.uint32, device="NULL").contiguous().realize()
+    boolean = Tensor.empty(16, dtype=dtypes.bool, device="NULL").contiguous().realize()
+    cases = {
+      "int_and": (i32 & 255, ("v_and_b32",)),
+      "uint_or_xor": ((u32 | 3) ^ 1, ("v_or_b32", "v_xor_b32")),
+      "logical_shift": (u32 >> 3, ("v_lshrrev_b32",)),
+      "arithmetic_shift": (i32 >> 3, ("v_ashrrev_i32",)),
+      "bool_and": (boolean & (boolean != True), ("v_cmp_ne_u32", "v_and_b32")),  # noqa: E712
+      "gated_load": (i32.pad((1, 1)).contiguous(), ("s_and_saveexec_b64", "flat_load_dword")),
     }
     for name, (result, expected) in cases.items():
       with self.subTest(name=name):
