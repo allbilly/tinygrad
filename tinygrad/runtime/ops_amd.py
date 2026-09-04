@@ -1048,6 +1048,14 @@ class DRMIface:
   needs_cwsr = False
 
   @staticmethod
+  def _require_power_on(dev_sysfs_path:str):
+    power_control = f"{dev_sysfs_path}/power/control"
+    try: control = FileIOInterface(power_control).read().strip()
+    except OSError: return
+    if control != "on":
+      raise RuntimeError(f"Polaris runtime PM must be disabled before opening its DRM render node; run: echo on | sudo tee {power_control}")
+
+  @staticmethod
   def _render_nodes() -> list[tuple[str, str]]:
     base = "/dev/dri/by-path"
     nodes:list[tuple[str, str]] = []
@@ -1071,6 +1079,7 @@ class DRMIface:
     self.dev, self.count = dev, len(visible)
     self.peer_group = f"AMD-DRM-{self.pcibus}"
     self.dev_sysfs_path = f"/sys/bus/pci/devices/{self.pcibus}"
+    self._require_power_on(self.dev_sysfs_path)
     self.drm_fd = FileIOInterface(render_node, os.O_RDWR)
 
     amdgpu_drm.DRM_IOCTL_AMDGPU_INFO(self.drm_fd, query=amdgpu_drm.AMDGPU_INFO_DEV_INFO,

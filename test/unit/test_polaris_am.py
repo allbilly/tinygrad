@@ -1,5 +1,6 @@
 import ctypes, unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 from tinygrad.codegen.opt import tc
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, DRMIface, GFX8GC, _gfx8_props, _kfd_doorbell_params
@@ -165,6 +166,15 @@ class TestPolarisAM(unittest.TestCase):
     iface.write_signal(0x100008, 0x1234)
     self.assertEqual(backing[1], 0x1234)
     with self.assertRaisesRegex(RuntimeError, "not CPU mapped"): iface.write_signal(0x200000, 1)
+
+  def test_drm_requires_runtime_pm_disabled_before_open(self):
+    with patch("tinygrad.runtime.ops_amd.FileIOInterface") as fio:
+      fio.return_value.read.return_value = "auto\n"
+      with self.assertRaisesRegex(RuntimeError, "runtime PM must be disabled"): DRMIface._require_power_on("/sys/mock")
+      fio.return_value.read.return_value = "on\n"
+      DRMIface._require_power_on("/sys/mock")
+      fio.side_effect = OSError
+      DRMIface._require_power_on("/sys/mock")
 
   def test_non_kfd_signal_does_not_emit_event(self):
     dev = SimpleNamespace(target=(8, 0, 3), xccs=1, iface=SimpleNamespace(has_queue_events=False), is_am=lambda: False)
