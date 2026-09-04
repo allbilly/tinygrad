@@ -590,7 +590,7 @@ def test_runtime_bounds_risky_and_oversize_pc_chains(monkeypatch):
   with pytest.raises(ValueError,match="invalid NPU task count"): program._submit(None,None,rockchip_runtime._MAX_PC_TASKS+1)  # type: ignore[arg-type]
 
 
-def test_numeric_output_program_resets_before_its_first_dpu_stage():
+def test_numeric_output_program_uses_its_self_initializing_dpu_stage():
   class FakeDevice:
     _native_int16, resets = False, 0
     def __init__(self): self._lock=threading.Lock()
@@ -603,7 +603,7 @@ def test_numeric_output_program_resets_before_its_first_dpu_stage():
   program.dev,program.image,program._scratch_offsets=FakeDevice(),RKImage(program=(op,)),(0,)
   program._run_ew_ops=lambda *_args,**_kwargs:None
   program()
-  assert program.dev.resets == 1
+  assert program.dev.resets == 0
 
 
 def test_program_records_only_the_terminal_native_int16_mode():

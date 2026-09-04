@@ -217,7 +217,7 @@ class RockchipProgram(Program['RockchipDevice']):
     start = time.perf_counter()
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
     native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
-    if ew_ops and (self.dev._native_int16 and not native_int16 or any(op.mode==RKEWMode.HALF_TO_FLOAT for op in ew_ops)): self.dev.reset_npu()  # noqa: E501
+    if ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
     for index,group in enumerate(groups:=tuple(tuple(items) for _,items in itertools.groupby(self.image.program[cursor:],type))):
       rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (isinstance(next_op:=groups[index+2][0],RKEWOp) and next_op.mode==RKEWMode.BOUNDED or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
       if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)

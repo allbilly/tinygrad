@@ -928,7 +928,15 @@ class TestRockchipLossOps(unittest.TestCase):
 class TestRockchipCastOps(unittest.TestCase):
   """Native DPU conversion from FP16 inputs to boolean, byte, INT32, and FP32 outputs."""
 
-  test_cast = _test_ops.TestOps.test_cast
+  def test_cast(self):
+    _test_ops.TestOps.test_cast(self)
+    bits=np.asarray((0x0000,0x8000,0x0001,0x8001,0x03ff,0x83ff,0x0400,0x8400,0x3c00,0xbc00,
+                     0x7bff,0xfbff,0x7c00,0xfc00,0x7e01,0xfe01),dtype=np.uint16)
+    expected=bits.view(np.float16).astype(np.float32)
+    got=Tensor(bits.view(np.float16)).cast(dtypes.float32).realize().numpy()
+    nan=np.isnan(expected)
+    np.testing.assert_array_equal(np.isnan(got),nan)
+    np.testing.assert_array_equal(got.view(np.uint32)[~nan],expected.view(np.uint32)[~nan])
   test_cast_relu = _test_ops.TestOpsUint8.test_cast_relu
 
 
