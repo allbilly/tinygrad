@@ -1,5 +1,5 @@
 from __future__ import annotations
-import array, ctypes, itertools, mmap, os, threading, time, typing
+import array, ctypes, itertools, mmap, operator, os, threading, time, typing
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, round_up, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
@@ -26,7 +26,7 @@ def _rk_buffer_view(raw:HCQBuffer, arg:RKArg, fmt:str, itemsize:int) -> MMIOInte
 
 def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|None:
   """Snapshot common broadcast/tiled affine gathers into one compact typed payload."""
-  axes,code=gather.axes,_RAW_FORMATS[gather.itemsize]
+  axes,code=tuple(sorted(gather.axes)),_RAW_FORMATS[gather.itemsize]
   if not axes or gather.base<0 or any(divisor<=0 or limit<=0 or stride<=0 for divisor,limit,stride in axes): return None
   periods=tuple(divisor*limit for divisor,limit,_ in axes)
   if gather.count%periods[-1] or any(divisor%period for period,(divisor,_,_) in zip(periods,axes[1:])) or \
@@ -52,39 +52,39 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
     if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend:
       ctypes.memset(int(raw_dst.va_addr),0,raw_dst.size)
     if gather.values:
-      stop=gather.dst_addend+(gather.count-1)*gather.dst_stride if gather.count else gather.dst_addend
+      stop=gather.dst_addend+(gather.count-1)*gather.dst_stride if gather.count else gather.dst_addend; values=array.array(_RAW_FORMATS[gather.itemsize],gather.values)  # noqa: E702,E501
       if gather.dst_addend<0 or stop>=len(dst): raise IndexError("RKGather destination exceeds buffer")
-      values=array.array(_RAW_FORMATS[gather.itemsize],gather.values)
       if len(values)==1: values*=gather.count
-      dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=values
-      continue
+      dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=values; continue  # noqa: E702
     assert gather.src is not None
     raw_src=buffer(gather.src.kind,gather.src.index)
-    src=_rk_buffer_view(raw_src,gather.src,_RAW_FORMATS[gather.itemsize],gather.itemsize)
+    src=_rk_buffer_view(raw_src,gather.src,_RAW_FORMATS[gather.itemsize],gather.itemsize); src_limit,dst_limit,overlap=len(src),len(dst),src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes  # noqa: E702,E501
     if gather.index is not None:
       indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,
                               _INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
-      if len(indices)<gather.count or len(dst)<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
+      if len(indices)<gather.count or dst_limit<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
       source_indices=tuple(int(indices[lane]) for lane in range(gather.count))
     else: source_indices=gather.offsets
     fill=not gather.partial and (bool(gather.offsets) or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
     if fill:
       start,stride=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
-      if start<0 or gather.count and start+(gather.count-1)*stride>=len(dst): raise IndexError("RKGather destination exceeds buffer")
+      if start<0 or gather.count and start+(gather.count-1)*stride>=dst_limit: raise IndexError("RKGather destination exceeds buffer")
       dst.mv[start:start+gather.count*stride:stride]=array.array(_RAW_FORMATS[gather.itemsize],[gather.fill_bits])*gather.count
+    if gather.index is None and gather.offsets and not overlap and gather.dst_addend>=0 and gather.dst_addend+(gather.count-1)*gather.dst_stride<dst_limit:  # noqa: E501
+      if (valid:=min(gather.offsets)>=0 and max(gather.offsets)<src_limit) and gather.count>1 or not gather.partial:
+        packed=array.array(_RAW_FORMATS[gather.itemsize],operator.itemgetter(*gather.offsets)(src.mv) if valid and gather.count>1 else (src.mv[index] if 0<=index<src_limit else gather.fill_bits for index in gather.offsets)); dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=packed; continue  # noqa: E702,E501
     if gather.index is None and not gather.offsets and gather.count and len(gather.axes)==1 and gather.axes[0][:2]==(1,gather.count):
       di,si,source_stride=gather.dst_addend,gather.base,gather.axes[0][2]
-      if di>=0 and si>=0 and source_stride>0 and di+(gather.count-1)*gather.dst_stride<len(dst) and \
-         si+(gather.count-1)*source_stride<len(src):
+      if di>=0 and si>=0 and source_stride>0 and di+(gather.count-1)*gather.dst_stride<dst_limit and \
+         si+(gather.count-1)*source_stride<src_limit:
         if gather.dst_stride==source_stride==1:
           ctypes.memmove(dst.addr+di*gather.itemsize,src.addr+si*gather.itemsize,gather.count*gather.itemsize)
         else: dst.mv[di:di+gather.count*gather.dst_stride:gather.dst_stride]=src.mv[si:si+gather.count*source_stride:source_stride]
         continue
-    if gather.index is None and not gather.offsets and gather.dst_stride==1 and gather.dst_addend>=0 and \
-       gather.dst_addend+gather.count<=len(dst) and (payload:=_regular_gather_payload(gather,src)) is not None:
-      dst.mv[gather.dst_addend:gather.dst_addend+gather.count]=payload
+    if gather.index is None and not gather.offsets and gather.dst_addend>=0 and (not gather.count or \
+       gather.dst_addend+(gather.count-1)*gather.dst_stride<dst_limit) and (payload:=_regular_gather_payload(gather,src)) is not None:
+      dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=payload
       continue
-    overlap=src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes
     pending:list[tuple[int,int]]=[]
     for lane in range(gather.count):
       di=lane if gather.index is not None else gather.dst_addend+lane*gather.dst_stride
@@ -93,10 +93,10 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
       else:
         si=gather.base
         for divisor,limit,stride in gather.axes: si+=(lane//divisor%limit)*stride
-      if 0<=di<len(dst) and 0<=si<len(src):
-        if overlap: pending.append((di,src[si]))
-        else: dst[di]=src[si]
-    for di,value in pending: dst[di]=value
+      if 0<=di<dst_limit and 0<=si<src_limit:
+        if overlap: pending.append((di,src.mv[si]))
+        else: dst.mv[di]=src.mv[si]
+    for di,value in pending: dst.mv[di]=value
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 class RockchipAllocator(LRUAllocator['RockchipDevice']):

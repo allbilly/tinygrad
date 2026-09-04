@@ -1,11 +1,11 @@
 from __future__ import annotations
 # ruff: noqa: E702
-import base64, functools, heapq, io, itertools, math, os, pickle, struct, zlib
+import array, base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
 from typing import Any, Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
-from tinygrad.helpers import all_same, argsort, ceildiv, polyN, round_up, strides_for_shape
+from tinygrad.helpers import argsort, ceildiv, polyN, round_up, strides_for_shape
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, identity_element, python_alu
@@ -80,7 +80,8 @@ def _reuse_linear_scratch(image:RKImage) -> RKImage:
 
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
-  return all(isinstance(value,int) and low<=value<high for value in values)
+  try: return (array.array(code,values),True)[1] if isinstance(values,tuple) and len(values)>1024 and (code:={(True,8):"b",(True,16):"h",(True,32):"i",(False,8):"B",(False,16):"H",(False,32):"I"}.get((signed,bits))) is not None else all(isinstance(value,int) and low<=value<high for value in values)  # noqa: E501
+  except (OverflowError,TypeError,ValueError): return False
 
 def _validate_image(image:RKImage) -> None:
   gathers=tuple(op for op in image.program if isinstance(op,RKGather)); hosts=tuple(op for op in gathers if op.index is not None); static=tuple(op for op in gathers if op.index is None); ew_ops=tuple(op for op in image.program if isinstance(op,RKEWOp)); cmacs=tuple(op for op in image.program if isinstance(op,RKCMAC))  # noqa: E501
@@ -243,39 +244,20 @@ RKStatic = RKScalar|tuple[RKScalar,...]
 
 def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
   scalar,commit=dtype.scalar(),truncate.get(dtype.scalar())
-  def lane(value:RKScalar) -> RKScalar:
-    if dtypes.is_int(scalar):
-      bits=scalar.bitsize; integer=int(value)&((1<<bits)-1)
-      return integer-(1<<bits) if not dtypes.is_unsigned(scalar) and integer&(1<<(bits-1)) else integer
-    value=typing_cast(RKScalar,scalar.const(value))
-    return value if commit is None else commit(value)
+  def lane(value:RKScalar) -> RKScalar: value=typing_cast(RKScalar,scalar.const(value)); return value if commit is None else commit(value)  # noqa: E702
   return tuple(map(lane,value)) if isinstance(value,tuple) else lane(value)
 
 def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
-  vectors=tuple(value for value in operands if isinstance(value,tuple))
-  if not vectors: return typing_cast(RKStatic,exec_alu(node.op,node.dtype.scalar(),operands))
+  if not (vectors:=tuple(value for value in operands if isinstance(value,tuple))): return typing_cast(RKStatic,exec_alu(node.op,node.dtype.scalar(),operands))  # noqa: E501
   count=len(vectors[0])
   if any(len(value)!=count for value in vectors): raise RuntimeError("RKPLAN_REJECT:static_index")
   expanded=tuple(value if isinstance(value,tuple) else itertools.repeat(value,count) for value in operands)
-  if node.op is Ops.ADD: result=tuple(a+b for a,b in zip(*expanded))
-  elif node.op is Ops.SUB: result=tuple(a-b for a,b in zip(*expanded))
-  elif node.op is Ops.MUL: result=tuple(a*b for a,b in zip(*expanded))
-  elif node.op is Ops.CMPLT: result=tuple(a<b for a,b in zip(*expanded))
-  elif node.op is Ops.CMPNE: result=tuple(a!=b for a,b in zip(*expanded))
-  elif node.op is Ops.AND: result=tuple(a&b for a,b in zip(*expanded))
-  elif node.op is Ops.OR: result=tuple(a|b for a,b in zip(*expanded))
-  elif node.op is Ops.XOR: result=tuple(a^b for a,b in zip(*expanded))
-  elif node.op is Ops.MAX: result=tuple(b if b>a else a for a,b in zip(*expanded))
-  elif node.op is Ops.WHERE: result=tuple(yes if condition else no for condition,yes,no in zip(*expanded))
-  elif node.op is Ops.CDIV: result=tuple(abs(a)//abs(b)*(1,-1)[a*b<0] if b else 0 for a,b in zip(*expanded))
-  elif node.op is Ops.CMOD: result=tuple(a-(abs(a)//abs(b)*(1,-1)[a*b<0] if b else 0)*b for a,b in zip(*expanded))
-  elif node.op is Ops.FLOORDIV: result=tuple(a//b if b else 0 for a,b in zip(*expanded))
-  elif node.op is Ops.FLOORMOD: result=tuple(a-(a//b if b else 0)*b for a,b in zip(*expanded))
-  elif node.op is Ops.RECIPROCAL: result=tuple(1/value if value else math.copysign(math.inf,value) for value in expanded[0])
-  elif node.op is Ops.TRUNC: result=tuple(math.trunc(value) if math.isfinite(value) else value for value in expanded[0])
-  else: result=tuple(python_alu[node.op](*values) for values in zip(*expanded))
-  scalar=node.dtype.scalar()
-  if dtypes.is_bool(scalar) or dtypes.is_int(scalar) and scalar.min<=int(node.vmin)<=int(node.vmax)<=scalar.max: return result
+  if node.op in (Ops.CMOD,Ops.FLOORMOD) and node.src[0].vmin>=0 and node.src[0].vmax<node.src[1].vmin: result=operands[0] if isinstance(operands[0],tuple) else (operands[0],)*count  # noqa: E501
+  elif node.op in (Ops.CDIV,Ops.FLOORDIV) and node.src[1].vmin==node.src[1].vmax==1: result=operands[0] if isinstance(operands[0],tuple) else (operands[0],)*count  # noqa: E501
+  else:
+    direct_div=node.src[1].vmin>0 and (node.op is Ops.FLOORDIV or node.src[0].vmin>=0) if node.op in (Ops.CDIV,Ops.FLOORDIV) else False; direct_mod=node.src[1].vmin>0 and (node.op is Ops.FLOORMOD or node.src[0].vmin>=0) if node.op in (Ops.CMOD,Ops.FLOORMOD) else False  # noqa: E702,E501
+    result=tuple(map(operator.floordiv if direct_div else operator.mod if direct_mod else python_alu[node.op],*expanded))
+  if dtypes.is_bool(scalar:=node.dtype.scalar()) or dtypes.is_int(scalar) and scalar.min<=int(node.vmin)<=int(node.vmax)<=scalar.max: return result
   return _commit_static(node.dtype,result)
 
 def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None=None) -> RKStatic:
@@ -283,17 +265,15 @@ def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None
   if _static_ranges(u) is None: raise RuntimeError("RKPLAN_REJECT:non_static_eval")
   cache={} if cache is None else cache; cache.update((node,_commit_static(node.dtype,value)) for node,value in env.items())
   for node in u.toposort(gate=lambda item:item not in cache):
-    if node.op is Ops.CONST: value=_commit_static(node.dtype,typing_cast(RKScalar,node.arg))
-    elif node.op is Ops.CAST: value=_commit_static(node.dtype,cache[node.src[0]])
-    else: value=_exec_static(node,tuple(cache[source] for source in node.src))
+    value=_commit_static(node.dtype,typing_cast(RKScalar,node.arg)) if node.op is Ops.CONST else _commit_static(node.dtype,cache[node.src[0]]) if node.op is Ops.CAST else _exec_static(node,tuple(cache[source] for source in node.src))  # noqa: E501
     cache[node]=value
   return cache[u]
 
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=2048)
 def _eval_static_block(u:UOp, axes:tuple[UOp,...], bounds:tuple[int,...], start:int, stop:int) -> RKStatic:
   if u in axes:
     stride=strides_for_shape(bounds)[axes.index(u)]; bound=bounds[axes.index(u)]
-    return tuple(0 if bound==1 else lane//stride%bound for lane in range(start,stop))
+    return (0,)*(stop-start) if bound==1 else tuple(range(start,stop)) if stride==1 and stop<=bound else tuple(lane//stride%bound for lane in range(start,stop))  # noqa: E501
   if u.op is Ops.CONST: return _commit_static(u.dtype,typing_cast(RKScalar,u.arg))
   values=tuple(_eval_static_block(source,axes,bounds,start,stop) for source in u.src)
   return _commit_static(u.dtype,values[0]) if u.op is Ops.CAST else _exec_static(u,values)
@@ -312,6 +292,29 @@ def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
 def _admit(o,d,v=True)->RKOutput|None: return o if v and o is not None and o[1].dtype.scalar() in (d if isinstance(d,tuple) else (d,)) else None
 def _try(o,d,f,*a,v=True)->RKImage|None: return None if not v or (o:=_admit(o,d)) is None else f(o,*a)
 
+def _static_range_pattern(u:UOp, axis:UOp, count:int) -> tuple[RKScalar,...]|None:
+  """Construct the large one-axis modulo/group patterns used by cumulative selectors without per-lane ALU evaluation."""
+  def clean(x:UOp) -> UOp: return clean(x.src[0]) if x.op in (Ops.CMOD,Ops.FLOORMOD) and x.src[1].op is Ops.CONST and x.src[0].vmin>=0 and x.src[0].vmax<x.src[1].vmin else x  # noqa: E501
+  def axis_mod(x:UOp) -> int|None: return int(x.src[1].arg) if x.op in (Ops.CMOD,Ops.FLOORMOD) and x.src[0] is axis and x.src[1].op is Ops.CONST and int(x.src[1].arg)>0 else None  # noqa: E501
+  def safe_mod(x:UOp) -> tuple[int,int]|None: wrapper=int(x.src[1].arg) if x.op in (Ops.CMOD,Ops.FLOORMOD) and x.src[1].op is Ops.CONST else None; x=clean(x.src[0]) if wrapper is not None else clean(x); return (period,limit) if x.op is Ops.WHERE and x.src[0].op is Ops.CMPLT and x.src[1] is x.src[0].src[0] and x.src[2].op is Ops.CONST and int(x.src[2].arg)==0 and (period:=axis_mod(x.src[1])) is not None and x.src[0].src[1].op is Ops.CONST and 0<=(limit:=int(x.src[0].src[1].arg))<=period and (wrapper is None or wrapper>=limit) else None  # noqa: E702,E501
+  def axis_group(x:UOp) -> tuple[int,int]|None: return (int(x.src[0].src[1].arg),int(x.src[1].arg)) if x.op in (Ops.CMOD,Ops.FLOORMOD) and x.src[1].op is Ops.CONST and x.src[0].op in (Ops.CDIV,Ops.FLOORDIV) and x.src[0].src[0] is axis and x.src[0].src[1].op is Ops.CONST and int(x.src[0].src[1].arg)>0 and int(x.src[1].arg)>0 else None  # noqa: E501
+  def local_mod(x:UOp) -> tuple[int,int]|None: return (int(x.src[0].src[1].arg),int(x.src[1].arg)) if x.op in (Ops.CMOD,Ops.FLOORMOD) and x.src[1].op is Ops.CONST and x.src[0].op in (Ops.CMOD,Ops.FLOORMOD) and x.src[0].src[0] is axis and x.src[0].src[1].op is Ops.CONST else None  # noqa: E501
+  def local_high(x:UOp) -> tuple[int,int,int,int]|None: value,scale=next(((value,int(scale.arg)) for value,scale in (x.src,x.src[::-1]) if scale.op is Ops.CONST),(x,0)) if x.op is Ops.MUL else (x,0); return (int(value.src[0].src[0].src[1].arg),int(value.src[0].src[1].arg),int(value.src[1].arg),scale) if value.op in (Ops.CMOD,Ops.FLOORMOD) and value.src[1].op is Ops.CONST and value.src[0].op in (Ops.CDIV,Ops.FLOORDIV) and value.src[0].src[1].op is Ops.CONST and value.src[0].src[0].op in (Ops.CMOD,Ops.FLOORMOD) and value.src[0].src[0].src[0] is axis and value.src[0].src[0].src[1].op is Ops.CONST else None  # noqa: E702,E501
+  def tiled(x:UOp) -> tuple[int,int,bool,int]|None: terms=(lambda fn:fn(fn,x))(lambda self,item:self(self,item.src[0])+self(self,item.src[1]) if item.op is Ops.ADD else (item,)); constant=sum(int(term.arg) for term in terms if term.op is Ops.CONST); groups=tuple(filter(None,(axis_group(term) for term in terms))); low=tuple(filter(None,(local_mod(term) for term in terms))); high=tuple(filter(None,(local_high(term) for term in terms))); period,group_count=groups[0] if len(groups)==1 else (0,0); return (period,group_count,bool(high),constant) if len(groups)==len(low)==1 and len(high)<=1 and len(terms)==2+bool(high)+(constant!=0) and low[0]==groups[0] and (not high or high[0]==(period,group_count,period//group_count,group_count)) and period%group_count==0 else None  # noqa: E702,E501
+  def tiled_values(x:UOp) -> tuple[int,...]|None: spec=tiled(x); period,groups,full,constant=spec or (0,0,False,0); row=tuple(itertools.chain.from_iterable(tuple(range(group+constant,group+constant+period)) if full else tuple(range(group+constant,group+constant+groups))*(period//groups) for group in range(groups))) if spec is not None and not count%(period*groups) else (); return row*(count//len(row)) if row else None  # noqa: E702,E501
+  if u.op is Ops.CMPLT and (period:=axis_mod(u.src[0])) is not None and u.src[1].op is Ops.CONST and 0<=(limit:=int(u.src[1].arg))<=period and count%period==0: return ((True,)*limit+(False,)*(period-limit))*(count//period)  # noqa: E501
+  if u.op is Ops.CMPLT and u.src[1].op is Ops.CONST and (values:=tiled_values(u.src[0])) is not None: return tuple(value<int(u.src[1].arg) for value in values)  # noqa: E501
+  if (values:=tiled_values(u)) is not None: return values
+  matched=next(((pattern,int(offset.arg)) for base,offset in ((u.src,u.src[::-1]) if u.op is Ops.ADD else ()) if offset.op is Ops.CONST and (pattern:=safe_mod(base)) is not None and count%pattern[0]==0),None)  # noqa: E501
+  if matched is not None: (period,limit),addend=matched; return (tuple(range(addend,addend+limit))+(addend,)*(period-limit))*(count//period)  # noqa: E701,E702,E501
+  descending=next(((group,int(offset.arg)) for negated,offset in ((u.src,u.src[::-1]) if u.op is Ops.ADD else ()) if offset.op is Ops.CONST for value,sign in ((negated.src,negated.src[::-1]) if negated.op is Ops.MUL else ()) if sign.op is Ops.CONST and int(sign.arg)==-1 and (group:=axis_group(value)) is not None and count%(group[0]*group[1])==0),None)  # noqa: E501
+  if descending is not None: (period,groups),offset=descending; row=tuple(itertools.chain.from_iterable(itertools.repeat(offset-value,period) for value in range(groups))); return row*(count//len(row))  # noqa: E701,E702,E501
+  compared=next((value for value,marker in (u.src,u.src[::-1]) if marker.op is Ops.CONST and bool(marker.arg)),None) if u.op is Ops.CMPNE else None
+  if compared is not None and compared.op is Ops.CMPLT and (safe:=safe_mod(compared.src[0])) is not None and (group:=axis_group(compared.src[1]))==(safe[0],safe[1]) and count%(safe[0]*safe[1])==0: period,groups=safe; row=tuple(itertools.chain.from_iterable((False,)*value+(True,)*(groups-value)+((True,)*(period-groups) if value==0 else (False,)*(period-groups)) for value in range(groups))); return row*(count//len(row))  # noqa: E701,E702,E501
+  if compared is not None and (nested:=_static_range_pattern(compared,axis,count)) is not None: return tuple(map(operator.not_,nested))
+  if u.op is Ops.AND and (lhs:=_static_range_pattern(u.src[0],axis,count)) is not None and (rhs:=_static_range_pattern(u.src[1],axis,count)) is not None: return tuple(map(operator.and_,lhs,rhs))  # noqa: E501
+  return None
+
 @functools.lru_cache(maxsize=2)
 def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> tuple[tuple[RKScalar,...],...]:
   """Enumerate one bounded static lane space and evaluate all requested roots in it."""
@@ -320,26 +323,26 @@ def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RA
   bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in axes); count=math.prod(bounds)
   if any(bound<0 for bound in bounds) or count>limit: raise RuntimeError("RKPLAN_REJECT:static_index_budget")
   if any((used:=_static_ranges(root)) is None or any(r not in ranges for r in used) for root in roots): raise RuntimeError("RKPLAN_REJECT:static_index")  # noqa: E501
-  output:list[list[RKScalar]]=[[] for _ in roots]
+  patterns=tuple(_static_range_pattern(root,axes[0],count) if len(axes)==1 and axes==ranges else None for root in roots)
+  output:list[list[RKScalar]]=[list(pattern or ()) for pattern in patterns]
   for start in range(0,count,4096):
     stop=min(start+4096,count)
-    for values,root in zip(output,roots):
-      value=_eval_static_block(root,axes,bounds,start,stop); values.extend(value if isinstance(value,tuple) else (value,)*(stop-start))
+    for values,root,pattern in zip(output,roots,patterns):
+      if pattern is None: value=_eval_static_block(root,axes,bounds,start,stop); values.extend(value if isinstance(value,tuple) else (value,)*(stop-start))  # noqa: E701,E501
   return tuple(tuple(values) for values in output)
 
+def _all_same(values:tuple[int,...]) -> bool: return values[0]==values[-1] and values.count(values[0])==len(values)
+def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_static_ranges(out_index) or (); bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges); affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); return ranges if affine is not None and affine[0]==0 and count==math.prod(bounds) and all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None  # noqa: E702,E501
+
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
+  if encode is int and dtypes.is_int(expr.dtype.scalar()) and (ranges:=_dense_ranges(out_index,count)) is not None: return typing_cast(tuple[int,...],_static_lanes(ranges,expr,dependencies=False)[0])  # noqa: E501
   dst_lanes,expr_lanes=_static_lanes(out_index,expr)
   missing=object(); result:list[int|object]=[missing]*count
   for destination,value in zip(dst_lanes,expr_lanes):
     dst=int(destination)
     if not 0<=dst<count: raise RuntimeError("RKPLAN_REJECT:static_index")
-    if encode is _fp16_bits:
-      fp_value=float(value)
-      if math.isfinite(fp_value) and abs(fp_value)>=65520: raise OverflowError("float too large to pack with e format")
-      encoded=_fp16_bits(fp_value)
-    elif encode is _int16_bits: encoded=int(value)&0xffff
-    elif encode is int: encoded=int(value)
-    else: encoded=encode(value)
+    if encode is _fp16_bits and math.isfinite(fp_value:=float(value)) and abs(fp_value)>=65520: raise OverflowError("float too large to pack with e format")  # noqa: E501
+    encoded=_fp16_bits(fp_value) if encode is _fp16_bits else int(value)&0xffff if encode is _int16_bits else int(value) if encode is int else encode(value)  # noqa: E501
     if result[dst] is not missing and result[dst]!=encoded: raise RuntimeError("RKPLAN_REJECT:static_index")
     result[dst]=encoded
   if any(value is missing for value in result): raise RuntimeError("RKPLAN_REJECT:static_index")
@@ -352,16 +355,16 @@ def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, i
   if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {((u, 1) if divided else u):1}
   if divided and u.op is Ops.CDIV and len(u.src)==2 and u.src[0].op in (Ops.RANGE,Ops.SPECIAL) and u.src[1].op is Ops.CONST and int(u.src[1].arg)>0: return 0,{(u.src[0],int(u.src[1].arg)):1}  # noqa: E501
   if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
-  lhs, rhs = _linear_index(u.src[0], divided), _linear_index(u.src[1], divided)
-  if lhs is None or rhs is None: return None
-  if u.op is Ops.MUL:
-    if lhs[1] and rhs[1]: return None
-    scale, affine = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
-    return affine[0]*scale, {key:coefficient*scale for key,coefficient in affine[1].items()}
-  sign=-1 if u.op is Ops.SUB else 1
-  return lhs[0]+sign*rhs[0],{key:value for key in lhs[1].keys()|rhs[1].keys() if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}  # noqa: E501
+  if (lhs:=_linear_index(u.src[0],divided)) is None or (rhs:=_linear_index(u.src[1],divided)) is None or u.op is Ops.MUL and lhs[1] and rhs[1]: return None  # noqa: E501
+  if u.op is Ops.MUL: scale,affine=(lhs[0],rhs) if not lhs[1] else (rhs[0],lhs); return affine[0]*scale,{key:coefficient*scale for key,coefficient in affine[1].items()}  # noqa: E701,E702,E501
+  sign=-1 if u.op is Ops.SUB else 1; return lhs[0]+sign*rhs[0],{key:value for key in lhs[1].keys()|rhs[1].keys() if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}  # noqa: E702,E501
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
+  if (ranges:=_dense_ranges(out_index,count)) is not None:
+    src,*mask=_static_lanes(ranges,load_index,*((gate,) if gate is not None else ()),dependencies=False)
+    active_mask=mask[0] if gate is not None else None
+    if min(src if active_mask is None else itertools.compress(src,active_mask),default=0)<0: raise RuntimeError("RKPLAN_REJECT:gather_index")
+    return typing_cast(tuple[int,...],src) if active_mask is None else tuple(int(source) if bool(active) else -1 for source,active in zip(src,active_mask))  # noqa: E501
   dst,src,*mask=_static_lanes(out_index,load_index,*((gate,) if gate is not None else ()))
   offsets,seen=[-1]*count,[False]*count; active_mask=mask[0] if gate is not None else None
   for lane,(destination,source) in enumerate(zip(dst,src)):
@@ -371,19 +374,21 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
   if not all(seen): raise RuntimeError("RKPLAN_REJECT:gather_index")
   return tuple(offsets)
 
-def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None:
-  ordered = tuple(sorted(affine[1].items(), key=lambda item:item[1]))
-  limits = tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered)
-  return tuple((r,stride,limit) for (r,stride),limit in zip(ordered,limits)) if all(limit>0 and stride==math.prod(limits[:i]) for i,((_,stride),limit) in enumerate(zip(ordered,limits))) and math.prod(limits)==count else None  # noqa: E501
+@functools.lru_cache(maxsize=2048)
+def _small_gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int,...]: return _gather_offsets(out_index,load_index,gate,count)  # noqa: E501
+
+def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None: ordered=tuple(sorted(affine[1].items(),key=lambda item:item[1])); limits=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered); return tuple((r,stride,limit) for (r,stride),limit in zip(ordered,limits)) if all(limit>0 and stride==math.prod(limits[:i]) for i,((_,stride),limit) in enumerate(zip(ordered,limits))) and math.prod(limits)==count else None  # noqa: E702,E501
 
 def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
   if gate is None and (out_affine:=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))) is not None and out_affine[0]==0 and (output_axes:=_affine_output_axes(out_affine,count)) is not None:  # noqa: E501
+    while load_index.op in (Ops.CMOD,Ops.FLOORMOD) and load_index.src[0].vmin>=0 and load_index.src[0].vmax<load_index.src[1].vmin: load_index=load_index.src[0]  # noqa: E501
+    if load_index.op in (Ops.CMOD,Ops.FLOORMOD) and load_index.src[0] in out_affine[1] and load_index.src[1].op is Ops.CONST and int(load_index.src[1].arg)>0: return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,axes=((out_affine[1][load_index.src[0]],min(int(load_index.src[0].src[0].arg),int(load_index.src[1].arg)),1),),fill_bits=fill_bits)  # noqa: E501
     if (load_divided:=typing_cast(tuple[int, dict[tuple[UOp, int], int]]|None, _linear_index(load_index, True))) is not None and \
        all(r in out_affine[1] and divisor <= int(r.src[0].arg) for r,divisor in load_divided[1]):
       # Preserve the ordinary affine axis order and object graph; true divided plans retain expression order.
       return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,load_divided[0],tuple((d,l,load_affine[1][r]) for r,d,l in output_axes if load_affine[1].get(r,0)) if (load_affine:=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(load_index))) is not None else  # noqa: E501
         tuple((out_affine[1][r]*divisor,(int(r.src[0].arg)+divisor-1)//divisor,stride) for (r,divisor),stride in load_divided[1].items() if stride))  # noqa: E501
-  return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=_gather_offsets(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
+  return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=(_small_gather_offsets if count<=4096 else _gather_offsets)(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
 
 def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
   low,high=(min(plan.offsets,default=0),max(plan.offsets,default=-1)) if plan.offsets else tuple(plan.base+sum(fn((limit-1)*stride,0) for _,limit,stride in plan.axes) for fn in (min,max))  # noqa: E501
@@ -573,8 +578,8 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     def orientation(plan:RKTypedLoadPlan) -> tuple[bool,bool]:
       key=plan.gather.axes,plan.gather.offsets
       if key not in orientations:
-        offsets=plan_offsets(plan); grid=tuple(offsets[lane] for lane in logical)
-        orientations[key]=(all(all_same(grid[row*n:(row+1)*n]) for row in range(m)),all(all_same(grid[column::n]) for column in range(n)))  # noqa: E501
+        offsets=plan_offsets(plan); grid=tuple(offsets[lane] for lane in logical) if lanes else offsets
+        orientations[key]=(all(_all_same(grid[row*n:(row+1)*n]) for row in range(m)),all(_all_same(grid[column::n]) for column in range(n)))  # noqa: E501
       return orientations[key]
     for lhs,rhs,weight in parsed:
       plans=typing_cast(tuple[RKTypedLoadPlan,...],tuple(plan for plan in (lhs,rhs) if plan is not None))
@@ -587,7 +592,7 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or (); views:list[tuple[int,int,tuple[int,...],tuple[int,...]]]=[(rows,1,(),()),(1,rows,(),())]+[(m,n,lanes,argsort(lanes)) for lhs,rhs in ((load_pairs[0],load_pairs[0][::-1]) if load_pairs else ()) for left,right in ((plan_offsets(lhs),plan_offsets(rhs)),) for m,n in ((len(set(left)),len(set(right))),) for lanes in (tuple(sorted(range(rows),key=lambda lane:(left[lane],right[lane]))),) if rows>_MAX_GENERIC_UNROLL and m*n==rows]  # noqa: E501
   for _,stride,limit in output_axes:
     m,n=limit,rows//limit; lanes=tuple(high*stride*limit+row*stride+low for row in range(limit) for high in range(rows//stride//limit) for low in range(stride)); outputs=tuple((i//stride%limit)*n+i//(stride*limit)*stride+i%stride for i in range(rows)); views.append((m,n,() if lanes==tuple(range(rows)) else lanes,() if outputs==tuple(range(rows)) else outputs))  # noqa: E501
-  candidates=[(m,n,lanes,outputs,aligned,ai,ao) for m,n,lanes,outputs in views for aligned in (align(m,n,lanes),) for ai,ao,_ in (_cmac_layout(n,groups),) if aligned and m<=0x7ff and ai<=13*32 and ao<=0x3fff and m*ai*2<=10*32768 and (m==1 or ai<=12*32)]  # noqa: E501
+  candidates=[(m,n,lanes,outputs,aligned,ai,ao) for m,n,lanes,outputs in views for ai,ao,_ in (_cmac_layout(n,groups),) if m<=0x7ff and ai<=13*32 and ao<=0x3fff and m*ai*2<=10*32768 and (m==1 or ai<=12*32) for aligned in (align(m,n,lanes),) if aligned]  # noqa: E501
   diagonal=not candidates; m,n,lanes,outputs,shape_terms,ai,ao=min(candidates,key=lambda shape:(shape[0]==1 and rows>1,shape[0]*shape[5]+shape[6]*shape[5]+2*shape[0]*shape[6])) if candidates else (rows,rows,(),(),tuple(parsed),*_cmac_layout(rows,groups)[:2])  # noqa: E501
   if m>0x7ff or ai>13*32 or ao>0x3fff or m*ai*2>10*32768 or m!=1 and ai>12*32: return None
   packed_a=tuple(((plan.param.arg.slot,int(plan_offsets(plan)[row if diagonal else lanes[row*n] if lanes else row*n])+(0 if plan.gather.offsets else plan.gather.base)) if (plan:=shape_terms[k][0]) is not None else (None,_fp16_bits(1.0 if shape_terms[k][1] is None else shape_terms[k][2]))) if k<groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
@@ -618,6 +623,15 @@ def _lower_one_hot_gather(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   valid=functools.reduce(lambda x,y:x.alu(Ops.AND,y),tuple(selected.alu(Ops.CMPLT,selected.const_like(0)).alu(Ops.CMPNE,UOp.const(True,dtypes.bool)).alu(Ops.AND,selected.alu(Ops.CMPLT,selected.const_like(int(axis.src[0].arg)))) for axis,selected in selections.items())); index=graph_rewrite(source.src[0].src[1].substitute(selections,walk=True),sym); direct=source.src[0].replace(src=(source.src[0].src[0],index)).load(body.src[2],valid); replacement=root.substitute({value:direct})  # noqa: E501
   return _lower_uop_program(list(store.replace(src=(store.src[0],replacement)).sink().toposort()),vectorize_reductions=False)
 
+def _int16_builder(scratch:list[int], ops:list[RKEWOp]):
+  def alloc(amount:int,addend:int=0) -> RKArg: scratch.append(max(64,amount)); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1,addend)  # noqa: E702
+  def emit(lhs:RKArg,rhs:RKArg,lanes:int,cfg:int,dst:RKArg|None=None) -> RKArg: dst=alloc(lanes*2) if dst is None else dst; ops.append(RKEWOp(dst,lhs,rhs,lanes,cfg,mode=RKEWMode.INT16)); return dst  # noqa: E702,E501
+  return alloc,emit
+
+def _checked_image(image:RKImage) -> RKImage|None:
+  try: _validate_image(image); return image
+  except ValueError: return None
+
 def _lower_int_equality_count(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Count exact INT32 candidates equal to each bounded output lane without repeating candidate arithmetic."""
   _,out,count,out_index,root=output
@@ -640,11 +654,7 @@ def _lower_int_equality_count(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   candidate_image=_alias_image_args(candidate_image._replace(scratch=candidate_image.scratch+(size*4,)),{slot:target}); split=next((index for index,op in enumerate(candidate_image.program) if not isinstance(op,RKGather)),len(candidate_image.program))  # noqa: E501
   if any(not isinstance(op,RKGather) for op in candidate_image.program[:split]) or any(not isinstance(op,RKEWOp) for op in candidate_image.program[split:]): return None  # noqa: E501
   scratch=list(candidate_image.scratch); candidate_preloads=list(typing_cast(tuple[RKGather,...],candidate_image.program[:split])); preloads:list[RKGather]=[]; ops:list[RKEWOp]=list(typing_cast(tuple[RKEWOp,...],candidate_image.program[split:])); cut=len(ops)  # noqa: E501
-  def alloc(amount:int,addend:int=0) -> RKArg:
-    scratch.append(max(64,amount)); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1,addend)
-  def emit(lhs:RKArg,rhs:RKArg,lanes:int,cfg:int,dst:RKArg|None=None) -> RKArg:
-    if dst is None: dst=alloc(lanes*2)
-    ops.append(RKEWOp(dst,lhs,rhs,lanes,cfg,mode=RKEWMode.INT16)); return dst
+  alloc,emit=_int16_builder(scratch,ops)
   block=math.ceil(count/32)*32; limit=1<<((_MAX_EW_ELEMS_FP16//block).bit_length()-1); accumulator=None
   for start in range(0,candidates,limit):
     rows=min(limit,candidates-start); chunk_size=1<<(rows-1).bit_length(); lanes=chunk_size*block
@@ -659,10 +669,7 @@ def _lower_int_equality_count(output:RKOutput, uops:list[UOp]) -> RKImage|None:
     accumulator=match if accumulator is None else emit(accumulator,match,count,_EW_CFG[Ops.ADD],accumulator)
   if accumulator is None: return None
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG,out.arg.slot),accumulator,accumulator,count,_EW_CFG[Ops.MAX],mode=RKEWMode.INT16_TO_INT32))
-  image=_reuse_linear_scratch(RKImage(tuple(scratch),tuple(candidate_preloads)+tuple(ops[:cut])+tuple(preloads)+tuple(ops[cut:])))
-  try: _validate_image(image)
-  except ValueError: return None
-  return image
+  return _checked_image(_reuse_linear_scratch(RKImage(tuple(scratch),tuple(candidate_preloads)+tuple(ops[:cut])+tuple(preloads)+tuple(ops[cut:]))))
 
 def _lower_bounded_int_lookup(output:RKOutput) -> RKImage|None:
   """Select a static INT16-valued row by an exact, range-gated runtime INT32 index."""
@@ -684,11 +691,7 @@ def _lower_bounded_int_lookup(output:RKOutput) -> RKImage|None:
   except (RuntimeError,ValueError,OverflowError): return None
   if any(not -32768<=item<=32767 for row in rows for item in row): return None
   scratch:list[int]=[]; preloads:list[RKGather]=[]; ops:list[RKEWOp]=[]
-  def alloc(amount:int,addend:int=0) -> RKArg:
-    scratch.append(max(64,amount)); return RKArg(RKBufferKind.SCRATCH,len(scratch)-1,addend)
-  def emit(lhs:RKArg,rhs:RKArg,lanes:int,cfg:int,dst:RKArg|None=None) -> RKArg:
-    if dst is None: dst=alloc(lanes*2)
-    ops.append(RKEWOp(dst,lhs,rhs,lanes,cfg,mode=RKEWMode.INT16)); return dst
+  alloc,emit=_int16_builder(scratch,ops)
   block=math.ceil(count/32)*32; chunk_limit=1<<((_MAX_EW_ELEMS_FP16//block).bit_length()-1); accumulator=None
   for start in range(0,limit,chunk_limit):
     active_rows=min(chunk_limit,limit-start); size=1<<(active_rows-1).bit_length(); lanes=size*block
@@ -703,34 +706,38 @@ def _lower_bounded_int_lookup(output:RKOutput) -> RKImage|None:
     accumulator=values if accumulator is None else emit(accumulator,values,count,_EW_CFG[Ops.ADD],accumulator)
   if accumulator is None: return None
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG,out.arg.slot),accumulator,accumulator,count,_EW_CFG[Ops.MAX],mode=RKEWMode.INT16_TO_INT32))
-  image=_reuse_linear_scratch(RKImage(tuple(scratch),tuple(preloads)+tuple(ops)))
-  try: _validate_image(image)
-  except ValueError: return None
-  return image
+  return _checked_image(_reuse_linear_scratch(RKImage(tuple(scratch),tuple(preloads)+tuple(ops))))
 
 def _lower_reduction(output:RKOutput, uops:list[UOp]) -> RKImage|None:
   """Prefer one dynamic gather or contraction, then map and reduce every remaining bounded reduction on the DPU."""
   return _lower_int_equality_count(output,uops) or _lower_bounded_int_lookup(output) or _lower_one_hot_gather(output,uops) or _lower_cmac_reduce(output,uops) or _lower_mapped_reduce(output,uops)  # noqa: E501
 
+def _bit_reverse_gather(gathers:list[RKGather], scratch:list[int], source:RKArg, dst:RKArg, groups:int, block:int, fill:int, dst_stride:int=1, source_count:int|None=None, row_major:bool=False) -> None:  # noqa: E501
+  """Encode bit reversal with affine axes, padding an existing scratch source when its group count is not a power of two."""
+  size=1<<(groups-1).bit_length(); bits=size.bit_length()-1; source_count=groups*block if source_count is None else source_count; compact=size==groups or source.kind is RKBufferKind.SCRATCH and not row_major  # noqa: E702,E501
+  if compact and source_count<size*block: scratch[source.index]=max(scratch[source.index],source.addend+size*block*2); gathers.append(RKGather(None,source._replace(addend=source.addend+source_count*2),size*block-source_count,values=(fill,)))  # noqa: E701,E702,E501
+  if compact: axes=(((1,block,groups if row_major else 1),) if block>1 else ())+tuple((block<<bit,2,(1 if row_major else block)<<(bits-1-bit)) for bit in range(bits)); gathers.append(RKGather(source,dst,size*block,axes=axes,fill_bits=fill,dst_stride=dst_stride)); return  # noqa: E701,E702,E501
+  offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<groups else -1 for lane in range(size)); offsets=offsets if block==1 else tuple(source_index if index>=0 and (source_index:=row*groups+index if row_major else index*block+row)<source_count else -1 for index in offsets for row in range(block)); gathers.append(RKGather(source,dst,len(offsets),offsets=offsets,fill_bits=fill,dst_stride=dst_stride))  # noqa: E702,E501
+
 def _reduce_mapped_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGather], source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, kahan:bool=False, pairwise:bool=False, barrier:bool=True) -> RKArg:  # noqa: E501
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
   block=8 if rows==1 else round_up(rows,8); groups=lanes if rows==1 else lanes//block
   if pairwise:
-    size=1<<(groups-1).bit_length(); high,target,low,next_low,temporary,virtual=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(6)); scratch.extend((_scratch_bytes(size*block),)*6); bits=size.bit_length()-1; offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<groups else -1 for lane in range(size)); offsets=offsets if rows==1 else tuple(index*block+row if index>=0 else -1 for index in offsets for row in range(block)); gathers.extend((RKGather(source,high,len(offsets),offsets=offsets,fill_bits=0,dst_stride=block if rows==1 else 1),RKGather(None,low,size*block,values=(0,))))  # noqa: E501
+    size=1<<(groups-1).bit_length(); high,target,low,next_low,temporary,virtual=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(6)); scratch.extend((_scratch_bytes(size*block),)*6); _bit_reverse_gather(gathers,scratch,source,high,groups,1 if rows==1 else block,0,block if rows==1 else 1); gathers.append(RKGather(None,low,size*block,values=(0,)))  # noqa: E501
     while size>1: size//=2; count=size*block; right,low_right=high._replace(addend=count*2),low._replace(addend=count*2); ops.extend((RKEWOp(target,high,right,count,cfg,submit_barrier=barrier,mode=RKEWMode.STATEFUL if barrier else RKEWMode.HALF),RKEWOp(temporary,target,high,count,_EW_CFG[Ops.SUB]),RKEWOp(virtual,target,temporary,count,_EW_CFG[Ops.SUB]),RKEWOp(virtual,high,virtual,count,_EW_CFG[Ops.SUB]),RKEWOp(temporary,right,temporary,count,_EW_CFG[Ops.SUB]),RKEWOp(next_low,virtual,temporary,count,cfg),RKEWOp(temporary,low,low_right,count,cfg),RKEWOp(next_low,next_low,temporary,count,cfg),RKEWOp(virtual,target,next_low,count,cfg),RKEWOp(temporary,virtual,target,count,_EW_CFG[Ops.SUB]),RKEWOp(next_low,next_low,temporary,count,_EW_CFG[Ops.SUB]))); high,target,virtual=virtual,high,target; low,next_low=next_low,low  # noqa: E501
     ops.append(RKEWOp(target,high,low,block if rows==1 else rows,cfg)); return target
   if kahan: arena=RKArg(RKBufferKind.SCRATCH,len(scratch)); total,updated,correction,adjusted=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i+1) for i in range(4)); scratch.extend((_scratch_bytes(groups*block),*(_scratch_bytes(rows),)*4)); gathers.extend((RKGather(source,arena,lanes,axes=((1,lanes,1),),dst_stride=block if rows==1 else 1),RKGather(None,correction,rows,values=(0,)))); ops.append(RKEWOp(total,arena,arena,rows,_EW_CFG[Ops.MAX],submit_barrier=barrier,mode=RKEWMode.STATEFUL))  # noqa: E501
   for index in range(1,groups) if kahan else ():
     value=arena._replace(addend=index*block*2); ops.append(RKEWOp(adjusted,value,correction,rows,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(updated,total,adjusted,rows,_EW_CFG[Ops.ADD])); ops.append(RKEWOp(correction,updated,total,rows,_EW_CFG[Ops.SUB])); ops.append(RKEWOp(correction,correction,adjusted,rows,_EW_CFG[Ops.SUB])); total,updated=updated,total  # noqa: E501
   if kahan: return total
-  size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*block),)*2); bits=size.bit_length()-1; offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<groups else -1 for lane in range(size)); neutral=0 if cfg==_EW_CFG[Ops.ADD] else (1 if int16 else _fp16_bits(1)) if cfg==_EW_CFG[Ops.MUL] else _int16_bits(dtypes.int16.min) if int16 else _fp16_bits(-math.inf); offsets=offsets if rows==1 else tuple(index*block+row if index>=0 else -1 for index in offsets for row in range(block)); gathers.append(RKGather(source,current,len(offsets),offsets=offsets,fill_bits=neutral,dst_stride=block if rows==1 else 1)); first=barrier and not int16  # noqa: E501
+  size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*block),)*2); neutral=0 if cfg==_EW_CFG[Ops.ADD] else (1 if int16 else _fp16_bits(1)) if cfg==_EW_CFG[Ops.MUL] else _int16_bits(dtypes.int16.min) if int16 else _fp16_bits(-math.inf); _bit_reverse_gather(gathers,scratch,source,current,groups,1 if rows==1 else block,neutral,block if rows==1 else 1); first=barrier and not int16  # noqa: E501
   while size>1: size//=2; count=size*block; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current  # noqa: E501
   return current
 
 def _reduce_boolean_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGather], source:RKArg, lanes:int, cfg:int, rows:int) -> RKArg:
   """Reduce each dense boolean row in place using exact INT16 carriers."""
   groups=lanes//rows; block=round_up(rows,8); size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*block),)*2)  # noqa: E501
-  bits=size.bit_length()-1; offsets=tuple(row*groups+index if (index:=int(f"{group:0{bits}b}"[::-1],2))<groups and row<rows else -1 for group in range(size) for row in range(block)); gathers.append(RKGather(source,current,len(offsets),offsets=offsets,fill_bits=1 if cfg==_EW_CFG[Ops.MUL] else 0))  # noqa: E501
+  _bit_reverse_gather(gathers,scratch,source,current,groups,block,1 if cfg==_EW_CFG[Ops.MUL] else 0,source_count=lanes,row_major=True)
   while size>1: size//=2; count=size*block; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,mode=RKEWMode.INT16)); current,target=target,current  # noqa: E501
   return current
 
@@ -971,7 +978,7 @@ class RKContext:
     if not _index_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{})),dtype))
     values = _static_values(self.out_index,u,self.count,_fp16_bits if layout is dtypes.half else int)
     if dtype is dtypes.int and layout is dtypes.int16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
-    encoded = values if layout is dtypes.half else tuple(value&0xffffffff if layout is dtypes.int else value&0xffff for value in values)
+    encoded = values if layout is dtypes.half else tuple(map(operator.and_,values,itertools.repeat(0xffffffff if layout is dtypes.int else 0xffff)))
     return self._slot(self.materialized_slots,encoded,layout)
 
   def _masked_load_default(self, u:UOp, dtype:DType, layout:DType, gate:UOp|None, default:UOp, runtime_address:bool) -> UOp:  # noqa: E501

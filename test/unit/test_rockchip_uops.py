@@ -467,6 +467,8 @@ def test_runtime_raw_gathers_preserve_bits_masks_and_overlap(itemsize:int, dtype
   ctypes.memmove(destination.va_addr,np.full(6,99,dtype=dtype).ctypes.data,destination.size)
   rockchip_runtime._apply_gathers((gather._replace(partial=True),),lookup)
   np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.asarray((99,30,99,99,10,99),dtype=dtype))
+  rockchip_runtime._apply_gathers((gather._replace(count=1,offsets=(1,),dst_addend=0),),lookup)
+  assert np.frombuffer(destination.storage,dtype=dtype)[0]==20
 
   source=_mapped_values(np.arange(10,dtype=dtype),0x3500)
   destination=_mapped_values(np.zeros(10,dtype=dtype),0x3600)
@@ -479,15 +481,16 @@ def test_runtime_raw_gathers_preserve_bits_masks_and_overlap(itemsize:int, dtype
   np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),expected)
 
   source=_mapped_values(np.arange(40,dtype=dtype),0x3700)
-  destination=_mapped_values(np.zeros(24,dtype=dtype),0x3800)
+  destination=_mapped_values(np.zeros(48,dtype=dtype),0x3800)
   buffers={(RKBufferKind.ARG,1):source,(RKBufferKind.ARG,0):destination}
   repeated=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),12,base=1,axes=((3,4,2),),itemsize=itemsize)
-  tiled=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),24,axes=((1,2,3),(6,4,10)),itemsize=itemsize)
+  tiled=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),24,axes=((6,4,10),(1,2,3)),dst_stride=2,itemsize=itemsize)
   rockchip_runtime._apply_gathers((repeated,),lookup)
   np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype)[:12],np.repeat((1,3,5,7),3))
+  ctypes.memset(destination.va_addr,0,destination.size)
   rockchip_runtime._apply_gathers((tiled,),lookup)
-  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.tile((0,3),3).tolist()+
-                                np.tile((10,13),3).tolist()+np.tile((20,23),3).tolist()+np.tile((30,33),3).tolist())
+  expected=np.zeros(48,dtype=dtype); expected[::2]=np.tile((0,3),3).tolist()+np.tile((10,13),3).tolist()+np.tile((20,23),3).tolist()+np.tile((30,33),3).tolist()  # noqa: E702,E501
+  np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),expected)
 
   overlap=_mapped_values(np.asarray((1,2,3,4,5,6),dtype=dtype),0x4000)
   buffers={(RKBufferKind.ARG,2):overlap}
@@ -1375,7 +1378,9 @@ def test_production_scatter_product_padding_uses_fp16_one_neutral():
   indices=np.asarray((0,0,2,2,2),dtype="<i4"); values=np.asarray((2,3,4,5,6),dtype="<f2"); initial=np.asarray((7,8,9,10,11),dtype="<f2")  # noqa: E702
   actual=np.frombuffer(_execute_raw_dynamic_image(image,10,indices.tobytes(),values.tobytes(),initial.tobytes()),dtype="<f2")
   np.testing.assert_array_equal(actual,np.asarray((6,8,120,10,11),dtype="<f2"))
-  assert any(gather.fill_bits==0x3c00 for gather in _static_gathers(image) if gather.offsets and -1 in gather.offsets)
+  reverse=next(gather for gather in _static_gathers(image) if gather.count==64 and len(gather.axes)==4)
+  assert reverse.fill_bits==0x3c00 and not reverse.offsets and any(gather.src is None and gather.values==(0x3c00,) and
+    gather.dst==reverse.src._replace(addend=80) and gather.count==24 for gather in _static_gathers(image))
 
 def test_multi_axis_reduce_routes_cmac_unrolling():
   out, source = UOp.param(0,dtypes.half,(2,)), UOp.param(1,dtypes.half,(12,))
@@ -1425,7 +1430,10 @@ def test_scalar_sum_beyond_cmac_k_blocks_uses_production_dpu_reduction():
   tree=_ew_ops(image)
   spread=next(gather for gather in _static_gathers(image) if gather.dst_stride==8)
   assert _cmac(image) is None and tuple(op.count for op in tree)==(2048,1024,512,256,128,64,32,16,8,1)
-  assert spread.count==512 and sorted(offset for offset in spread.offsets if offset>=0)==list(range(417))
+  source_offsets=tuple(spread.base+sum((lane//divisor%limit)*stride for divisor,limit,stride in spread.axes) for lane in range(spread.count))
+  assert spread.count==512 and not spread.offsets and sorted(source_offsets)==list(range(512))
+  assert any(gather.src is None and gather.dst==spread.src._replace(addend=417*2) and gather.count==95 and gather.values==(0,)
+    for gather in _static_gathers(image))
   assert all(arg.addend%16==0 for op in tree for arg in (op.lhs,op.rhs)) and tree[-1].dst==RKArg(RKBufferKind.ARG,0)
   values=(np.arange(417)%7-3).astype(np.float16)
   assert _execute_fp16_reduction_tail(image,values)[0] == values.sum(dtype=np.float16)
@@ -3088,7 +3096,11 @@ def test_production_large_cumulative_index_uses_bounded_mapped_max():
       to_program_cache.clear()
       images.append(decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)))
   coordinate=images[-1]
-  assert len(images)==4 and (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)))==(26,19,66)
+  static=_static_gathers(coordinate)
+  assert len(images)==4 and (len(coordinate.scratch),len(static),len(_ew_ops(coordinate)))==(26,20,66)
+  reverse=next((gather for gather in static if gather.count==1024*1024 and len(gather.axes)==11),None)
+  assert reverse is not None and not reverse.offsets and any(gather.src is None and gather.count==2048 and
+    gather.dst==reverse.src._replace(addend=1022*1024*2) for gather in static)
   assert not _runtime_gathers(coordinate) and _assert_decoded_image_bounds(coordinate)==coordinate
   data=np.random.default_rng(1022).uniform(-8,8,size=count).astype("<f2")
   data[:8]=np.asarray((0,-0.0,1,1,-1,-1,2,2),dtype="<f2")
