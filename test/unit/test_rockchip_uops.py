@@ -795,7 +795,7 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
      (("submit",(31,)),("standalone",37),("submit",(31,)))),
     ((op(),*(op(count=1,mode=RKEWMode.HALF_TO_FLOAT) for _ in range(17))),
      (("submit",(31,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
-    ((op(count=large),op(count=large)), (("submit",(31,18)),("submit",(31,18)))),
+    ((op(count=large),op(count=large)), (("submit",(31,18,31,18)),)),
     ((op(),op(count=large,barrier=True,mode=RKEWMode.STATEFUL),op(count=large),op(barrier=True)),
      (("submit",(31,)),("submit",(31,31)),("submit",(31,31)),("submit",(31,)))),
     ((op(mode=RKEWMode.STATEFUL),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),

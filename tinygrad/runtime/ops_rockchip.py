@@ -187,7 +187,7 @@ class RockchipProgram(Program['RockchipDevice']):
         tiled=len(group)>1 and group[0].mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
         if tiled:
           tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(group))  # noqa: E501
-          for bodies in zip(*tiles): self._submit_bodies(bodies)
+          for bodies in itertools.batched(itertools.chain.from_iterable(zip(*tiles)),_MAX_PC_TASKS): self._submit_bodies(bodies)
         else: run_group(tuple(op._replace(submit_barrier=False) for op in group),limit)
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
