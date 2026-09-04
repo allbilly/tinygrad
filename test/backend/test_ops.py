@@ -1608,8 +1608,8 @@ class TestOps(unittest.TestCase):
 
   def test_isclose_scalar(self):
     # torch needs a tensor
-    helper_test_op([(3, 4, 5, 6)], lambda x: x.isclose(torch.tensor(1.0)), lambda x: x.isclose(1.0), forward_only=True)
-    helper_test_op(None, lambda x: x.isclose(torch.tensor(1.0)), lambda x: x.isclose(1.0),
+    helper_test_op([(3, 4, 5, 6)], lambda x: x.isclose(x.new_tensor(1.0)), lambda x: x.isclose(1.0), forward_only=True)
+    helper_test_op(None, lambda x: x.isclose(x.new_tensor(1.0)), lambda x: x.isclose(1.0),
                    vals=[[1.0, 1.0 + 1e-7, 2.0, math.inf, -math.inf, math.nan]], forward_only=True)
 
   def test_mean(self):
@@ -2771,7 +2771,7 @@ class TestOps(unittest.TestCase):
     # TODO: DEV=PYTHON backward hangs?
     atol = 1e-2 if DEV.device == "AMD" and DEV.renderer == "LLVM" else 1e-6
     helper_test_op([(1,1,16,16,16)],
-      lambda x: torch.nn.functional.avg_pool3d(x, kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False),
+      lambda x: torch.nn.functional.avg_pool3d(x.float(), kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False).to(x.dtype),
       lambda x: Tensor.avg_pool2d(x, kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False), atol=atol, rtol=1e-5, forward_only=True)
 
   def test_interpolate_linear(self):
@@ -3072,8 +3072,8 @@ class TestOps(unittest.TestCase):
                                                        lambda x,src: x.scatter(dim=1, index=a, src=src), expected=(RuntimeError, AssertionError))
     self.helper_test_exception([(3,4,5), (3,4,5)], lambda x,src: x.scatter(dim=1, index=b, src=src, mode="typo"),
                                                    lambda x,src: x.scatter(dim=1, index=a, src=src, mode="typo"), expected=TypeError)
-    self.helper_test_exception([(3,4,5), (3,4,5)], lambda x,src: x.half().scatter(dim=1, index=b, src=src),
-                                                   lambda x,src: x.half().scatter(dim=1, index=a, src=src), expected=RuntimeError)
+    self.helper_test_exception([(3,4,5), (3,4,5)], lambda x,src: x.half().scatter(dim=1, index=b, src=src.float()),
+                                                   lambda x,src: x.half().scatter(dim=1, index=a, src=src.float()), expected=RuntimeError)
 
     helper_test_op([(4,5,6)], lambda x: x.scatter(dim=1, index=b, value=3), lambda x: x.scatter(dim=1, index=a, src=3), forward_only=True)
     helper_test_op([(4,5,6)], lambda x: x.scatter(dim=1, index=b, value=float("inf")),
@@ -3134,8 +3134,8 @@ class TestOps(unittest.TestCase):
     x = Tensor.zeros([4,5,6]).float()
     y = torch.zeros([4,5,6]).float()
     helper_test_op([(4,5,6)],
-      lambda src: y.scatter_reduce(dim=1, index=b, src=src, reduce="prod"),
-      lambda src: x.scatter_reduce(dim=1, index=a, src=src, reduce="prod"), forward_only=True)
+      lambda src: y.scatter_reduce(dim=1, index=b, src=src.float(), reduce="prod"),
+      lambda src: x.scatter_reduce(dim=1, index=a, src=src.float(), reduce="prod"), forward_only=True)
 
   def test_scatter_reduce_errors(self):
     b = torch.randint(3, size=[3,4,5], dtype=torch.int64, requires_grad=False)
@@ -3147,8 +3147,8 @@ class TestOps(unittest.TestCase):
       RuntimeError)
     # dtype mismatch
     self.helper_test_exception([(4,5,6), (4,5,6)],
-      lambda x,src: x.half().scatter_reduce(dim=0, index=b, src=src, reduce="sum"),
-      lambda x,src: x.half().scatter_reduce(dim=0, index=a, src=src, reduce="sum"),
+      lambda x,src: x.half().scatter_reduce(dim=0, index=b, src=src.float(), reduce="sum"),
+      lambda x,src: x.half().scatter_reduce(dim=0, index=a, src=src.float(), reduce="sum"),
       RuntimeError)
 
   @slow_test
@@ -3293,16 +3293,18 @@ class TestOps(unittest.TestCase):
     weight = np.random.normal(0, 1, (10,)).astype(np.float32).tolist()
     for r in ("mean", "sum", "none"):
       helper_test_op([(32,10)],
-        lambda x: torch.nn.functional.nll_loss(torch.nn.functional.log_softmax(x, dim=1), torch.tensor(target), torch.tensor(weight), reduction=r),
-        lambda x: x.log_softmax(axis=1).nll_loss(Tensor(target), Tensor(weight), reduction=r))
+        lambda x: torch.nn.functional.nll_loss(torch.nn.functional.log_softmax(x, dim=1), torch.tensor(target),
+                                               torch.tensor(weight, dtype=x.dtype), reduction=r),
+        lambda x: x.log_softmax(axis=1).nll_loss(Tensor(target), Tensor(weight, dtype=x.dtype), reduction=r))
 
   def test_nll_loss_3d_weight(self):
     target = np.random.randint(0, 10, (16,3,3,3), dtype=np.int32).tolist()
     weight = np.random.normal(0, 1, (10,)).astype(np.float32).tolist()
     for r in ("mean", "sum", "none"):
       helper_test_op([(16,10,3,3,3)],
-          lambda x: torch.nn.functional.nll_loss(torch.nn.functional.log_softmax(x, dim=1), torch.tensor(target), torch.tensor(weight), reduction=r),
-          lambda x: x.log_softmax(axis=1).nll_loss(Tensor(target), Tensor(weight), reduction=r))
+          lambda x: torch.nn.functional.nll_loss(torch.nn.functional.log_softmax(x, dim=1), torch.tensor(target),
+                                                 torch.tensor(weight, dtype=x.dtype), reduction=r),
+          lambda x: x.log_softmax(axis=1).nll_loss(Tensor(target), Tensor(weight, dtype=x.dtype), reduction=r))
 
   def test_nll_loss_ignore_index(self):
     logits = [[2.0, 0.5, -1.0],
@@ -3372,7 +3374,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3, 3)], lambda x: x.bool(), forward_only=True)
 
   def test_bitcast(self):
-    helper_test_op([(3, 3)], lambda x: x.view(torch.int32), lambda x: x.bitcast(dtypes.int32), forward_only=True)
+    helper_test_op([(3, 4)], lambda x: x.view(torch.int32), lambda x: x.bitcast(dtypes.int32), forward_only=True)
 
   def test_int_or(self):
     t = (Tensor([0], dtype='int') | 0xFFFFFFFF).item()
