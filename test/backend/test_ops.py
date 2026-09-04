@@ -368,6 +368,12 @@ class TestOps(unittest.TestCase):
       lambda x: torch.where(x > 0.5, 4, 2).type(torch.int32).permute((1, 0)),
       lambda x: (x > 0.5).where(4, 2).permute((1, 0)), forward_only=True)
 
+  def test_where_nan_cond(self):
+    # a NaN compares false against everything except !=.
+    for fxn in (lambda x: x<1, lambda x: x>1, lambda x: x!=1, lambda x: x==1):
+      helper_test_op(None, lambda x,a,b: torch.where(fxn(x), a, b), lambda x,a,b: fxn(x).where(a, b), forward_only=True,
+                     vals=[[math.nan, 1.0, 2.0, -1.0], [10, 20, 30, 40], [-1, -2, -3, -4]])
+
   def _test_cmp(self, fxn, reverse=True):
     # test different dtypes
     helper_test_op(None, fxn, fxn, forward_only=True, vals=[[0.,1,2], [2.,1,0]])
@@ -1766,6 +1772,9 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,65)], lambda x: torch.nn.functional.normalize(x, p=3, dim=0), lambda x: x.normalize(p=3, dim=0), atol=1e-7, grad_atol=1e-7)
     helper_test_op([(45,65)], lambda x: torch.nn.functional.normalize(x, p=0), lambda x: x.normalize(p=0), atol=1e-7, grad_atol=1e-7)
     helper_test_op([(45,65)], lambda x: torch.nn.functional.normalize(x, p=-1), lambda x: x.normalize(p=-1), atol=1e-7, grad_atol=1e-7)
+  def test_normalize_int(self):
+    helper_test_op(None, lambda x: torch.nn.functional.normalize(x.to(torch.get_default_dtype()), p=2), lambda x: x.normalize(p=2),
+                   forward_only=True, vals=[[[3, 4], [6, 8]]])
 
   def test_logsumexp(self):
     helper_test_op([(45,65)], lambda x: torch.logsumexp(x, dim=0), lambda x: x.logsumexp(0), atol=1e-7, grad_atol=1e-7)
@@ -2962,6 +2971,10 @@ class TestOps(unittest.TestCase):
   def test_fancy_indexing_inf(self):
     data = [math.inf, -math.inf, math.nan]
     helper_test_op((), lambda: torch.tensor(data)[torch.tensor([0, 1, 2])], lambda: Tensor(data)[Tensor([0, 1, 2])])
+
+  def test_fancy_indexing_index_dtypes(self):
+    helper_test_op((), lambda: torch.tensor([10., 20., 30., 40.])[torch.tensor([1, 2, 3, 0])],
+                       lambda: Tensor([10., 20., 30., 40.])[Tensor([1, 2, 3, 0], dtype=dtypes.uint8)])
 
   @slow_test
   def test_slice_fancy_indexing_no_dim_collapse(self):
