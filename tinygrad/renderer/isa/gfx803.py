@@ -112,8 +112,10 @@ KERNARG_PTR = Register("s[0:1]", 0, size=8)
 WGID = tuple(Register(f"s{i}", i, size=4) for i in range(2, 5))
 WIID = tuple(Register(f"v{i}", i, size=4) for i in range(3))
 SGPR64 = tuple(Register(f"s[{i}:{i+1}]", i, size=8) for i in range(6, 32, 2))
-VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 68, 2))
-VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(68, 224))
+# Broadcasts and masked indexing keep many 64-bit flat addresses live at once.
+# Keep 40 address pairs disjoint from scalar values because this allocator does not model pair overlap.
+VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 84, 2))
+VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(84, 224))
 REG_BUFFER_BASE = 224
 REG_BUFFER_COUNT = 256 - REG_BUFFER_BASE
 

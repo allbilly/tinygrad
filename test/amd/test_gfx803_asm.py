@@ -290,6 +290,18 @@ class TestGFX803Program(unittest.TestCase):
     self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 2)  # 16 explicit + 4 implicit SGPRs round up to 24.
     self.assertEqual(_assembled(*lines), text.content)
 
+  def test_address_register_pressure(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    logits = Tensor.empty(12, 10, dtype=dtypes.half, device="NULL").contiguous().realize()
+    classes = Tensor.empty(12, dtype=dtypes.int32, device="NULL").contiguous().realize()
+    linear = logits.sparse_categorical_crossentropy(classes).schedule_linear()
+    programs = [to_program(call.src[0], renderer) for call in linear.src if call.src[0].op is Ops.SINK]
+    self.assertEqual(len(programs), 3)
+    for program in programs:
+      text, _, _, relocs = self._elf(program)
+      self.assertEqual(relocs, [])
+      self.assertEqual(_assembled(*llvm_disasm(text.content, "gfx803", "+wavefrontsize64")), text.content)
+
   def test_dynamic_add_elf(self):
     wgid_x = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT
     for n, grid, local, uses_wgid, uses_lidx in [(5, (5, 1, 1), (1, 1, 1), True, False),
