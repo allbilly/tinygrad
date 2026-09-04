@@ -12,6 +12,7 @@ from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, Profil
 from tinygrad.helpers import VIZ, ceildiv, unwrap, pluralize
 from tinygrad.renderer.cstyle import HIPRenderer, HIPCCRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
+from tinygrad.renderer.isa.gfx803 import AMDASMRenderer
 from tinygrad.runtime.autogen import kfd, hsa, sqtt, amdgpu_kd, amdgpu_drm
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.elf import elf_loader
@@ -1447,7 +1448,7 @@ class AMDDevice(HCQCompiled):
     self.sdma_queues:dict = {}
     self.has_sdma_queue = self.sdma_queue(0) is not None
 
-    renderers:list[type[Renderer]] = [AMDLLVMRenderer] if self.target[0] == 8 else [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer]
+    renderers:list[type[Renderer]] = [AMDLLVMRenderer, AMDASMRenderer] if self.target[0] == 8 else [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer]
     super().__init__(device, AMDAllocator(self), renderers, AMDProgram, AMDSignal,
                      functools.partial(AMDComputeAQLQueue if self.is_aql else AMDComputeQueue, self),
                      functools.partial(AMDCopyQueue, self, max_copy_size=self.max_copy_size) if self.has_sdma_queue else None,
