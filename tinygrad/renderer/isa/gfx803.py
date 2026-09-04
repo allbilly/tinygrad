@@ -25,10 +25,15 @@ class GFX803Ops(FastEnum):
   FLAT_ADDR = auto()
   LDS_ADDR = auto()
   FLAT_LOAD_B32 = auto()
+  FLAT_LOAD_U16 = auto()
   FLAT_STORE_B32 = auto()
+  FLAT_STORE_B16 = auto()
   GATED_FLAT_STORE_B32 = auto()
+  GATED_FLAT_STORE_B16 = auto()
   DS_LOAD_B32 = auto()
+  DS_LOAD_U16 = auto()
   DS_STORE_B32 = auto()
+  DS_STORE_B16 = auto()
   REG_STORE_B32 = auto()
   V_ADD_U32 = auto()
   V_LSHLREV_B32 = auto()
@@ -36,6 +41,8 @@ class GFX803Ops(FastEnum):
   V_ADD_F32 = auto()
   V_MUL_F32 = auto()
   V_MAX_F32 = auto()
+  V_CVT_F32_F16 = auto()
+  V_CVT_F16_F32 = auto()
   V_CMPLT = auto()
   V_CMPEQ = auto()
   V_CMPNE = auto()
@@ -140,23 +147,27 @@ def _indexed_addrspace(addr:UOp) -> AddrSpace|None:
 
 
 def _load(x:UOp, addr:UOp) -> UOp|None:
-  if x.dtype is not dtypes.float32: raise NotImplementedError(f"gfx803 load dtype {x.dtype} is not lowered yet")
+  if x.dtype not in (dtypes.float32, dtypes.half): raise NotImplementedError(f"gfx803 load dtype {x.dtype} is not lowered yet")
   if (addrspace:=_indexed_addrspace(addr)) is AddrSpace.REG: return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.V_MOV_B32)
-  if addrspace is AddrSpace.LOCAL: return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.DS_LOAD_B32)
-  return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.FLAT_LOAD_B32)
+  if addrspace is AddrSpace.LOCAL:
+    return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.DS_LOAD_U16 if x.dtype is dtypes.half else GFX803Ops.DS_LOAD_B32)
+  return UOp(Ops.INS, x.dtype, (addr,), GFX803Ops.FLAT_LOAD_U16 if x.dtype is dtypes.half else GFX803Ops.FLAT_LOAD_B32)
 
 
 def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
-  if value.dtype is not dtypes.float32: raise NotImplementedError(f"gfx803 store dtype {value.dtype} is not lowered yet")
+  if value.dtype not in (dtypes.float32, dtypes.half): raise NotImplementedError(f"gfx803 store dtype {value.dtype} is not lowered yet")
   if value.op is Ops.CONST: value = UOp(Ops.INS, value.dtype, (value,), GFX803Ops.V_MOV_B32)
   if (addrspace:=_indexed_addrspace(addr)) is AddrSpace.REG:
     if gate is not None: raise NotImplementedError("gfx803 gated register stores are not implemented")
     return UOp(Ops.INS, dtypes.void, (addr, value), GFX803Ops.REG_STORE_B32)
   if addrspace is AddrSpace.LOCAL:
     if gate is not None: raise NotImplementedError("gfx803 gated LDS stores are not implemented")
-    return UOp(Ops.INS, dtypes.void, (addr, value), GFX803Ops.DS_STORE_B32)
+    return UOp(Ops.INS, dtypes.void, (addr, value), GFX803Ops.DS_STORE_B16 if value.dtype is dtypes.half else GFX803Ops.DS_STORE_B32)
+  store_op = GFX803Ops.GATED_FLAT_STORE_B16 if gate is not None and value.dtype is dtypes.half else \
+             GFX803Ops.GATED_FLAT_STORE_B32 if gate is not None else \
+             GFX803Ops.FLAT_STORE_B16 if value.dtype is dtypes.half else GFX803Ops.FLAT_STORE_B32
   return UOp(Ops.INS, dtypes.void, (addr, value, *((gate,) if gate is not None else ())),
-             GFX803Ops.GATED_FLAT_STORE_B32 if gate is not None else GFX803Ops.FLAT_STORE_B32)
+             store_op)
 
 
 def _buffer(x:UOp) -> UOp:
@@ -214,6 +225,14 @@ def _where(x:UOp, cond:UOp, true_value:UOp, false_value:UOp) -> UOp:
   return UOp(Ops.INS, x.dtype, (cond, true_value, false_value), GFX803Ops.V_CNDMASK_B32)
 
 
+def _cast(x:UOp, value:UOp) -> UOp|None:
+  if value.dtype is dtypes.half and x.dtype is dtypes.float32:
+    return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_CVT_F32_F16)
+  if value.dtype is dtypes.float32 and x.dtype is dtypes.half:
+    return UOp(Ops.INS, x.dtype, (value,), GFX803Ops.V_CVT_F16_F32)
+  return None
+
+
 pre_isel_matcher = PatternMatcher([])
 isel_matcher = PatternMatcher([
   (UPat((Ops.PARAM, Ops.SPECIAL), name="x"), _abi),
@@ -226,14 +245,15 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.MUL, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_mul),
   (UPat(Ops.SHL, dtypes.int32s, src=(UPat.var("value"), UPat.var("shift")), name="x"),
    lambda x,value,shift: UOp(Ops.INS, x.dtype, (shift, value), GFX803Ops.V_LSHLREV_B32)),
-  ((UPat.var("a", dtypes.float32) + UPat.var("b", dtypes.float32)).named("x"),
+  ((UPat.var("a", (dtypes.half, dtypes.float32)) + UPat.var("b", (dtypes.half, dtypes.float32))).named("x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_ADD_F32)),
-  (UPat(Ops.MUL, dtypes.float32, src=(UPat.var("a"), UPat.var("b")), name="x"),
+  (UPat(Ops.MUL, (dtypes.half, dtypes.float32), src=(UPat.var("a"), UPat.var("b")), name="x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_MUL_F32)),
-  (UPat(Ops.MAX, dtypes.float32, src=(UPat.var("a"), UPat.var("b")), name="x"),
+  (UPat(Ops.MAX, (dtypes.half, dtypes.float32), src=(UPat.var("a"), UPat.var("b")), name="x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_MAX_F32)),
   (UPat((Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE), dtypes.bool, src=(UPat.var("a"), UPat.var("b")), name="x"), _cmp),
   (UPat(Ops.WHERE, src=(UPat.var("cond"), UPat.var("true_value"), UPat.var("false_value")), name="x"), _where),
+  (UPat(Ops.CAST, src=(UPat.var("value"),), name="x"), _cast),
   (UPat(Ops.STORE, src=(UPat.var("addr"), UPat.var("value"), UPat.var("gate")), name="x"), _store),
   (UPat(Ops.STORE, src=(UPat.var("addr"), UPat.var("value")), name="x"), _store),
   (UPat(Ops.INS, name="x"), _alloc_vreg),
@@ -287,6 +307,10 @@ def _register_counts(x:UOp) -> tuple[int, int, int]:
 def _word(value:int) -> bytes: return struct.pack("<I", value & 0xffffffff)
 
 
+def _vop1(op:int, dst:int, src0:int) -> int:
+  return 0x7e000000 | ((dst & 0xff) << 17) | ((op & 0xff) << 9) | (src0 & 0x1ff)
+
+
 def _vop2(op:int, dst:int, src0:int, src1:int) -> int:
   return ((op & 0x3f) << 25) | ((dst & 0xff) << 17) | ((src1 & 0xff) << 9) | (src0 & 0x1ff)
 
@@ -306,6 +330,11 @@ def _vopc(op:int, src0:int, src1:int) -> int:
 def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
   if x.op is Ops.CONST:
     if dtypes.is_float(x.dtype):
+      if x.dtype is dtypes.half:
+        value = struct.unpack("<H", struct.pack("<e", float(x.arg)))[0]
+        inline = {0x0000:128, 0x3800:240, 0xb800:241, 0x3c00:242, 0xbc00:243,
+                  0x4000:244, 0xc000:245, 0x4400:246, 0xc400:247}
+        return (inline[value], ()) if value in inline else (255, (value,))
       value = struct.unpack("<I", struct.pack("<f", float(x.arg)))[0]
       inline = {0x00000000:128, 0x3f000000:240, 0xbf000000:241, 0x3f800000:242, 0xbf800000:243,
                 0x40000000:244, 0xc0000000:245, 0x40800000:246, 0xc0800000:247}
@@ -316,6 +345,14 @@ def _src0(x:UOp) -> tuple[int, tuple[int, ...]]:
     return 255, (value & 0xffffffff,)
   reg = _physical_reg(x)
   return (256 + reg.index if reg.name.startswith("v") else reg.index), ()
+
+
+def _raw_src0(x:UOp) -> tuple[int, tuple[int, ...], str]:
+  if x.op is Ops.CONST and x.dtype is dtypes.half:
+    value = struct.unpack("<H", struct.pack("<e", float(x.arg)))[0]
+    return 255, (value,), f"{value:#x}"
+  src, literal = _src0(x)
+  return src, literal, str(x.arg) if x.op is Ops.CONST else _physical_reg(x).name
 
 
 def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
@@ -339,9 +376,9 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     text = f"s_load_dwordx2 s[{dst.index}:{dst.index+1}], s[{base.index}:{base.index+1}], {int(offset.arg):#x}"
   elif x.arg is GFX803Ops.V_MOV_B32:
     assert dst is not None
-    src, literal = _src0(x.src[0])
-    data = _word(0x7e000200 | (dst.index << 17) | src) + b"".join(_word(v) for v in literal)
-    text = f"v_mov_b32_e32 v{dst.index}, {x.src[0].arg if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name}"
+    src, literal, src_text = _raw_src0(x.src[0])
+    data = _word(_vop1(0x01, dst.index, src)) + b"".join(_word(v) for v in literal)
+    text = f"v_mov_b32_e32 v{dst.index}, {src_text}"
   elif x.arg is GFX803Ops.FLAT_ADDR:
     assert dst is not None
     base, offset = _physical_reg(x.src[0]), x.src[1]
@@ -382,40 +419,46 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
       else:
         data = _word(0x7e000200 | (dst.index << 17) | 256 | idx_reg.index)
         text = f"v_mov_b32_e32 v{dst.index}, v{idx_reg.index}"
-  elif x.arg is GFX803Ops.FLAT_LOAD_B32:
+  elif x.arg in {GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16}:
     assert dst is not None
     addr = _physical_reg(x.src[0])
-    data = _word(0xdc500000) + _word((dst.index << 24) | addr.index)
-    text = f"flat_load_dword v{dst.index}, v[{addr.index}:{addr.index+1}]"
-  elif x.arg is GFX803Ops.FLAT_STORE_B32:
+    opcode, mnemonic = (0xdc480000, "flat_load_ushort") if x.arg is GFX803Ops.FLAT_LOAD_U16 else (0xdc500000, "flat_load_dword")
+    data = _word(opcode) + _word((dst.index << 24) | addr.index)
+    text = f"{mnemonic} v{dst.index}, v[{addr.index}:{addr.index+1}]"
+  elif x.arg in {GFX803Ops.FLAT_STORE_B32, GFX803Ops.FLAT_STORE_B16}:
     addr, value = _physical_reg(x.src[0]), _physical_reg(x.src[1])
-    data = _word(0xdc700000) + _word((value.index << 8) | addr.index)
-    text = f"flat_store_dword v[{addr.index}:{addr.index+1}], v{value.index}"
-  elif x.arg is GFX803Ops.GATED_FLAT_STORE_B32:
+    opcode, mnemonic = (0xdc680000, "flat_store_short") if x.arg is GFX803Ops.FLAT_STORE_B16 else (0xdc700000, "flat_store_dword")
+    data = _word(opcode) + _word((value.index << 8) | addr.index)
+    text = f"{mnemonic} v[{addr.index}:{addr.index+1}], v{value.index}"
+  elif x.arg in {GFX803Ops.GATED_FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B16}:
     addr, value, gate = map(_physical_reg, x.src)
     if not gate.name.startswith("v"): raise RuntimeError(f"gfx803 store gate must be a VGPR, got {gate}")
     # s[32:33] is reserved above the scalar allocator's s[6:31] pool.
-    words = [_vopc(0xcd, 128, gate.index), 0xbea0206a, 0xdc700000, (value.index << 8) | addr.index, 0xbefe0120]
+    store_opcode = 0xdc680000 if x.arg is GFX803Ops.GATED_FLAT_STORE_B16 else 0xdc700000
+    store_mnemonic = "flat_store_short" if x.arg is GFX803Ops.GATED_FLAT_STORE_B16 else "flat_store_dword"
+    words = [_vopc(0xcd, 128, gate.index), 0xbea0206a, store_opcode, (value.index << 8) | addr.index, 0xbefe0120]
     data = b"".join(_word(w) for w in words)
     text = (f"v_cmp_ne_u32_e32 vcc, 0, v{gate.index}\n"
             f"s_and_saveexec_b64 s[32:33], vcc\n"
-            f"flat_store_dword v[{addr.index}:{addr.index+1}], v{value.index}\n"
+            f"{store_mnemonic} v[{addr.index}:{addr.index+1}], v{value.index}\n"
             f"s_mov_b64 exec, s[32:33]")
     counts = (counts[0], max(counts[1], 34), counts[2])
-  elif x.arg is GFX803Ops.DS_LOAD_B32:
+  elif x.arg in {GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16}:
     assert dst is not None
     addr = _physical_reg(x.src[0])
-    data = _word(0xd86c0000) + _word((dst.index << 24) | addr.index)
-    text = f"ds_read_b32 v{dst.index}, v{addr.index}"
-  elif x.arg is GFX803Ops.DS_STORE_B32:
+    opcode, mnemonic = (0xd8780000, "ds_read_u16") if x.arg is GFX803Ops.DS_LOAD_U16 else (0xd86c0000, "ds_read_b32")
+    data = _word(opcode) + _word((dst.index << 24) | addr.index)
+    text = f"{mnemonic} v{dst.index}, v{addr.index}"
+  elif x.arg in {GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16}:
     addr, value = _physical_reg(x.src[0]), _physical_reg(x.src[1])
-    data = _word(0xd81a0000) + _word((value.index << 8) | addr.index)
-    text = f"ds_write_b32 v{addr.index}, v{value.index}"
+    opcode, mnemonic = (0xd83e0000, "ds_write_b16") if x.arg is GFX803Ops.DS_STORE_B16 else (0xd81a0000, "ds_write_b32")
+    data = _word(opcode) + _word((value.index << 8) | addr.index)
+    text = f"{mnemonic} v{addr.index}, v{value.index}"
   elif x.arg is GFX803Ops.REG_STORE_B32:
     addr = _physical_reg(x.src[0])
-    src, literal = _src0(x.src[1])
-    data = _word(0x7e000200 | (addr.index << 17) | src) + b"".join(_word(v) for v in literal)
-    text = f"v_mov_b32_e32 v{addr.index}, {x.src[1].arg if x.src[1].op is Ops.CONST else _physical_reg(x.src[1]).name}"
+    src, literal, src_text = _raw_src0(x.src[1])
+    data = _word(_vop1(0x01, addr.index, src)) + b"".join(_word(v) for v in literal)
+    text = f"v_mov_b32_e32 v{addr.index}, {src_text}"
   elif x.arg in {GFX803Ops.V_ADD_U32, GFX803Ops.V_LSHLREV_B32}:
     assert dst is not None
     src0, literal = _src0(x.src[0])
@@ -438,29 +481,39 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     src0, literal = _src0(x.src[0])
     src1 = _physical_reg(x.src[1])
     if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
-    op, mnemonic = {GFX803Ops.V_ADD_F32:(0x01, "v_add_f32_e32"), GFX803Ops.V_MUL_F32:(0x05, "v_mul_f32_e32"),
-                    GFX803Ops.V_MAX_F32:(0x0b, "v_max_f32_e32")}[x.arg]
+    if x.dtype is dtypes.half:
+      op, mnemonic = {GFX803Ops.V_ADD_F32:(0x1f, "v_add_f16_e32"), GFX803Ops.V_MUL_F32:(0x22, "v_mul_f16_e32"),
+                      GFX803Ops.V_MAX_F32:(0x2d, "v_max_f16_e32")}[x.arg]
+    else:
+      op, mnemonic = {GFX803Ops.V_ADD_F32:(0x01, "v_add_f32_e32"), GFX803Ops.V_MUL_F32:(0x05, "v_mul_f32_e32"),
+                      GFX803Ops.V_MAX_F32:(0x0b, "v_max_f32_e32")}[x.arg]
     data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     text = f"{mnemonic} v{dst.index}, {src0_text}, v{src1.index}"
+  elif x.arg in {GFX803Ops.V_CVT_F32_F16, GFX803Ops.V_CVT_F16_F32}:
+    assert dst is not None
+    src_reg = _physical_reg(x.src[0])
+    op, mnemonic = (0x0b, "v_cvt_f32_f16_e32") if x.arg is GFX803Ops.V_CVT_F32_F16 else (0x0a, "v_cvt_f16_f32_e32")
+    data, text = _word(_vop1(op, dst.index, 256 + src_reg.index)), f"{mnemonic} v{dst.index}, v{src_reg.index}"
   elif x.arg in {GFX803Ops.V_CMPLT, GFX803Ops.V_CMPEQ, GFX803Ops.V_CMPNE}:
     assert dst is not None
     src0, literal = _src0(x.src[0])
     src1 = _physical_reg(x.src[1])
     if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
     cmp_code = {
-      GFX803Ops.V_CMPLT:{dtypes.float32:0x41, dtypes.int32:0xc1, dtypes.uint32:0xc9, dtypes.bool:0xc9},
-      GFX803Ops.V_CMPEQ:{dtypes.float32:0x42, dtypes.int32:0xc2, dtypes.uint32:0xca, dtypes.bool:0xca},
-      GFX803Ops.V_CMPNE:{dtypes.float32:0x4d, dtypes.int32:0xc5, dtypes.uint32:0xcd, dtypes.bool:0xcd},
+      GFX803Ops.V_CMPLT:{dtypes.half:0x21, dtypes.float32:0x41, dtypes.int32:0xc1, dtypes.uint32:0xc9, dtypes.bool:0xc9},
+      GFX803Ops.V_CMPEQ:{dtypes.half:0x22, dtypes.float32:0x42, dtypes.int32:0xc2, dtypes.uint32:0xca, dtypes.bool:0xca},
+      GFX803Ops.V_CMPNE:{dtypes.half:0x2d, dtypes.float32:0x4d, dtypes.int32:0xc5, dtypes.uint32:0xcd, dtypes.bool:0xcd},
     }[x.arg][x.src[0].dtype]
-    suffix = "f32" if x.src[0].dtype is dtypes.float32 else "i32" if x.src[0].dtype is dtypes.int32 else "u32"
+    suffix = "f16" if x.src[0].dtype is dtypes.half else "f32" if x.src[0].dtype is dtypes.float32 else \
+             "i32" if x.src[0].dtype is dtypes.int32 else "u32"
     # Materializing true into dst before the compare is not alias-safe: the
     # allocator may legally reuse a dying compare input for dst. VOP3 accepts
     # inline constants in both data positions, so only write dst after VCC is set.
     words = [_vopc(cmp_code, src0, src1.index), *literal, *_vop3_3(0x100, dst.index, 128, 129, 106)]
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     cmp_name = ({GFX803Ops.V_CMPLT:"lt", GFX803Ops.V_CMPEQ:"eq"}.get(x.arg) or
-                ("neq" if x.src[0].dtype is dtypes.float32 else "ne"))
+                ("neq" if x.src[0].dtype in (dtypes.half, dtypes.float32) else "ne"))
     text = (f"v_cmp_{cmp_name}_{suffix}_e32 vcc, {src0_text}, v{src1.index}\n"
             f"v_cndmask_b32_e64 v{dst.index}, 0, 1, vcc")
     data = b"".join(_word(w) for w in words)
@@ -469,9 +522,8 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     cond, true_value, false_value = _physical_reg(x.src[0]), _physical_reg(x.src[1]), x.src[2]
     if not cond.name.startswith("v") or not true_value.name.startswith("v"):
       raise RuntimeError(f"v_cndmask inputs must be VGPRs, got {cond} and {true_value}")
-    false_src, literal = _src0(false_value)
+    false_src, literal, false_text = _raw_src0(false_value)
     words = [_vopc(0xcd, 128, cond.index), _vop2(0x00, dst.index, false_src, true_value.index), *literal]
-    false_text = str(false_value.arg) if false_value.op is Ops.CONST else _physical_reg(false_value).name
     data = b"".join(_word(w) for w in words)
     text = (f"v_cmp_ne_u32_e32 vcc, 0, v{cond.index}\n"
             f"v_cndmask_b32_e32 v{dst.index}, {false_text}, v{true_value.index}, vcc")
@@ -509,7 +561,7 @@ class AMDASMRenderer(ISARenderer):
     if target.arch != "gfx803": raise RuntimeError(f"AMDASMRenderer only supports gfx803, got {target.arch}")
     super().__init__(target)
 
-  def supported_dtypes(self): return {dtypes.float32, dtypes.int32, dtypes.uint32, dtypes.bool}
+  def supported_dtypes(self): return {dtypes.half, dtypes.float32, dtypes.int32, dtypes.uint32, dtypes.bool}
   def stack_pointer(self) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
   def spill(self, disp:UOp, x:UOp) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
   def fill(self, disp:UOp, x:UOp, reg:Register) -> UOp: raise NotImplementedError("gfx803 spills are not implemented yet")
@@ -527,8 +579,10 @@ class AMDASMRenderer(ISARenderer):
     for u in lin.src:
       if u.arg is GFX803Ops.DEFINE: continue
       ordered.append(u)
-      if u.arg in {GFX803Ops.S_LOAD_B64, GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B32,
-                   GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_STORE_B32}:
+      if u.arg in {GFX803Ops.S_LOAD_B64, GFX803Ops.FLAT_LOAD_B32, GFX803Ops.FLAT_LOAD_U16,
+                   GFX803Ops.FLAT_STORE_B32, GFX803Ops.FLAT_STORE_B16,
+                   GFX803Ops.GATED_FLAT_STORE_B32, GFX803Ops.GATED_FLAT_STORE_B16,
+                   GFX803Ops.DS_LOAD_B32, GFX803Ops.DS_LOAD_U16, GFX803Ops.DS_STORE_B32, GFX803Ops.DS_STORE_B16}:
         ordered.append(UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_WAITCNT))
     labels:dict[str, int] = {}
     pc = 0

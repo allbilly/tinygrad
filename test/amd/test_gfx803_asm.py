@@ -115,6 +115,35 @@ class TestGFX803Encoder(unittest.TestCase):
     for uop, lines, branch_offset in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop, branch_offset).to_bytes(), _assembled(*lines))
 
+  def test_half_memory_alu_and_casts(self):
+    a, b, out = (_reg(dtypes.half, f"v{i}", i) for i in (40, 41, 42))
+    out_float, gate = _reg(dtypes.float32, "v43", 43), _reg(dtypes.bool, "v44", 44)
+    addr, lds_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8), _reg(dtypes.uint32, "v45", 45)
+    cases = [
+      (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, 2.5),), GFX803Ops.V_MOV_B32, out.tag),
+       ("v_mov_b32_e32 v42, 0x4100",)),
+      (UOp(Ops.INS, dtypes.half, (addr,), GFX803Ops.FLAT_LOAD_U16, out.tag),
+       ("flat_load_ushort v42, v[4:5]",)),
+      (UOp(Ops.INS, dtypes.void, (addr, out), GFX803Ops.FLAT_STORE_B16),
+       ("flat_store_short v[4:5], v42",)),
+      (UOp(Ops.INS, dtypes.half, (lds_addr,), GFX803Ops.DS_LOAD_U16, out.tag), ("ds_read_u16 v42, v45",)),
+      (UOp(Ops.INS, dtypes.void, (lds_addr, out), GFX803Ops.DS_STORE_B16), ("ds_write_b16 v45, v42",)),
+      (UOp(Ops.INS, dtypes.half, (a, b), GFX803Ops.V_ADD_F32, out.tag), ("v_add_f16_e32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.half, (a, b), GFX803Ops.V_MUL_F32, out.tag), ("v_mul_f16_e32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.half, (a, b), GFX803Ops.V_MAX_F32, out.tag), ("v_max_f16_e32 v42, v40, v41",)),
+      (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, 2.5), b), GFX803Ops.V_ADD_F32, out.tag),
+       ("v_add_f16_e32 v42, 2.5, v41",)),
+      (UOp(Ops.INS, dtypes.float32, (a,), GFX803Ops.V_CVT_F32_F16, out_float.tag), ("v_cvt_f32_f16_e32 v43, v40",)),
+      (UOp(Ops.INS, dtypes.half, (out_float,), GFX803Ops.V_CVT_F16_F32, out.tag), ("v_cvt_f16_f32_e32 v42, v43",)),
+      (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPLT, gate.tag),
+       ("v_cmp_lt_f16_e32 vcc, v40, v41", "v_cndmask_b32_e64 v44, 0, 1, vcc")),
+      (UOp(Ops.INS, dtypes.void, (addr, out, gate), GFX803Ops.GATED_FLAT_STORE_B16),
+       ("v_cmp_ne_u32_e32 vcc, 0, v44", "s_and_saveexec_b64 s[32:33], vcc",
+        "flat_store_short v[4:5], v42", "s_mov_b64 exec, s[32:33]")),
+    ]
+    for uop, lines in cases:
+      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
 
 class TestGFX803Program(unittest.TestCase):
   @staticmethod
@@ -227,6 +256,27 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(sum(line == "s_barrier" for line in code_lines), 1)
         self.assertEqual(sum(line.startswith("s_and_saveexec_b64") for line in code_lines), 1)
         self.assertEqual(sum(line.startswith("flat_store_dword") for line in code_lines), 1)
+
+  def test_half_programs_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    a = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    b = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    ma = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    mb = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
+    cases = {
+      "add": (a+b, ("flat_load_ushort", "v_add_f16", "flat_store_short")),
+      "sum": (a.sum(), ("flat_load_ushort", "v_cvt_f32_f16", "ds_write_b32", "v_add_f32", "v_cvt_f16_f32", "flat_store_short")),
+      "matmul": (ma@mb, ("flat_load_ushort", "v_mul_f16", "ds_write_b32", "v_add_f32", "flat_store_short")),
+    }
+    for name, (result, expected) in cases.items():
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, _, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        code_lines = lines[:lines.index("s_endpgm")+1]
+        self.assertEqual(relocs, [])
+        self.assertEqual(_assembled(*lines), text.content)
+        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
 
 
 if __name__ == "__main__": unittest.main()
