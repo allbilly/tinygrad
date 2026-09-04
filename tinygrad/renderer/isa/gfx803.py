@@ -54,6 +54,8 @@ class GFX803Ops(FastEnum):
   V_ADD_F32 = auto()
   V_MUL_F32 = auto()
   V_MAX_F32 = auto()
+  V_MAX_I32 = auto()
+  V_MAX_U32 = auto()
   V_CVT_F32_F16 = auto()
   V_CVT_F16_F32 = auto()
   V_CVT_F32_I32 = auto()
@@ -97,7 +99,7 @@ SGPR64 = tuple(Register(f"s[{i}:{i+1}]", i, size=8) for i in range(6, 32, 2))
 VGPR64 = tuple(Register(f"v[{i}:{i+1}]", i, size=8) for i in range(4, 68, 2))
 VGPR32 = tuple(Register(f"v{i}", i, size=4) for i in range(68, 224))
 REG_BUFFER_BASE = 224
-REG_BUFFER_STRIDE = 16
+REG_BUFFER_COUNT = 256 - REG_BUFFER_BASE
 
 
 def _fixed_reg(dtype:DType, reg:Register) -> UOp: return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(reg,))
@@ -134,12 +136,13 @@ def _global_index(x:UOp, base:UOp, idx:UOp) -> UOp|None:
                   (root.op is Ops.BUFFER and root.addrspace is AddrSpace.LOCAL)
   if is_reg_buffer:
     if idx.op is not Ops.CONST: raise NotImplementedError("gfx803 indirect register-buffer indexing is not implemented")
-    slot = int(root.src[0].arg) if root.op is Ops.INS else int(root.arg.slot)
+    reg_offset = int(root.src[0].arg) if root.op is Ops.INS else int(root.arg.slot)
     size = int(root.src[1].arg) if root.op is Ops.INS else int(root.src[0].arg)
     elem = int(idx.arg)
-    if not 0 <= elem < size <= REG_BUFFER_STRIDE: raise RuntimeError(f"unsupported gfx803 register buffer shape/index: {size=}, {elem=}")
-    reg_idx = REG_BUFFER_BASE + slot * REG_BUFFER_STRIDE + elem
-    if reg_idx >= 256: raise RuntimeError(f"gfx803 register buffer slot {slot} exceeds the VGPR file")
+    if not 0 <= elem < size: raise RuntimeError(f"unsupported gfx803 register buffer shape/index: {size=}, {elem=}")
+    reg_idx = REG_BUFFER_BASE + reg_offset + elem
+    if reg_idx >= REG_BUFFER_BASE + REG_BUFFER_COUNT:
+      raise RuntimeError(f"gfx803 register buffers exceed the reserved {REG_BUFFER_COUNT} VGPRs")
     ref = UOp(Ops.INS, x.dtype, (root,), GFX803Ops.REG_BUFFER, (Register(f"v{reg_idx}", reg_idx, size=4),))
     return ref.after(*deps)
   if is_lds_buffer:
@@ -207,9 +210,13 @@ def _store(x:UOp, addr:UOp, value:UOp, gate:UOp|None=None) -> UOp|None:
              store_op)
 
 
-def _buffer(x:UOp) -> UOp:
+def _buffer(ctx:IselContext, x:UOp) -> UOp:
   if x.addrspace is AddrSpace.REG:
-    return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, x.arg.slot), x.src[0]), GFX803Ops.REG_BUFFER_META, True)
+    buffers = sorted((u for u in ctx.uses if u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG), key=lambda u: int(u.arg.slot))
+    offset = sum(int(u.src[0].arg) for u in buffers[:buffers.index(x)])
+    if offset + int(x.src[0].arg) > REG_BUFFER_COUNT:
+      raise RuntimeError(f"gfx803 register buffers require {offset + int(x.src[0].arg)} VGPRs, only {REG_BUFFER_COUNT} are reserved")
+    return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, offset), x.src[0]), GFX803Ops.REG_BUFFER_META, True)
   if x.addrspace is AddrSpace.LOCAL:
     return UOp(Ops.INS, x.dtype, (UOp.const(dtypes.int32, x.arg.slot), x.src[0]), GFX803Ops.LDS_BUFFER, True)
   raise RuntimeError(f"unexpected gfx803 buffer address space {x.addrspace}")
@@ -275,6 +282,12 @@ def _float_bin(x:UOp, a:UOp, b:UOp, ins:GFX803Ops) -> UOp:
   return UOp(Ops.INS, x.dtype, (a, b), ins)
 
 
+def _int_max(x:UOp, a:UOp, b:UOp) -> UOp:
+  if b.op is Ops.CONST: a, b = b, a
+  if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
+  return UOp(Ops.INS, x.dtype, (a, b), GFX803Ops.V_MAX_I32 if x.dtype is dtypes.int32 else GFX803Ops.V_MAX_U32)
+
+
 def _cmp(x:UOp, a:UOp, b:UOp) -> UOp:
   if b.op is Ops.CONST: b = UOp(Ops.INS, b.dtype, (b,), GFX803Ops.V_MOV_B32)
   return UOp(Ops.INS, x.dtype, (a, b), {Ops.CMPLT:GFX803Ops.V_CMPLT, Ops.CMPEQ:GFX803Ops.V_CMPEQ, Ops.CMPNE:GFX803Ops.V_CMPNE}[x.op])
@@ -315,7 +328,7 @@ def _cast(x:UOp, value:UOp) -> UOp|None:
 
 
 def _unsupported_elementwise(x:UOp):
-  raise NotImplementedError(f"gfx803 {x.op.name} is not lowered yet")
+  raise NotImplementedError(f"gfx803 {x.op.name} {x.dtype} from {tuple(s.dtype for s in x.src)} is not lowered yet")
 
 
 pre_isel_matcher = PatternMatcher([
@@ -342,6 +355,7 @@ isel_matcher = PatternMatcher([
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_MUL_F32)),
   (UPat(Ops.MAX, (dtypes.half, dtypes.float32), src=(UPat.var("a"), UPat.var("b")), name="x"),
    lambda x,a,b: _float_bin(x, a, b, GFX803Ops.V_MAX_F32)),
+  (UPat(Ops.MAX, dtypes.int32s, src=(UPat.var("a"), UPat.var("b")), name="x"), _int_max),
   (UPat((Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE), dtypes.bool, src=(UPat.var("a"), UPat.var("b")), name="x"), _cmp),
   (UPat(Ops.WHERE, src=(UPat.var("cond"), UPat.var("true_value"), UPat.var("false_value")), name="x"), _where),
   (UPat(Ops.CAST, src=(UPat.var("value"),), name="x"), _cast),
@@ -612,6 +626,15 @@ def _encode(x:UOp, branch_offset:int=0) -> GFX803Instruction:
     else:
       op, mnemonic = {GFX803Ops.V_ADD_F32:(0x01, "v_add_f32_e32"), GFX803Ops.V_MUL_F32:(0x05, "v_mul_f32_e32"),
                       GFX803Ops.V_MAX_F32:(0x0b, "v_max_f32_e32")}[x.arg]
+    data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
+    src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
+    text = f"{mnemonic} v{dst.index}, {src0_text}, v{src1.index}"
+  elif x.arg in {GFX803Ops.V_MAX_I32, GFX803Ops.V_MAX_U32}:
+    assert dst is not None
+    src0, literal = _src0(x.src[0])
+    src1 = _physical_reg(x.src[1])
+    if not src1.name.startswith("v"): raise RuntimeError(f"{x.arg} second source must be a VGPR, got {src1}")
+    op, mnemonic = (0x0d, "v_max_i32_e32") if x.arg is GFX803Ops.V_MAX_I32 else (0x0f, "v_max_u32_e32")
     data = _word(_vop2(op, dst.index, src0, src1.index)) + b"".join(_word(v) for v in literal)
     src0_text = str(x.src[0].arg) if x.src[0].op is Ops.CONST else _physical_reg(x.src[0]).name
     text = f"{mnemonic} v{dst.index}, {src0_text}, v{src1.index}"

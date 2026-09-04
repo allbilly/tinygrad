@@ -183,6 +183,8 @@ class TestGFX803Encoder(unittest.TestCase):
        ("v_lshrrev_b32_e32 v42, 8, v41",)),
       (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.uint32, 8), signed), GFX803Ops.V_ASHRREV_I32, signed.tag),
        ("v_ashrrev_i32_e32 v43, 8, v43",)),
+      (UOp(Ops.INS, dtypes.int32, (signed, a), GFX803Ops.V_MAX_I32, signed.tag), ("v_max_i32_e32 v43, v43, v40",)),
+      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_MAX_U32, out.tag), ("v_max_u32_e32 v42, v40, v41",)),
     ]
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
@@ -403,6 +405,24 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(relocs, [])
         self.assertEqual(_assembled(*lines), text.content)
         for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
+
+  def test_integer_max_reductions_elf(self):
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    cases = {
+      "signed": (Tensor.empty(2, 16, dtype=dtypes.int32, device="NULL").contiguous().realize().max(axis=1), "v_max_i32"),
+      "unsigned": (Tensor.empty(2, 16, dtype=dtypes.uint32, device="NULL").contiguous().realize().max(axis=1), "v_max_u32"),
+      "argmax": (Tensor.empty(32, dtype=dtypes.half, device="NULL").contiguous().realize().argmax(), "v_max_i32"),
+    }
+    for name, (result, mnemonic) in cases.items():
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, desc, relocs = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        code_lines = lines[:lines.index("s_endpgm")+1]
+        self.assertEqual(relocs, [])
+        self.assertGreater(desc.group_segment_fixed_size, 0)
+        self.assertEqual(_assembled(*lines), text.content)
+        self.assertTrue(any(line.startswith(mnemonic) for line in code_lines))
 
 
 if __name__ == "__main__": unittest.main()
