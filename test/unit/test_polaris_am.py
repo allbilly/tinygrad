@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from tinygrad.runtime.ops_amd import AMDComputeQueue, _kfd_doorbell_params
+from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDQueueDesc, _kfd_doorbell_params
 from tinygrad.runtime.autogen.am import pm4_soc15
 from tinygrad.runtime.support.am.polaris import (
   PolarisAMDev, ViMqd, DOORBELL_MEC_RING0, VI_MQD_ALLOC_DWORDS, MQD_HQD_WORD, mmCP_HQD_ACTIVE, mmCP_HQD_PQ_BASE_LO, mmCP_HQD_PQ_BASE_HI,
@@ -34,6 +34,25 @@ class FakePCI:
   def map_bar(self, bar, fmt='B'): return self.bars[bar]
 
 class TestPolarisAM(unittest.TestCase):
+  def test_drm_submit_callback_reuses_ring(self):
+    submitted = []
+    ring_buf = SimpleNamespace()
+    desc = AMDQueueDesc(ring=FakeMMIO(0x1000), read_ptr=FakeMMIO(8), write_ptr=FakeMMIO(8), doorbell=FakeMMIO(8),
+                        put_value=7, submit_ib=lambda ib, size: submitted.append((ib, size)), ring_buf=ring_buf)  # type: ignore[arg-type]
+    dev = SimpleNamespace(error_state=None)
+    desc.signal_doorbell(dev)
+    self.assertEqual(submitted, [(ring_buf, 28)])
+    self.assertEqual(desc.put_value, 0)
+    self.assertEqual(desc.read_ptr[0], 0)
+    self.assertEqual(desc.write_ptr[0], 0)
+
+  def test_non_kfd_signal_does_not_emit_event(self):
+    dev = SimpleNamespace(target=(8, 0, 3), xccs=1, iface=SimpleNamespace(has_queue_events=False), is_am=lambda: False)
+    queue = AMDComputeQueue.__new__(AMDComputeQueue)
+    queue.dev, queue.pm4, queue._q, queue.binded_device = dev, pm4_soc15, [], None
+    queue.signal(SimpleNamespace(value_addr=0x12345000, owner=dev, is_timeline=True), 7)  # type: ignore[arg-type]
+    self.assertEqual(len(queue._q), 7)
+
   def test_vi_ring_padding_is_direct_only(self):
     class FakePM4:
       PACKET3_NOP = 0x10

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, cast
-import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit
+import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit, time
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram, FileIOInterface
@@ -47,6 +47,12 @@ class ProfilePMCEvent(ProfileEvent): device:str; kern:int; sched:list[PMCSample]
 @dataclass
 class PolarisAllocationMeta:
   off:int
+  cpu_addr:int
+
+@dataclass
+class DRMAllocationMeta:
+  handle:int
+  va_addr:int
   cpu_addr:int
 
 class GFX8GC:
@@ -460,7 +466,7 @@ class AMDComputeQueue(HWQueue):
       self.release_mem(signal.value_addr, value, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
                        self.pm4.int_sel__mec_release_mem__none, cache_flush=True)
 
-      if (dev:=signal.owner) is not None and signal.is_timeline and not dev.is_am():
+      if (dev:=signal.owner) is not None and signal.is_timeline and getattr(dev.iface, 'has_queue_events', False):
         self.release_mem(dev.queue_event_mailbox_ptr, dev.queue_event.event_id, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
                          self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm, ctxid=dev.queue_event.event_id)
     return self
@@ -565,7 +571,7 @@ class AMDCopyQueue(HWQueue):
     fence_flags = self.sdma.SDMA_PKT_FENCE_HEADER_MTYPE(3) if self.dev.target[0] != 9 else 0
     self.q(self.sdma.SDMA_OP_FENCE | fence_flags, *data64_le(signal.value_addr), value)
 
-    if (dev:=signal.owner) is not None and signal.is_timeline and not dev.is_am():
+    if (dev:=signal.owner) is not None and signal.is_timeline and getattr(dev.iface, 'has_queue_events', False):
       self.q(self.sdma.SDMA_OP_FENCE | fence_flags, *data64_le(dev.queue_event_mailbox_ptr), dev.queue_event.event_id)
       self.q(self.sdma.SDMA_OP_TRAP, self.sdma.SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT(dev.queue_event.event_id))
     return self
@@ -729,6 +735,11 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
   def _do_map(self, buf:HCQBuffer): return self.dev.iface.map(buf._base if buf._base is not None else buf)
 
   def _copyin(self, dest:HCQBuffer, src:memoryview):
+    if getattr(self.dev.iface, 'cpu_mapped_buffers', False):
+      self.dev.synchronize()
+      dest.cpu_view().view(size=len(src), fmt='B')[:] = src.cast('B')
+      System.memory_barrier()
+      return
     if isinstance(getattr(self.dev.iface, 'dev_impl', None), PolarisAMDev):
       self.dev.synchronize()
       dest.cpu_view().view(size=len(src), fmt='B')[:] = src.cast('B')
@@ -738,6 +749,11 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
     return super()._copyin(dest, src)
 
   def _copyout(self, dest:memoryview, src:HCQBuffer):
+    if getattr(self.dev.iface, 'cpu_mapped_buffers', False):
+      self.dev.synchronize()
+      System.memory_barrier()
+      dest.cast('B')[:] = src.cpu_view().view(size=len(dest), fmt='B')[:]
+      return
     if isinstance(getattr(self.dev.iface, 'dev_impl', None), PolarisAMDev):
       self.dev.synchronize()
       self.dev.iface.dev_impl.gmc.flush_hdp()
@@ -764,11 +780,22 @@ class AMDQueueDesc:
   doorbell: MMIOInterface
   put_value: int = 0
   params: tuple|None = None  # setup_ring params for recovery
+  submit_ib: Any|None = None
+  ring_buf: HCQBuffer|None = None
 
   def signal_doorbell(self, dev, doorbell_value:int|None=None):
     try:
       self.write_ptr[0] = self.put_value
       System.memory_barrier()
+
+      # Kernel command submission consumes this memory as one IB. Waiting for
+      # its fence here makes the HCQ ring reusable from dword zero immediately.
+      if self.submit_ib is not None:
+        assert self.ring_buf is not None
+        self.submit_ib(self.ring_buf, self.put_value * 4)
+        self.read_ptr[0] = self.put_value
+        self.put_value = self.read_ptr[0] = self.write_ptr[0] = 0
+        return
 
       # No mapped access with usb
       if dev.is_am() and not dev.is_usb():
@@ -781,6 +808,7 @@ class AMDQueueDesc:
       raise
 
 class KFDIface:
+  has_queue_events = True
   kfd:FileIOInterface|None = None
   event_page:HCQBuffer|None = None
   gpus:list[FileIOInterface] = []
@@ -978,6 +1006,172 @@ class KFDIface:
     return inf
   def is_wgp_active(self, xcc, se, sa, wgp) -> bool: return ((self.drm_dev_info.cu_bitmap[se % 4][sa + (se // 4) * 2] >> (2 * wgp)) & 0x3) == 0x3
 
+class DRMIface:
+  """Kernel-managed AMDGPU command submission for GPUs unavailable through KFD."""
+  cpu_mapped_buffers = True
+  needs_cwsr = False
+
+  @staticmethod
+  def _render_nodes() -> list[tuple[str, str]]:
+    base = "/dev/dri/by-path"
+    nodes:list[tuple[str, str]] = []
+    if not FileIOInterface.exists(base): return nodes
+    for name in sorted(os.listdir(base)):
+      if not name.startswith("pci-") or not name.endswith("-render"): continue
+      pcibus = name[len("pci-"):-len("-render")]
+      try:
+        vendor = int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/vendor").read(), 16)
+        device = int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/device").read(), 16)
+      except OSError: continue
+      # The generic PM4 path currently has a complete legacy register map only
+      # for Polaris10. KFD remains first choice for every other AMD generation.
+      if vendor == 0x1002 and device == 0x67df: nodes.append((pcibus, f"{base}/{name}"))
+    return nodes
+
+  def __init__(self, dev, device_id):
+    try: self.pcibus, render_node = (visible:=hcq_filter_visible_devices(self._render_nodes(), "AMD"))[device_id]
+    except IndexError: raise RuntimeError(f"AMD:{device_id} does not exist ({pluralize('DRM Polaris device', len(visible))} available)")
+
+    self.dev, self.count = dev, len(visible)
+    self.peer_group = f"AMD-DRM-{self.pcibus}"
+    self.dev_sysfs_path = f"/sys/bus/pci/devices/{self.pcibus}"
+    self.drm_fd = FileIOInterface(render_node, os.O_RDWR)
+
+    amdgpu_drm.DRM_IOCTL_AMDGPU_INFO(self.drm_fd, query=amdgpu_drm.AMDGPU_INFO_DEV_INFO,
+      return_pointer=ctypes.addressof(info:=amdgpu_drm.struct_drm_amdgpu_info_device()), return_size=ctypes.sizeof(info))
+    if info.device_id != 0x67df: raise RuntimeError(f"unsupported AMDGPU DRM device {info.device_id:#06x}")
+    self.drm_dev_info = info
+
+    # Polaris10 has no ip_discovery sysfs tree. These are the kernel driver's
+    # IP versions and match the legacy packet/register definitions used below.
+    self.ip_versions = {am.GC_HWIP:(8,0,3), am.SDMA0_HWIP:(3,0,0), am.NBIF_HWIP:(5,0,0)}
+    self.props = {'cu_per_simd_array':8, 'simd_count':64, 'simd_per_cu':2, 'array_count':4,
+      'max_slots_scratch_cu':32, 'max_waves_per_simd':10, 'simd_arrays_per_engine':2,
+      'lds_size_in_kb':64, 'num_xcc':1, 'gfx_target_version':80003}
+
+    # Keep GFX8 allocations in the same low aperture used by the passing
+    # libdrm reference. GEM_VA maps our chosen non-overlapping addresses.
+    va_base = max(1 << 32, round_up(info.virtual_address_offset, mmap.PAGESIZE))
+    va_end = min(1 << 36, (info.virtual_address_max + 1) & -mmap.PAGESIZE)
+    if va_end <= va_base: raise RuntimeError(f"AMDGPU DRM has no usable low VA aperture: {va_base:#x}..{va_end:#x}")
+    self.va_allocator = TLSFAllocator(va_end - va_base, base=va_base, block_size=mmap.PAGESIZE)
+    self._allocations:dict[int, HCQBuffer] = {}
+
+    ctx = amdgpu_drm.union_drm_amdgpu_ctx()
+    ctx._in.op, ctx._in.priority = amdgpu_drm.AMDGPU_CTX_OP_ALLOC_CTX, amdgpu_drm.AMDGPU_CTX_PRIORITY_NORMAL
+    amdgpu_drm.DRM_IOCTL_AMDGPU_CTX(self.drm_fd, __payload=ctx)
+    self.ctx_id = ctx.out.alloc.ctx_id
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, cpu_addr=None, **kwargs) -> HCQBuffer:
+    if cpu_addr is not None: raise RuntimeError("AMDGPU DRM userptr mappings are not implemented")
+    size, va_addr = round_up(size, mmap.PAGESIZE), 0
+    handle, cpu_map, gpu_mapped = 0, 0, False
+    try:
+      va_addr = self.va_allocator.alloc(size, mmap.PAGESIZE)
+      create = amdgpu_drm.union_drm_amdgpu_gem_create()
+      create._in.bo_size, create._in.alignment = size, mmap.PAGESIZE
+      create._in.domains = amdgpu_drm.AMDGPU_GEM_DOMAIN_GTT
+      create._in.domain_flags = amdgpu_drm.AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | amdgpu_drm.AMDGPU_GEM_CREATE_VM_ALWAYS_VALID | \
+        (amdgpu_drm.AMDGPU_GEM_CREATE_CPU_GTT_USWC if uncached else 0)
+      amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_CREATE(self.drm_fd, __payload=create)
+      handle = create.out.handle
+
+      map_flags = amdgpu_drm.AMDGPU_VM_PAGE_READABLE | amdgpu_drm.AMDGPU_VM_PAGE_WRITEABLE | amdgpu_drm.AMDGPU_VM_PAGE_EXECUTABLE
+      amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_VA(self.drm_fd, handle=handle, operation=amdgpu_drm.AMDGPU_VA_OP_MAP,
+        flags=map_flags, va_address=va_addr, offset_in_bo=0, map_size=size)
+      gpu_mapped = True
+
+      gem_mmap = amdgpu_drm.union_drm_amdgpu_gem_mmap()
+      gem_mmap._in.handle = handle
+      amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_MMAP(self.drm_fd, __payload=gem_mmap)
+      cpu_map = self.drm_fd.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, gem_mmap.out.addr_ptr)
+
+      meta = DRMAllocationMeta(handle, va_addr, cpu_map)
+      self._allocations[handle] = buf = HCQBuffer(va_addr, size, meta=meta, view=MMIOInterface(cpu_map, size), owner=self.dev)
+      return buf
+    except OSError as e:
+      if cpu_map: FileIOInterface.munmap(cpu_map, size)
+      if gpu_mapped:
+        with contextlib.suppress(OSError): amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_VA(self.drm_fd, handle=handle,
+          operation=amdgpu_drm.AMDGPU_VA_OP_UNMAP, va_address=va_addr, map_size=size)
+      if handle:
+        with contextlib.suppress(OSError): amdgpu_drm.DRM_IOCTL_GEM_CLOSE(self.drm_fd, handle=handle)
+      if va_addr: self.va_allocator.free(va_addr)
+      if e.errno == errno.ENOMEM: raise MemoryError(f"Cannot allocate {size} bytes of AMDGPU GTT memory") from e
+      raise
+
+  def free(self, mem):
+    meta:DRMAllocationMeta = mem.meta
+    if meta.handle not in self._allocations: return
+    amdgpu_drm.DRM_IOCTL_AMDGPU_GEM_VA(self.drm_fd, handle=meta.handle, operation=amdgpu_drm.AMDGPU_VA_OP_UNMAP,
+      va_address=meta.va_addr, map_size=mem.size)
+    FileIOInterface.munmap(meta.cpu_addr, mem.size)
+    amdgpu_drm.DRM_IOCTL_GEM_CLOSE(self.drm_fd, handle=meta.handle)
+    self.va_allocator.free(meta.va_addr)
+    del self._allocations[meta.handle]
+
+  def map(self, mem):
+    if mem.owner is self.dev: return mem
+    raise RuntimeError("External mappings are not supported by the AMDGPU DRM interface")
+
+  def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
+                   xcc_id=0, idx=0):
+    if queue_type == kfd.KFD_IOC_QUEUE_TYPE_SDMA: raise OSError(errno.ENODEV, "Polaris SDMA3 is not implemented")
+    read_ptr, write_ptr = gart.cpu_view().view(offset=rptr, size=8, fmt='Q'), gart.cpu_view().view(offset=wptr, size=8, fmt='Q')
+    read_ptr[0] = write_ptr[0] = 0
+    return AMDQueueDesc(ring=ring.cpu_view().view(fmt='I'), read_ptr=read_ptr, write_ptr=write_ptr,
+      doorbell=gart.cpu_view().view(offset=0x80, size=8, fmt='Q'), submit_ib=self._submit_ib, ring_buf=ring)
+
+  def _submit_ib(self, ib:HCQBuffer, ib_bytes:int):
+    if not ib_bytes or ib_bytes > ib.size or ib_bytes & 3: raise RuntimeError(f"invalid AMDGPU DRM IB size {ib_bytes}")
+
+    handles = sorted(self._allocations)
+    entries = (amdgpu_drm.struct_drm_amdgpu_bo_list_entry * len(handles))(
+      *[amdgpu_drm.struct_drm_amdgpu_bo_list_entry(bo_handle=handle) for handle in handles])
+    bo_list = amdgpu_drm.union_drm_amdgpu_bo_list()
+    bo_list._in.operation, bo_list._in.bo_number = amdgpu_drm.AMDGPU_BO_LIST_OP_CREATE, len(entries)
+    bo_list._in.bo_info_size = ctypes.sizeof(amdgpu_drm.struct_drm_amdgpu_bo_list_entry)
+    bo_list._in.bo_info_ptr = ctypes.addressof(entries)
+    amdgpu_drm.DRM_IOCTL_AMDGPU_BO_LIST(self.drm_fd, __payload=bo_list)
+    list_handle = bo_list.out.list_handle
+
+    try:
+      ib_info = amdgpu_drm.struct_drm_amdgpu_cs_chunk_ib(va_start=ib.va_addr, ib_bytes=ib_bytes,
+        ip_type=amdgpu_drm.AMDGPU_HW_IP_COMPUTE, ip_instance=0, ring=0)
+      chunk = amdgpu_drm.struct_drm_amdgpu_cs_chunk(chunk_id=amdgpu_drm.AMDGPU_CHUNK_ID_IB,
+        length_dw=ctypes.sizeof(ib_info)//4, chunk_data=ctypes.addressof(ib_info))
+      chunk_ptrs = (ctypes.c_uint64 * 1)(ctypes.addressof(chunk))
+      submit = amdgpu_drm.union_drm_amdgpu_cs()
+      submit._in.ctx_id, submit._in.bo_list_handle = self.ctx_id, list_handle
+      submit._in.num_chunks, submit._in.chunks = 1, ctypes.addressof(chunk_ptrs)
+      System.memory_barrier()
+      amdgpu_drm.DRM_IOCTL_AMDGPU_CS(self.drm_fd, __payload=submit)
+
+      wait = amdgpu_drm.union_drm_amdgpu_wait_cs()
+      wait._in.handle = submit.out.handle
+      wait._in.timeout = time.monotonic_ns() + int(getenv("AMD_DRM_TIMEOUT_MS", 30000)) * 1_000_000
+      wait._in.ip_type, wait._in.ip_instance, wait._in.ring = amdgpu_drm.AMDGPU_HW_IP_COMPUTE, 0, 0
+      wait._in.ctx_id = self.ctx_id
+      amdgpu_drm.DRM_IOCTL_AMDGPU_WAIT_CS(self.drm_fd, __payload=wait)
+      if wait.out.status: raise RuntimeError(f"AMDGPU DRM compute fence {submit.out.handle} timed out")
+    finally:
+      destroy = amdgpu_drm.union_drm_amdgpu_bo_list()
+      destroy._in.operation, destroy._in.list_handle = amdgpu_drm.AMDGPU_BO_LIST_OP_DESTROY, list_handle
+      amdgpu_drm.DRM_IOCTL_AMDGPU_BO_LIST(self.drm_fd, __payload=destroy)
+
+  def sleep(self, timeout): time.sleep(min(timeout, 1) / 1000)
+  def require_profile_mode(self): raise RuntimeError("profiling is not implemented for the AMDGPU DRM interface")
+  def is_wgp_active(self, xcc, se, sa, wgp) -> bool: return True
+  def on_device_hang(self): raise RuntimeError("AMDGPU DRM compute submission failed")
+
+  def device_fini(self):
+    if not getattr(self, 'ctx_id', 0): return
+    ctx = amdgpu_drm.union_drm_amdgpu_ctx()
+    ctx._in.op, ctx._in.ctx_id = amdgpu_drm.AMDGPU_CTX_OP_FREE_CTX, self.ctx_id
+    with contextlib.suppress(OSError): amdgpu_drm.DRM_IOCTL_AMDGPU_CTX(self.drm_fd, __payload=ctx)
+    self.ctx_id = 0
+
+
 class PCIIface(PCIIfaceBase):
   def __init__(self, dev, dev_id):
     devices = ((0xffff, (0x67df,0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0)),)
@@ -1138,7 +1332,7 @@ class USBIface(PCIIface):
 def _mock(iface, name=None): return type(name or f"MOCK{iface.__name__}", (iface,), {})
 
 class AMDDevice(HCQCompiled):
-  ifaces = [KFDIface, PCIIface, USBIface, _mock(KFDIface, "MOCKIface"), _mock(KFDIface), _mock(PCIIface), _mock(USBIface)]
+  ifaces = [KFDIface, DRMIface, PCIIface, USBIface, _mock(KFDIface, "MOCKIface"), _mock(KFDIface), _mock(PCIIface), _mock(USBIface)]
 
   def is_am(self) -> bool: return isinstance(self.iface, (PCIIface, USBIface))
   def is_usb(self) -> bool: return isinstance(self.iface, USBIface)
@@ -1186,7 +1380,8 @@ class AMDDevice(HCQCompiled):
 
     self.compute_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL if self.is_aql else kfd.KFD_IOC_QUEUE_TYPE_COMPUTE,
       0x2000 if self.is_usb() else (16 << 20), eop_buffer_size=0x1000,
-      ctx_save_restore_size=0 if self.is_am() else wg_data_size + ctl_stack_size, ctl_stack_size=ctl_stack_size, debug_memory_size=debug_memory_size)
+      ctx_save_restore_size=wg_data_size + ctl_stack_size if getattr(self.iface, 'needs_cwsr', not self.is_am()) else 0,
+      ctl_stack_size=ctl_stack_size, debug_memory_size=debug_memory_size)
 
     self.max_copy_size = 0x40000000 if self.iface.ip_versions[am.SDMA0_HWIP][0] >= 5 else 0x400000
     self.sdma_queues:dict = {}
