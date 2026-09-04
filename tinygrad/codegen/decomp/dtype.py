@@ -137,6 +137,25 @@ def f2f_store(st, idx, val, fr:DType, to:DType):
   if (n:=val.max_numel()) == 1: return st.replace(src=(idx, f2f(val.bitcast(f2f_dt[to]), to, fr)))
   return UOp.group(*(st.replace(src=(reindex(idx, i, 1), f2f(val.index(i).bitcast(f2f_dt[to]), to, fr))) for i in range(n)))
 
+_FLOAT_ROUND_TAG = "float_emulation_round"
+def _round_float_boundary(x:UOp, fr:DType) -> UOp:
+  if x.dtype != fr or (x.op is Ops.BITCAST and x.tag == _FLOAT_ROUND_TAG): return x
+  # Preserve the source dtype through the bottom-up decomposition. The two
+  # bitcasts become a narrow/widen pair in pm_float_decomp.
+  return x.bitcast(f2f_dt[fr]).bitcast(fr).replace(tag=_FLOAT_ROUND_TAG)
+
+def _round_nonfloat_inputs(x:UOp, fr:DType) -> UOp|None:
+  # A promoted value must have its storage-dtype rounding before exact
+  # consumers. Floating casts stay wide so reductions/dot products accumulate
+  # in float, as intended by the emulation path.
+  src = tuple(_round_float_boundary(s, fr) for s in x.src)
+  return x.replace(src=src) if src != x.src else None
+
+pm_float_boundaries = PatternMatcher([
+  (UPat((*GroupOp.Comparison, Ops.CAST), name="x"), lambda ctx,x:
+   _round_nonfloat_inputs(x, ctx) if x.op is not Ops.CAST or x.dtype not in dtypes.floats else None),
+])
+
 pm_long_decomp = PatternMatcher([
   (UPat(GroupOp.Defines, src=(UPat.var("sz"),), name="x"), lambda x,sz:
    x.replace(dtype=l2i_dt[x.dtype], arg=replace(x.arg, dtype=l2i_dt[x.dtype]), src=(sz*2,)) if x.dtype in l2i_dt else None),
@@ -194,6 +213,8 @@ def do_dtype_decomps(sink:UOp, ctx:tuple[set[DType], Renderer]) -> UOp:
       to = dtypes.int if fr == dtypes.long else dtypes.half if not _should_emulate(dtypes.half) and fr in dtypes.fp8s else dtypes.float
       if DEBUG >= 2: print(f"emulating {fr} as {to}")
       pm = pm_float_decomp if fr in dtypes.floats else pm_long_decomp
+      if pm is pm_float_decomp:
+        sink = graph_rewrite(sink, pm_float_boundaries, name=f"round {fr} boundaries", ctx=fr, bottom_up=True)
       sink = graph_rewrite(sink, pm, name=f"decomp {fr} -> {to}", ctx=(fr, to), bottom_up=True)
   ctx[0].clear()
   return sink

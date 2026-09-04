@@ -1,7 +1,10 @@
 import struct, unittest
+import numpy as np
 
+from tinygrad import Tensor
 from tinygrad.codegen.decomp.dtype import f2f, pm_float_decomp
 from tinygrad.dtype import AddrSpace, dtypes
+from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, graph_rewrite
 from tinygrad.uop.spec import spec_program, type_verify
 
@@ -37,6 +40,13 @@ class TestFloatDecomp(unittest.TestCase):
     after = next(u for u in rewritten.toposort() if u.op is Ops.AFTER)
     self.assertEqual((after.dtype, after.src[0].dtype, after.tag), (dtypes.ushort, dtypes.ushort, dtypes.half))
     type_verify(rewritten, spec_program)
+
+  def test_nonfloat_consumer_rounds_emulated_half(self):
+    # float32(half(1.1)) * 10 is just below 11, while half multiplication rounds to 11.
+    with Context(EMULATED_DTYPES="half"):
+      x = Tensor(np.array([0x3c66], dtype=np.uint16).view(np.float16))
+      self.assertEqual((x * 10).cast(dtypes.uint8).item(), 11)
+      self.assertTrue((x * 10 == 11).item())
 
 
 if __name__ == "__main__":
