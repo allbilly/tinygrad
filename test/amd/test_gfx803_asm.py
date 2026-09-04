@@ -60,6 +60,27 @@ class TestGFX803Encoder(unittest.TestCase):
     for uop, lines in cases:
       with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
 
+  def test_float_alu_and_select(self):
+    a, b, cond, out = (_reg(dtype, f"v{i}", i) for dtype, i in
+                       ((dtypes.float32, 36), (dtypes.float32, 37), (dtypes.bool, 38), (dtypes.float32, 39)))
+    cases = [
+      (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 2.5),), GFX803Ops.V_MOV_B32, out.tag),
+       ("v_mov_b32_e32 v39, 2.5",)),
+      (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 2.5), b), GFX803Ops.V_ADD_F32, out.tag),
+       ("v_add_f32_e32 v39, 2.5, v37",)),
+      (UOp(Ops.INS, dtypes.float32, (a, b), GFX803Ops.V_MUL_F32, out.tag), ("v_mul_f32_e32 v39, v36, v37",)),
+      (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 0), b), GFX803Ops.V_MAX_F32, out.tag),
+       ("v_max_f32_e32 v39, 0, v37",)),
+      (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPLT, cond.tag),
+       ("v_mov_b32_e32 v38, 1", "v_cmp_lt_f32_e32 vcc, v36, v37", "v_cndmask_b32_e32 v38, 0, v38, vcc")),
+      (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPNE, cond.tag),
+       ("v_mov_b32_e32 v38, 1", "v_cmp_neq_f32_e32 vcc, v36, v37", "v_cndmask_b32_e32 v38, 0, v38, vcc")),
+      (UOp(Ops.INS, dtypes.float32, (cond, a, b), GFX803Ops.V_CNDMASK_B32, out.tag),
+       ("v_cmp_ne_u32_e32 vcc, 0, v38", "v_cndmask_b32_e32 v39, v37, v36, vcc")),
+    ]
+    for uop, lines in cases:
+      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+
 
 class TestGFX803Program(unittest.TestCase):
   @staticmethod
@@ -112,6 +133,24 @@ class TestGFX803Program(unittest.TestCase):
         self.assertEqual(_assembled(*lines), text.content)
         self.assertEqual(any("s2" in line for line in lines), uses_wgid)
         self.assertEqual(any(line.startswith(("v_add_u32", "v_lshlrev")) and "v0" in line for line in lines), uses_lidx)
+
+  def test_elementwise_alu_elf(self):
+    a = Tensor.empty(16, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    b = Tensor.empty(16, dtype=dtypes.float32, device="NULL").contiguous().realize()
+    cases = {
+      "add_const": (a+2.5, ("v_add_f32",)), "sub": (a-b, ("v_mul_f32", "v_add_f32")),
+      "mul": (a*b, ("v_mul_f32",)), "max": (a.maximum(b), ("v_max_f32",)),
+      "relu": (a.relu(), ("v_cmp_lt_f32", "v_cndmask_b32")), "where": ((a<b).where(a, b), ("v_cmp_lt_f32", "v_cndmask_b32")),
+      "full": (Tensor.full((16,), 2.5, dtype=dtypes.float32, device="NULL").contiguous(), ("v_mov_b32",)),
+    }
+    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+    for name, (result, expected) in cases.items():
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
+        text, _, _, _ = self._elf(program)
+        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
+        self.assertEqual(_assembled(*lines), text.content)
+        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in lines), mnemonic)
 
 
 if __name__ == "__main__": unittest.main()
