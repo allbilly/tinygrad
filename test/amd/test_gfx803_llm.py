@@ -1,18 +1,18 @@
-import os
-import pathlib
-import subprocess
-import sys
-import unittest
-
+import os, pathlib, subprocess, sys, unittest
 
 class TestGFX803LLM(unittest.TestCase):
-  def test_llama3_tied_weights_and_cpu_staging(self):
-    source = """
-from pathlib import Path
-from tinygrad import Device, Tensor, dtypes
-from tinygrad.renderer.isa.gfx803 import AMDASMRenderer
+  def _compile(self, source, **env):
+    setup = "from tinygrad import Device, Tensor, Variable, dtypes\nfrom tinygrad.renderer.isa.gfx803 import AMDASMRenderer\n"
+    setup += "Device['NULL'].renderers.append(AMDASMRenderer)\n"
+    env = {**os.environ, "DEV":"NULL:AMDASM:gfx803", "NULL_ALLOW_COPYOUT":"1", "FORWARD_ONLY":"1", "DEFAULT_FLOAT":"HALF",
+           "JIT":"0", "DEBUG":"0", **env}
+    result = subprocess.run([sys.executable, "-c", setup + source], cwd=pathlib.Path(__file__).parents[2],
+                            env=env, capture_output=True, text=True, timeout=20)
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-if AMDASMRenderer not in Device['NULL'].renderers: Device['NULL'].renderers.append(AMDASMRenderer)
+  def test_llama3_tied_weights_and_cpu_staging(self):
+    self._compile("""
+from pathlib import Path
 import examples.llama3 as llama3
 
 llama3.MODEL_PARAMS['TINY'] = {'args': {'dim': 4, 'n_heads': 1, 'n_kv_heads': 1, 'n_layers': 0,
@@ -26,21 +26,10 @@ model = llama3.build_transformer(Path('/tmp/tiny.gguf'), model_size='TINY', quan
                                  device=Device.DEFAULT, max_context=4, load_device='CPU')
 assert model.output.weight.uop is model.tok_embeddings.weight.uop
 assert model.freqs_cis.device == Device.DEFAULT
-print('tied weights and CPU staging preserved')
-"""
-    root = pathlib.Path(__file__).parents[2]
-    env = {**os.environ, "DEV":"NULL:AMDASM:gfx803", "NULL_ALLOW_COPYOUT":"1", "FORWARD_ONLY":"1", "DEFAULT_FLOAT":"HALF",
-           "JIT":"0", "DEBUG":"0"}
-    result = subprocess.run([sys.executable, "-c", source], cwd=root, env=env, capture_output=True, text=True, timeout=20)
-    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-    self.assertIn("tied weights and CPU staging preserved", result.stdout)
+""")
 
   def test_tiny_half_gpt2_compile(self):
-    source = """
-from tinygrad import Device, Tensor, Variable, dtypes
-from tinygrad.renderer.isa.gfx803 import AMDASMRenderer
-
-if AMDASMRenderer not in Device['NULL'].renderers: Device['NULL'].renderers.append(AMDASMRenderer)
+    self._compile("""
 from examples.gpt2 import Transformer
 from tinygrad.nn.state import get_state_dict
 
@@ -54,21 +43,10 @@ for pos, token_id in enumerate((1, 2)):
   start_pos = Variable('start_pos', 0 if pos == 0 else 1, 15).bind(pos)
   output = model(token, start_pos, temperature=0.0)
   assert output.shape == (1,) and output.dtype is dtypes.int32
-print('tiny half autoregressive GPT-2 compiled')
-"""
-    root = pathlib.Path(__file__).parents[2]
-    env = {**os.environ, "DEV":"NULL:AMDASM:gfx803", "NULL_ALLOW_COPYOUT":"1", "FORWARD_ONLY":"1", "DEFAULT_FLOAT":"HALF",
-           "HALF":"1", "MAX_CONTEXT":"16", "JIT":"0", "DEBUG":"0"}
-    result = subprocess.run([sys.executable, "-c", source], cwd=root, env=env, capture_output=True, text=True, timeout=20)
-    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-    self.assertIn("tiny half autoregressive GPT-2 compiled", result.stdout)
+""", HALF="1", MAX_CONTEXT="16")
 
   def test_llama3_1b_compile(self):
-    source = """
-from tinygrad import Device, Tensor, Variable, dtypes
-from tinygrad.renderer.isa.gfx803 import AMDASMRenderer
-
-if AMDASMRenderer not in Device['NULL'].renderers: Device['NULL'].renderers.append(AMDASMRenderer)
+    self._compile("""
 from examples.llama3 import MODEL_PARAMS
 from extra.models.llama import Transformer
 from tinygrad.nn.state import get_state_dict
@@ -83,14 +61,6 @@ for pos, token_id in enumerate((128000, 9906)):
   start_pos = Variable('start_pos', 0 if pos == 0 else 1, 7).bind(pos)
   output = model.forward(Tensor([[token_id]], dtype=dtypes.int32), start_pos, 0.0, 0, 0.0, 0.0, 0.0)
   assert output.shape == () and output.dtype is dtypes.int32
-print('Llama 3.2 1B autoregressive graph compiled')
-"""
-    root = pathlib.Path(__file__).parents[2]
-    env = {**os.environ, "DEV":"NULL:AMDASM:gfx803", "NULL_ALLOW_COPYOUT":"1", "FORWARD_ONLY":"1", "DEFAULT_FLOAT":"HALF",
-           "JIT":"0", "DEBUG":"0"}
-    result = subprocess.run([sys.executable, "-c", source], cwd=root, env=env, capture_output=True, text=True, timeout=20)
-    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-    self.assertIn("Llama 3.2 1B autoregressive graph compiled", result.stdout)
-
+""")
 
 if __name__ == "__main__": unittest.main()

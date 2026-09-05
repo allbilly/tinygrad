@@ -1,5 +1,4 @@
-import ctypes
-import unittest
+import ctypes, unittest
 
 from tinygrad.codegen import to_program
 from tinygrad.dtype import dtypes
@@ -12,640 +11,205 @@ from tinygrad.tensor import Tensor
 from tinygrad.uop.ops import Ops, UOp
 from test.amd.helpers import llvm_assemble, llvm_disasm
 
+def _renderer(): return AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
+def _tensor(dtype, *shape): return Tensor.empty(*shape, dtype=dtype, device="NULL").contiguous().realize()
 
-def _reg(dtype, name:str, index:int, size:int=4) -> UOp:
-  return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(Register(name, index, size=size),))
+def _assembled(*lines:str) -> bytes: return b"".join(llvm_assemble(list(lines), "gfx803", "+wavefrontsize64"))
 
+# Golden bytes were checked against LLVM assembly for each case. Operand prefixes preserve mixed dtypes.
+ENCODINGS = [
+  ("V_AND_B32 uint v42 v40 v41", "28535426"),
+  ("V_OR_B32 uint v42 3 v41", "83525428"),
+  ("V_XOR_B32 uint v42 v40 v41", "2853542a"),
+  ("V_MUL_HI_U32 uint v42 v40 v41", "2a0086d228530200"),
+  ("V_BFE_I32 int v45 short:v44 uint:0 uint:16", "2d00c9d12c014102"),
+  ("V_BFE_U32 uint v42 v40 0 8", "2a00c8d128012102"),
+  ("V_LSHRREV_B32 uint v42 8 v41", "88525420"),
+  ("V_ASHRREV_I32 int v43 uint:8 v43", "88565622"),
+  ("V_MAX_I32 int v43 v43 uint:v40", "2b51561a"),
+  ("V_MAX_U32 uint v42 v40 v41", "2853541e"),
+  ("V_MOV_B32 int v36 s2", "0202487e"),
+  ("V_LSHLREV_B32 int v36 2 v0", "82004824"),
+  ("V_ADD_U32 int v36 1 v0", "81004832"),
+  ("V_MUL_LO_U32 int v37 v0 4", "250085d200090100"),
+  ("FLAT_ADDR ulong v[4:5] s[6:7] int:v36", "0602087e07020a7e24090832800a0a38"),
+  ("V_MOV_B32 float v39 2.5", "ff024e7e00002040"),
+  ("V_ADD_F32 float v39 2.5 v37", "ff4a4e0200002040"),
+  ("V_MUL_F32 float v39 v36 v37", "244b4e0a"),
+  ("V_MAX_F32 float v39 0.0 v37", "804a4e16"),
+  ("V_CMPLT bool v38 float:v36 float:v37", "244b827c260000d18002a901"),
+  ("V_CMPNE bool v38 float:v36 float:v37", "244b9a7c260000d18002a901"),
+  ("V_CNDMASK_B32 float v39 bool:v38 v36 v37", "804c9a7d25494e00"),
+  ("V_CMPNE bool v36 float:v36 float:v37", "244b9a7c240000d18002a901"),
+  ("V_MOV_B32 half v42 2.5", "ff02547e00410000"),
+  ("V_MOV_B32 half v42 -2147483648.0", "ff02547e00fc0000"),
+  ("FLAT_LOAD_U16 half v42 ulong:v[4:5]", "000048dc0400002a"),
+  ("FLAT_STORE_B16 void - ulong:v[4:5] half:v42", "000068dc042a0000"),
+  ("DS_LOAD_U16 half v42 uint:v45", "000078d82d00002a"),
+  ("DS_STORE_B16 void - uint:v45 half:v42", "00003ed82d2a0000"),
+  ("V_ADD_F32 half v42 v40 v41", "2853543e"),
+  ("V_MUL_F32 half v42 v40 v41", "28535444"),
+  ("V_MAX_F32 half v42 v40 v41", "2853545a"),
+  ("V_ADD_F32 half v42 2.5 v41", "ff52543e00410000"),
+  ("V_CVT_F32_F16 float v43 half:v40", "2817567e"),
+  ("V_CVT_F16_F32 half v42 float:v43", "2b15547e"),
+  ("V_CVT_I16_F16 short v46 half:v40", "28795c7e"),
+  ("V_CVT_U16_F16 ushort v47 half:v40", "28775e7e"),
+  ("V_CVT_F16_I16 half v42 short:v46", "2e75547e"),
+  ("V_CVT_F16_U16 half v42 ushort:v47", "2f73547e"),
+  ("V_TRUNC half v42 v40", "288d547e"),
+  ("V_TRUNC float v43 v43", "2b39567e"),
+  ("V_CMPLT bool v44 half:v40 half:v41", "2853427c2c0000d18002a901"),
+  ("GATED_FLAT_STORE_B16 void - ulong:v[4:5] half:v42 bool:v44", "80589a7d6a20a0be000068dc042a00002001febe"),
+  ("FLAT_LOAD_U8 bool v44 ulong:v[4:5]", "000040dc0400002c"),
+  ("FLAT_LOAD_U8 uchar v47 ulong:v[4:5]", "000040dc0400002f"),
+  ("FLAT_LOAD_S8 char v48 ulong:v[4:5]", "000044dc04000030"),
+  ("FLAT_LOAD_U16 ushort v50 ulong:v[4:5]", "000048dc04000032"),
+  ("FLAT_LOAD_S16 short v51 ulong:v[4:5]", "00004cdc04000033"),
+  ("GATED_FLAT_LOAD_U16 half v43 ulong:v[4:5] 0.0 bool:v46", "805c9a7d8002567e6a20a0be000048dc0400002b2001febe"),
+  ("FLAT_STORE_B8 void - ulong:v[4:5] bool:v44", "000060dc042c0000"),
+  ("DS_LOAD_U8 bool v44 uint:v45", "000074d82d00002c"),
+  ("DS_LOAD_S8 char v48 uint:v45", "000072d82d000030"),
+  ("DS_LOAD_S16 short v51 uint:v45", "000076d82d000033"),
+  ("DS_STORE_B8 void - uint:v45 bool:v44", "00003cd82d2c0000"),
+  ("FLAT_LOAD_B32 int v40 ulong:v[4:5]", "000050dc04000028"),
+  ("FLAT_STORE_B32 void - ulong:v[4:5] uint:v41", "000070dc04290000"),
+  ("V_CVT_F32_I32 float v42 int:v40", "280b547e"),
+  ("V_CVT_F32_U32 float v42 uint:v41", "290d547e"),
+  ("V_CVT_I32_F32 int v40 float:v42", "2a11507e"),
+  ("V_CVT_U32_F32 uint v41 float:v42", "2a0f527e"),
+  ("V_CVT_F32_F16 float v42 half:v43", "2b17547e"),
+  ("V_CMPLT bool v44 char:v48 char:v49", "3063827d2c0000d18002a901"),
+  ("GATED_FLAT_STORE_B8 void - ulong:v[4:5] bool:v44 bool:v46", "805c9a7d6a20a0be000060dc042c00002001febe"),
+  ("GATED_FLAT_LOAD_U16 half v46 ulong:v[4:5] 0.0 bool:v46", "805c9a7d80025c7e6a20a0be000048dc0400002e2001febe"),
+  ("LDS_ADDR uint v37 int:v36 int:2 lds", "82484a24"),
+  ("DS_LOAD_B32 float v39 uint:v37", "00006cd825000027"),
+  ("DS_STORE_B32 void - uint:v37 float:v38", "00001ad825260000"),
+  ("S_BARRIER void -", "00008abf"),
+  ("V_CMP_GT_U32 void - int:16 int:v36", "9048987d"),
+  ("S_CBRANCH_VCCNZ void -10", "f6ff87bf"),
+  ("GATED_FLAT_STORE_B32 void - ulong:v[4:5] float:v38 bool:v40", "80509a7d6a20a0be000070dc042600002001febe"),
+  ("V_RCP_F32 float v42 v40", "2845547e"),
+  ("V_RCP_IFLAG_F32 float v42 v40", "2847547e"),
+  ("V_SQRT_F32 float v42 v40", "284f547e"),
+  ("V_RSQ_F32 float v42 v40", "2849547e"),
+  ("V_RCP_F32 half v43 v41", "297b567e"),
+  ("V_SQRT_F32 half v43 v41", "297d567e"),
+  ("V_RSQ_F32 half v43 v41", "297f567e"),
+  ("V_EXP2_F32 float v42 v40", "2841547e"),
+  ("V_LOG2_F32 float v42 v40", "2843547e"),
+  ("V_EXP2_F32 half v43 v41", "2983567e"),
+  ("V_LOG2_F32 half v43 v41", "2981567e"),
+  ("V_SIN float v42 v40", "2853547e"),
+  ("V_SIN half v43 v41", "2993567e"),
+  ("SCRATCH_STORE_B64 void - ulong:v[4:5] int:8", "080070e0000409800c0070e000050980"),
+  ("SCRATCH_LOAD_B64 ulong v[4:5] int:8", "080050e0000409800c0050e000050980"),
+  ("SCRATCH_STORE_B32 void - float:v84 int:4", "040070e000540980"),
+  ("SCRATCH_LOAD_B32 float v84 int:4", "040050e000540980"),
+  ("SCRATCH_STORE_B16 void - half:v85 int:2", "020068e000550980"),
+  ("SCRATCH_LOAD_U16 half v85 int:2", "020048e000550980"),
+  ("SCRATCH_STORE_B16 void - short:v86 int:6", "060068e000560980"),
+  ("SCRATCH_LOAD_S16 short v86 int:6", "06004ce000560980"),
+  ("SCRATCH_STORE_B8 void - uchar:v87 int:1", "010060e000570980"),
+  ("SCRATCH_LOAD_U8 uchar v87 int:1", "010040e000570980"),
+  ("SCRATCH_STORE_B8 void - char:v88 int:3", "030060e000580980"),
+  ("SCRATCH_LOAD_S8 char v88 int:3", "030044e000580980"),
+  ("S_LOAD_B64 ulong s[2:3] s[0:1] uint:8", "800006c008000000"),
+  ("FLAT_ADDR ulong v[2:3] s[2:3] uint:4", "0202047e0302067e8404043280060638"),
+  ("FLAT_LOAD_B32 float v32 ulong:v[2:3]", "000050dc02000020"),
+  ("V_ADD_F32 float v34 v32 v33", "20434402"),
+  ("FLAT_STORE_B32 void - ulong:v[2:3] float:v34", "000070dc02220000"),
+  ("S_WAITCNT void -", "00008cbf"),
+  ("S_ENDPGM void -", "000081bf"),
+]
 
-def _assembled(*lines:str) -> bytes:
-  return b"".join(llvm_assemble(list(lines), "gfx803", "+wavefrontsize64"))
-
+def _operand(text, dtype):
+  if ":" in text and not text.startswith(("v[", "s[")):
+    name, text = text.split(":", 1)
+    dtype = getattr(dtypes, name)
+  if text == "lds": return UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.int32, 0), UOp.const(dtypes.int32, 16)), GFX803Ops.LDS_BUFFER)
+  if text.startswith(("v", "s")):
+    index = int(text[2:].split(":")[0]) if "[" in text else int(text[1:])
+    return UOp(Ops.INS, dtype, arg=GFX803Ops.DEFINE, tag=(Register(text, index, size=8 if "[" in text else 4),))
+  return UOp.const(dtype, float(text) if dtypes.is_float(dtype) else int(text))
 
 class TestGFX803Encoder(unittest.TestCase):
-  def test_scalar_memory_add(self):
-    kernarg, ptr = _reg(dtypes.uint64, "s[0:1]", 0, 8), _reg(dtypes.uint64, "s[2:3]", 2, 8)
-    addr = _reg(dtypes.uint64, "v[2:3]", 2, 8)
-    a, b, out = (_reg(dtypes.float32, f"v{i}", i) for i in (32, 33, 34))
-
-    cases = [
-      (UOp(Ops.INS, dtypes.uint64, (kernarg, UOp.const(dtypes.uint32, 8)), GFX803Ops.S_LOAD_B64, ptr.tag),
-       ("s_load_dwordx2 s[2:3], s[0:1], 0x8",)),
-      (UOp(Ops.INS, dtypes.uint64, (ptr, UOp.const(dtypes.uint32, 4)), GFX803Ops.FLAT_ADDR, addr.tag),
-       ("v_mov_b32_e32 v2, s2", "v_mov_b32_e32 v3, s3", "v_add_u32 v2, vcc, 4, v2", "v_addc_u32 v3, vcc, 0, v3, vcc")),
-      (UOp(Ops.INS, dtypes.float32, (addr,), GFX803Ops.FLAT_LOAD_B32, a.tag), ("flat_load_dword v32, v[2:3]",)),
-      (UOp(Ops.INS, dtypes.float32, (a, b), GFX803Ops.V_ADD_F32, out.tag), ("v_add_f32_e32 v34, v32, v33",)),
-      (UOp(Ops.INS, dtypes.void, (addr, out), GFX803Ops.FLAT_STORE_B32), ("flat_store_dword v[2:3], v34",)),
-      (UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_WAITCNT), ("s_waitcnt 0",)),
-      (UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_ENDPGM), ("s_endpgm",)),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
+  def test_encodings(self):
+    for case, expected in ENCODINGS:
+      with self.subTest(case=case):
+        op, dtype, dst, *src = case.split()
+        dtype, op = getattr(dtypes, dtype), GFX803Ops[op]
+        branch = op is GFX803Ops.S_CBRANCH_VCCNZ
+        tag = dst if branch else None if dst == "-" else _operand(dst, dtype).tag
+        inst = _encode(UOp(Ops.INS, dtype, tuple(_operand(s, dtype) for s in src), op, tag), int(dst) if branch else 0)
+        self.assertEqual(inst.to_bytes(), bytes.fromhex(expected))
+        self.assertEqual(inst.to_bytes(), _assembled(*llvm_disasm(inst.to_bytes(), "gfx803", "+wavefrontsize64")))
 
   def test_private_scratch(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    setup = UOp(Ops.INS, dtypes.void, (UOp.const(dtypes.uint32, 144),), GFX803Ops.SCRATCH_SETUP)
-    setup_inst = _encode(setup)
-    setup_lines = (
-      "s_add_u32 s0, s0, s9", "s_addc_u32 s1, s1, 0",
+    renderer = _renderer()
+    setup = _encode(UOp(Ops.INS, dtypes.void, (UOp.const(dtypes.uint32, 144),), GFX803Ops.SCRATCH_SETUP))
+    self.assertEqual(setup.scratch_size, 144)
+    self.assertEqual(setup.to_bytes(), _assembled("s_add_u32 s0, s0, s9", "s_addc_u32 s1, s1, 0",
       "s_mov_b64 s[36:37], s[0:1]", "s_mov_b64 s[38:39], s[2:3]", "s_mov_b64 s[0:1], s[4:5]",
-      "s_mov_b32 s2, s6", "s_mov_b32 s3, s7", "s_mov_b32 s4, s8",
-    )
-    self.assertEqual(setup_inst.scratch_size, 144)
-    self.assertEqual(setup_inst.to_bytes(), _assembled(*setup_lines))
-
-    cases = [
-      (dtypes.uint64, Register("v[4:5]", 4, size=8), 8, "buffer_store_dwordx2 v[4:5]", "buffer_load_dwordx2 v[4:5]"),
-      (dtypes.float32, Register("v84", 84, size=4), 4, "buffer_store_dword v84", "buffer_load_dword v84"),
-      (dtypes.half, Register("v85", 85, size=4), 2, "buffer_store_short v85", "buffer_load_ushort v85"),
-      (dtypes.int16, Register("v86", 86, size=4), 6, "buffer_store_short v86", "buffer_load_sshort v86"),
-      (dtypes.uint8, Register("v87", 87, size=4), 1, "buffer_store_byte v87", "buffer_load_ubyte v87"),
-      (dtypes.int8, Register("v88", 88, size=4), 3, "buffer_store_byte v88", "buffer_load_sbyte v88"),
-    ]
-    for dtype, reg, offset, store_text, load_text in cases:
+      "s_mov_b32 s2, s6", "s_mov_b32 s3, s7", "s_mov_b32 s4, s8"))
+    for dtype in (dtypes.uint64, dtypes.float32, dtypes.half, dtypes.int16, dtypes.uint8, dtypes.int8):
       with self.subTest(dtype=dtype):
-        value = _reg(dtype, reg.name, reg.index, reg.size)
-        disp = UOp.const(dtypes.int32, offset)
-        store, load = renderer.spill(disp, value), renderer.fill(disp, value, reg)
-        suffix = f", off, s[36:39], 0 offset:{offset}"
-        if dtype is dtypes.uint64:
-          self.assertEqual(_encode(store).to_bytes(), _assembled(
-            "buffer_store_dword v4, off, s[36:39], 0 offset:8", "buffer_store_dword v5, off, s[36:39], 0 offset:12"))
-          self.assertEqual(_encode(load).to_bytes(), _assembled(
-            "buffer_load_dword v4, off, s[36:39], 0 offset:8", "buffer_load_dword v5, off, s[36:39], 0 offset:12"))
-        else:
-          self.assertEqual(_encode(store).to_bytes(), _assembled(store_text + suffix))
-          self.assertEqual(_encode(load).to_bytes(), _assembled(load_text + suffix))
-
-  def test_dynamic_indexing(self):
-    s2, v0 = _reg(dtypes.int32, "s2", 2), _reg(dtypes.int32, "v0", 0)
-    idx, tmp = _reg(dtypes.int32, "v36", 36), _reg(dtypes.int32, "v37", 37)
-    ptr, addr = _reg(dtypes.uint64, "s[6:7]", 6, 8), _reg(dtypes.uint64, "v[4:5]", 4, 8)
-    cases = [
-      (UOp(Ops.INS, dtypes.int32, (s2,), GFX803Ops.V_MOV_B32, idx.tag), ("v_mov_b32_e32 v36, s2",)),
-      (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.int32, 2), v0), GFX803Ops.V_LSHLREV_B32, idx.tag),
-       ("v_lshlrev_b32_e32 v36, 2, v0",)),
-      (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.int32, 1), v0), GFX803Ops.V_ADD_U32, idx.tag),
-       ("v_add_u32_e32 v36, vcc, 1, v0",)),
-      (UOp(Ops.INS, dtypes.int32, (v0, UOp.const(dtypes.int32, 4)), GFX803Ops.V_MUL_LO_U32, tmp.tag),
-       ("v_mul_lo_u32 v37, v0, 4",)),
-      (UOp(Ops.INS, dtypes.uint64, (ptr, idx), GFX803Ops.FLAT_ADDR, addr.tag),
-       ("v_mov_b32_e32 v4, s6", "v_mov_b32_e32 v5, s7", "v_add_u32_e32 v4, vcc, v36, v4",
-        "v_addc_u32_e32 v5, vcc, 0, v5, vcc")),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
-
-  def test_float_alu_and_select(self):
-    a, b, cond, out = (_reg(dtype, f"v{i}", i) for dtype, i in
-                       ((dtypes.float32, 36), (dtypes.float32, 37), (dtypes.bool, 38), (dtypes.float32, 39)))
-    cases = [
-      (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 2.5),), GFX803Ops.V_MOV_B32, out.tag),
-       ("v_mov_b32_e32 v39, 2.5",)),
-      (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 2.5), b), GFX803Ops.V_ADD_F32, out.tag),
-       ("v_add_f32_e32 v39, 2.5, v37",)),
-      (UOp(Ops.INS, dtypes.float32, (a, b), GFX803Ops.V_MUL_F32, out.tag), ("v_mul_f32_e32 v39, v36, v37",)),
-      (UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.float32, 0), b), GFX803Ops.V_MAX_F32, out.tag),
-       ("v_max_f32_e32 v39, 0, v37",)),
-      (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPLT, cond.tag),
-       ("v_cmp_lt_f32_e32 vcc, v36, v37", "v_cndmask_b32_e64 v38, 0, 1, vcc")),
-      (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPNE, cond.tag),
-       ("v_cmp_neq_f32_e32 vcc, v36, v37", "v_cndmask_b32_e64 v38, 0, 1, vcc")),
-      (UOp(Ops.INS, dtypes.float32, (cond, a, b), GFX803Ops.V_CNDMASK_B32, out.tag),
-       ("v_cmp_ne_u32_e32 vcc, 0, v38", "v_cndmask_b32_e32 v39, v37, v36, vcc")),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
-
-    # The destination may alias a dying input. The compare must read v36
-    # before materializing its boolean result back into v36.
-    aliased = UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPNE, a.tag)
-    self.assertEqual(_encode(aliased).to_bytes(), _assembled(
-      "v_cmp_neq_f32_e32 vcc, v36, v37", "v_cndmask_b32_e64 v36, 0, 1, vcc"))
-
-  def test_lds_loop_and_gated_store(self):
-    idx, lds_addr = _reg(dtypes.int32, "v36", 36), _reg(dtypes.uint32, "v37", 37)
-    value, loaded, gate = _reg(dtypes.float32, "v38", 38), _reg(dtypes.float32, "v39", 39), _reg(dtypes.bool, "v40", 40)
-    global_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8)
-    lds = UOp(Ops.INS, dtypes.float32, (UOp.const(dtypes.int32, 0), UOp.const(dtypes.int32, 16)), GFX803Ops.LDS_BUFFER, True)
-
-    lds_inst = _encode(lds)
-    self.assertEqual(lds_inst.lds_size, 64)
-    self.assertEqual(lds_inst.to_bytes(), _assembled("s_mov_b32 m0, -1"))
-    cases = [
-      (UOp(Ops.INS, dtypes.uint32, (idx, UOp.const(dtypes.int32, 2), lds), GFX803Ops.LDS_ADDR, lds_addr.tag),
-       ("v_lshlrev_b32_e32 v37, 2, v36",), 0),
-      (UOp(Ops.INS, dtypes.float32, (lds_addr,), GFX803Ops.DS_LOAD_B32, loaded.tag),
-       ("ds_read_b32 v39, v37",), 0),
-      (UOp(Ops.INS, dtypes.void, (lds_addr, value), GFX803Ops.DS_STORE_B32),
-       ("ds_write_b32 v37, v38",), 0),
-      (UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_BARRIER), ("s_barrier",), 0),
-      (UOp(Ops.INS, dtypes.void, (UOp.const(dtypes.int32, 16), idx), GFX803Ops.V_CMP_GT_U32),
-       ("v_cmp_gt_u32_e32 vcc, 16, v36",), 0),
-      (UOp(Ops.INS, dtypes.void, arg=GFX803Ops.S_CBRANCH_VCCNZ, tag=".LOOP"),
-       ("s_cbranch_vccnz -10",), -10),
-      (UOp(Ops.INS, dtypes.void, (global_addr, value, gate), GFX803Ops.GATED_FLAT_STORE_B32),
-       ("v_cmp_ne_u32_e32 vcc, 0, v40", "s_and_saveexec_b64 s[32:33], vcc",
-        "flat_store_dword v[4:5], v38", "s_mov_b64 exec, s[32:33]"), 0),
-    ]
-    for uop, lines, branch_offset in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop, branch_offset).to_bytes(), _assembled(*lines))
-
-  def test_half_memory_alu_and_casts(self):
-    a, b, out = (_reg(dtypes.half, f"v{i}", i) for i in (40, 41, 42))
-    out_float, gate = _reg(dtypes.float32, "v43", 43), _reg(dtypes.bool, "v44", 44)
-    signed_short, unsigned_short = _reg(dtypes.int16, "v46", 46), _reg(dtypes.uint16, "v47", 47)
-    addr, lds_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8), _reg(dtypes.uint32, "v45", 45)
-    cases = [
-      (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, 2.5),), GFX803Ops.V_MOV_B32, out.tag),
-       ("v_mov_b32_e32 v42, 0x4100",)),
-      (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, -2147483648),), GFX803Ops.V_MOV_B32, out.tag),
-       ("v_mov_b32_e32 v42, 0xfc00",)),
-      (UOp(Ops.INS, dtypes.half, (addr,), GFX803Ops.FLAT_LOAD_U16, out.tag),
-       ("flat_load_ushort v42, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.void, (addr, out), GFX803Ops.FLAT_STORE_B16),
-       ("flat_store_short v[4:5], v42",)),
-      (UOp(Ops.INS, dtypes.half, (lds_addr,), GFX803Ops.DS_LOAD_U16, out.tag), ("ds_read_u16 v42, v45",)),
-      (UOp(Ops.INS, dtypes.void, (lds_addr, out), GFX803Ops.DS_STORE_B16), ("ds_write_b16 v45, v42",)),
-      (UOp(Ops.INS, dtypes.half, (a, b), GFX803Ops.V_ADD_F32, out.tag), ("v_add_f16_e32 v42, v40, v41",)),
-      (UOp(Ops.INS, dtypes.half, (a, b), GFX803Ops.V_MUL_F32, out.tag), ("v_mul_f16_e32 v42, v40, v41",)),
-      (UOp(Ops.INS, dtypes.half, (a, b), GFX803Ops.V_MAX_F32, out.tag), ("v_max_f16_e32 v42, v40, v41",)),
-      (UOp(Ops.INS, dtypes.half, (UOp.const(dtypes.half, 2.5), b), GFX803Ops.V_ADD_F32, out.tag),
-       ("v_add_f16_e32 v42, 2.5, v41",)),
-      (UOp(Ops.INS, dtypes.float32, (a,), GFX803Ops.V_CVT_F32_F16, out_float.tag), ("v_cvt_f32_f16_e32 v43, v40",)),
-      (UOp(Ops.INS, dtypes.half, (out_float,), GFX803Ops.V_CVT_F16_F32, out.tag), ("v_cvt_f16_f32_e32 v42, v43",)),
-      (UOp(Ops.INS, dtypes.int16, (a,), GFX803Ops.V_CVT_I16_F16, signed_short.tag), ("v_cvt_i16_f16_e32 v46, v40",)),
-      (UOp(Ops.INS, dtypes.uint16, (a,), GFX803Ops.V_CVT_U16_F16, unsigned_short.tag), ("v_cvt_u16_f16_e32 v47, v40",)),
-      (UOp(Ops.INS, dtypes.half, (signed_short,), GFX803Ops.V_CVT_F16_I16, out.tag), ("v_cvt_f16_i16_e32 v42, v46",)),
-      (UOp(Ops.INS, dtypes.half, (unsigned_short,), GFX803Ops.V_CVT_F16_U16, out.tag), ("v_cvt_f16_u16_e32 v42, v47",)),
-      (UOp(Ops.INS, dtypes.half, (a,), GFX803Ops.V_TRUNC, out.tag), ("v_trunc_f16_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.float32, (out_float,), GFX803Ops.V_TRUNC, out_float.tag), ("v_trunc_f32_e32 v43, v43",)),
-      (UOp(Ops.INS, dtypes.bool, (a, b), GFX803Ops.V_CMPLT, gate.tag),
-       ("v_cmp_lt_f16_e32 vcc, v40, v41", "v_cndmask_b32_e64 v44, 0, 1, vcc")),
-      (UOp(Ops.INS, dtypes.void, (addr, out, gate), GFX803Ops.GATED_FLAT_STORE_B16),
-       ("v_cmp_ne_u32_e32 vcc, 0, v44", "s_and_saveexec_b64 s[32:33], vcc",
-        "flat_store_short v[4:5], v42", "s_mov_b64 exec, s[32:33]")),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
-
-  def test_integer_bool_memory_and_casts(self):
-    i32, u32 = _reg(dtypes.int32, "v40", 40), _reg(dtypes.uint32, "v41", 41)
-    f32, half = _reg(dtypes.float32, "v42", 42), _reg(dtypes.half, "v43", 43)
-    boolean, gate = _reg(dtypes.bool, "v44", 44), _reg(dtypes.bool, "v46", 46)
-    u8, i8, i8_b = _reg(dtypes.uint8, "v47", 47), _reg(dtypes.int8, "v48", 48), _reg(dtypes.int8, "v49", 49)
-    u16, i16 = _reg(dtypes.uint16, "v50", 50), _reg(dtypes.int16, "v51", 51)
-    addr, lds_addr = _reg(dtypes.uint64, "v[4:5]", 4, 8), _reg(dtypes.uint32, "v45", 45)
-    cases = [
-      (UOp(Ops.INS, dtypes.bool, (addr,), GFX803Ops.FLAT_LOAD_U8, boolean.tag), ("flat_load_ubyte v44, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.uint8, (addr,), GFX803Ops.FLAT_LOAD_U8, u8.tag), ("flat_load_ubyte v47, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.int8, (addr,), GFX803Ops.FLAT_LOAD_S8, i8.tag), ("flat_load_sbyte v48, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.uint16, (addr,), GFX803Ops.FLAT_LOAD_U16, u16.tag), ("flat_load_ushort v50, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.int16, (addr,), GFX803Ops.FLAT_LOAD_S16, i16.tag), ("flat_load_sshort v51, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.half, (addr, UOp.const(dtypes.half, 0), gate), GFX803Ops.GATED_FLAT_LOAD_U16, half.tag),
-       ("v_cmp_ne_u32_e32 vcc, 0, v46", "v_mov_b32_e32 v43, 0", "s_and_saveexec_b64 s[32:33], vcc",
-        "flat_load_ushort v43, v[4:5]", "s_mov_b64 exec, s[32:33]")),
-      (UOp(Ops.INS, dtypes.void, (addr, boolean), GFX803Ops.FLAT_STORE_B8), ("flat_store_byte v[4:5], v44",)),
-      (UOp(Ops.INS, dtypes.bool, (lds_addr,), GFX803Ops.DS_LOAD_U8, boolean.tag), ("ds_read_u8 v44, v45",)),
-      (UOp(Ops.INS, dtypes.int8, (lds_addr,), GFX803Ops.DS_LOAD_S8, i8.tag), ("ds_read_i8 v48, v45",)),
-      (UOp(Ops.INS, dtypes.int16, (lds_addr,), GFX803Ops.DS_LOAD_S16, i16.tag), ("ds_read_i16 v51, v45",)),
-      (UOp(Ops.INS, dtypes.void, (lds_addr, boolean), GFX803Ops.DS_STORE_B8), ("ds_write_b8 v45, v44",)),
-      (UOp(Ops.INS, dtypes.int32, (addr,), GFX803Ops.FLAT_LOAD_B32, i32.tag), ("flat_load_dword v40, v[4:5]",)),
-      (UOp(Ops.INS, dtypes.void, (addr, u32), GFX803Ops.FLAT_STORE_B32), ("flat_store_dword v[4:5], v41",)),
-      (UOp(Ops.INS, dtypes.float32, (i32,), GFX803Ops.V_CVT_F32_I32, f32.tag), ("v_cvt_f32_i32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.float32, (u32,), GFX803Ops.V_CVT_F32_U32, f32.tag), ("v_cvt_f32_u32_e32 v42, v41",)),
-      (UOp(Ops.INS, dtypes.int32, (f32,), GFX803Ops.V_CVT_I32_F32, i32.tag), ("v_cvt_i32_f32_e32 v40, v42",)),
-      (UOp(Ops.INS, dtypes.uint32, (f32,), GFX803Ops.V_CVT_U32_F32, u32.tag), ("v_cvt_u32_f32_e32 v41, v42",)),
-      (UOp(Ops.INS, dtypes.float32, (half,), GFX803Ops.V_CVT_F32_F16, f32.tag), ("v_cvt_f32_f16_e32 v42, v43",)),
-      (UOp(Ops.INS, dtypes.bool, (i8, i8_b), GFX803Ops.V_CMPLT, boolean.tag),
-       ("v_cmp_lt_i32_e32 vcc, v48, v49", "v_cndmask_b32_e64 v44, 0, 1, vcc")),
-      (UOp(Ops.INS, dtypes.void, (addr, boolean, gate), GFX803Ops.GATED_FLAT_STORE_B8),
-       ("v_cmp_ne_u32_e32 vcc, 0, v46", "s_and_saveexec_b64 s[32:33], vcc",
-        "flat_store_byte v[4:5], v44", "s_mov_b64 exec, s[32:33]")),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
-
-    # The destination may alias a dying gate. Preserve its predicate in VCC before writing the fallback value.
-    aliased_gate = UOp(Ops.INS, dtypes.half, (addr, UOp.const(dtypes.half, 0), gate), GFX803Ops.GATED_FLAT_LOAD_U16, gate.tag)
-    self.assertEqual(_encode(aliased_gate).to_bytes(), _assembled(
-      "v_cmp_ne_u32_e32 vcc, 0, v46", "v_mov_b32_e32 v46, 0", "s_and_saveexec_b64 s[32:33], vcc",
-      "flat_load_ushort v46, v[4:5]", "s_mov_b64 exec, s[32:33]"))
-
-  def test_bitwise_and_shifts(self):
-    a, b, out = (_reg(dtypes.uint32, f"v{i}", i) for i in (40, 41, 42))
-    signed = _reg(dtypes.int32, "v43", 43)
-    signed_short, extended = _reg(dtypes.int16, "v44", 44), _reg(dtypes.int32, "v45", 45)
-    cases = [
-      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_AND_B32, out.tag), ("v_and_b32_e32 v42, v40, v41",)),
-      (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 3), b), GFX803Ops.V_OR_B32, out.tag),
-       ("v_or_b32_e32 v42, 3, v41",)),
-      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_XOR_B32, out.tag), ("v_xor_b32_e32 v42, v40, v41",)),
-      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_MUL_HI_U32, out.tag), ("v_mul_hi_u32 v42, v40, v41",)),
-      (UOp(Ops.INS, dtypes.int32, (signed_short, UOp.const(dtypes.uint32, 0), UOp.const(dtypes.uint32, 16)),
-           GFX803Ops.V_BFE_I32, extended.tag), ("v_bfe_i32 v45, v44, 0, 16",)),
-      (UOp(Ops.INS, dtypes.uint32, (a, UOp.const(dtypes.uint32, 0), UOp.const(dtypes.uint32, 8)),
-           GFX803Ops.V_BFE_U32, out.tag), ("v_bfe_u32 v42, v40, 0, 8",)),
-      (UOp(Ops.INS, dtypes.uint32, (UOp.const(dtypes.uint32, 8), b), GFX803Ops.V_LSHRREV_B32, out.tag),
-       ("v_lshrrev_b32_e32 v42, 8, v41",)),
-      (UOp(Ops.INS, dtypes.int32, (UOp.const(dtypes.uint32, 8), signed), GFX803Ops.V_ASHRREV_I32, signed.tag),
-       ("v_ashrrev_i32_e32 v43, 8, v43",)),
-      (UOp(Ops.INS, dtypes.int32, (signed, a), GFX803Ops.V_MAX_I32, signed.tag), ("v_max_i32_e32 v43, v43, v40",)),
-      (UOp(Ops.INS, dtypes.uint32, (a, b), GFX803Ops.V_MAX_U32, out.tag), ("v_max_u32_e32 v42, v40, v41",)),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
-
-  def test_native_reciprocal_sqrt(self):
-    f32, out_f32 = _reg(dtypes.float32, "v40", 40), _reg(dtypes.float32, "v42", 42)
-    half, out_half = _reg(dtypes.half, "v41", 41), _reg(dtypes.half, "v43", 43)
-    cases = [
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RCP_F32, out_f32.tag), ("v_rcp_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RCP_IFLAG_F32, out_f32.tag), ("v_rcp_iflag_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_SQRT_F32, out_f32.tag), ("v_sqrt_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_RSQ_F32, out_f32.tag), ("v_rsq_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RCP_F32, out_half.tag), ("v_rcp_f16_e32 v43, v41",)),
-      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_SQRT_F32, out_half.tag), ("v_sqrt_f16_e32 v43, v41",)),
-      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_RSQ_F32, out_half.tag), ("v_rsq_f16_e32 v43, v41",)),
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_EXP2_F32, out_f32.tag), ("v_exp_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_LOG2_F32, out_f32.tag), ("v_log_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_EXP2_F32, out_half.tag), ("v_exp_f16_e32 v43, v41",)),
-      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_LOG2_F32, out_half.tag), ("v_log_f16_e32 v43, v41",)),
-      (UOp(Ops.INS, dtypes.float32, (f32,), GFX803Ops.V_SIN, out_f32.tag), ("v_sin_f32_e32 v42, v40",)),
-      (UOp(Ops.INS, dtypes.half, (half,), GFX803Ops.V_SIN, out_half.tag), ("v_sin_f16_e32 v43, v41",)),
-    ]
-    for uop, lines in cases:
-      with self.subTest(op=uop.arg, dtype=uop.dtype): self.assertEqual(_encode(uop).to_bytes(), _assembled(*lines))
-
+        value, offset = _operand("v[4:5]" if dtype is dtypes.uint64 else "v84", dtype), UOp.const(dtypes.int32, 8)
+        for inst in (renderer.spill(offset, value), renderer.fill(offset, value, value.tag[0])):
+          binary = _encode(inst).to_bytes()
+          self.assertEqual(binary, _assembled(*llvm_disasm(binary, "gfx803", "+wavefrontsize64")))
+    lds = _encode(_operand("lds", dtypes.float32))
+    self.assertEqual(lds.lds_size, 64)
+    self.assertEqual(lds.to_bytes(), _assembled("s_mov_b32 m0, -1"))
 
 class TestGFX803Program(unittest.TestCase):
-  @staticmethod
-  def _add_program(n:int):
-    a = Tensor.empty(n, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    b = Tensor.empty(n, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    return to_program((a+b).schedule_linear().src[-1].src[0], AMDASMRenderer(Target("AMD", "ASM", "gfx803")))
-
-  @staticmethod
-  def _elf(program):
-    image, sections, relocs = elf_loader(program.src[-1].arg)
-    text = next(section for section in sections if section.name == ".text")
-    rodata = next(section for section in sections if section.name == ".rodata")
-    desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(
-      bytes(image[rodata.header.sh_addr:rodata.header.sh_addr+ctypes.sizeof(amdgpu_kd.llvm_amdhsa_kernel_descriptor_t)]))
-    return text, rodata, desc, relocs
-
-  def test_tinygrad_float4_add_elf(self):
-    program = self._add_program(4)
-    self.assertEqual([u.op for u in program.src], [Ops.SINK, Ops.LINEAR, Ops.SOURCE, Ops.BINARY])
-
-    text, rodata, desc, relocs = self._elf(program)
-
-    self.assertEqual(relocs, [])
-    self.assertEqual(desc.kernarg_size, 24)
-    self.assertEqual(desc.kernel_code_properties, 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT)
-    self.assertEqual(rodata.header.sh_addr + desc.kernel_code_entry_byte_offset, text.header.sh_addr)
-    self.assertEqual(len(text.content) % 256, 0)
-
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-    code_lines = lines[:lines.index("s_endpgm")+1]
-    self.assertEqual(_assembled(*lines), text.content)
-    self.assertEqual(sum(line.startswith("v_add_f32") for line in code_lines), 4)
-    self.assertEqual(sum(line.startswith("flat_load_dword") for line in code_lines), 8)
-    self.assertEqual(sum(line.startswith("flat_store_dword") for line in code_lines), 4)
-
-  def test_five_buffer_sgpr_reservation(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    inputs = [Tensor.empty(64, dtype=dtypes.float32, device="NULL").contiguous().realize() for _ in range(4)]
-    program = to_program(sum(inputs[1:], start=inputs[0]).schedule_linear().src[-1].src[0], renderer)
-    text, _, desc, relocs = self._elf(program)
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-
-    self.assertEqual(relocs, [])
-    self.assertEqual(desc.kernarg_size, 40)
-    self.assertTrue(any(line.startswith("s_load_dwordx2 s[14:15]") for line in lines))
-    self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 2)  # 16 explicit + 4 implicit SGPRs round up to 24.
-    self.assertEqual(_assembled(*lines), text.content)
-
-  def test_address_register_pressure(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    logits = Tensor.empty(12, 10, dtype=dtypes.half, device="NULL").contiguous().realize()
-    classes = Tensor.empty(12, dtype=dtypes.int32, device="NULL").contiguous().realize()
-    linear = logits.sparse_categorical_crossentropy(classes).schedule_linear()
-    programs = [to_program(call.src[0], renderer) for call in linear.src if call.src[0].op is Ops.SINK]
-    self.assertEqual(len(programs), 3)
-    for program in programs:
-      text, _, _, relocs = self._elf(program)
-      self.assertEqual(relocs, [])
-      self.assertEqual(_assembled(*llvm_disasm(text.content, "gfx803", "+wavefrontsize64")), text.content)
-
-  def test_private_scratch_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    source = Tensor.empty(1, 1, 5, 5, 5, dtype=dtypes.half, device="NULL").contiguous().realize()
-    sink = source.pad((1, 2, 3, 4, 1, 2), mode="replicate").contiguous().schedule_linear().src[-1].src[0]
-    program = to_program(sink, renderer)
-    text, _, desc, relocs = self._elf(program)
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-
-    scratch = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT_SHIFT
-    all_wgids = sum(1 << shift for shift in (amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT,
-                                             amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Y_SHIFT,
-                                             amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT))
-    private_rsrc = 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER_SHIFT
-    kernarg = 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT
-    self.assertEqual(relocs, [])
-    self.assertGreater(desc.private_segment_fixed_size, 0)
-    self.assertEqual(desc.compute_pgm_rsrc2 & scratch, scratch)
-    self.assertEqual((desc.compute_pgm_rsrc2 >> amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT) & 0x1f, 6)
-    self.assertEqual(desc.compute_pgm_rsrc2 & all_wgids, all_wgids)
-    self.assertEqual(desc.kernel_code_properties, private_rsrc | kernarg)
-    self.assertEqual(lines[:8], [
-      "s_add_u32 s0, s0, s9", "s_addc_u32 s1, s1, 0",
-      "s_mov_b64 s[36:37], s[0:1]", "s_mov_b64 s[38:39], s[2:3]", "s_mov_b64 s[0:1], s[4:5]",
-      "s_mov_b32 s2, s6", "s_mov_b32 s3, s7", "s_mov_b32 s4, s8",
-    ])
-    self.assertTrue(any(line.startswith("buffer_store_dword") for line in lines))
-    self.assertTrue(any(line.startswith("buffer_load_dword") for line in lines))
-    self.assertFalse(any(line.startswith(("buffer_store_dwordx2", "buffer_load_dwordx2")) for line in lines))
-    self.assertEqual(_assembled(*lines), text.content)
-
-  def test_private_register_buffer_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    source = Tensor.empty(1, 1, 5, 5, dtype=dtypes.half, device="NULL").contiguous().realize()
-    sink = source.max_pool2d(kernel_size=(3, 3), padding=1, return_indices=True)[1].schedule_linear().src[-1].src[0]
-    program = to_program(sink, renderer)
-    text, _, desc, relocs = self._elf(program)
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-
-    self.assertEqual(relocs, [])
-    self.assertTrue(any(u.arg is GFX803Ops.SCRATCH_BUFFER_META for u in program.src[1].src))
-    self.assertEqual(desc.private_segment_fixed_size, 36 * dtypes.int32.itemsize)
-    self.assertTrue(any(line.startswith("buffer_store_dword") for line in lines))
-    self.assertTrue(any(line.startswith("buffer_load_dword") for line in lines))
-    self.assertIn("buffer_store_dword v84, off, s[36:39], 0 offset:140", lines)
-    self.assertEqual(_assembled(*lines), text.content)
-
-  def test_half_select_constants_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    source = Tensor.empty(3, dtype=dtypes.half, device="NULL").contiguous().realize()
-    program = to_program(source.sign().schedule_linear().src[-1].src[0], renderer)
-    text, _, _, relocs = self._elf(program)
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-
-    self.assertEqual(relocs, [])
-    self.assertTrue(any(line.startswith("v_mov_b32_e32") and "0x3c00" in line for line in lines))
-    self.assertTrue(any(line.startswith("v_cndmask_b32_e32") for line in lines))
-    self.assertFalse(any(line.startswith("v_cndmask_b32_e32") and "0x" in line for line in lines))
-    self.assertEqual(_assembled(*lines), text.content)
-
-  def test_dynamic_add_elf(self):
-    wgid_x = 1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT
-    for n, grid, local, uses_wgid, uses_lidx in [(5, (5, 1, 1), (1, 1, 1), True, False),
-                                                  (16, (1, 1, 1), (4, 1, 1), False, True),
-                                                  (1024, (8, 1, 1), (32, 1, 1), True, True)]:
-      with self.subTest(n=n):
-        program = self._add_program(n)
-        text, rodata, desc, relocs = self._elf(program)
+  def test_elf_contracts(self):
+    # Numerical/operator coverage lives in test/backend/test_ops.py. Check the ISA-specific ABI here.
+    inputs = [_tensor(dtypes.float32, 64) for _ in range(4)]
+    cases = [("five_buffers", sum(inputs[1:], start=inputs[0]), None, None)]
+    cases += [(f"add_{n}", _tensor(dtypes.float32, n) + _tensor(dtypes.float32, n), grid, local)
+              for n, grid, local in ((4, (1,1,1), (1,1,1)), (5, (5,1,1), (1,1,1)), (16, (1,1,1), (4,1,1)), (1024, (8,1,1), (32,1,1)))]
+    cases += [(f"matmul_{n}", _tensor(dtypes.float32, n, n) @ _tensor(dtypes.float32, n, n), (1,1,1), (n,n,1)) for n in (2,4,8)]
+    cases += [("sum", _tensor(dtypes.float32, 2, 16).sum(axis=1), (2,1,1), (16,1,1)),
+              ("matmul", _tensor(dtypes.float32, 16, 16) @ _tensor(dtypes.float32, 16, 16), (16,16,1), (16,1,1)),
+              ("spill", _tensor(dtypes.half, 1,1,5,5,5).pad((1,2,3,4,1,2), mode="replicate").contiguous(), None, None),
+              ("private", _tensor(dtypes.half, 1,1,5,5).max_pool2d(kernel_size=(3,3), padding=1, return_indices=True)[1], None, None)]
+    for name, result, grid, local in cases:
+      with self.subTest(name=name):
+        program = to_program(result.schedule_linear().src[-1].src[0], _renderer())
+        self.assertEqual([u.op for u in program.src], [Ops.SINK, Ops.LINEAR, Ops.SOURCE, Ops.BINARY])
+        image, sections, relocs = elf_loader(program.src[-1].arg)
+        text, rodata = (next(s for s in sections if s.name == name) for name in (".text", ".rodata"))
+        desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(
+          bytes(image[rodata.header.sh_addr:rodata.header.sh_addr+ctypes.sizeof(amdgpu_kd.llvm_amdhsa_kernel_descriptor_t)]))
         lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
         self.assertEqual(relocs, [])
-        self.assertEqual((program.arg.global_size, program.arg.local_size), (grid, local))
-        self.assertEqual(bool(desc.compute_pgm_rsrc2 & wgid_x), uses_wgid)
+        self.assertEqual(_assembled(*lines), text.content)
         self.assertEqual(rodata.header.sh_addr + desc.kernel_code_entry_byte_offset, text.header.sh_addr)
-        self.assertEqual(_assembled(*lines), text.content)
-        self.assertEqual(any("s2" in line for line in lines), uses_wgid)
-        self.assertEqual(any(line.startswith(("v_add_u32", "v_lshlrev")) and "v0" in line for line in lines), uses_lidx)
-
-  def test_elementwise_alu_elf(self):
-    a = Tensor.empty(16, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    b = Tensor.empty(16, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    cases = {
-      "add_const": (a+2.5, ("v_add_f32",)), "sub": (a-b, ("v_mul_f32", "v_add_f32")),
-      "mul": (a*b, ("v_mul_f32",)), "max": (a.maximum(b), ("v_max_f32",)),
-      "relu": (a.relu(), ("v_cmp_lt_f32", "v_cndmask_b32")), "where": ((a<b).where(a, b), ("v_cmp_lt_f32", "v_cndmask_b32")),
-      "full": (Tensor.full((16,), 2.5, dtype=dtypes.float32, device="NULL").contiguous(), ("v_mov_b32",)),
-    }
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    for name, (result, expected) in cases.items():
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, _, _ = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        self.assertEqual(_assembled(*lines), text.content)
-        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in lines), mnemonic)
-
-  def test_small_matmul_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    for n in (2, 4, 8):
-      with self.subTest(n=n):
-        a = Tensor.empty(n, n, dtype=dtypes.float32, device="NULL").contiguous().realize()
-        b = Tensor.empty(n, n, dtype=dtypes.float32, device="NULL").contiguous().realize()
-        program = to_program((a@b).schedule_linear().src[-1].src[0], renderer)
-        text, _, _, _ = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        self.assertEqual((program.arg.global_size, program.arg.local_size), ((1, 1, 1), (n, n, 1)))
-        self.assertEqual(_assembled(*lines), text.content)
-        self.assertEqual(sum(line.startswith("v_mul_f32") for line in lines), n)
-        self.assertEqual(sum(line.startswith("v_add_f32") for line in lines), n-1)
-
-  def test_grouped_reduction_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    x = Tensor.empty(2, 16, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    a = Tensor.empty(16, 16, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    b = Tensor.empty(16, 16, dtype=dtypes.float32, device="NULL").contiguous().realize()
-    for name, result, grid in (("sum", x.sum(axis=1), (2, 1, 1)), ("matmul", a@b, (16, 16, 1))):
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, desc, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        branch = next(line for line in code_lines if line.startswith("s_cbranch_vccnz"))
-        branch_offset = int(branch.rsplit(" ", 1)[1])
-        branch_offset -= 0x10000 if branch_offset & 0x8000 else 0
-
-        self.assertEqual(relocs, [])
-        self.assertEqual((program.arg.global_size, program.arg.local_size), (grid, (16, 1, 1)))
-        self.assertEqual(desc.group_segment_fixed_size, 64)
-        self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 4)  # s[32:33] makes 40 allocated SGPRs.
-        self.assertEqual(_assembled(*lines), text.content)
-        self.assertEqual(branch_offset, -10)
-        self.assertEqual(sum(line == "s_mov_b32 m0, -1" for line in code_lines), 1)
-        self.assertEqual(sum(line.startswith("ds_write_b32") for line in code_lines), 1)
-        self.assertEqual(sum(line.startswith("ds_read_b32") for line in code_lines), 1)
-        self.assertEqual(sum(line == "s_barrier" for line in code_lines), 1)
-        self.assertEqual(sum(line.startswith("s_and_saveexec_b64") for line in code_lines), 1)
-        self.assertEqual(sum(line.startswith("flat_store_dword") for line in code_lines), 1)
-
-  def test_half_programs_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    a = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    b = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    ma = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    mb = Tensor.empty(16, 16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    cx = Tensor.empty(1, 2, 3, 3, dtype=dtypes.half, device="NULL").contiguous().realize()
-    cw = Tensor.empty(2, 2, 1, 1, dtype=dtypes.half, device="NULL").contiguous().realize()
-    cb = Tensor.empty(2, dtype=dtypes.half, device="NULL").contiguous().realize()
-    cases = {
-      "add": (a+b, ("flat_load_ushort", "v_add_f16", "flat_store_short")),
-      "int16_roundtrip": (a.cast(dtypes.int16).cast(dtypes.half), ("v_cvt_i16_f16", "v_cvt_f16_i16")),
-      "int16_negative": (a.cast(dtypes.int16)<0, ("v_cvt_i16_f16", "v_bfe_i32", "v_cmp_lt_i32")),
-      "sum": (a.sum(), ("flat_load_ushort", "v_cvt_f32_f16", "ds_write_b32", "v_add_f32", "v_cvt_f16_f32", "flat_store_short")),
-      "matmul": (ma@mb, ("flat_load_ushort", "v_cvt_f32_f16", "v_mul_f32", "ds_write_b32", "v_add_f32", "flat_store_short")),
-      "biased_conv": (cx.conv2d(cw, cb), ("v_cvt_f32_f16", "v_mul_f32", "v_add_f32", "v_cvt_f16_f32")),
-    }
-    for name, (result, expected) in cases.items():
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, _, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        self.assertEqual(relocs, [])
-        self.assertEqual(_assembled(*lines), text.content)
-        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
-        if name in {"matmul", "biased_conv"}: self.assertFalse(any(line.startswith("v_mul_f16") for line in code_lines))
-        if name == "biased_conv": self.assertFalse(any(line.startswith("v_add_f16") for line in code_lines))
-
-  def test_integer_bool_programs_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    i32 = Tensor.empty(16, dtype=dtypes.int32, device="NULL").contiguous().realize()
-    i32_divisor = Tensor.empty(16, dtype=dtypes.int32, device="NULL").contiguous().realize()
-    u32 = Tensor.empty(16, dtype=dtypes.uint32, device="NULL").contiguous().realize()
-    u32_divisor = Tensor.empty(16, dtype=dtypes.uint32, device="NULL").contiguous().realize()
-    half = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    boolean = Tensor.empty(16, dtype=dtypes.bool, device="NULL").contiguous().realize()
-    i8 = Tensor.empty(16, dtype=dtypes.int8, device="NULL").contiguous().realize()
-    u8 = Tensor.empty(16, dtype=dtypes.uint8, device="NULL").contiguous().realize()
-    u16 = Tensor.empty(16, dtype=dtypes.uint16, device="NULL").contiguous().realize()
-    cases = {
-      "int_add": (i32+2, ("flat_load_dword", "v_add_u32", "flat_store_dword")),
-      "uint_div": (u32.div(u32_divisor, rounding_mode="trunc"), ("v_cvt_f32_u32", "v_rcp_iflag_f32", "v_mul_hi_u32")),
-      "int_mod": (i32.fmod(i32_divisor), ("v_cmp_lt_i32", "v_mul_hi_u32")),
-      "half_compare": (half<0, ("flat_load_ushort", "v_cmp_lt_f16", "flat_store_byte")),
-      "bool_to_uint": (boolean.cast(dtypes.uint32), ("flat_load_ubyte", "v_mov_b32", "flat_store_dword")),
-      "int_to_float": (i32.float(), ("flat_load_dword", "v_cvt_f32_i32", "flat_store_dword")),
-      "float_to_uint8": (half.float().cast(dtypes.uint8), ("v_cvt_u16_f16", "v_bfe_u32", "flat_store_byte")),
-      "uint8_add": (u8+u8, ("flat_load_ubyte", "v_add_u32", "v_bfe_u32", "flat_store_byte")),
-      "int8_to_int": (i8.cast(dtypes.int32), ("flat_load_sbyte", "v_bfe_i32", "flat_store_dword")),
-      "int8_to_uint16_eq": (i8.cast(dtypes.uint16)==u16, ("v_bfe_i32", "v_bfe_u32", "v_cmp_ne_u32")),
-      "uint16_to_float": (u16.float(), ("flat_load_ushort", "v_bfe_u32", "v_cvt_f32_u32", "flat_store_dword")),
-    }
-    for name, (result, expected) in cases.items():
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, _, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        self.assertEqual(relocs, [])
-        self.assertEqual(_assembled(*lines), text.content)
-        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
-        if name == "int8_to_int":
-          for idx, line in enumerate(code_lines):
-            if line.startswith("flat_load_sbyte"): self.assertTrue(code_lines[idx+1].startswith("s_waitcnt"))
-
-  def test_bitwise_programs_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    i32 = Tensor.empty(16, dtype=dtypes.int32, device="NULL").contiguous().realize()
-    u32 = Tensor.empty(16, dtype=dtypes.uint32, device="NULL").contiguous().realize()
-    boolean = Tensor.empty(16, dtype=dtypes.bool, device="NULL").contiguous().realize()
-    cases = {
-      "int_and": (i32 & 255, ("v_and_b32",)),
-      "uint_or_xor": ((u32 | 3) ^ 1, ("v_or_b32", "v_xor_b32")),
-      "logical_shift": (u32 >> 3, ("v_lshrrev_b32",)),
-      "arithmetic_shift": (i32 >> 3, ("v_ashrrev_i32",)),
-      "bool_and": (boolean & (boolean != True), ("v_cmp_ne_u32", "v_and_b32")),  # noqa: E712
-      "gated_load": (i32.pad((1, 1)).contiguous(), ("s_and_saveexec_b64", "flat_load_dword")),
-    }
-    for name, (result, expected) in cases.items():
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, _, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        self.assertEqual(relocs, [])
-        self.assertEqual(_assembled(*lines), text.content)
-        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
-
-  def test_native_reciprocal_sqrt_programs_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    cases = {
-      "rcp_f32": (dtypes.float32, "reciprocal", ("v_rcp_f32",)), "sqrt_f32": (dtypes.float32, "sqrt", ("v_sqrt_f32",)),
-      "rsqrt_f32": (dtypes.float32, "rsqrt", ("v_rsq_f32",)), "rcp_f16": (dtypes.half, "reciprocal", ("v_rcp_f16",)),
-      "sqrt_f16": (dtypes.half, "sqrt", ("v_sqrt_f16",)), "rsqrt_f16": (dtypes.half, "rsqrt", ("v_rsq_f16",)),
-      "exp2_f32": (dtypes.float32, "exp2", ("v_exp_f32",)), "log2_f32": (dtypes.float32, "log2", ("v_log_f32",)),
-      "exp2_f16": (dtypes.half, "exp2", ("v_exp_f16",)), "log2_f16": (dtypes.half, "log2", ("v_log_f16",)),
-      "sin_f32": (dtypes.float32, "sin", ("v_mul_f32", "v_trunc_f32", "v_sin_f32")),
-      "sin_f16": (dtypes.half, "sin", ("v_cvt_f32_f16", "v_trunc_f32", "v_sin_f32", "v_cvt_f16_f32")),
-      "trunc_f32": (dtypes.float32, "trunc", ("v_trunc_f32",)), "trunc_f16": (dtypes.half, "trunc", ("v_trunc_f16",)),
-    }
-    for name, (dtype, op, expected) in cases.items():
-      with self.subTest(name=name):
-        source = Tensor.empty(16, dtype=dtype, device="NULL").contiguous().realize()
-        result = getattr(source, op)()
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, _, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        self.assertEqual(relocs, [])
-        self.assertEqual(_assembled(*lines), text.content)
-        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
-
-  def test_half_division_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    numerator = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    denominator = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    program = to_program((numerator/denominator).schedule_linear().src[-1].src[0], renderer)
-    text, _, _, relocs = self._elf(program)
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-    code_lines = lines[:lines.index("s_endpgm")+1]
-    self.assertEqual(relocs, [])
-    self.assertEqual(_assembled(*lines), text.content)
-    for mnemonic in ("v_cvt_f32_f16", "v_rcp_f32", "v_mul_f32", "v_cvt_f16_f32"):
-      self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
-    self.assertFalse(any(line.startswith(("v_rcp_f16", "v_mul_f16")) for line in code_lines))
-
-  def test_half_composite_transcendentals_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    source = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    for name, result, expected in (
-      ("atan", source.atan(), ("v_rsq_f32",)),
-      ("asinh", source.asinh(), ("v_sqrt_f32", "v_log_f32")),
-      ("acosh", source.acosh(), ("v_sqrt_f32", "v_log_f32")),
-    ):
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, _, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        self.assertEqual(relocs, [])
-        self.assertEqual(_assembled(*lines), text.content)
-        for mnemonic in expected: self.assertTrue(any(line.startswith(mnemonic) for line in code_lines), mnemonic)
-
-  def test_half_hardsigmoid_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    source = Tensor.empty(16, dtype=dtypes.half, device="NULL").contiguous().realize()
-    program = to_program(source.hardsigmoid().schedule_linear().src[-1].src[0], renderer)
-    text, _, _, relocs = self._elf(program)
-    lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-    code_lines = lines[:lines.index("s_endpgm")+1]
-    self.assertEqual(relocs, [])
-    self.assertEqual(_assembled(*lines), text.content)
-    self.assertTrue(any(line.startswith("v_cndmask_b32") for line in code_lines))
-    self.assertFalse(any(line.startswith("v_mul_f16") and "-1" in line for line in code_lines))
-
-  def test_integer_max_reductions_elf(self):
-    renderer = AMDASMRenderer(Target("AMD", "ASM", "gfx803"))
-    cases = {
-      "signed": (Tensor.empty(2, 16, dtype=dtypes.int32, device="NULL").contiguous().realize().max(axis=1), "v_max_i32"),
-      "unsigned": (Tensor.empty(2, 16, dtype=dtypes.uint32, device="NULL").contiguous().realize().max(axis=1), "v_max_u32"),
-      "argmax": (Tensor.empty(32, dtype=dtypes.half, device="NULL").contiguous().realize().argmax(), "v_max_i32"),
-    }
-    for name, (result, mnemonic) in cases.items():
-      with self.subTest(name=name):
-        program = to_program(result.schedule_linear().src[-1].src[0], renderer)
-        text, _, desc, relocs = self._elf(program)
-        lines = llvm_disasm(text.content, "gfx803", "+wavefrontsize64")
-        code_lines = lines[:lines.index("s_endpgm")+1]
-        self.assertEqual(relocs, [])
-        self.assertGreater(desc.group_segment_fixed_size, 0)
-        self.assertEqual(_assembled(*lines), text.content)
-        self.assertTrue(any(line.startswith(mnemonic) for line in code_lines))
-
+        self.assertEqual(len(text.content) % 256, 0)
+        if grid is not None: self.assertEqual((program.arg.global_size, program.arg.local_size), (grid, local))
+        if name.startswith("add_") or name == "five_buffers":
+          self.assertEqual(desc.kernarg_size, 40 if name == "five_buffers" else 24)
+          self.assertEqual(desc.kernel_code_properties, 1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT)
+        if name == "five_buffers":
+          self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 2)
+          self.assertTrue(any(line.startswith("s_load_dwordx2 s[14:15]") for line in lines))
+        if name in ("sum", "matmul"):
+          self.assertEqual(desc.group_segment_fixed_size, 64)
+          self.assertEqual((desc.compute_pgm_rsrc1 >> 6) & 0xf, 4)
+          branch = next(line for line in lines if line.startswith("s_cbranch_vccnz"))
+          self.assertEqual(int(branch.rsplit(" ", 1)[1]) & 0xffff, 0xfff6)
+          for op in ("s_mov_b32 m0, -1", "ds_write_b32", "ds_read_b32", "s_barrier", "s_and_saveexec_b64", "flat_store_dword"):
+            self.assertEqual(sum(line.startswith(op) for line in lines), 1)
+        if name in ("spill", "private"):
+          self.assertGreater(desc.private_segment_fixed_size, 0)
+          self.assertEqual((desc.compute_pgm_rsrc2 >> amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT) & 0x1f, 6)
+          self.assertTrue(desc.compute_pgm_rsrc2 & (1 << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT_SHIFT))
+          for op in ("buffer_store_dword", "buffer_load_dword"): self.assertTrue(any(line.startswith(op) for line in lines))
+          self.assertFalse(any(line.startswith(("buffer_store_dwordx2", "buffer_load_dwordx2")) for line in lines))
+        if name == "private":
+          self.assertTrue(any(u.arg is GFX803Ops.SCRATCH_BUFFER_META for u in program.src[1].src))
+          self.assertEqual(desc.private_segment_fixed_size, 144)
+          self.assertIn("buffer_store_dword v84, off, s[36:39], 0 offset:140", lines)
 
 if __name__ == "__main__": unittest.main()
