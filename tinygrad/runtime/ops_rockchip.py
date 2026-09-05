@@ -1,5 +1,5 @@
 from __future__ import annotations
-import array, ctypes, itertools, mmap, operator, os, threading, time, typing
+import array, ctypes, functools, itertools, mmap, operator, os, threading, time, typing
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, round_up, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
@@ -24,91 +24,66 @@ def _rk_buffer_view(raw:HCQBuffer, arg:RKArg, fmt:str, itemsize:int) -> MMIOInte
   start=max(0,count+start) if start<0 else min(start,count)
   return raw.cpu_view().view(offset=start*itemsize,size=(count-start)*itemsize,fmt=fmt)
 
-def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|None:
-  """Snapshot common broadcast/tiled affine gathers into one compact typed payload."""
+def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|memoryview|None:
+  """Copy regular affine blocks, retaining a vectorized view for a single contiguous or strided leaf."""
   axes,code=tuple(sorted(gather.axes)),_RAW_FORMATS[gather.itemsize]
   if not axes or gather.base<0 or any(divisor<=0 or limit<=0 or stride<=0 for divisor,limit,stride in axes): return None
   periods=tuple(divisor*limit for divisor,limit,_ in axes)
   if gather.count%periods[-1] or any(divisor%period for period,(divisor,_,_) in zip(periods,axes[1:])) or \
      gather.base+sum((limit-1)*stride for _,limit,stride in axes)>=len(src): return None
+  if len(axes)==1 and axes[0][:2]==(1,gather.count): return src.mv[gather.base:gather.base+gather.count*axes[0][2]:axes[0][2]]
   def block(index:int, base:int) -> array.array:
     divisor,limit,stride=axes[index]
-    if index==0:
-      samples=array.array(code,src.mv[base:base+limit*stride:stride])
-      if divisor==1: return samples
-      result=array.array(code)
-      for value in samples: result.extend(array.array(code,[value])*divisor)
-      return result
-    result=array.array(code)
-    for value in range(limit): result.extend(block(index-1,base+value*stride)*(divisor//periods[index-1]))
-    return result
+    if index==0 and divisor==1: return array.array(code,src.mv[base:base+limit*stride:stride])
+    chunks=(array.array(code,[value]) for value in src.mv[base:base+limit*stride:stride]) if index==0 else (block(index-1,base+i*stride) for i in range(limit))  # noqa: E501
+    return functools.reduce(operator.iadd,(chunk*(divisor//(periods[index-1] if index else 1)) for chunk in chunks),array.array(code))
   return block(len(axes)-1,gather.base)*(gather.count//periods[-1])
 
 def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBufferKind,int],HCQBuffer]) -> None:
   """Apply host-addressed raw-lane movement; all numeric tensor operations remain on the NPU."""
   for gather in gathers:
-    raw_dst=buffer(gather.dst.kind,gather.dst.index)
-    dst=_rk_buffer_view(raw_dst,gather.dst,_RAW_FORMATS[gather.itemsize],gather.itemsize)
+    raw_dst,code=buffer(gather.dst.kind,gather.dst.index),_RAW_FORMATS[gather.itemsize]
+    dst=_rk_buffer_view(raw_dst,gather.dst,code,gather.itemsize)
+    dst_limit=len(dst)
+    begin,step=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
+    span,bounded=slice(begin,begin+gather.count*step,step),begin>=0 and begin+max(0,gather.count-1)*step<dst_limit
     if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend:
       ctypes.memset(int(raw_dst.va_addr),0,raw_dst.size)
     if gather.values:
-      stop=gather.dst_addend+(gather.count-1)*gather.dst_stride if gather.count else gather.dst_addend; values=array.array(_RAW_FORMATS[gather.itemsize],gather.values)  # noqa: E702,E501
-      if gather.dst_addend<0 or stop>=len(dst): raise IndexError("RKGather destination exceeds buffer")
-      if len(values)==1: values*=gather.count
-      dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=values; continue  # noqa: E702
+      if not bounded: raise IndexError("RKGather destination exceeds buffer")
+      values=array.array(code,gather.values)
+      dst.mv[span]=values*gather.count if len(values)==1 else values
+      continue
     assert gather.src is not None
-    raw_src=buffer(gather.src.kind,gather.src.index)
-    src=_rk_buffer_view(raw_src,gather.src,_RAW_FORMATS[gather.itemsize],gather.itemsize); src_limit,dst_limit,overlap=len(src),len(dst),src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes  # noqa: E702,E501
+    src=_rk_buffer_view(buffer(gather.src.kind,gather.src.index),gather.src,code,gather.itemsize)
+    src_limit,offsets,overlap=len(src),gather.offsets,src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes
     if gather.index is not None:
-      indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,
-                              _INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
+      indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,_INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
       if len(indices)<gather.count or dst_limit<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
-      source_indices=tuple(int(indices[lane]) for lane in range(gather.count))
-    else: source_indices=gather.offsets
-    fill=not gather.partial and (bool(gather.offsets) or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
-    if fill:
-      start,stride=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
-      if start<0 or gather.count and start+(gather.count-1)*stride>=dst_limit: raise IndexError("RKGather destination exceeds buffer")
-      dst.mv[start:start+gather.count*stride:stride]=array.array(_RAW_FORMATS[gather.itemsize],[gather.fill_bits])*gather.count
-    if gather.index is None and gather.offsets and gather.partial and not overlap and gather.dst_stride==1 and gather.dst_addend>=0 and gather.dst_addend+gather.count<=dst_limit:  # noqa: E501
-      runs:list[tuple[int,int,int]]=[]; begin=first=-1  # noqa: E702
-      for lane,source in enumerate(gather.offsets):
-        if 0<=source<src_limit and (begin<0 or source==gather.offsets[lane-1]+1):
-          if begin<0: begin,first=lane,source
-        else:
-          runs.extend(((begin,first,lane-begin),) if begin>=0 else ()); begin,first=(lane,source) if 0<=source<src_limit else (-1,-1)  # noqa: E702,E501
+      offsets=tuple(indices.mv[:gather.count])
+    if not gather.partial and (gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH):
+      if not bounded and gather.count: raise IndexError("RKGather destination exceeds buffer")
+      dst.mv[span]=array.array(code,[gather.fill_bits])*gather.count
+    if gather.index is None and not offsets and bounded:
+      if (payload:=_regular_gather_payload(gather,src)) is not None:
+        dst.mv[span]=payload
+        continue
+    if gather.index is None and offsets and gather.partial and not overlap and step==1 and bounded:
+      runs:list[tuple[int,int,int]]=[]
+      for delta,items in itertools.groupby(enumerate(offsets),lambda item:item[1]-item[0] if 0<=item[1]<src_limit else None):
+        lane,count=next(items)[0],1+sum(1 for _ in items)
+        if delta is not None: runs.append((lane,lane+delta,count))
         if len(runs)>2048: break
       else:
-        if begin>=0: runs.append((begin,first,gather.count-begin))
-        for lane,source,count in runs: ctypes.memmove(dst.addr+(gather.dst_addend+lane)*gather.itemsize,src.addr+source*gather.itemsize,count*gather.itemsize)  # noqa: E501
+        for lane,source,count in runs: ctypes.memmove(dst.addr+(begin+lane)*gather.itemsize,src.addr+source*gather.itemsize,count*gather.itemsize)
         continue
-    if gather.index is None and gather.offsets and not overlap and gather.dst_addend>=0 and gather.dst_addend+(gather.count-1)*gather.dst_stride<dst_limit:  # noqa: E501
-      if (valid:=min(gather.offsets)>=0 and max(gather.offsets)<src_limit) and gather.count>1 or not gather.partial:
-        packed=array.array(_RAW_FORMATS[gather.itemsize],operator.itemgetter(*gather.offsets)(src.mv) if valid and gather.count>1 else (src.mv[index] if 0<=index<src_limit else gather.fill_bits for index in gather.offsets)); dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=packed; continue  # noqa: E702,E501
-    if gather.index is None and not gather.offsets and gather.count and len(gather.axes)==1 and gather.axes[0][:2]==(1,gather.count):
-      di,si,source_stride=gather.dst_addend,gather.base,gather.axes[0][2]
-      if di>=0 and si>=0 and source_stride>0 and di+(gather.count-1)*gather.dst_stride<dst_limit and \
-         si+(gather.count-1)*source_stride<src_limit:
-        if gather.dst_stride==source_stride==1:
-          ctypes.memmove(dst.addr+di*gather.itemsize,src.addr+si*gather.itemsize,gather.count*gather.itemsize)
-        else: dst.mv[di:di+gather.count*gather.dst_stride:gather.dst_stride]=src.mv[si:si+gather.count*source_stride:source_stride]
-        continue
-    if gather.index is None and not gather.offsets and gather.dst_addend>=0 and (not gather.count or \
-       gather.dst_addend+(gather.count-1)*gather.dst_stride<dst_limit) and (payload:=_regular_gather_payload(gather,src)) is not None:
-      dst.mv[gather.dst_addend:gather.dst_addend+gather.count*gather.dst_stride:gather.dst_stride]=payload
+    if gather.index is None and offsets and bounded and not overlap and ((valid:=min(offsets)>=0 and max(offsets)<src_limit) and gather.count>1 or not gather.partial):  # noqa: E501
+      dst.mv[span]=array.array(code,operator.itemgetter(*offsets)(src.mv) if valid and gather.count>1 else
+        (src.mv[index] if 0<=index<src_limit else gather.fill_bits for index in offsets))
       continue
-    pending:list[tuple[int,int]]=[]
-    for lane in range(gather.count):
-      di=lane if gather.index is not None else gather.dst_addend+lane*gather.dst_stride
-      if gather.index is not None: si=source_indices[lane]
-      elif gather.offsets: si=gather.offsets[lane]
-      else:
-        si=gather.base
-        for divisor,limit,stride in gather.axes: si+=(lane//divisor%limit)*stride
-      if 0<=di<dst_limit and 0<=si<src_limit:
-        if overlap: pending.append((di,src.mv[si]))
-        else: dst.mv[di]=src.mv[si]
-    for di,value in pending: dst.mv[di]=value
+    source_indices=offsets or (gather.base+sum((lane//divisor%limit)*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
+    writes=((begin+lane*step,src.mv[index]) for lane,index in enumerate(source_indices) if 0<=begin+lane*step<dst_limit and 0<=index<src_limit)
+    for lane,value in tuple(writes) if overlap else writes: dst.mv[lane]=value
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
@@ -170,41 +145,33 @@ class RockchipProgram(Program['RockchipDevice']):
       if standalone and not self.dev._poisoned: self.dev.reset_npu()
 
   def _run_ew_ops(self, address, ops:tuple[RKEWOp, ...], rearm:bool=False) -> None:
+    """Partition barriers into precision runs, retaining each exact submission and reset boundary."""
     if not ops: return
     M=RKEWMode; program_modes=getattr(self,"_ew_modes",None) or {op.mode for op in ops}  # noqa: E702
-    def run_group(group:tuple[RKEWOp, ...], pc_limit:int) -> None:
-      chain:list[tuple[int, ...]]=[]; precision=0  # noqa: E702
-      def flush_chain(reset:bool=False) -> None:
-        if not chain: return
-        for chunk in itertools.batched(chain,pc_limit): self._submit_bodies(chunk)
-        if reset or precision>=64 and not rearm: self.dev.reset_npu()
-        chain.clear()
-      for op in group:
-        mode=op.mode
-        if mode==M.COMPARE:
-          flush_chain(bool(precision))
-          for body in self._tile(op,_MAX_EW_ELEMS_FP16,address): self._submit_bodies((body,),True)
-          continue
-        next_precision,limit,itemsize,dst_step,src_step=_EW_MODE_INFO[mode]
-        if chain and next_precision!=precision and not (mode==M.INT16_TO_INT32 and precision in (0,16)):
-          flush_chain(not next_precision and mode!=M.INT16_TO_INT32 and bool(precision) and precision!=16)
-        chain.extend((emit_ew_stage(op,address),) if not limit else self._tile(op,limit,address,itemsize,dst_step,src_step,mode=M.BOUNDED if not chain and mode in (M.HALF,M.BOUNDED) else M.HALF if mode==M.BOUNDED else mode))  # noqa: E501
-        precision=next_precision
-        if precision==128 and len(chain)>=16: flush_chain()
-      flush_chain()
     cuts=tuple(sorted({0,len(ops),*(j for i,o in enumerate(ops) if o.submit_barrier for j in ((i,) if o.mode!=M.BOUNDED else (i,i+1)) if j)}))
     for begin,end in zip(cuts,cuts[1:]):
       section=ops[begin:end]; limit=_MAX_EW_GROUP_OPS if M.HALF in program_modes and M.INT16 in program_modes or section[0].mode in (M.BOUNDED,M.HALF_TO_INT16,M.FLOAT_TO_HALF) and len(section)>_MAX_EW_GROUP_OPS and max(op.count for op in section)<=_MAX_EW_ELEMS_FP16 and not any(op.mode in (M.INT32,M.INT16_TO_INT32,M.HALF_TO_INT32,M.INT32_TO_HALF,M.HALF_TO_FLOAT) for op in section) else _MAX_PC_TASKS  # noqa: E501,E702
       for group in map(tuple,itertools.batched(section,limit)):
         tiled=len(group)>1 and group[0].mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) and group[0].count>_MAX_EW_ELEMS_FP16 and all(op.count==group[0].count and op.mode in (M.HALF,M.BOUNDED,M.FLOAT_TO_HALF) for op in group)  # noqa: E501
-        if tiled:
-          tiles=(self._tile(op,_MAX_EW_ELEMS_FP16,address,mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(group))  # noqa: E501
-          for bodies in itertools.batched(itertools.chain.from_iterable(zip(*tiles)),_MAX_PC_TASKS): self._submit_bodies(bodies)
-        else: run_group(tuple(op._replace(submit_barrier=False) for op in group),limit)
+        # COMPARE is always standalone. INT16_TO_INT32 may finish an INT16 run without a reset.
+        precisions=tuple(_EW_MODE_INFO[op.mode][0] if op.mode!=M.COMPARE else -1 for op in group)
+        splits=(0,*(i for i,(left,right) in enumerate(zip(precisions,precisions[1:]),1) if left<0 or right<0 or left!=right and not (group[i].mode==M.INT16_TO_INT32 and left in (0,16))),len(group))  # noqa: E501
+        for first,last in zip(splits,splits[1:]):
+          run=group[first:last]; precision=precisions[last-1]  # noqa: E702
+          if run[0].mode==M.COMPARE:
+            for body in self._tile(run[0],_MAX_EW_ELEMS_FP16,address): self._submit_bodies((body,),True)
+            continue
+          tiles=((emit_ew_stage(op,address),) if not info[1] else self._tile(op,info[1],address,*info[2:],mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(run) for info in (_EW_MODE_INFO[op.mode],))  # noqa: E501
+          bodies=tuple(itertools.chain.from_iterable(zip(*tiles) if tiled else tiles)); capacity=16 if precision==128 else len(bodies)  # noqa: E702
+          reset=last<len(group) and ((following:=group[last].mode)==M.COMPARE and bool(precision) or following!=M.COMPARE and not _EW_MODE_INFO[following][0] and following!=M.INT16_TO_INT32 and precision not in (0,16))  # noqa: E501
+          for start in range(0,len(bodies),capacity):
+            for chunk in itertools.batched(bodies[start:start+capacity],_MAX_PC_TASKS if tiled else limit): self._submit_bodies(chunk)
+            # A full 16-body FLOAT flush has already emptied the chain; rearm suppresses its normal reset.
+            # Only a remaining partial FLOAT chain can require the following mode's transition reset.
+            if precision>=64 and not rearm or reset and start+capacity>=len(bodies) and (precision!=128 or len(bodies)%16): self.dev.reset_npu()
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
-    if op.count<=limit: yield emit_ew_stage(op._replace(**flags),address); return  # noqa: E702
-    for start in range(0, op.count, limit):
+    for start in range(0, max(1,op.count), limit):
       args=tuple(arg._replace(addend=arg.addend+start*itemsize*(dst_step if i==0 else src_step)) for i,arg in enumerate((op.dst,op.lhs,op.rhs)))  # noqa: E501
       yield emit_ew_stage(op._replace(dst=args[0],lhs=args[1],rhs=args[2],count=min(limit,op.count-start),**flags),address)
 
