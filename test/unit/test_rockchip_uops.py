@@ -3675,6 +3675,59 @@ def test_production_ordered_comparison_covers_every_byte_pair(byte:int,order:int
   assert actual==expected.tobytes()
 
 
+@pytest.mark.parametrize('dtype,count',((dtypes.int16,1),(dtypes.int16,257),(dtypes.int16,65536),(dtypes.int,1),(dtypes.int,257)))
+@pytest.mark.parametrize('kind',('sign','bytes','striped','overlap','nested'))
+def test_production_fused_bitwise_masks_preserve_all_bits(dtype,count:int,kind:str):
+  # The long INT16 case visits every raw HALF word, including all NaN payloads and signed zero.
+  fmt=f'<u{dtype.itemsize}'
+  words=np.arange(count,dtype=np.uint64)
+  if dtype is dtypes.int: words=words*0x10203041+0x80000001
+  raw=[np.roll(words,shift).astype(fmt) for shift in (0,7,19)]
+  maximum=(1<<(8*dtype.itemsize))-1
+  mask=dtype.max if kind=='sign' else 0xff if kind=='bytes' else maximum//3
+  def expression(a,b,c):
+    merged=(a&mask)|(b&~mask)
+    return (a&mask)|(b&mask) if kind=='overlap' else (merged^c)&((a|c)^b) if kind=='nested' else merged
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    buffers=[UOp.new_buffer('ROCKCHIP',count,dtype,num=43000+i) for i in range(3)]
+    calls=expression(*(Tensor(buffer) for buffer in buffers)).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP'))).src
+                            if node.op is Ops.BINARY))
+  unsigned_mask=np.asarray(mask,dtype=fmt)
+  a,b,c=raw
+  merged=(a&unsigned_mask)|(b&(unsigned_mask^maximum))
+  expected=(a&unsigned_mask)|(b&unsigned_mask) if kind=='overlap' else (merged^c)&((a|c)^b) if kind=='nested' else merged
+  bindings={buffer:value.tobytes() for buffer,value in zip(buffers,raw)}
+  assert _assert_decoded_image_bounds(image)==image
+  assert all(op.mode in (RKEWMode.INT16,RKEWMode.INT32) for op in _ew_ops(image))
+  assert _execute_raw_dynamic_image(image,count*dtype.itemsize,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  if kind=='sign': assert len(_ew_ops(image))==10  # Only the high byte needs arithmetic, at either width.
+  assert rockchip_renderer._linear_index.cache_info().currsize==0
+
+
+@pytest.mark.parametrize('depth',(3,129))
+def test_production_nested_bitwise_reconstruction_stays_in_int16_range(depth:int):
+  left=np.asarray((0x8001,0x7fff,0x5555,0x1234),dtype='<u2')
+  middle,right=np.roll(left,1).copy(),np.roll(left,2).copy()
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    buffers=[UOp.new_buffer('ROCKCHIP',4,dtypes.int16,num=44000+i) for i in range(3)]
+    a,b,c=(Tensor(buffer) for buffer in buffers)
+    output=a
+    for _ in range(depth): output=(output^b)|c
+    calls=output.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP'))).src
+                            if node.op is Ops.BINARY))
+  expected=left.copy()
+  for _ in range(depth): expected=(expected^middle)|right
+  bindings={buffer:value.tobytes() for buffer,value in zip(buffers,(left,middle,right))}
+  assert _assert_decoded_image_bounds(image)==image
+  assert _execute_raw_dynamic_image(image,8,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+
+
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   rng = np.random.default_rng(0x2608)
   samples = [rng.integers(-(1<<31), 1<<31, 64, dtype=np.int64).astype(np.int32) for _ in range(3)]

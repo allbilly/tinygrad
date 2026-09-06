@@ -362,15 +362,16 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
   if any(value is missing for value in result): raise _RKGenericReject("static_index")
   return typing_cast(tuple[int,...],tuple(result))
 
-def _linear_index(u:UOp, divided:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int], int]]|None:
-  """Represent static address arithmetic as a sum of scaled RANGE or RANGE//constant terms."""
+@functools.lru_cache(maxsize=8192)
+def _linear_index(u:UOp, divided:bool=False, *, opaque:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int], int]]|None:
+  """Collect scaled address terms, or exact byte-reconstruction terms with nonlinear/native nodes opaque."""
   if divided and u.op is Ops.CAST and len(u.src) == 1 and u.dtype.scalar() in (dtypes.int,dtypes.uint): u=u.src[0]
   if u.op is Ops.CONST: return int(u.arg), {}
   if u.op in (Ops.RANGE, Ops.SPECIAL): return 0, {((u, 1) if divided else u):1}
   if divided and u.op is Ops.CDIV and len(u.src)==2 and u.src[0].op in (Ops.RANGE,Ops.SPECIAL) and u.src[1].op is Ops.CONST and int(u.src[1].arg)>0: return 0,{(u.src[0],int(u.src[1].arg)):1}  # noqa: E501
-  if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
-  if (lhs:=_linear_index(u.src[0],divided)) is None or (rhs:=_linear_index(u.src[1],divided)) is None or u.op is Ops.MUL and lhs[1] and rhs[1]: return None  # noqa: E501
-  if u.op is Ops.MUL: scale,affine=(lhs[0],rhs) if not lhs[1] else (rhs[0],lhs); return affine[0]*scale,{key:coefficient*scale for key,coefficient in affine[1].items()}  # noqa: E701,E702,E501
+  if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL) or opaque and u.arg is not None: return (0,{u:1}) if opaque else None
+  if (lhs:=_linear_index(u.src[0],divided,opaque=opaque)) is None or (rhs:=_linear_index(u.src[1],divided,opaque=opaque)) is None or u.op is Ops.MUL and lhs[1] and rhs[1]: return (0,{u:1}) if opaque else None  # noqa: E501
+  if u.op is Ops.MUL: scale,affine=(lhs[0],rhs) if not lhs[1] else (rhs[0],lhs); return affine[0]*scale,{key:coefficient*scale for key,coefficient in affine[1].items() if not opaque or coefficient*scale}  # noqa: E701,E702,E501
   sign=-1 if u.op is Ops.SUB else 1; return lhs[0]+sign*rhs[0],{key:value for key in lhs[1].keys()|rhs[1].keys() if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}  # noqa: E702,E501
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
@@ -947,10 +948,17 @@ class RKContext:
   def _pack_bits(self, bits:Iterable[UOp], layout:DType, u:UOp) -> UOp:
     planes=tuple(bits)
     if len(planes)!=layout.itemsize*8: raise _RKGenericReject
-    raw=tuple(functools.reduce(lambda x,y:x.alu(Ops.ADD,y),
-      (planes[byte*8+bit].alu(Ops.MUL,planes[byte*8+bit].const_like(1<<bit)) for bit in range(1,8)),planes[byte*8])
+    raw=tuple(sum((planes[byte*8+bit].alu(Ops.MUL,planes[byte*8+bit].const_like(1<<bit)) for bit in range(1,8)),planes[byte*8])
       for byte in range(layout.itemsize))
-    return self._pack_bytes(tuple(self.lower(part) for part in raw),layout,u=u)
+    # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
+    # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
+    # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
+    affines=(typing_cast(tuple[int,dict[UOp,int]],_linear_index(part,opaque=True)) for part in raw)
+    return self._pack_bytes(tuple(self.lower(part if
+      abs(offset)+sum(abs(scale)*(255 if term.op is Ops.NOOP else 1) for term,scale in factors.items())>32767 else _fold_static_terms(Ops.ADD,dtypes.int16,  # noqa: E501
+      [term if scale==1 else term.alu(Ops.MUL,term.const_like(scale)) for term,scale in factors.items()] +
+      ([UOp.const(offset,dtypes.int16)] if offset or not factors else []),False))
+      for part,(offset,factors) in zip(raw,affines)),layout,u=u)
 
   def _alu(self, u:UOp) -> UOp:
     if u.op in (Ops.RECIPROCAL, Ops.NEG):
@@ -1009,27 +1017,22 @@ class RKContext:
 
   def _integer_bitwise(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
-    dtype,layout=u.dtype.scalar(),self._layout(u.dtype.scalar())
-    if dtype not in (dtypes.int16,dtypes.int) or u.op not in (Ops.AND,Ops.OR,Ops.XOR): raise _RKGenericReject
+    layout=self._layout(u.dtype.scalar())
     if (pair:=_const_operand(u,Ops.XOR,-1)) is not None:
       value=self.lower(pair[0])
       if value.dtype is dtypes.int16: return self._lower_recipe(u,UOp.const(-1,dtypes.int16).alu(Ops.SUB,value))
       inverted=tuple(self.lower(component.const_like(255).alu(Ops.SUB,component)) for component in self._unpack_bytes(value))
       return self._pack_bytes(inverted,dtypes.int,u=u)
-    masked=tuple(_const_operand(term,Ops.AND) for term in u.src) if dtype is dtypes.int16 and u.op is Ops.OR else ()
-    if len(masked)==2 and all(pair is not None for pair in masked) and {int(typing_cast(tuple[UOp,UOp],pair)[1].arg)&0xffff for pair in masked}=={0x7fff,0x8000}:  # noqa: E501
-      sources={int(typing_cast(tuple[UOp,UOp],pair)[1].arg)&0xffff:typing_cast(tuple[UOp,UOp],pair)[0] for pair in masked}
-      (low,hi),(_,shi)=(self._unpack_bytes(self.lower(sources[mask])) for mask in (0x7fff,0x8000))
-      magnitude_sign=_i16_bit(hi.alu(Ops.SUB,hi.const_like(127))).alu(Ops.MUL,hi.const_like(128))
-      sign=_i16_bit(shi.alu(Ops.SUB,shi.const_like(127))).alu(Ops.MUL,shi.const_like(128))
-      return self._pack_bytes(tuple(self.lower(part) for part in (low,hi.alu(Ops.SUB,magnitude_sign).alu(Ops.ADD,sign))),layout,u=u)
-    values = tuple(self.lower(source) for source in u.src)
-    if not 1 <= self.count*layout.itemsize <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    lhs_bits,rhs_bits=(self._bitplanes(value) for value in values)
-    combined=tuple(left.alu(Ops.MUL,right) if u.op is Ops.AND else left.alu(Ops.MAX,right) if u.op is Ops.OR else
-                   _native_same(left.alu(Ops.SUB,right),_NATIVE_ABS)
-                   for left,right in zip(lhs_bits,rhs_bits))
-    return self._pack_bits(combined,layout,u)
+    if self.count<1 or layout is dtypes.int and self.count*4>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
+    # Fuse the semantic bitwise subgraph before allocating carriers: AND=ab, OR=a+b-ab, XOR=a+b-2ab.
+    @functools.cache
+    def bits(node:UOp) -> tuple[UOp,...]:
+      if node.op is Ops.CONST: return tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8))
+      if node.op not in (Ops.AND,Ops.OR,Ops.XOR) or node.dtype is not u.dtype: return self._bitplanes(self.lower(node))
+      lhs,rhs=(bits(source) for source in node.src)
+      return tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
+        for left,right in zip(lhs,rhs))
+    return self._pack_bits(bits(u),layout,u)
 
   def _int32_shift(self, u:UOp) -> UOp:
     if len(u.src) != 2 or u.dtype.scalar() not in (dtypes.int, dtypes.uint) or u.src[1].dtype.scalar() not in (dtypes.int, dtypes.uint) or self.int_layout is not dtypes.int:  # noqa: E501
@@ -1500,7 +1503,7 @@ class RockchipRenderer(Renderer):
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
-    for cache in (_semantic_loads,_static_ranges,_eval_static_block,_static_lanes,_small_gather_offsets,_int_info): cache.cache_clear()
+    for cache in (_semantic_loads,_static_ranges,_eval_static_block,_static_lanes,_small_gather_offsets,_int_info,_linear_index): cache.cache_clear()
     return base64.b64encode(encode_image(image,validate=False)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
