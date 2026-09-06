@@ -3,7 +3,7 @@ import array, ctypes, functools, itertools, mmap, operator, os, threading, time,
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, round_up, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
-  emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16)
+  emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16, _cmd as _pc)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
 
@@ -20,8 +20,7 @@ def _rk_buffer_view(raw:HCQBuffer, arg:RKArg, fmt:str, itemsize:int) -> MMIOInte
   """Return the same typed suffix that NumPy frombuffer(...)[addend//itemsize:] exposed."""
   if arg.addend%itemsize: raise RuntimeError("unaligned RKGather")
   if raw.size%itemsize: raise RuntimeError("mis-sized RKGather view")
-  count,start=raw.size//itemsize,arg.addend//itemsize
-  start=max(0,count+start) if start<0 else min(start,count)
+  start,count,_=slice(arg.addend//itemsize,None).indices(raw.size//itemsize)
   return raw.cpu_view().view(offset=start*itemsize,size=(count-start)*itemsize,fmt=fmt)
 
 def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|memoryview|None:
@@ -47,6 +46,14 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
     dst_limit=len(dst)
     begin,step=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
     span,bounded=slice(begin,begin+gather.count*step,step),begin>=0 and begin+max(0,gather.count-1)*step<dst_limit
+    src=_rk_buffer_view(buffer(gather.src.kind,gather.src.index),gather.src,code,gather.itemsize) if gather.src is not None else dst
+    src_limit,offsets,overlap=len(src),gather.offsets,src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes
+    # Preserve every input before writes, including whole-scratch padding and index-buffer aliases.
+    if gather.src is not None and overlap: src.mv=memoryview(bytes(src.mv)).cast(src.fmt)
+    if gather.index is not None:
+      indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,_INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
+      if len(indices)<gather.count or dst_limit<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
+      offsets=tuple(indices.mv[:gather.count])
     if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend:
       ctypes.memset(int(raw_dst.va_addr),0,raw_dst.size)
     if gather.values:
@@ -55,37 +62,22 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
       dst.mv[span]=values*gather.count if len(values)==1 else values
       continue
     assert gather.src is not None
-    src=_rk_buffer_view(buffer(gather.src.kind,gather.src.index),gather.src,code,gather.itemsize)
-    src_limit,offsets,overlap=len(src),gather.offsets,src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes
-    if gather.index is not None:
-      indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,_INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
-      if len(indices)<gather.count or dst_limit<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
-      offsets=tuple(indices.mv[:gather.count])
-    if not gather.partial and (gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH):
-      if not bounded and gather.count: raise IndexError("RKGather destination exceeds buffer")
-      dst.mv[span]=array.array(code,[gather.fill_bits])*gather.count
+    fill=not gather.partial and bool(gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
+    if fill and not bounded and gather.count: raise IndexError("RKGather destination exceeds buffer")
     if gather.index is None and not offsets and bounded:
       if (payload:=_regular_gather_payload(gather,src)) is not None:
         dst.mv[span]=payload
         continue
-    if gather.index is None and offsets and gather.partial and not overlap and step==1 and bounded:
-      runs:list[tuple[int,int,int]]=[]
-      for delta,items in itertools.groupby(enumerate(offsets),lambda item:item[1]-item[0] if 0<=item[1]<src_limit else None):
-        lane,count=next(items)[0],1+sum(1 for _ in items)
-        if delta is not None: runs.append((lane,lane+delta,count))
-        if len(runs)>2048: break
-      else:
-        for lane,source,count in runs: ctypes.memmove(dst.addr+(begin+lane)*gather.itemsize,src.addr+source*gather.itemsize,count*gather.itemsize)
-        continue
-    if gather.index is None and offsets and bounded and not overlap and ((valid:=min(offsets)>=0 and max(offsets)<src_limit) and gather.count>1 or not gather.partial):  # noqa: E501
-      dst.mv[span]=array.array(code,operator.itemgetter(*offsets)(src.mv) if valid and gather.count>1 else
-        (src.mv[index] if 0<=index<src_limit else gather.fill_bits for index in offsets))
+    # Build one raw payload before assignment; inactive partial lanes retain their existing destination bits.
+    if gather.index is None and offsets and bounded:
+      picked=operator.itemgetter(*offsets)(src.mv) if gather.count>1 and min(offsets)>=0 and max(offsets)<src_limit else (
+        src.mv[index] if 0<=index<src_limit else dst.mv[begin+lane*step] if gather.partial else gather.fill_bits for lane,index in enumerate(offsets))  # noqa: E501
+      dst.mv[span]=array.array(code,picked)
       continue
     source_indices=offsets or (gather.base+sum((lane//divisor%limit)*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
-    writes=((begin+lane*step,src.mv[index]) for lane,index in enumerate(source_indices) if 0<=begin+lane*step<dst_limit and 0<=index<src_limit)
-    for lane,value in tuple(writes) if overlap else writes: dst.mv[lane]=value
+    writes=((begin+lane*step,src.mv[index] if 0<=index<src_limit else gather.fill_bits) for lane,index in enumerate(source_indices) if 0<=begin+lane*step<dst_limit and (fill or 0<=index<src_limit))  # noqa: E501
+    for lane,value in writes: dst.mv[lane]=value
 
-def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
   def _copyin(self, dest:HCQBuffer, src:memoryview):

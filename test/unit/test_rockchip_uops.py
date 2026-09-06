@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from tinygrad import Tensor
 from tinygrad.codegen import expand_horizontal_reduce, to_program, to_program_cache
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import Context, Target
+from tinygrad.helpers import Context, Target, strides_for_shape
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_CEIL, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
@@ -50,6 +50,11 @@ def _intermediate_gathers(image:RKImage) -> tuple[RKGather, ...]:
 def _gather_point(image:RKImage, gather:RKGather) -> int:
   return sum(isinstance(op,RKEWOp) for op in image.program[:next(i for i,op in enumerate(image.program) if op is gather)])
 def _gather_after(image:RKImage) -> int: return min((_gather_point(image,g) for g in _intermediate_gathers(image)),default=0)
+
+def _gather_lanes(gather:RKGather) -> tuple[int,...]:
+  """Resolve either physical index representation without changing expected lane addresses."""
+  if gather.offsets: return gather.offsets
+  return tuple(gather.base+sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
 
 
 def _program(dtype, value, count:int=4):
@@ -432,8 +437,35 @@ def test_static_evaluation_requires_explicit_runtime_binding():
   lane=UOp.range(3,104)
   load=UOp.param(0,dtypes.int,(3,)).index(lane).load()
   expression=load*3+5
-  with pytest.raises(RuntimeError,match="non_static_eval"): rockchip_renderer._eval_static(expression,{})
+  with pytest.raises(rockchip_renderer._RKGenericReject,match="non_static_eval"): rockchip_renderer._eval_static(expression,{})
   assert rockchip_renderer._eval_static(expression,{load:(-2,0,7)})==(-1,5,26)
+
+
+@pytest.mark.parametrize("vector",(False,True))
+@pytest.mark.parametrize("preseed",(False,True))
+def test_static_evaluation_preserves_shared_cache_and_bound_frontier(vector:bool,preseed:bool,monkeypatch):
+  load=UOp.param(0,dtypes.int,(3,)).index(UOp.range(3,105)).load()
+  shared=UOp(Ops.MUL,dtypes.int,src=(load,UOp.const(3,dtypes.int)))
+  first=UOp(Ops.ADD,dtypes.int,src=(shared,UOp.const(5,dtypes.int)))
+  second=UOp(Ops.ADD,dtypes.int,src=(shared,shared))
+  sentinel=UOp.const(123,dtypes.int)
+  cache={sentinel:123}
+  if preseed: cache[shared]=(-6,0,21) if vector else -6
+  visited=[]
+  execute=rockchip_renderer._exec_static
+  def observe(node,operands):
+    visited.append(node)
+    return execute(node,operands)
+  monkeypatch.setattr(rockchip_renderer,"_exec_static",observe)
+  env={load:(-2,0,7) if vector else -2}
+  assert rockchip_renderer._eval_static(first,env,cache)==((-1,5,26) if vector else -1)
+  assert rockchip_renderer._eval_static(second,env,cache)==((-12,0,42) if vector else -12)
+  assert visited.count(shared)==int(not preseed) and load not in visited and cache[sentinel]==123
+  # A supplied parent is opaque, and its scalar dtype still commits the supplied value.
+  assert rockchip_renderer._eval_static(first,{first:2**32+7})==7
+  # A memoized value alone must not authorize evaluation of an unbound runtime load.
+  with pytest.raises(rockchip_renderer._RKGenericReject,match="non_static_eval"):
+    rockchip_renderer._eval_static(first,{},cache)
 
 
 def test_static_vector_commit_matches_scalar_typed_bits():
@@ -520,6 +552,170 @@ def test_image_argument_mapping_preserves_field_order_and_nonbuffer_metadata():
                                        for field,value in zip(original._fields,original) if isinstance(value,RKArg)})
 
 
+@pytest.mark.parametrize("invalid",("header","gather","cmac"))
+def test_owned_program_validation_and_rejected_emission_roll_back(invalid:str, monkeypatch):
+  arg=RKArg(RKBufferKind.SCRATCH,0)
+  valid=RKImage((64,),(RKGather(None,arg,4,values=(0,)),))
+  fragment=valid._replace(scratch=(-1,)) if invalid=="header" else valid._replace(
+    program=(RKGather(None,arg,4,values=(0x10000,)),) if invalid=="gather" else (RKCMAC(arg,arg,arg,1,4,4),))
+  plan=rockchip_renderer.RKPlan([])
+  plan.scratch.extend(valid.scratch)
+  plan.program.extend(valid.program)
+  before=tuple(plan.scratch),tuple(plan.program),dict(plan.bindings),plan.slot
+  with pytest.raises(ValueError): encode_image(fragment)
+  assert (tuple(plan.scratch),tuple(plan.program),plan.bindings,plan.slot)==before
+  def attempt() -> bool:
+    plan.parameter(dtypes.half,4)
+    plan.scratch[:]=fragment.scratch
+    plan.program[:]=fragment.program
+    rockchip_renderer._validate_image(RKImage(tuple(plan.scratch),tuple(plan.program)))
+    return True
+  # Malformed emitted commands remain programming errors, not unsupported graphs.
+  with pytest.raises(ValueError): plan.lower(attempt)
+  assert (tuple(plan.scratch),tuple(plan.program),plan.bindings,plan.slot)==before
+  def emit_invalid(target, *_args, **_kwargs):
+    target.scratch.extend(fragment.scratch)
+    target.program.extend(fragment.program)
+    return True
+  monkeypatch.setattr(rockchip_renderer,"_lower_into",emit_invalid)
+  # Validation now guards the complete owned program, before it can be serialized or submitted.
+  with pytest.raises(ValueError): _lower_uop_program([])
+
+
+def _seed_transaction_plan():
+  plan=rockchip_renderer.RKPlan([])
+  source=plan.parameter(dtypes.half,4)
+  physical=plan.resolve(RKArg(RKBufferKind.ARG,source.arg.slot))
+  plan.program.append(RKGather(None,physical,4,values=(0x3c00,)))
+  return plan
+
+
+def _transaction_state(plan):
+  return tuple(plan.scratch),tuple(plan.program),dict(plan.bindings),plan.slot
+
+
+@pytest.mark.parametrize("stage",("parameter","resolve","scratch","emission","existing_scratch","existing_program"))
+@pytest.mark.parametrize("failure",("false","reject","runtime","value","key"))
+@pytest.mark.parametrize("debug",(False,True))
+def test_rejected_plan_restores_complete_state(stage:str,failure:str,debug:bool,monkeypatch):
+  monkeypatch.setenv("ROCKCHIP_UOPS_DEBUG",str(int(debug)))
+  plan=_seed_transaction_plan()
+  scratch,program=plan.scratch,plan.program
+  before=_transaction_state(plan)
+  exception={"reject":rockchip_renderer._RKGenericReject,"runtime":RuntimeError,"value":ValueError,"key":KeyError}.get(failure)
+  def attempt():
+    parameter=plan.parameter(dtypes.half,9)
+    if stage!="parameter": plan.resolve(RKArg(RKBufferKind.ARG,parameter.arg.slot))
+    if stage in ("scratch","emission","existing_scratch","existing_program"): plan.scratch.append(128)
+    if stage in ("emission","existing_scratch","existing_program"):
+      plan.program.append(RKGather(None,RKArg(RKBufferKind.SCRATCH,0),4,values=(0x4000,)))
+    if stage=="existing_scratch": plan.scratch[0]=256
+    if stage=="existing_program": plan.program[0]=plan.program[0]._replace(values=(0x4200,))
+    if exception is not None: raise exception("deliberate rejection")
+    return False
+  if exception is not None and (failure!="reject" or debug):
+    with pytest.raises(exception,match="deliberate rejection"): plan.lower(attempt)
+  else: assert not plan.lower(attempt)
+  assert plan.scratch is scratch and plan.program is program
+  assert _transaction_state(plan)==before
+  # A rejected A must not affect the following accepted B, including virtual identifiers.
+  def compile_b(target):
+    parameter=target.parameter(dtypes.half,9)
+    target.program.append(RKGather(None,target.resolve(RKArg(RKBufferKind.ARG,parameter.arg.slot)),9,values=(0x4400,)))
+    return True
+  fresh=_seed_transaction_plan()
+  assert plan.lower(lambda:compile_b(plan)) and fresh.lower(lambda:compile_b(fresh))
+  assert _transaction_state(plan)==_transaction_state(fresh)
+
+
+def test_plan_finalization_failure_restores_checkpoint(monkeypatch):
+  plan=_seed_transaction_plan()
+  before=_transaction_state(plan)
+  original=RKEWOp._replace
+  def fail_barrier(op,**kwargs):
+    if "submit_barrier" in kwargs: raise KeyError("barrier bug")
+    return original(op,**kwargs)
+  monkeypatch.setattr(RKEWOp,"_replace",fail_barrier)
+  def attempt():
+    arg=RKArg(RKBufferKind.SCRATCH,0)
+    plan.program.append(RKEWOp(arg,arg,arg,4,_EW_CFG[Ops.ADD]))
+    return True
+  with pytest.raises(KeyError,match="barrier bug"): plan.lower(attempt)
+  assert _transaction_state(plan)==before
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int))
+@pytest.mark.parametrize("accepted",(False,True))
+def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatch):
+  plan=_seed_transaction_plan()
+  before=_transaction_state(plan)
+  output=rockchip_renderer._outs(_program(dtype,lambda _:UOp.const(0,dtype),4))[0]
+  assert output is not None
+  def reject(*args):
+    target=args[-1]
+    target.parameter(dtypes.half,16)
+    target.scratch[0]=128
+    target.program[0]=target.program[0]._replace(values=(0x4000,))
+    return False
+  def final_attempt(*args):
+    assert _transaction_state(args[-1])==before
+    if not accepted: return reject(*args)
+    return True
+  monkeypatch.setattr(rockchip_renderer,"_lower_bounded_int_lookup",reject)
+  monkeypatch.setattr(rockchip_renderer,"_lower_one_hot_gather",reject)
+  monkeypatch.setattr(rockchip_renderer,"_lower_cmac_reduce",lambda *_:None)
+  monkeypatch.setattr(rockchip_renderer,"_lower_mapped_reduce",final_attempt)
+  assert rockchip_renderer._lower_reduction(output,[],plan) is accepted
+  assert _transaction_state(plan)==before
+
+
+@pytest.mark.parametrize("failure",("false","reject","key"))
+def test_rejected_plan_restores_existing_lazy_binding(failure:str):
+  plan=_seed_transaction_plan()
+  lazy=plan.parameter(dtypes.half,17)
+  alias=plan.parameter(dtypes.half,17,RKArg(RKBufferKind.ARG,lazy.arg.slot))
+  before=_transaction_state(plan)
+  def attempt():
+    plan.resolve(RKArg(RKBufferKind.ARG,alias.arg.slot))
+    if failure=="reject": raise rockchip_renderer._RKGenericReject
+    if failure=="key": raise KeyError("binding bug")
+    return False
+  if failure=="key":
+    with pytest.raises(KeyError,match="binding bug"): plan.lower(attempt)
+  else: assert not plan.lower(attempt)
+  assert _transaction_state(plan)==before
+
+
+@pytest.mark.parametrize("operation",("sum","square_sum","argmax"))
+def test_production_program_is_unchanged_after_rejected_mutation(operation:str,monkeypatch):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF"):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",3*65,dtypes.half,num=12842)).reshape(3,65)
+    result=source.argmax(1) if operation=="argmax" else (source*source if operation=="square_sum" else source).sum(1)
+    calls=[u for u in result.schedule_linear().toposort() if u.op is Ops.CALL and u.src and u.src[0].op is Ops.SINK]
+    renderer=RockchipRenderer(Target(device="ROCKCHIP"))
+    def binaries():
+      to_program_cache.clear()
+      return tuple(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY) for call in calls)
+    expected=binaries()
+    mutations=[]
+    def wrapped(original):
+      def attempt(*args):
+        accepted=original(*args)
+        if not accepted:
+          plan=args[-1]
+          parameter=plan.parameter(dtypes.half,9)
+          slot=plan.resolve(RKArg(RKBufferKind.ARG,parameter.arg.slot))
+          plan.program.append(RKGather(None,slot,9,values=(0x4400,)))
+          plan.scratch[0]+=64
+          mutations.append(slot)
+        return accepted
+      return attempt
+    for name in ("_lower_bounded_int_lookup","_lower_one_hot_gather"):
+      monkeypatch.setattr(rockchip_renderer,name,wrapped(getattr(rockchip_renderer,name)))
+    assert binaries()==expected
+    assert mutations
+
+
 def test_uop_is_the_typed_physical_abi():
   program = _program(dtypes.half, lambda _:UOp.const(0.0,dtypes.half), 1)
   output=rockchip_renderer._outs(program)[0]
@@ -538,6 +734,36 @@ def _mapped_values(values:np.ndarray, dma:int):
   memory=_runtime_memory(values.nbytes,dma)
   ctypes.memmove(memory.va_addr,values.ctypes.data,values.nbytes)
   return memory
+
+@pytest.mark.parametrize("itemsize",(1,2,4))
+@pytest.mark.parametrize("count",(0,1,8))
+def test_runtime_typed_suffix_matches_python_slicing(itemsize:int,count:int):
+  values=np.arange(count,dtype=f"<u{itemsize}")
+  memory=_mapped_values(values,0x1000)
+  for start in (-10**20,-count-1,-count,-1,0,1,count-1,count,count+1,10**20):
+    arg=RKArg(RKBufferKind.ARG,0,start*itemsize)
+    view=rockchip_runtime._rk_buffer_view(memory,arg,rockchip_runtime._RAW_FORMATS[itemsize],itemsize)
+    assert bytes(view.mv)==values[start:].tobytes()
+    assert view.addr==memory.va_addr+len(values[:start])*itemsize
+
+
+@pytest.mark.parametrize("itemsize",(2,4))
+def test_runtime_typed_suffix_keeps_alignment_checks(itemsize:int):
+  raw=_runtime_memory(3*itemsize,0x1000)
+  with pytest.raises(RuntimeError,match="unaligned RKGather"):
+    rockchip_runtime._rk_buffer_view(raw,RKArg(RKBufferKind.ARG,0,1),"B",itemsize)
+  with pytest.raises(RuntimeError,match="mis-sized RKGather view"):
+    rockchip_runtime._rk_buffer_view(_runtime_memory(3*itemsize+1,0x2000),RKArg(RKBufferKind.ARG,0),"B",itemsize)
+
+
+@pytest.mark.parametrize("value",(0,1,-1,0x7fffffff,0x80000000,0xffffffff,0x100000000))
+def test_runtime_and_renderer_share_register_word_encoding(value:int):
+  assert rockchip_runtime._pc is rockchip_renderer._cmd
+  for target,register in itertools.product((0,0x1001,0xffff),(0,1,0x3010,0xffff)):
+    word=rockchip_runtime._pc(target,register,value)
+    assert struct.pack("<Q",word)==struct.pack("<HIH",register,value&0xffffffff,target)
+    assert rockchip_runtime._pc(target,register)==rockchip_renderer._cmd(target,register,0)
+
 
 @pytest.mark.parametrize(("itemsize","dtype","values"),((1,"<u1",(3,5,7)),(2,"<u2",(0x1234,0xabcd,9)),
                                                            (4,"<u4",(0x12345678,0xabcdef01,11))))
@@ -596,6 +822,72 @@ def test_runtime_raw_gathers_preserve_bits_masks_and_overlap(itemsize:int, dtype
   np.testing.assert_array_equal(np.frombuffer(overlap.storage,dtype=dtype)[:4],np.asarray((1,2,3,1),dtype=dtype))
 
 @pytest.mark.parametrize("itemsize",(1,2,4))
+def test_nonpartial_gather_preserves_aliased_source(itemsize:int):
+  values=np.asarray((10,20,30,40),dtype=f"<u{itemsize}")
+  memory=_mapped_values(values,0x4000)
+  arg=RKArg(RKBufferKind.ARG,0)
+  gather=RKGather(arg,arg,4,offsets=(3,2,1,0),itemsize=itemsize)
+  rockchip_runtime._apply_gathers((gather,),lambda *_:memory)
+  assert memory.storage.raw==values[::-1].tobytes()
+
+
+@pytest.mark.parametrize("itemsize",(1,2,4))
+@pytest.mark.parametrize("partial",(False,True))
+@pytest.mark.parametrize("kind",(RKBufferKind.ARG,RKBufferKind.SCRATCH))
+@pytest.mark.parametrize("layout",("reverse","masked","strided","source_addend","destination_addend","overlapping_views","affine"))
+def test_runtime_gather_aliasing_preserves_inputs_before_padding(itemsize:int,partial:bool,kind:RKBufferKind,layout:str):
+  values=np.asarray(tuple(10+13*i for i in range(16)),dtype=f"<u{itemsize}")
+  memory=_mapped_values(values,0x4000)
+  source_base,destination_base=(2,0) if layout=="overlapping_views" else (0,0)
+  source_addend=int(layout=="source_addend")
+  destination_addend=int(layout=="destination_addend")
+  step=2 if layout in ("strided","overlapping_views","affine") else 1
+  begin=int(layout=="masked")
+  offsets=(3,-1,99,0) if layout=="masked" else (3,2,1,0)
+  gather=RKGather(RKArg(RKBufferKind.ARG,1,source_addend*itemsize),RKArg(kind,0,destination_addend*itemsize),4,
+    offsets=() if layout=="affine" else offsets,axes=((1,4,1),) if layout=="affine" else (),
+    fill_bits=7,partial=partial,dst_stride=step,dst_addend=begin,itemsize=itemsize)
+  buffers={(RKBufferKind.ARG,1):memory.offset(source_base*itemsize),(kind,0):memory.offset(destination_base*itemsize)}
+  expected=values.copy()
+  # Scratch initialization owns its whole allocation, including padding outside selected destination lanes.
+  if kind is RKBufferKind.SCRATCH and not partial and not destination_addend and not begin: expected[destination_base:]=0
+  destinations=destination_base+destination_addend+begin+np.arange(4)*step
+  if not partial and gather.offsets: expected[destinations]=gather.fill_bits
+  for destination,index in zip(destinations,range(4) if layout=="affine" else offsets):
+    if 0<=index<len(values)-source_base-source_addend: expected[destination]=values[source_base+source_addend+index]
+  rockchip_runtime._apply_gathers((gather,),lambda kind,index:buffers[kind,index])
+  assert memory.storage.raw==expected.tobytes()
+
+
+@pytest.mark.parametrize("itemsize",(1,2,4))
+@pytest.mark.parametrize("index_itemsize",(2,4))
+@pytest.mark.parametrize("alias",("source","index","both"))
+@pytest.mark.parametrize("addend",(0,1))
+def test_runtime_index_gather_preserves_aliased_data_and_indices(itemsize:int,index_itemsize:int,alias:str,addend:int):
+  memory=_runtime_memory(128,0x4000)
+  source_base,index_base,destination_base=(0,32,0) if alias=="source" else (0,32,32) if alias=="index" else (0,0,0)
+  values=np.asarray((10,20,30,40,50),dtype=f"<u{itemsize}")
+  indices=np.asarray((99,3,-1,99,0) if addend else (3,-1,99,0),dtype=f"<i{index_itemsize}")
+  ctypes.memmove(memory.va_addr+source_base,values.ctypes.data,values.nbytes)
+  ctypes.memmove(memory.va_addr+index_base,indices.ctypes.data,indices.nbytes)
+  before=memory.storage.raw
+  source_values=np.frombuffer(before[source_base:source_base+values.nbytes],dtype=values.dtype)[addend:]
+  index_values=np.frombuffer(before[index_base:index_base+indices.nbytes],dtype=indices.dtype)[addend:]
+  expected=bytearray(before)
+  for lane,index in enumerate(index_values):
+    value=int(source_values[index]) if 0<=index<len(source_values) else 7
+    start=destination_base+lane*itemsize
+    expected[start:start+itemsize]=value.to_bytes(itemsize,"little")
+  buffers={(RKBufferKind.ARG,1):memory.offset(source_base,values.nbytes),
+           (RKBufferKind.ARG,2):memory.offset(index_base,indices.nbytes),
+           (RKBufferKind.SCRATCH,0):memory.offset(destination_base,4*itemsize)}
+  gather=RKGather(RKArg(RKBufferKind.ARG,1,addend*itemsize),RKArg(RKBufferKind.SCRATCH,0),4,fill_bits=7,itemsize=itemsize,
+    index=RKArg(RKBufferKind.ARG,2,addend*index_itemsize),index_itemsize=index_itemsize)
+  rockchip_runtime._apply_gathers((gather,),lambda kind,index:buffers[kind,index])
+  assert memory.storage.raw==bytes(expected)
+
+
+@pytest.mark.parametrize("itemsize",(1,2,4))
 @pytest.mark.parametrize("axes",(((1,4,1),),((3,4,2),),((6,4,10),(1,2,3)),((12,2,40),(6,2,9),(1,3,2))))
 def test_runtime_affine_gather_repetition_snapshots_overlap(itemsize:int, axes:tuple[tuple[int,int,int],...]):
   count=2*max(divisor*limit for divisor,limit,_ in axes)
@@ -610,6 +902,73 @@ def test_runtime_affine_gather_repetition_snapshots_overlap(itemsize:int, axes:t
     expected[destination_start:destination_start+count*step:step]=values[indices]
     rockchip_runtime._apply_gathers((gather,),lambda kind,index:memory)
     assert memory.storage.raw==expected.tobytes()
+
+
+@pytest.mark.parametrize('itemsize',(1,2,4))
+@pytest.mark.parametrize('partial',(False,True))
+@pytest.mark.parametrize('alias',(False,True))
+@pytest.mark.parametrize('dst_addend',(0,1))
+def test_compact_affine_gather_preserves_full_raw_movement(itemsize,partial,alias,dst_addend):
+  rng=np.random.default_rng(0xaff1)
+  for shape in ((1,),(7,),(3,5),(2,3,4),(2,3,16,32),(4,1,8)):
+    count=math.prod(shape)
+    for kind in ('forward','reverse','broadcast','masked','irregular'):
+      strides=tuple(int(value) for value in rng.integers(-12,13,size=len(shape)))
+      if kind=='forward': strides=strides_for_shape(shape)
+      elif kind=='reverse': strides=tuple(-value for value in strides_for_shape(shape))
+      elif kind=='broadcast': strides=(0,)*len(shape)
+      raw=tuple(sum(lane//d%extent*stride for d,extent,stride in zip(strides_for_shape(shape),shape,strides) if extent>1) for lane in range(count))
+      offsets=tuple(value-min(raw)+3 for value in raw)
+      if kind=='masked': offsets=tuple(-1 if lane%3==0 else value for lane,value in enumerate(offsets))
+      elif kind=='irregular' and count>2: offsets=(*offsets[:-1],offsets[-1]+1)
+      size=max(max(offsets)+2,count*2+3)
+      values=(np.arange(size,dtype=np.uint64)*173+37).astype(f'<u{itemsize}')
+      gather=rockchip_renderer.RKGather(rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.ARG,0),rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.SCRATCH,0),count,
+                        offsets=offsets,fill_bits=19,partial=partial,dst_stride=2,dst_addend=dst_addend,itemsize=itemsize)
+      compact=rockchip_renderer._compact_gather(gather,shape)
+      assert compact._replace(base=gather.base,axes=gather.axes,offsets=gather.offsets)==gather
+      actual=compact.offsets or tuple(compact.base+sum(lane//d%extent*stride for d,extent,stride in compact.axes) for lane in range(count))
+      assert actual==offsets
+      if kind=='masked': assert compact is gather
+      outputs=[]
+      for movement in (gather,compact):
+        source=_mapped_values(values,0x4000)
+        destination=source if alias else _mapped_values(np.full(size,91,dtype=values.dtype),0x8000)
+        rockchip_runtime._apply_gathers((movement,),lambda kind,_:source if kind is rockchip_renderer.RKBufferKind.ARG else destination)
+        outputs.append(destination.storage.raw)
+      assert outputs[0]==outputs[1],(shape,kind,itemsize,partial,alias)
+
+@pytest.mark.parametrize('itemsize',(1,2,4))
+@pytest.mark.parametrize('partial',(False,True))
+@pytest.mark.parametrize('alias',('none','same','shifted'))
+def test_raw_offset_copy_preserves_snapshot_fill_and_partial_lanes(itemsize,partial,alias):
+  # Alternating masks at these lengths straddle the removed 2,048-run shortcut.
+  for count in (1,2,63,4093,4095,4097):
+    for step,begin,kind in ((1,0,RKBufferKind.SCRATCH),(1,1,RKBufferKind.ARG),(2,0,RKBufferKind.SCRATCH),(2,1,RKBufferKind.ARG)):
+      size=count*step+7
+      data=(np.arange(size,dtype=np.uint64)*0x123457+0x80000081).astype(f'<u{itemsize}')
+      patterns=(tuple(range(count)),tuple(range(count-1,-1,-1)),(-1,)*count,(size+3,)*count,
+                tuple(lane if lane%2==0 else -1 for lane in range(count)),
+                tuple(-1 if lane%7==0 else size+1 if lane%11==0 else lane*37%size for lane in range(count)))
+      for offsets in patterns:
+        source=_mapped_values(data,0x4000)
+        destination=_mapped_values(np.full(size,91,dtype=data.dtype),0x8000) if alias=='none' else source
+        addend=int(alias=='shifted')
+        expected=np.frombuffer(destination.storage.raw,dtype=data.dtype).copy()
+        if kind is RKBufferKind.SCRATCH and not partial and not addend and not begin: expected[:]=0
+        for lane,index in enumerate(offsets):
+          if 0<=index<size: expected[addend+begin+lane*step]=data[index]
+          elif not partial: expected[addend+begin+lane*step]=19
+        gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(kind,0,addend*itemsize),count,offsets=offsets,
+                        fill_bits=19,partial=partial,dst_stride=step,dst_addend=begin,itemsize=itemsize)
+        rockchip_runtime._apply_gathers((gather,),lambda _kind,index:source if index==1 else destination)
+        assert destination.storage.raw==expected.tobytes(),(count,step,begin,kind,offsets[:4])
+
+
+@pytest.mark.parametrize('shape',((),(0,),(-1,-4),(3,2),(1,1,1)))
+def test_compact_gather_rejects_incompatible_physical_shape(shape):
+  gather=rockchip_renderer.RKGather(rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.ARG,0),rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.SCRATCH,0),4,offsets=(1,2,3,4))
+  assert rockchip_renderer._compact_gather(gather,shape) is gather
 
 
 def test_runtime_index_gather_uses_signed_indices_and_fill_bits():
@@ -1054,15 +1413,21 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
   with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
     x = Tensor(UOp.new_buffer("ROCKCHIP",24,dtypes.half,num=12001)).reshape(2,3,4)
     y = Tensor(UOp.new_buffer("ROCKCHIP",24,dtypes.half,num=12002)).reshape(2,3,4)
-    records = []
+    records,images = [],[]
     for output in (x.abs(), x.minimum(y)):
       to_program_cache.clear()
       program = to_program(output.schedule_linear().src[0].src[0], RockchipRenderer(Target(device="ROCKCHIP")))
       blob = next(u.arg for u in program.src if u.op is Ops.BINARY)
       image = decode_image(blob)
+      images.append(image)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("765c50748dc3fdc7eab909360bcd22002fc790a70525c4bb18bb26fcde8c2e1b",1195,98,6),
+  assert records == [("af4cc83284a677f0d879ff2af2b9720f12fc335f75ef1df96ec4597dd74606ff",647,46,0),
                      ("6b4f9c0fc3228c0d4672c2d1a39e3740806fc4c32fe83268e628729698845bda",258,4,0)]
+  values=np.resize(np.asarray((-65504,-2048,-3,-1,0,2**-24,2,65504),dtype="<f2"),24)
+  other=np.roll(values,7).copy()
+  for image,inputs,expected in ((images[0],(values,),np.abs(values)),(images[1],(values,other),np.minimum(values,other))):
+    assert _assert_decoded_image_bounds(image)==image
+    assert _execute_raw_dynamic_image(image,48,*(value.tobytes() for value in inputs))==expected.tobytes()
 
 
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
@@ -1133,6 +1498,41 @@ def test_production_static_selection_reuses_leaves_after_inactive_occurrences(co
   assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
   assert _execute_raw_dynamic_image(image,count*dtype.itemsize,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==(
     expected^((1<<(dtype.itemsize*8))-1)).tobytes()
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int16,dtypes.int))
+@pytest.mark.parametrize("count",(1,7,8,9,65,4097,65536))
+@pytest.mark.parametrize("nested",(False,True))
+def test_production_dynamic_selection_preserves_native_words(dtype,count:int,nested:bool,monkeypatch):
+  words=np.arange(1<<16,dtype="<u2") if count==1<<16 else np.resize(
+    np.asarray((0,0x8000,0x7fff,0xffff,0x7c00,0xfc00,0x7e01,0xfe55,0x3c00,0xbc00,0x0400,1),dtype="<u2"),count)
+  left=((words.astype("<u4")<<16)|np.roll(words,3).astype("<u4")) if dtype is dtypes.int else words
+  right=np.roll(left,7).copy()
+  gate,second=np.arange(count)%3!=1,np.arange(count)%5<2
+  expected=np.where(gate,left,right)
+  if nested: expected=np.where(second,expected,right)
+  observed=[]
+  original=rockchip_renderer.RKContext._raw_where
+  def capture(context,u,*args,**kwargs):
+    observed.append(u.dtype.scalar())
+    return original(context,u,*args,**kwargs)
+  monkeypatch.setattr(rockchip_renderer.RKContext,"_raw_where",capture)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    inputs=[Tensor(UOp.new_buffer("ROCKCHIP",count,kind,num=31000+slot)) for slot,kind in enumerate((dtypes.bool,dtypes.bool,dtype,dtype))]
+    condition,other,a,b=inputs
+    output=condition.where(a,b)
+    if nested: output=other.where(output,b)
+    # Observe the selector's raw value without a terminal HALF arithmetic copy that can canonicalize NaNs on the NPU.
+    if dtype is dtypes.half: output=output.bitcast(dtypes.int16)
+    calls=[node for node in output.schedule_linear().toposort() if node.op is Ops.CALL and node.src[0].op is Ops.SINK]
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert dtype in observed and _assert_decoded_image_bounds(image)==image
+  bindings={tensor.uop.buf_uop:array.tobytes() for tensor,array in zip(inputs,(gate,second,left,right))}
+  actual=_execute_raw_dynamic_image(image,count*dtype.itemsize,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))
+  assert actual==expected.tobytes()
 
 
 def test_bitcast_and_int16_masks_preserve_raw_fp16_sign_and_payload():
@@ -1248,6 +1648,30 @@ def test_fp16_negated_max_equality_covers_every_bit_pattern():
     with np.errstate(invalid="ignore"): np.testing.assert_array_equal(actual,left*np.float16(-1.0)!=maximum)
 
 
+@pytest.mark.parametrize("name",("eq","ne","lt","ge","le"))
+@pytest.mark.parametrize("shift",(1,12345,32768))
+def test_production_fp16_predicates_cover_every_bit_pattern(name:str, shift:int):
+  count=32768
+  compare={"eq":lambda a,b:a.eq(b),"ne":lambda a,b:a!=b,"lt":lambda a,b:a<b,"ge":lambda a,b:a>=b,"le":lambda a,b:a<=b}[name]
+  reference={"eq":np.equal,"ne":np.not_equal,"lt":np.less,"ge":np.greater_equal,"le":np.less_equal}[name]
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    inputs=[Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=71500+i)) for i in range(2)]
+    calls=compare(*inputs).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and not _runtime_gathers(image)
+  assert all(op.mode is RKEWMode.INT16 for op in _ew_ops(image))
+  patterns=np.arange(1<<16,dtype="<u2")
+  right=np.roll(patterns,shift)
+  for start in (0,count):
+    arrays=[values[start:start+count].view("<f2") for values in (patterns,right)]
+    bindings={tensor.uop.buf_uop:array.tobytes() for tensor,array in zip(inputs,arrays)}
+    actual=np.frombuffer(_execute_raw_dynamic_image(image,count,*(bindings[arg.buf_uop] for arg in calls[0].src[2:])),dtype=np.bool_)
+    with np.errstate(invalid="ignore"): np.testing.assert_array_equal(actual,reference(*arrays))
+
+
 def test_generic_where_selects_infinity_without_mask_multiplication():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
@@ -1283,7 +1707,12 @@ def test_generic_where_materializes_nan_only_on_selected_lanes():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:
     (source.index(i).load() < UOp.const(0.0, dtypes.half)).where(UOp.const(math.nan, dtypes.half), source.index(i).load())))
-  assert image is not None and _intermediate_gathers(image) and not any(op.mode==RKEWMode.COMPARE or op.submit_barrier for op in _ew_ops(image))
+  # Signed-word selection needs no intermediate byte unpacking or packing.
+  assert image is not None and not _intermediate_gathers(image) and not any(op.mode==RKEWMode.COMPARE or op.submit_barrier for op in _ew_ops(image))
+  assert _assert_decoded_image_bounds(image)==image
+  values=np.asarray((0xc000,0x8000,0x7c00,0x7e33),dtype="<u2").view("<f2")
+  expected=np.where(values<0,np.float16(math.nan),values)
+  assert _execute_raw_dynamic_image(image,8,values.tobytes())==expected.tobytes()
 
 
 def test_nested_where_around_math_preserves_raw_uop_selection():
@@ -1295,9 +1724,12 @@ def test_nested_where_around_math_preserves_raw_uop_selection():
     invalid = (y != y.cast(dtypes.int).cast(dtypes.half)).where(UOp.const(math.nan, dtypes.half), magnitude)
     return (x < UOp.const(0.0, dtypes.half)).where(invalid, magnitude)
   image = _lower_uop_program(_program(dtypes.half, power))
-  assert image is not None and len(_intermediate_gathers(image)) >= 6
-  assert len({_gather_point(image,gather) for gather in _intermediate_gathers(image)}) >= 2
+  assert image is not None and not _intermediate_gathers(image)
+  assert _assert_decoded_image_bounds(image)==image
   assert decode_image(encode_image(image)) == image
+  x,y=np.asarray((-2,-4,2,4),dtype="<f2"),np.asarray((0.5,2,1,0),dtype="<f2")
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,8,x.tobytes(),y.tobytes()),dtype="<f2")
+  np.testing.assert_array_equal(actual,np.asarray((math.nan,16,2,1),dtype="<f2"))
 
 
 def test_generic_where_abs_recipe_avoids_infinite_arm_blend():
@@ -1601,6 +2033,41 @@ def test_batched_unrolled_math_reduction_materializes_each_uop_result():
   assert decode_image(encode_image(image)) == image
 
 
+@pytest.mark.parametrize('exhaustive',(False,True))
+@pytest.mark.parametrize('consumer',('direct','offset','reciprocal'))
+def test_production_exp2_uses_exact_exponent_fields_and_conversion_barriers(exhaustive:bool,consumer:str):
+  values=np.arange(1<<16,dtype='<u2').view('<f2') if exhaustive else np.arange(-24,16,dtype='<f2')
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    source=Tensor(UOp.new_buffer('ROCKCHIP',values.size,dtypes.half,num=35000+values.size))
+    result=source.exp2()
+    if consumer=='offset': result=result+0.25
+    elif consumer=='reciprocal': result=(result+1).reciprocal()
+    calls=[node for node in result.schedule_linear().toposort() if node.op is Ops.CALL and node.src[0].op is Ops.SINK]
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP'))).src
+                               if node.op is Ops.BINARY))
+  conversions=tuple(op for op in _ew_ops(image) if op.mode is RKEWMode.HALF_TO_INT16)
+  assert len(conversions)==2 and all(op.submit_barrier for op in conversions)
+  assert _assert_decoded_image_bounds(image)==image
+  # The executor checks IEEE-domain arithmetic; real NPU NaN behavior is a separate baseline limitation.
+  with np.errstate(all='ignore'):
+    actual=np.frombuffer(_execute_raw_dynamic_image(image,values.nbytes,values.tobytes()),dtype='<f2')
+    expected=np.exp2(values.astype('<f4')).astype('<f2')
+    if consumer=='offset': expected=(expected+np.float16(0.25)).astype('<f2')
+    elif consumer=='reciprocal': expected=(np.float16(1)/(np.float16(1)+expected)).astype('<f2')
+  if not exhaustive and consumer=='direct': assert actual.tobytes()==expected.tobytes()
+  else: np.testing.assert_allclose(actual,expected,rtol=2e-3,atol=2**-24,equal_nan=True)
+
+def test_production_internal_exponent_cast_does_not_admit_general_half_to_int16():
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    source=Tensor(UOp.new_buffer('ROCKCHIP',40,dtypes.half,num=44000))
+    sink=source.cast(dtypes.int16).schedule_linear().src[0].src[0]
+    to_program_cache.clear()
+    with pytest.raises(RuntimeError,match='RKPLAN_REJECT:generic_uops'):
+      to_program(sink,RockchipRenderer(Target(device='ROCKCHIP')))
+
+
 def test_attention_softmax_sum_maps_production_exp_rows():
   rows,groups=4096,16
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
@@ -1610,8 +2077,8 @@ def test_attention_softmax_sum_maps_production_exp_rows():
     program=to_program((scores-maxima).exp().sum(-1).schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
   image=decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY))
   assert not _typed_ops(image,RKCMAC)
-  assert len(_ew_ops(image))==103 and sum(op.mode is RKEWMode.BOUNDED for op in _ew_ops(image))==9
-  assert len(_static_gathers(image))==23 and len(image.program)==126
+  assert len(_ew_ops(image))==64 and sum(op.mode is RKEWMode.BOUNDED for op in _ew_ops(image))==3
+  assert len(_static_gathers(image))==19 and len(image.program)==83
   assert not _runtime_gathers(image) and decode_image(encode_image(image))==image
   values=np.random.default_rng(0x3588).uniform(-4,0,size=(rows,groups)).astype("<f2")
   maxima_values=values.max(1).astype("<f2")
@@ -1620,15 +2087,23 @@ def test_attention_softmax_sum_maps_production_exp_rows():
   np.testing.assert_allclose(actual,expected,rtol=5e-3,atol=5e-3)
 
 
-def test_attention_softmax_sum_keeps_gqa_surface_fail_closed():
+def test_attention_softmax_sum_keeps_gqa_surface_fail_closed(monkeypatch):
   rows,groups=16384,16
+  attempts=[]
+  original=rockchip_renderer._lower_mapped_reduce
+  def capture(*args):
+    result=original(*args)
+    attempts.append((args[0][2],result))
+    return result
+  monkeypatch.setattr(rockchip_renderer,'_lower_mapped_reduce',capture)
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     scores=Tensor(UOp.new_buffer("ROCKCHIP",rows*groups,dtypes.half,num=1062).reshape((rows,groups)))
     maxima=Tensor(UOp.new_buffer("ROCKCHIP",rows,dtypes.half,num=1063).reshape((rows,1)))
     to_program_cache.clear()
     program=to_program((scores-maxima).exp().sum(-1).schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
   image=decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY))
-  assert len(_ew_ops(image))>1000 and not _runtime_gathers(image) and decode_image(encode_image(image))==image
+  assert attempts==[(rows,False)], 'oversized mapped math must remain rejected before emission'
+  assert len(_ew_ops(image))==943 and not _runtime_gathers(image) and decode_image(encode_image(image))==image
 
 
 def test_static_reduce_uops_are_structurally_executed():
@@ -1720,7 +2195,7 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
   assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (3,4,5)
   assert len(_initial_gathers(image)) == 2 and len(_output_gathers(image)) == 1 and not _ew_ops(image)
-  assert _output_gathers(image)[0].offsets == tuple(row*64+col for row in range(3) for col in range(4))
+  assert _gather_lanes(_output_gathers(image)[0]) == tuple(row*64+col for row in range(3) for col in range(4))
   assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
   lhs_values, rhs_values = np.arange(15, dtype=np.float16), np.arange(20, dtype=np.float16).reshape(5,4)
   sources = {_initial_gathers(image)[0].src.index:lhs_values.view(np.uint16),
@@ -1840,7 +2315,7 @@ def test_real_matmul_relu_routes_one_production_cmac_stage():
   packed_rhs = scratch[_cmac(image).rhs.index].view(np.float16).reshape(2,1,16,32).transpose(0,2,1,3).reshape(32,32)
   physical = np.zeros(3*32*2,dtype=np.float16)
   physical.reshape(3,64)[:,:4] = np.maximum(packed_lhs.astype(np.float32)@packed_rhs.astype(np.float32).T,0)[:,:4].astype(np.float16)
-  np.testing.assert_array_equal(physical[np.asarray(_output_gathers(image)[0].offsets)],
+  np.testing.assert_array_equal(physical[np.asarray(_gather_lanes(_output_gathers(image)[0]))],
                                 np.maximum(lhs_values.astype(np.float32)@rhs_values.astype(np.float32),0).astype(np.float16).reshape(-1))
 
 
@@ -2074,6 +2549,22 @@ def test_arange_weighted_tensor_sum_routes_binary_outer_scale_cmac():
   assert all(image is not None and _cmac(image) is None and _ew_ops(image) for image in rejected)
 
 
+@pytest.mark.parametrize("count",(1,2,7,8,9,63,64,65,511,512,513))
+def test_product_terms_keep_highs_before_only_product_residuals(count:int):
+  axis=UOp.range(count,19001)
+  left,right=(UOp.param(slot,dtypes.half,(count,)).index(axis).load() for slot in (19002,19003))
+  # Non-products, repeated products and tagged products retain their original positions and identities.
+  choices=(left*right,left+right,left.const_like(0),left.alu(Ops.MUL,right).replace(arg="physical_product"))
+  terms=[choices[i%len(choices)] for i in range(count)]
+  expanded=rockchip_renderer._product_terms(terms)
+  assert all(actual is expected for actual,expected in zip(expanded[:count],terms))
+  products=[term for term in terms if term.op is Ops.MUL]
+  assert len(expanded)==count+len(products)
+  for residual,term in zip(expanded[count:],products):
+    assert residual is rockchip_renderer._two_product(term,left.const_like(-1),left.const_like(65))[1]
+  assert rockchip_renderer._product_terms(tuple(terms))==expanded
+
+
 def test_static_dot_reduce_owns_accurate_physical_recipe():
   out, lhs, rhs = UOp.param(0, dtypes.half, (2,)), UOp.param(1, dtypes.half, (6,)), UOp.param(2, dtypes.half, (6,))
   row, axis = UOp.range(2, 0), UOp.range(3, 1, AxisType.REDUCE)
@@ -2166,7 +2657,7 @@ def test_production_sparse_label_smoothing_stages_nested_reductions(smoothing:fl
     for call in calls:
       to_program_cache.clear()
       images.append(decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)))
-  assert len(images)==3 and len(_ew_ops(images[2]))==108 and len(images[2].program)<180
+  assert len(images)==3 and len(_ew_ops(images[2]))==106 and len(images[2].program)<180
   assert not _typed_ops(images[2],RKCMAC)
   assert not _runtime_gathers(images[2]) and all(_assert_decoded_image_bounds(image)==image for image in images)
   digest=hashlib.sha256()
@@ -2203,7 +2694,8 @@ def test_production_causal_attention_applies_infinite_mask_after_precise_dot():
 
 
 def test_generic_image_allows_many_small_ew_stages():
-  count = 1237
+  # Carry comparison emits 35 stages per term; retain the test above the 16-bit command-count boundary.
+  count = 1873
   out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.int, (count,)), UOp.param(2, dtypes.int, (count,))
   value = UOp.const(0.0, dtypes.half)
   for index in range(count):
@@ -2306,10 +2798,13 @@ def test_production_chunked_conversions_preserve_lanes(count:int,source_dtype,ta
 
 
 def test_remapped_integer_and_bool_to_float_casts_use_generic_typed_values():
-  for dtype,stages in ((dtypes.int, 6), (dtypes.bool, 9)):
+  for dtype,stages in ((dtypes.int, 6), (dtypes.bool, 7)):
     source = UOp.param(1, dtype, (9,))
     image = _lower_uop_program(_program(dtypes.float, lambda i:source.index(8-i).load().cast(dtypes.float), count=9))
     assert image is not None and len(_ew_ops(image)) == stages and decode_image(encode_image(image)) == image
+    values=np.asarray((-2048,-1024,-1,0,1,2,1024,2048,32752),dtype="<i4") if dtype is dtypes.int else np.arange(9)%3!=1
+    assert _assert_decoded_image_bounds(image)==image
+    assert _execute_raw_dynamic_image(image,36,values.tobytes())==values[::-1].astype("<f4").tobytes()
 
 
 def test_terminal_half_casts_use_typed_integer_and_canonical_bool_abis():
@@ -2320,6 +2815,26 @@ def test_terminal_half_casts_use_typed_integer_and_canonical_bool_abis():
   assert boolean is not None and _ew_ops(boolean)[-1].mode==RKEWMode.HALF_TO_INT16 and _ew_ops(boolean)[-1].dst.kind is RKBufferKind.SCRATCH
   assert len(_output_gathers(boolean)) == 1 and _output_gathers(boolean)[0].itemsize == 1
   assert decode_image(encode_image(integer)) == integer and decode_image(encode_image(boolean)) == boolean
+
+
+@pytest.mark.parametrize("count",(1,7,65,4097))
+@pytest.mark.parametrize("view",("direct","flip","pad"))
+@pytest.mark.parametrize("spelling",("cast","ne"))
+def test_production_half_nonzero_casts_share_boolean_conversion(count:int,view:str,spelling:str):
+  # This executor models ordered NumPy comparisons; NaN classification is verified separately on the actual NPU.
+  words=np.resize(np.asarray((0x8000,0,0xfc00,0x7c00,1,0x8001,0x7bff,0xfbff,0x3c00,0xbc00),dtype="<u2"),count)
+  expected_words=words if view=="direct" else words[::-1] if view=="flip" else np.pad(words,(1,2))
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=21000+count))
+    value=source if view=="direct" else source.flip(0) if view=="flip" else source.pad(((1,2),))
+    output=value.bool() if spelling=="cast" else value!=0
+    calls=output.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
+  assert _execute_raw_dynamic_image(image,len(expected_words),words.tobytes())==((expected_words&0x7fff)!=0).tobytes()
 
 
 def test_fp32_pure_add_tree_routes_cmac_at_the_half_output_boundary():
@@ -2638,6 +3153,35 @@ def test_production_large_all_uses_bounded_row_reduction():
   assert _execute_raw_dynamic_image(images[2],1,rows)==bytes((int(expected.all()),))
 
 
+@pytest.mark.parametrize("rows",(1,3,9))
+@pytest.mark.parametrize("width",(31,32,33,63,64,65,511,512,513))
+@pytest.mark.parametrize("invert",(False,True))
+def test_production_boolean_reduction_consumes_int16_masks(rows:int,width:int,invert:bool):
+  # The accumulator's exact {0,1} domain permits ordinary INT16 comparison, without a HALF storage bridge.
+  # NaN input classification is checked separately on real hardware, not inferred from this NumPy executor.
+  words=np.resize(np.asarray((0x3c00,0xbc00,0x7c00,0xfc00,1,0x8001),dtype="<u2"),rows*width).reshape(rows,width)
+  for row in range(1,rows): words[row,row*17%width]=0 if row%2 else 0x8000
+  expected=np.all((words&0x7fff)!=0,axis=1)
+  if invert: expected=~expected
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",rows*width,dtypes.half,num=23000+rows*1000+width)).reshape(rows,width)
+    result=(source!=0).all(1)
+    if invert: result=result.logical_not()
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and not _runtime_gathers(image)
+  actual=_execute_raw_dynamic_image(image,rows,words.tobytes())
+  assert actual==expected.tobytes()
+  if width>=32:
+    stages=_ew_ops(image)
+    assert len(stages)<400  # A rejected mapped consumer must not silently turn into a large unrolled program.
+    terminal_product=max(index for index,stage in enumerate(stages) if stage.mode is RKEWMode.INT16 and stage.ew_cfg==_EW_CFG[Ops.MUL])
+    assert all(stage.mode is RKEWMode.INT16 for stage in stages[terminal_product+1:])
+
+
 def test_dependent_scalar_extrema_uses_direct_native_lowering():
   for extents in ((4,), (45,65)):
     count=math.prod(extents)
@@ -2755,10 +3299,10 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
 
   coordinate = images[-1]
   # Bounded counts use the shared mapped INT16 reduction after exact INT32 predicates and raw narrowing.
-  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (135,148,7861,1)
+  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (120,108,7765,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="35e50a800397d5fccee67c44a1b284f7ed977f1c1499c86d43072f88cc1e7f63"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="779978a6def3589de6d22197d99c88bac532baf7ee2516ee44b94defcdc3b4a0"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -2771,12 +3315,12 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
     large_images=[decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)) for call in large_calls]
   assert len(large_images)==5
   prefix,mapped_coordinate,large_coordinate=large_images[0],large_images[2],large_images[-1]
-  assert (len(prefix.scratch),len(_static_gathers(prefix)),len(_ew_ops(prefix)),len(_output_gathers(prefix))) == (21,19,83,0)
+  assert (len(prefix.scratch),len(_static_gathers(prefix)),len(_ew_ops(prefix)),len(_output_gathers(prefix))) == (11,13,40,0)
   assert not _typed_ops(prefix,RKCMAC)
   assert (len(mapped_coordinate.scratch),len(_static_gathers(mapped_coordinate)),len(_ew_ops(mapped_coordinate)),
-          len(_output_gathers(mapped_coordinate))) == (19,30,47,0)
+          len(_output_gathers(mapped_coordinate))) == (14,20,39,0)
   assert (len(large_coordinate.scratch),len(_static_gathers(large_coordinate)),len(_ew_ops(large_coordinate)),
-          len(_output_gathers(large_coordinate))) == (129,148,7903,1)
+          len(_output_gathers(large_coordinate))) == (114,102,7764,1)
   assert not _typed_ops(large_coordinate,RKCMAC)
   values=np.random.default_rng(1001).uniform(-1,1,size=320).astype("<f2")
   assert hashlib.sha256(_execute_raw_dynamic_image(prefix,768*4,values.tobytes())).hexdigest() == \
@@ -2897,13 +3441,13 @@ def test_affine_gather_bounds_reject_negative_low_but_keep_offset_sentinel():
     for count in (1, 2):
       invalid = RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),count,base=-1,axes=((1,count,1),),itemsize=dtype.itemsize)
       try: rockchip_renderer._validate_gather_bounds(invalid, count)
-      except RuntimeError: pass
+      except rockchip_renderer._RKGenericReject: pass
       else: raise AssertionError(f"negative affine low admitted for {dtype} lane{count}")
       rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),count,axes=((1,count,1),),itemsize=dtype.itemsize),count)
       rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),count,offsets=(-1,)+(0,)*(count-1)),1)
       try: rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),
         count,offsets=(-2,0)[:count]),count)
-      except RuntimeError: pass
+      except rockchip_renderer._RKGenericReject: pass
       else: raise AssertionError(f"offset below sentinel admitted for {dtype} lane{count}")
       if dtype is not dtypes.bool:
         assert _lower_uop_program(_dynamic_load_program(count=count, dtype=dtype, normalized=True)) is not None
@@ -2913,7 +3457,7 @@ def test_scalar_gather_bounds_reject_negative_low_for_all_typed_lanes():
   for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
     try: rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),1,
       base=-1,itemsize=dtype.itemsize),1)
-    except RuntimeError: pass
+    except rockchip_renderer._RKGenericReject: pass
     else: raise AssertionError(f"negative scalar low admitted for {dtype}")
     rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),1,itemsize=dtype.itemsize),1)
 
@@ -2932,7 +3476,7 @@ def test_gather_offsets_reject_true_gate_negative_and_allow_false_sentinel():
 
 def test_gather_offsets_validate_before_repeated_destination_overwrite():
   lane=UOp.range(4,1200,dtype=dtypes.int)
-  with pytest.raises(RuntimeError): rockchip_renderer._gather_offsets(lane%2,lane-1,UOp.const(True,dtypes.bool),2)
+  with pytest.raises(rockchip_renderer._RKGenericReject): rockchip_renderer._gather_offsets(lane%2,lane-1,UOp.const(True,dtypes.bool),2)
   assert rockchip_renderer._gather_offsets(lane%2,lane-1,lane>0,2)==(1,2)
 
 
@@ -3100,6 +3644,37 @@ def test_production_bounded_lookup_uses_shared_runtime_load(count:int,limit:int,
   assert _execute_raw_dynamic_image(image,count*4,inputs.tobytes())==expected.tobytes()
 
 
+def _ordered_byte_values(byte:int, order:int):
+  pairs=np.arange(65536,dtype=np.uint32)
+  prefix=np.uint32(0xa55aa55a & (0xffffffff ^ ((1<<(8*(byte+1)))-1)))
+  left=(prefix|((pairs//256)<<(8*byte))|int(order>0)).view(np.int32)
+  right=(prefix|((pairs%256)<<(8*byte))|int(order<0)).view(np.int32)
+  return left,right
+
+
+@pytest.mark.parametrize('byte,order',((0,0),*((byte,order) for byte in (1,2,3) for order in (-1,0,1))))
+@pytest.mark.parametrize('suffix',('plain','invert','select'))
+def test_production_ordered_comparison_covers_every_byte_pair(byte:int,order:int,suffix:str):
+  # Every byte pair is checked with lower components equal, smaller and larger, including the signed high byte.
+  left,right=_ordered_byte_values(byte,order)
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    a,b=(Tensor(UOp.new_buffer('ROCKCHIP',len(left),dtypes.int,num=41000+i)) for i in range(2))
+    less=a<b
+    result=less if suffix=='plain' else less.logical_not() if suffix=='invert' else less.where(dtypes.int.min,dtypes.int.max).cast(dtypes.int)
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP')))
+    image=decode_image(next(node.arg for node in program.src if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image
+  bindings={a.uop.buf_uop:left.tobytes(),b.uop.buf_uop:right.tobytes()}
+  expected=left<right
+  if suffix=='invert': expected=~expected
+  elif suffix=='select': expected=np.where(expected,dtypes.int.min,dtypes.int.max).astype('<i4')
+  actual=_execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))
+  assert actual==expected.tobytes()
+
+
 def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   rng = np.random.default_rng(0x2608)
   samples = [rng.integers(-(1<<31), 1<<31, 64, dtype=np.int64).astype(np.int32) for _ in range(3)]
@@ -3125,6 +3700,38 @@ def test_int32_bitwise_uop_executes_over_raw_byte_planes():
   maximum = _lower_uop_program(_int32_binary_program(lambda lhs,rhs:lhs & rhs, _MAX_EW_ELEMS_FP16//4))
   assert maximum is not None and decode_image(encode_image(maximum)) == maximum
   assert _lower_uop_program(_int32_binary_program(lambda lhs,rhs:lhs & rhs, _MAX_EW_ELEMS_FP16//4+1)) is None
+
+
+@pytest.mark.parametrize('count',(1,4,257))
+@pytest.mark.parametrize('kind',('trunc','floor','fmod','mod','pair'))
+def test_production_int32_divmod_preserves_byte_borrows(count:int,kind:str):
+  # Cross every byte boundary, including negative values, INT32_MIN/-1 and zero divisors.
+  edges=(0,1,-1,255,-255,256,-256,257,-257,65535,-65535,65536,-65536,65537,-65537,
+         16777215,-16777215,16777216,-16777216,16777217,-16777217,dtypes.int.min,dtypes.int.max)
+  left=np.resize(np.asarray(edges,dtype='<i4'),count)
+  right=np.resize(np.asarray((-1,0,1,3,-3,255,-255,256,-256,65535,-65535,65536,-65536,
+                              16777215,-16777215,16777216,-16777216,dtypes.int.min,dtypes.int.max),dtype='<i4'),count)
+  left[0],right[0]=dtypes.int.min,-1
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    a,b=(Tensor(UOp.new_buffer('ROCKCHIP',count,dtypes.int,num=46000+i)) for i in range(2))
+    quotient=a.div(b,rounding_mode='trunc')
+    value=(quotient if kind=='trunc' else a.div(b,rounding_mode='floor') if kind=='floor' else
+           a.fmod(b) if kind=='fmod' else a%b if kind=='mod' else quotient+a.fmod(b))
+    calls=value.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP')))
+    image=decode_image(next(node.arg for node in program.src if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and not _runtime_gathers(image)
+  expected=[]
+  for lhs,rhs in zip(left.tolist(),right.tolist()):
+    quotient,remainder=_trunc_divmod_int32(lhs,rhs)
+    correction=int(remainder!=0 and (lhs<0)!=(rhs<0))
+    expected.append(_wrap_int32(quotient if kind=='trunc' else quotient-correction if kind=='floor' else remainder if kind=='fmod' else
+                               remainder+correction*rhs if kind=='mod' else quotient+remainder))
+  bindings={a.uop.buf_uop:left.tobytes(),b.uop.buf_uop:right.tobytes()}
+  actual=_execute_raw_dynamic_image(image,count*4,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))
+  assert actual==np.asarray(expected,dtype='<i4').tobytes()
 
 
 def test_wide_int32_cdiv_cmod_physical_semantics_and_composition():
@@ -3361,7 +3968,7 @@ def test_cmac_candidate_filter_keeps_later_valid_layout():
   boundary, expanded = lower(384), lower(385)
   assert _cmac(boundary) is not None and (_cmac(boundary).m,_cmac(boundary).n,_cmac(boundary).k) == (2,1,384)
   assert _cmac(expanded) is not None and (_cmac(expanded).m,_cmac(expanded).n,_cmac(expanded).k) == (1,2,385)
-  assert _output_gathers(boundary)[0].offsets == (0,64) and _output_gathers(expanded)[0].offsets == (0,1)
+  assert _gather_lanes(_output_gathers(boundary)[0]) == (0,64) and _gather_lanes(_output_gathers(expanded)[0]) == (0,1)
   assert all(not _ew_ops(image) and len(_initial_gathers(image)) == 2 and decode_image(encode_image(image)) == image for image in (boundary,expanded))
   source_values = (np.arange(770)%17-8).astype(np.float16).reshape(2,385)
   scratch = [np.zeros(size//2,dtype=np.uint16) for size in expanded.scratch]
@@ -3380,7 +3987,7 @@ def test_cmac_candidate_filter_keeps_later_valid_layout():
   product, physical = lhs.astype(np.float32)@rhs.astype(np.float32).T, np.zeros(cmac.m*ao*2,dtype=np.float16)
   for row in range(cmac.m):
     for col in range(cmac.n): physical[row*ao*2+col//16*32+col%16] = product[row,col]
-  np.testing.assert_array_equal(physical[np.asarray(_output_gathers(expanded)[0].offsets)],source_values.sum(axis=1,dtype=np.float32))
+  np.testing.assert_array_equal(physical[np.asarray(_gather_lanes(_output_gathers(expanded)[0]))],source_values.sum(axis=1,dtype=np.float32))
 
 
 def test_cmac_extent_bound_rejects_before_static_unroll(monkeypatch):
@@ -3392,10 +3999,12 @@ def test_cmac_extent_bound_rejects_before_static_unroll(monkeypatch):
     output=rockchip_renderer._outs(uops)[1]
     assert output is not None
     return output,uops
-  assert rockchip_renderer._lower_cmac_reduce(*reduction(4096)) is not None
+  output,uops=reduction(4096)
+  assert rockchip_renderer._lower_cmac_reduce(output,uops,rockchip_renderer.RKPlan(uops))
   def forbidden(*_args,**_kwargs): raise AssertionError("oversized CMAC candidate was statically unrolled")
   monkeypatch.setattr(rockchip_renderer,"_unroll_static_reduces",forbidden)
-  assert rockchip_renderer._lower_cmac_reduce(*reduction(4097)) is None
+  output,uops=reduction(4097)
+  assert not rockchip_renderer._lower_cmac_reduce(output,uops,rockchip_renderer.RKPlan(uops))
 
 
 def test_wide_mapped_where_sum_routes_production_cacc():
@@ -3408,7 +4017,9 @@ def test_wide_mapped_where_sum_routes_production_cacc():
                        RockchipRenderer(Target(device="ROCKCHIP")))
   image=decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY))
   assert tuple((op.m,op.n,op.k) for op in _typed_ops(image,RKCMAC))==((1,16,4096),)
-  assert len(_ew_ops(image))==80 and len(image.program)==104 and not _runtime_gathers(image)
+  # Ordinary contraction lowering commits CACC's HALF result directly; no terminal DPU MAX-copy is needed.
+  # Native-word selection removes two DPU operations and five raw-byte gathers.
+  assert len(_ew_ops(image))==34 and len(image.program)==47 and not _runtime_gathers(image)
   rng=np.random.default_rng(0x44)
   select_values=rng.uniform(-1,1,size=shape).astype("<f2")
   lhs_values=rng.uniform(-0.125,0.125,size=shape).astype("<f2")
@@ -3466,7 +4077,7 @@ def test_production_sort_maps_short_bounded_integer_sums():
       params=tuple(param for param in uops if param.op is Ops.PARAM)
       input_count=next(int(param.src[0].arg) for param in params if param.arg.slot==1)
       (ranked if len(params)==2 else weighted).append((input_count,image))
-  assert [count for count,_ in ranked]==[384,512] and all(len(_ew_ops(image))==53 for _,image in ranked)
+  assert [count for count,_ in ranked]==[384,512] and all(len(_ew_ops(image))==40 for _,image in ranked)
   assert all(not _typed_ops(image,RKCMAC) for _,image in ranked)
   special=np.asarray((0.0,-0.0,np.inf,-np.inf,np.nan,np.nextafter(np.float16(0),np.float16(1)),-1.0),dtype="<f2")
   for input_count,image in ranked:
@@ -3480,7 +4091,7 @@ def test_production_sort_maps_short_bounded_integer_sums():
       expected.append(sum(index<position+1 and row[index]==row[position] for index in range(6)))
     np.testing.assert_array_equal(actual,np.asarray(expected,dtype=np.int32))
     assert _assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image
-  assert len(weighted)==1 and weighted[0][0]==384 and len(_ew_ops(weighted[0][1]))==77
+  assert len(weighted)==1 and weighted[0][0]==384 and len(_ew_ops(weighted[0][1]))==64
   weighted_image=weighted[0][1]
   assert not _typed_ops(weighted_image,RKCMAC)
   assert not any(op.mode==RKEWMode.HALF_TO_INT32 for op in _ew_ops(weighted_image))
@@ -3567,7 +4178,7 @@ def test_production_large_cumulative_index_uses_bounded_mapped_max():
       images.append(decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)))
   coordinate=images[-1]
   static=_static_gathers(coordinate)
-  assert len(images)==4 and (len(coordinate.scratch),len(static),len(_ew_ops(coordinate)))==(21,21,62)
+  assert len(images)==4 and (len(coordinate.scratch),len(static),len(_ew_ops(coordinate)))==(14,15,49)
   reverse=next((gather for gather in static if gather.count==1024*1024 and len(gather.axes)==11),None)
   assert reverse is not None and not reverse.offsets and any(gather.src is None and gather.count==2048 and
     gather.dst==reverse.src._replace(addend=1022*1024*2) for gather in static)
@@ -3661,7 +4272,7 @@ def test_deep_generic_graph_canonicalization_is_iterative():
 def test_static_range_environment_allocation_is_bounded():
   axes = [UOp.range(1024, 0), UOp.range(1024, 1)]
   try: _static_lanes(tuple(axes),*axes,limit=1024)
-  except RuntimeError as error: assert "static_index_budget" in str(error)
+  except rockchip_renderer._RKGenericReject as error: assert "static_index_budget" in str(error)
   else: raise AssertionError("oversized static RANGE product was materialized")
 
 
@@ -3792,3 +4403,27 @@ def test_nonaffine_scalar_dot_uses_cmac_static_packing():
   assert any(gather.offsets[:groups] == permutation for gather in _initial_gathers(image))
   assert not _ew_ops(image) and _output_gathers(image)[0].offsets == (0,)
   assert decode_image(encode_image(image)) == image
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float))
+@pytest.mark.parametrize("boundary",("none","root","parent","leaf","nested","unrelated"))
+def test_recipe_tagging_preserves_opaque_semantic_subgraphs(dtype, boundary):
+  source=UOp.param(1,dtype,(4,)).index(UOp.range(4,0,dtype=dtypes.int)).load()
+  leaf=source+source.const_like(1)
+  parent=leaf*leaf+source.const_like(0.5)
+  root=(parent+leaf)*(parent-source.const_like(2))
+  opaque={"none":(),"root":(root,),"parent":(parent,),"leaf":(leaf,),
+          "nested":(parent,leaf),"unrelated":(source.const_like(19),)}[boundary]
+  tagged=rockchip_renderer._tag_precise_adds(root,opaque)
+  pending,seen=[(root,tagged)],set()
+  while pending:
+    original,physical=pending.pop()
+    if (original,physical) in seen: continue
+    seen.add((original,physical))
+    if original in opaque:
+      assert physical is original  # Includes every cast and untagged ADD below this semantic boundary.
+      continue
+    expected=rockchip_renderer._NATIVE_PRECISE_ADD if original.op is Ops.ADD and original.dtype.scalar() is dtypes.half else original.arg
+    assert (physical.op,physical.dtype,physical.arg,physical.tag)==(original.op,original.dtype,expected,original.tag)
+    assert len(physical.src)==len(original.src)
+    pending.extend(zip(original.src,physical.src))
