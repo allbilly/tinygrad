@@ -2219,12 +2219,9 @@ def test_real_matmul_routes_production_cmac_and_packs_the_output_surface():
   ("prsq,tquvr->pstuv",(3,8,10,5),(11,5,7,13,8)),
   ("zqrs,tuqvr->zstuv",(3,5,8,10),(11,7,5,13,8))))
 def test_large_einsum_uses_transposed_contiguous_cmac_view(formula:str, lhs_shape:tuple[int,...], rhs_shape:tuple[int,...], monkeypatch):
-  projections=[]
-  original_argsort=rockchip_renderer.argsort
-  def selected_projection(values):
-    projections.append(len(values))
-    return original_argsort(values)
-  monkeypatch.setattr(rockchip_renderer,"argsort",selected_projection)
+  # The source projection is the inverse mixed-radix map, not a sorted output-size permutation.
+  def forbidden_projection(*_): raise AssertionError("CMAC packing must not expand and sort the output permutation")
+  monkeypatch.setattr(rockchip_renderer,"argsort",forbidden_projection,raising=False)
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
     lhs=Tensor(UOp.new_buffer("ROCKCHIP",math.prod(lhs_shape),dtypes.half,num=1064).reshape(lhs_shape))
     rhs=Tensor(UOp.new_buffer("ROCKCHIP",math.prod(rhs_shape),dtypes.half,num=1065).reshape(rhs_shape))
@@ -2232,13 +2229,34 @@ def test_large_einsum_uses_transposed_contiguous_cmac_view(formula:str, lhs_shap
     program=to_program(Tensor.einsum(formula,lhs,rhs).schedule_linear().src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP")))
   image=decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY))
   assert _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k)==(1001,30,40)
-  assert projections==[30030], "only the selected CMAC layout needs a lane permutation"
   assert not _ew_ops(image) and not _runtime_gathers(image) and _assert_decoded_image_bounds(image)==image
   lhs_values=(np.arange(math.prod(lhs_shape))%5-2).astype("<f2").reshape(lhs_shape)
   rhs_values=(np.arange(math.prod(rhs_shape))%5-2).astype("<f2").reshape(rhs_shape)
   actual=np.frombuffer(_execute_raw_dynamic_image(image,30030*2,lhs_values.tobytes(),rhs_values.tobytes()),dtype="<f2").reshape(3,10,11,7,13)
   expected=np.einsum(formula,lhs_values.astype(np.float32),rhs_values.astype(np.float32)).astype("<f2")
   np.testing.assert_array_equal(actual,expected)
+
+
+@pytest.mark.parametrize("order",("pstuv","ptsvu","vstpu","tupvs","utsvp","spvut"))
+def test_production_cmac_permuted_output_composes_source_coordinates(order):
+  # Materialize the requested order: a lazy permuted view alone need not change the compiled store layout.
+  lhs_shape,rhs_shape=(3,5,8,10),(11,7,5,13,8)
+  formula=f"pqrs,tuqvr->{order}"
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    lhs=Tensor(UOp.new_buffer("ROCKCHIP",math.prod(lhs_shape),dtypes.half,num=31003).reshape(lhs_shape))
+    rhs=Tensor(UOp.new_buffer("ROCKCHIP",math.prod(rhs_shape),dtypes.half,num=31004).reshape(rhs_shape))
+    calls=Tensor.einsum(formula,lhs,rhs).contiguous().schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert (cmac:=_cmac(image)) is not None and (cmac.m,cmac.n,cmac.k)==(1001,30,40)
+  assert not _ew_ops(image) and not _runtime_gathers(image) and _assert_decoded_image_bounds(image)==image
+  for seed in range(3):
+    rng=np.random.default_rng(seed)
+    lhs_values,rhs_values=(rng.integers(-3,4,shape).astype("<f2") for shape in (lhs_shape,rhs_shape))
+    expected=np.einsum(formula,lhs_values.astype("<f4"),rhs_values.astype("<f4")).astype("<f2")
+    assert _execute_raw_dynamic_image(image,expected.nbytes,lhs_values.tobytes(),rhs_values.tobytes())==expected.tobytes()
 
 
 @pytest.mark.parametrize(("m","k","n"), ((256,256,256),(192,256,160),(64,384,384),(512,128,128)))

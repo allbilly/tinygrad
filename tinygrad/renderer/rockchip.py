@@ -5,7 +5,7 @@ from enum import IntEnum
 from typing import Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
-from tinygrad.helpers import argsort, ceildiv, polyN, round_up, strides_for_shape
+from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, identity_element, python_alu
@@ -567,10 +567,10 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   diagonal=not candidates; m,n,row_axes,shape_terms,ai,ao=min(candidates,key=lambda shape:(shape[0]==1 and rows>1,shape[0]*shape[4]+shape[5]*shape[4]+2*shape[0]*shape[5])) if candidates else (rows,rows,None,tuple(parsed),*_cmac_layout(rows,groups)[:2])  # noqa: E501
   if m>0x7ff or ai>_MAX_CMAC_K or ao>0x3fff or m*ai*2>10*32768 or ao*ai*2>11*32768 or m!=1 and ai>12*32: return False
   fields=tuple((stride,limit,math.prod(extent for previous,_,extent in output_axes[:i] if (previous in row_axes)==(axis in row_axes))*(n if axis in row_axes else 1)) for i,(axis,stride,limit) in enumerate(output_axes)) if row_axes and row_axes<all_axes else ()  # noqa: E501
-  outputs=tuple(sum(lane//stride%limit*coefficient for stride,limit,coefficient in fields) for lane in range(rows)) if row_axes and row_axes<all_axes else ()  # noqa: E501
-  lanes=argsort(outputs)
-  packed_a=tuple(((load_plan.param.arg.slot,int(plan_offsets(load_plan.gather.axes,load_plan.gather.offsets)[row if diagonal else lanes[row*n] if lanes else row*n])+(0 if load_plan.gather.offsets else load_plan.gather.base)) if (load_plan:=shape_terms[k][0]) is not None else (None,_storage_bits(1.0 if shape_terms[k][1] is None else shape_terms[k][2]))) if k<groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
-  packed_b=tuple(((load_plan.param.arg.slot,int(plan_offsets(load_plan.gather.axes,load_plan.gather.offsets)[col if diagonal else lanes[col] if lanes else col])+(0 if load_plan.gather.offsets else load_plan.gather.base)) if (load_plan:=shape_terms[k][1]) is not None else (None,_storage_bits(shape_terms[k][2]))) if col<n and (k:=ib*32+ki)<groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32) for col in (ob*16+ni,))  # noqa: E501
+  # Invert the mixed-radix strides directly; only the selected A/B lanes need a source coordinate.
+  def source_lane(lane:int) -> int: return sum(lane//coefficient%limit*stride for stride,limit,coefficient in fields) if fields else lane
+  packed_a=tuple(((load_plan.param.arg.slot,int(plan_offsets(load_plan.gather.axes,load_plan.gather.offsets)[row if diagonal else source_lane(row*n)])+(0 if load_plan.gather.offsets else load_plan.gather.base)) if (load_plan:=shape_terms[k][0]) is not None else (None,_storage_bits(1.0 if shape_terms[k][1] is None else shape_terms[k][2]))) if k<groups else (None,0) for row in range(m) for k in range(ai))  # noqa: E501
+  packed_b=tuple(((load_plan.param.arg.slot,int(plan_offsets(load_plan.gather.axes,load_plan.gather.offsets)[col if diagonal else source_lane(col)])+(0 if load_plan.gather.offsets else load_plan.gather.base)) if (load_plan:=shape_terms[k][1]) is not None else (None,_storage_bits(shape_terms[k][2]))) if col<n and (k:=ib*32+ki)<groups else (None,0) for ob in range(ao//16) for ib in range(ai//32) for ni in range(16) for ki in range(32) for col in (ob*16+ni,))  # noqa: E501
   gathers=[]
   for dst,(packed,shape) in enumerate(zip((packed_a,packed_b),((m,ai),(ao//16,ai//32,16,32)))):
     sources=tuple(dict.fromkeys(owner for owner,_ in packed if owner is not None)); values=tuple(value if owner is None else 0 for owner,value in packed); seeded=not sources or any(values)  # noqa: E501
@@ -578,7 +578,7 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
     gathers.extend(_compact_gather(RKGather(RKArg(RKBufferKind.ARG,source),slots[dst],len(packed),offsets=tuple(value if owner==source else -1 for owner,value in packed),partial=seeded or bool(i)),shape) for i,source in enumerate(sources))  # noqa: E501
   if sum(gather.count for gather in gathers)+rows>_MAX_DYNAMIC_SELECTOR_CELLS: return False
   fp16=out.dtype.scalar() is dtypes.half; cmac=RKCMAC(slots[2],slots[0],slots[1],m,n,groups,fp16,relu_root is not None)  # noqa: E501
-  output_offsets=tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for position in (tuple(i*rows+i for i in range(rows)) if diagonal else outputs or tuple(range(rows))) for row,col in (divmod(position,n),))  # noqa: E501
+  output_offsets=tuple(row*ao*(2 if fp16 else 1)+(col//16*32+col%16 if fp16 else col) for lane in range(rows) for position in (lane*(rows+1) if diagonal else sum(lane//stride%limit*coefficient for stride,limit,coefficient in fields) if fields else lane,) for row,col in (divmod(position,n),))  # noqa: E501
   commit=_compact_gather(RKGather(cmac.dst,RKArg(RKBufferKind.ARG,out.arg.slot),rows,offsets=output_offsets,itemsize=2 if fp16 else 4),(m,n//16,16) if n%16==0 else (m,n))  # noqa: E501
   plan.scratch.extend((m*ai*2,ao*ai*2,m*ao*4)); plan.program.extend((*gathers,cmac,commit))
   return True
