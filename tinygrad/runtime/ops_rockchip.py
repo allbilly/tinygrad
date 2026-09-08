@@ -23,18 +23,18 @@ def _rk_buffer_view(raw:HCQBuffer, arg:RKArg, fmt:str, itemsize:int) -> MMIOInte
   start,count,_=slice(arg.addend//itemsize,None).indices(raw.size//itemsize)
   return raw.cpu_view().view(offset=start*itemsize,size=(count-start)*itemsize,fmt=fmt)
 
-def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|memoryview|None:
-  """Copy regular affine blocks, retaining a vectorized view for a single contiguous or strided leaf."""
+def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|None:
+  """Copy regular affine blocks through one bounded contiguous or strided leaf slice."""
   axes,code=tuple(sorted(gather.axes)),_RAW_FORMATS[gather.itemsize]
-  if not axes or gather.base<0 or any(divisor<=0 or limit<=0 or stride<=0 for divisor,limit,stride in axes): return None
+  if not axes or any(divisor<=0 or limit<=0 or stride==0 for divisor,limit,stride in axes): return None
   periods=tuple(divisor*limit for divisor,limit,_ in axes)
+  low,high=(gather.base+sum(fn((limit-1)*stride,0) for _,limit,stride in axes) for fn in (min,max))
   if gather.count%periods[-1] or any(divisor%period for period,(divisor,_,_) in zip(periods,axes[1:])) or \
-     gather.base+sum((limit-1)*stride for _,limit,stride in axes)>=len(src): return None
-  if len(axes)==1 and axes[0][:2]==(1,gather.count): return src.mv[gather.base:gather.base+gather.count*axes[0][2]:axes[0][2]]
+     low<0 or high>=len(src): return None
   def block(index:int, base:int) -> array.array:
     divisor,limit,stride=axes[index]
-    if index==0 and divisor==1: return array.array(code,src.mv[base:base+limit*stride:stride])
-    chunks=(array.array(code,[value]) for value in src.mv[base:base+limit*stride:stride]) if index==0 else (block(index-1,base+i*stride) for i in range(limit))  # noqa: E501
+    if index==0 and divisor==1: return array.array(code,src.mv[base::stride][:limit].tobytes())
+    chunks=(array.array(code,[value]) for value in src.mv[base::stride][:limit]) if index==0 else (block(index-1,base+i*stride) for i in range(limit))  # noqa: E501
     return functools.reduce(operator.iadd,(chunk*(divisor//(periods[index-1] if index else 1)) for chunk in chunks),array.array(code))
   return block(len(axes)-1,gather.base)*(gather.count//periods[-1])
 
@@ -64,10 +64,9 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
     assert gather.src is not None
     fill=not gather.partial and bool(gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
     if fill and not bounded and gather.count: raise IndexError("RKGather destination exceeds buffer")
-    if gather.index is None and not offsets and bounded:
-      if (payload:=_regular_gather_payload(gather,src)) is not None:
-        dst.mv[span]=payload
-        continue
+    if gather.index is None and not offsets and bounded and (payload:=_regular_gather_payload(gather,src)) is not None:
+      dst.mv[span]=payload
+      continue
     # Build one raw payload before assignment; inactive partial lanes retain their existing destination bits.
     if gather.index is None and offsets and bounded:
       picked=operator.itemgetter(*offsets)(src.mv) if gather.count>1 and min(offsets)>=0 and max(offsets)<src_limit else (

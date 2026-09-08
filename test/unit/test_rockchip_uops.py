@@ -904,6 +904,42 @@ def test_runtime_affine_gather_repetition_snapshots_overlap(itemsize:int, axes:t
     assert memory.storage.raw==expected.tobytes()
 
 
+@pytest.mark.parametrize("itemsize",(1,2,4))
+@pytest.mark.parametrize("axes",(((1,7,-1),),((1,3,-2),(6,2,10)),((1,3,2),(3,5,-7)),
+                                  ((3,4,-2),),((1,3,-2),(3,2,-9),(6,2,40))))
+@pytest.mark.parametrize("alias",(False,True))
+@pytest.mark.parametrize("partial",(False,True))
+@pytest.mark.parametrize("dst_addend",(0,1))
+def test_runtime_signed_affine_blocks_share_bounded_leaf_copy(itemsize:int,axes,alias:bool,partial:bool,dst_addend:int):
+  count=2*max(divisor*limit for divisor,limit,_ in axes)
+  base=-sum(min((limit-1)*stride,0) for _,limit,stride in axes)
+  indices=tuple(base+sum(lane//divisor%limit*stride for divisor,limit,stride in axes) for lane in range(count))
+  size=max(max(indices)+1,count*2+3)
+  values=(np.arange(size,dtype=np.uint64)*0x1234567+0x81).astype(f"<u{itemsize}")
+  source=_mapped_values(values,0x4000)
+  destination=source if alias else _mapped_values(np.full(size,91,dtype=values.dtype),0x8000)
+  gather=RKGather(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),count,base,axes,
+                  partial=partial,dst_stride=2,dst_addend=dst_addend,itemsize=itemsize)
+  view=rockchip_runtime._rk_buffer_view(source,gather.src,rockchip_runtime._RAW_FORMATS[itemsize],itemsize)
+  payload=rockchip_runtime._regular_gather_payload(gather,view)
+  assert payload is not None and payload.tobytes()==values[list(indices)].tobytes()
+  expected=values.copy() if alias else np.full(size,91,dtype=values.dtype)
+  if not partial and not dst_addend: expected[:]=0
+  expected[dst_addend:dst_addend+count*2:2]=values[list(indices)]
+  rockchip_runtime._apply_gathers((gather,),lambda kind,_:source if kind is RKBufferKind.ARG else destination)
+  assert destination.storage.raw==expected.tobytes()
+
+
+@pytest.mark.parametrize("itemsize",(1,2,4))
+@pytest.mark.parametrize("base,axes,count",((-1,((1,4,1),),4),(0,((1,4,-1),),4),(31,((1,4,1),),4),
+                                          (0,((1,3,1),(4,2,2)),8),(0,((1,4,0),),4),(0,((1,4,1),),7)))
+def test_runtime_affine_leaf_rejects_unsafe_or_incomplete_blocks(itemsize:int,base:int,axes,count:int):
+  source=_mapped_values(np.arange(32,dtype=f"<u{itemsize}"),0x4000)
+  gather=RKGather(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),count,base,axes,itemsize=itemsize)
+  view=rockchip_runtime._rk_buffer_view(source,gather.src,rockchip_runtime._RAW_FORMATS[itemsize],itemsize)
+  assert rockchip_runtime._regular_gather_payload(gather,view) is None
+
+
 @pytest.mark.parametrize('itemsize',(1,2,4))
 @pytest.mark.parametrize('partial',(False,True))
 @pytest.mark.parametrize('alias',(False,True))
@@ -3398,6 +3434,31 @@ def _boolean_load_view(source, layout:str):
   if layout=="broadcast": return source[:,:1].expand(source.shape)
   if layout=="masked": return source.pad(((1,1),(1,2)),value=True)
   return source
+
+
+def _raw_affine_values(dtype,width:int):
+  raw=(np.arange(3*width,dtype=np.uint64)*0x1234567+0x7c01).astype(f"<u{dtype.itemsize}").reshape(3,width)
+  return raw.view("<f2" if dtype is dtypes.half else f"<i{dtype.itemsize}")
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int16,dtypes.int))
+@pytest.mark.parametrize("width",(5,1367))
+@pytest.mark.parametrize("layout",("contiguous","transpose","stride","reverse"))
+def test_production_affine_views_preserve_raw_carriers(dtype,width:int,layout:str):
+  values=_raw_affine_values(dtype,width)
+  expected={"contiguous":values,"transpose":values.T,"stride":values[:,::2],"reverse":values[::-1,::-1]}[layout]
+  expected=expected.view(f"<u{dtype.itemsize}")^((1<<(8*dtype.itemsize))-1)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",values.size,dtype,num=65100)).reshape(values.shape)
+    view=_boolean_load_view(source,layout)
+    output=(view.bitcast(dtypes.int16) if dtype is dtypes.half else view)^-1
+    calls=output.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
+  assert _execute_raw_dynamic_image(image,expected.nbytes,values.tobytes())==expected.tobytes()
 
 
 @pytest.mark.parametrize("width",(5,17,257,1367))
