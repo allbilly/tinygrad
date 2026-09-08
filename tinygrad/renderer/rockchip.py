@@ -807,7 +807,7 @@ class RKContext:
     self.store,self.out_param,self.count,self.out_index,self.root=output; self.out=RKArg(RKBufferKind.ARG,self.out_param.arg.slot)
     # Initialize per-context state before checking the root-derived layout.
     self.plan=plan or RKPlan(list(self.store.sink().toposort())); self.scratch=self.plan.scratch; self.program=self.plan.program
-    self.values:dict[UOp,UOp]={}; self.materialized_slots:dict[tuple,int]={}
+    self.values:dict[UOp,UOp]={}; self.materialized_values:dict[tuple,UOp]={}
     self.raw_components:dict[RKArg,tuple[UOp,...]]={}
     self.recipe_owners:dict[UOp,UOp]={}
     nodes=self.root.toposort(); value_nodes=self.root.toposort(gate=lambda node:node.op is not Ops.LOAD); self.semantic_nodes=set(nodes); self.bounded_chain=any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)  # noqa: E501
@@ -834,11 +834,10 @@ class RKContext:
   def _slot(self, source:RKGather|tuple, layout:DType, size:int|None=None) -> UOp:
     plan=source if isinstance(source,RKGather) else RKGather(None,RKArg(RKBufferKind.SCRATCH,0),self.count,values=source,itemsize=layout.itemsize)  # noqa: E501
     cache_key=(layout,size,plan[:1]+plan[2:])
-    if cache_key not in self.materialized_slots:
-      value = self._scratch(layout,size)
+    if cache_key not in self.materialized_values:
+      value = self.materialized_values[cache_key] = self._scratch(layout,size)
       self.program.append(plan._replace(dst=value.arg))
-      self.materialized_slots[cache_key] = value.arg.index
-    return self._carrier(RKArg(RKBufferKind.SCRATCH,self.materialized_slots[cache_key]),layout)
+    return self.materialized_values[cache_key]
 
   def _constant(self, u:UOp, dtype_hint:DType|None=None) -> UOp:
     layout = self._layout(dtype_hint or u.dtype.scalar())

@@ -533,6 +533,32 @@ def test_materialized_slot_cache_owns_layout_size_and_source_not_destination():
   assert len(context.program)==3
 
 
+@pytest.mark.parametrize("layout",(dtypes.half,dtypes.float,dtypes.int16,dtypes.int))
+@pytest.mark.parametrize("kind",("constant","static","dynamic"))
+def test_materialization_cache_reuses_typed_value_without_reconstruction(layout,kind,monkeypatch):
+  out,axis=UOp.param(0,dtypes.half,(4,)),UOp.range(4,24)
+  root=UOp.const(0.0,dtypes.half)
+  output=(out.index(axis).store(root),out,4,axis,root)
+  plan=rockchip_renderer.RKPlan(list(output[0].sink().toposort()))
+  context=rockchip_renderer.RKContext(output,plan)
+  gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,99),4,itemsize=layout.itemsize,
+    index=RKArg(RKBufferKind.ARG,2) if kind=="dynamic" else None,axes=() if kind=="dynamic" else ((1,4,1),))
+  source=(7,) if kind=="constant" else gather
+  original_carrier=context._carrier
+  calls=[]
+  def carrier(arg,dtype):
+    calls.append((arg,dtype))
+    return original_carrier(arg,dtype)
+  monkeypatch.setattr(context,"_carrier",carrier)
+  first=context._slot(source,layout,64)
+  for _ in range(3): assert context._slot(source,layout,64) is first
+  assert calls==[(first.arg,layout)] and len(plan.program)==len(plan.scratch)==1
+  assert context._slot(source,layout,128).arg!=first.arg
+  other=rockchip_renderer.RKContext(output,plan)
+  assert other._slot(source,layout,64).arg!=first.arg
+  assert len(plan.program)==len(plan.scratch)==3
+
+
 def test_image_argument_mapping_preserves_field_order_and_nonbuffer_metadata():
   source,index=(RKArg(RKBufferKind.ARG,slot,slot*2) for slot in (1,2))
   lhs,rhs,dst=(RKArg(RKBufferKind.SCRATCH,slot) for slot in range(3))
