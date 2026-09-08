@@ -323,7 +323,8 @@ def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
   return (output if len(stores) == 1 else None), output, [store]
 
 def _admit(o,d)->RKOutput|None: return o if o is not None and o[1].dtype.scalar() in (d if isinstance(d,tuple) else (d,)) else None
-def _try(plan:RKPlan,o,d,f,*a)->bool: return (o:=_admit(o,d)) is not None and plan.lower(lambda:f(o,*a,plan))
+# Specialized lowerers receive nonempty, dtype-admitted outputs; generic lowering owns empty programs.
+def _try(plan:RKPlan,o,d,f,*a)->bool: return (o:=_admit(o,d)) is not None and o[2]>0 and plan.lower(lambda:f(o,*a,plan))
 
 
 @functools.lru_cache(maxsize=2)
@@ -497,7 +498,7 @@ def _gate_zero_term(term:UOp) -> UOp:
 def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
   """Normalize a row-reused linear expression to indexed loads, retaining its rounded coefficient matrix."""
   store,out,rows,out_index,root=output; dense=_dense_ranges(out_index,rows); one=UOp.const(1.0,dtypes.float)
-  if out.dtype.scalar() is not dtypes.float or dense is None or len(dense)<2 or rows<=0 or any(isinstance(op,RKCMAC) for op in plan.program): return False  # noqa: E501
+  if dense is None or len(dense)<2 or any(isinstance(op,RKCMAC) for op in plan.program): return False
   def expand(node:UOp,scale:UOp) -> tuple[tuple[UOp,UOp],...]:
     node=_strip_cast(node)
     if node.op in (Ops.ADD,Ops.SUB): return expand(node.src[0],scale)+expand(node.src[1],scale if node.op is Ops.ADD else scale.alu(Ops.MUL,one.const_like(-1.0)))  # noqa: E501
@@ -520,7 +521,7 @@ def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
 def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Append a separable contraction directly to the shared physical plan; mapped reduction owns other bounded shapes."""
   _,out,rows,out_index,root=output
-  if rows<=0 or any(isinstance(op,RKCMAC) for op in plan.program) or out.dtype.scalar() not in (dtypes.half,dtypes.float) or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])>_MAX_CMAC_K for node in root.toposort()): return False  # noqa: E501
+  if any(isinstance(op,RKCMAC) for op in plan.program) or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])>_MAX_CMAC_K for node in root.toposort()): return False  # noqa: E501
   slots=tuple(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(3))
   relu_root=_relu_operand(fp32_root if (fp32_root:=_typed_cast_source(root,dtypes.half,dtypes.float)) is not None else root)
   root=_strip_cast(relu_root if relu_root is not None else root); additive=root.op is Ops.ADD and root.dtype.scalar() is dtypes.float or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD for node in root.toposort())  # noqa: E501
@@ -596,7 +597,7 @@ _lookup_value=UPat(Ops.WHERE,src=(_lookup_guard,UPat.var("value"),UPat.const(0))
 def _lower_bounded_int_lookup(output:RKOutput, plan:RKPlan) -> bool:
   """Select a static INT16-valued row by an exact, range-gated runtime INT32 index."""
   store,out,count,out_index,root=output
-  if out.dtype.scalar() is not dtypes.int or not 1<=count<=_FP16_EXACT_INTEGER or not (matches:=_lookup_value.match(root,{})): return False
+  if count>_FP16_EXACT_INTEGER or not (matches:=_lookup_value.match(root,{})): return False
   source,gate,value=(matches[0][name] for name in ("source","gate","value")); limit=int(matches[0]["limit"].arg)
   if not 0<limit<=_FP16_EXACT_INTEGER or tuple(node for node in root.toposort() if node.op is Ops.LOAD)!=(source,): return False
   try:
@@ -614,7 +615,7 @@ def _lower_bounded_int_lookup(output:RKOutput, plan:RKPlan) -> bool:
 
 def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Prefer one dynamic gather or contraction, then map and reduce every remaining bounded reduction on the DPU."""
-  if output[1].dtype.scalar() is dtypes.half and 0<output[2]<=_RKIMAGE_U16_MAX and (root:=graph_rewrite(output[4],_pm_selected_load,name="rockchip selected loads")) is not output[4] and plan.lower(list(output[0].replace(src=(output[0].src[0],root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in root.toposort())): return True  # noqa: E501
+  if output[1].dtype.scalar() is dtypes.half and output[2]<=_RKIMAGE_U16_MAX and (root:=graph_rewrite(output[4],_pm_selected_load,name="rockchip selected loads")) is not output[4] and plan.lower(list(output[0].replace(src=(output[0].src[0],root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in root.toposort())): return True  # noqa: E501
   return _try(plan,output,dtypes.int,_lower_bounded_int_lookup) or _try(plan,output,(dtypes.half,dtypes.float),_lower_cmac_reduce,uops) or _try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)  # noqa: E501
 
 def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
@@ -632,7 +633,6 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
 def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Render one canonical mapped reduction, reduce it physically, then compile its dependent scalar suffix."""
   store,out,rows,out_index,root=output
-  if rows<1 or out.dtype.scalar() not in (dtypes.half,dtypes.int,dtypes.bool): return False
   reductions=tuple(node for node in root.toposort() if node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] in (Ops.ADD,Ops.MAX,Ops.MUL)); nested={child for value in reductions for child in value.src[0].toposort() if child is not value and child.op is Ops.REDUCE}  # noqa: E501
   if not (outer:=tuple(value for value in reductions if value not in nested)): return False
   value=outer[0]; body=value.src[0]; ranges=list(value.src[1:])
@@ -727,7 +727,7 @@ def _twos_complement(raw:Iterable[UOp], sign:UOp) -> tuple[UOp, ...]:
 def _lower_raw_fp16_bitcast(output:RKOutput, plan:RKPlan) -> bool:
   """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
   _,out,n,index,value=output; packed=value.src[0] if value.op is Ops.BITCAST and value.dtype is dtypes.int and len(value.src)==1 else None
-  if n <= 0 or packed is None or packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: return False
+  if packed is None or packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: return False
   lanes:dict[int,RKGather|None]={int(term.src[1].arg):_typed_load_plan(bitcast.src[0],dtypes.half,index,n,require_offsets=True) for term in packed.src if term.op is Ops.SHL and len(term.src)==2 and term.src[1].op is Ops.CONST and int(term.src[1].arg) in (0,16) for bitcast in (_typed_cast_source(term.src[0],dtypes.uint,dtypes.ushort),) if bitcast is not None and bitcast.op is Ops.BITCAST and len(bitcast.src)==1 and len(bitcast.src[0].src)==1}  # noqa: E501
   if len(packed.src)!=2 or set(lanes)!={0,16} or (low:=lanes[0]) is None or (high:=lanes[16]) is None or low.src!=high.src or any(a&1 or b!=a+1 for a,b in zip(low.offsets,high.offsets)): return False  # noqa: E501
   plan.program.append(low._replace(dst=RKArg(RKBufferKind.ARG,out.arg.slot),itemsize=4,offsets=tuple(offset//2 for offset in low.offsets)))

@@ -669,6 +669,62 @@ def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatc
   assert _transaction_state(plan)==before
 
 
+@pytest.mark.parametrize("dtype",(None,dtypes.half,dtypes.int,dtypes.float,dtypes.bool))
+@pytest.mark.parametrize("count",(0,4))
+def test_specialized_dispatch_owns_basic_output_admission(dtype,count):
+  plan=_seed_transaction_plan()
+  before=_transaction_state(plan)
+  output=None if dtype is None else rockchip_renderer._outs(_program(dtype,lambda _:UOp.const(0,dtype),count))[0]
+  calls=[]
+  def lowerer(received,target):
+    assert received is output and target is plan
+    calls.append(received)
+    return True
+  expected=count>0 and dtype in (dtypes.half,dtypes.int)
+  assert rockchip_renderer._try(plan,output,(dtypes.half,dtypes.int),lowerer) is expected
+  assert len(calls)==int(expected) and _transaction_state(plan)==before
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool))
+def test_empty_output_bypasses_specialized_lowerers(dtype,monkeypatch):
+  def forbidden(*_args): raise AssertionError("empty output reached a specialized lowerer")
+  for name in ("_lower_linear_contraction","_lower_reduction","_lower_cmac_storage_epilogue","_lower_raw_fp16_bitcast"):
+    monkeypatch.setattr(rockchip_renderer,name,forbidden)
+  assert _lower_uop_program(_program(dtype,lambda _:UOp.const(0,dtype),0))==RKImage()
+
+
+@pytest.mark.parametrize("operation",("sum","argmax","bitcast","wide_matmul"))
+def test_production_specialized_lowerers_receive_admitted_outputs(operation,monkeypatch,record_property):
+  observed=[]
+  domains={"_lower_linear_contraction":(dtypes.float,),"_lower_reduction":(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),
+           "_lower_cmac_storage_epilogue":(dtypes.half,),"_lower_raw_fp16_bitcast":(dtypes.int,),
+           "_lower_bounded_int_lookup":(dtypes.int,),"_lower_cmac_reduce":(dtypes.half,dtypes.float),
+           "_lower_mapped_reduce":(dtypes.half,dtypes.int,dtypes.bool)}
+  for name,domain in domains.items():
+    original=getattr(rockchip_renderer,name)
+    def lowerer(output,*args,_name=name,_domain=domain,_original=original):
+      assert output[2]>0 and output[1].dtype.scalar() in _domain
+      observed.append((_name,output[2]))
+      return _original(output,*args)
+    monkeypatch.setattr(rockchip_renderer,name,lowerer)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",260,dtypes.half,num=92000)).reshape(4,65)
+    if operation=="wide_matmul":
+      weight=Tensor(UOp.new_buffer("ROCKCHIP",65*7,dtypes.half,num=92001)).reshape(65,7)
+      result=source.cast(dtypes.float)@weight.cast(dtypes.float)
+    elif operation=="bitcast": result=source.reshape(5,26,2).permute(1,0,2).bitcast(dtypes.int).contiguous()
+    else: result=source.sum(1) if operation=="sum" else source.argmax(1)
+    calls=result.schedule_linear().src
+    assert calls
+    to_program_cache.clear()
+    images=[decode_image(next(node.arg for node in to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                             if node.op is Ops.BINARY)) for call in calls]
+  assert observed and all(_assert_decoded_image_bounds(image)==image for image in images)
+  record_property("lowerer_entries",repr(observed))
+  record_property("physical_ops",repr([len(image.program) for image in images]))
+  record_property("scratch_bytes",repr([sum(image.scratch) for image in images]))
+
+
 @pytest.mark.parametrize("failure",("false","reject","key"))
 def test_rejected_plan_restores_existing_lazy_binding(failure:str):
   plan=_seed_transaction_plan()
