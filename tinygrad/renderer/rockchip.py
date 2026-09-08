@@ -1020,8 +1020,7 @@ class RKContext:
         for bit,amount in enumerate((1,2,4,8,16)):
           if not masks and not (int(node.src[1].arg)&amount): continue
           fill=current[31] if node.op is Ops.SHR and node.dtype.scalar() is dtypes.int else current[0].const_like(0)
-          shifted=tuple(current[index-amount] if node.op is Ops.SHL and index>=amount else
-            current[index+amount] if node.op is Ops.SHR and index+amount<32 else fill for index in range(32))
+          shifted=(fill,)*amount+current[:-amount] if node.op is Ops.SHL else current[amount:]+(fill,)*amount
           current=shifted if not masks else tuple(old.alu(Ops.ADD,masks[bit].alu(Ops.MUL,new.alu(Ops.SUB,old)))
             for old,new in zip(current,shifted))
         return current
