@@ -856,23 +856,6 @@ class RKContext:
     encoded = values if layout is dtypes.half else tuple(map(operator.and_,values,itertools.repeat(0xffffffff if layout is dtypes.int else 0xffff)))
     return self._slot(encoded,layout)
 
-  def _host_address_load(self, param:UOp, index:UOp, gate:UOp|None, address_loads:tuple[UOp, ...], dtype:DType, layout:DType, fill_bits:int) -> UOp:  # noqa: E501
-    """Compute a dynamic address and predicate on the NPU, then move only the selected raw lane on the host.
-
-    The host never interprets tensor arithmetic or a boolean gate: an invalid lane is encoded as index -1 by the
-    ordinary typed UOp path. This replaces candidate-domain value selection with one exact physical address carrier.
-    """
-    if os.getenv("ROCKCHIP_HOST_GATHER","1") != "1" or not address_loads: raise _RKGenericReject
-    if (any((load:=_strip_cast(node)).op is Ops.LOAD and len(load.src)==1 and load.src[0].op is Ops.INDEX and (owner:=_root_param(load.src[0])) is not None and owner.src[0].op is Ops.CONST and  # noqa: E501
-            owner.dtype.scalar() in (dtypes.int,dtypes.int16) and int(owner.src[0].arg)*owner.dtype.scalar().itemsize-1>dtypes.int.max for node in address_loads) or  # noqa: E501
-        int(param.src[0].arg)*dtype.itemsize-1>dtypes.int.max): raise _RKGenericReject
-    physical=self.lower(index if gate is None else gate.where(index,index.const_like(-1)))
-    if physical.dtype not in (dtypes.int16,dtypes.int): raise _RKGenericReject
-    value=self._scratch(layout,self.count*dtype.itemsize)
-    self.program.append(RKGather(RKArg(RKBufferKind.ARG,param.arg.slot),value.arg,self.count,fill_bits=fill_bits,
-      itemsize=dtype.itemsize,index=physical.arg,index_itemsize=physical.dtype.itemsize))
-    return value
-
   def _load(self, u:UOp, fill_override:int|None=None) -> UOp:
     dtype,layout = u.dtype.scalar(),self._layout(u.dtype.scalar())
     if not u.src or u.src[0].op is not Ops.INDEX or (param:=_root_param(u.src[0])) is None or param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST: raise _RKGenericReject  # noqa: E501
@@ -889,14 +872,25 @@ class RKContext:
     fill_bits=fill_override if fill_override is not None and dtype is not dtypes.float else _storage_bits(
       0 if default is None else default.arg,dtype if dtype.itemsize>1 else dtypes.int)
     if address_loads:
-      return self._host_address_load(param,index,gate,address_loads,dtype,layout,fill_bits)
-    if (plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=fill_bits)) is None: raise _RKGenericReject
-    if dtype not in (dtypes.float,dtypes.bool) and gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
-      return self._carrier(RKArg(RKBufferKind.ARG,param.arg.slot),layout)
+      # Compute a dynamic address and predicate on the NPU, then move only the selected raw lane on the host.
+      # The host never interprets tensor arithmetic or a boolean gate: an invalid lane is encoded as index -1 by the
+      # ordinary typed UOp path. This replaces candidate-domain value selection with one exact physical address carrier.
+      if os.getenv("ROCKCHIP_HOST_GATHER","1") != "1": raise _RKGenericReject
+      if (any((load:=_strip_cast(node)).op is Ops.LOAD and len(load.src)==1 and load.src[0].op is Ops.INDEX and (owner:=_root_param(load.src[0])) is not None and owner.src[0].op is Ops.CONST and  # noqa: E501
+              owner.dtype.scalar() in (dtypes.int,dtypes.int16) and int(owner.src[0].arg)*owner.dtype.scalar().itemsize-1>dtypes.int.max for node in address_loads) or  # noqa: E501
+          int(param.src[0].arg)*dtype.itemsize-1>dtypes.int.max): raise _RKGenericReject
+      address=self.lower(index if gate is None else gate.where(index,index.const_like(-1)))
+      if address.dtype not in (dtypes.int16,dtypes.int): raise _RKGenericReject
+      gather=RKGather(RKArg(RKBufferKind.ARG,param.arg.slot),RKArg(RKBufferKind.SCRATCH,0),self.count,fill_bits=fill_bits,
+        itemsize=dtype.itemsize,index=address.arg,index_itemsize=address.dtype.itemsize)
+    else:
+      if (plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=fill_bits)) is None: raise _RKGenericReject
+      if dtype not in (dtypes.float,dtypes.bool) and gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
+        return self._carrier(RKArg(RKBufferKind.ARG,param.arg.slot),layout)
+      gather=plan._replace(itemsize=dtype.itemsize,dst_stride=2 if dtype is dtypes.bool else 1,
+        fill_bits=int(bool(default.arg)) if dtype is dtypes.bool and default is not None else 0 if dtype is dtypes.bool else fill_bits)
     physical=dtype if dtype is dtypes.float else layout
     size=ceildiv(self.count,_EW_ELEMS_32BIT)*16 if dtype is dtypes.float else self.count*(2 if dtype is dtypes.bool else dtype.itemsize)
-    gather=plan._replace(itemsize=dtype.itemsize,dst_stride=2 if dtype is dtypes.bool else 1,
-      fill_bits=int(bool(default.arg)) if dtype is dtypes.bool and default is not None else 0 if dtype is dtypes.bool else fill_bits)
     raw=self._slot(gather,physical,size)
     return self._convert(u,raw,dtypes.half) if dtype is dtypes.float else raw
 

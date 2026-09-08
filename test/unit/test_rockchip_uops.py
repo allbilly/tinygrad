@@ -5016,6 +5016,52 @@ def test_large_divided_range_address_uses_compact_gather_axes():
   assert set(plan.axes) == {(1, 64, 1), (4096, 256, 1024)}
 
 
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int16,dtypes.int,dtypes.uint))
+def test_dynamic_load_materialization_cache_keeps_descriptor_dependencies(dtype):
+  count=7
+  out,source,indices=(UOp.param(slot,typ,(size,)) for slot,typ,size in
+                      ((0,dtype,count),(1,dtype,16),(2,dtypes.int,count)))
+  lane=UOp.range(count,0,dtype=dtypes.int)
+  index=indices.index(lane).load()
+  load=source.index(index).load(UOp.const(0,dtype),index<16)
+  context=rockchip_renderer.RKContext((out.index(lane).store(load),out,count,lane,load))
+  first=context._load(load)
+  emitted=len(context.program)
+  assert context._load(load).arg==first.arg and len(context.program)==emitted
+  changed=(context._load(load,1),context._load(load.replace(src=(source.index(index+1),*load.src[1:]))),
+           context._load(load.replace(src=(UOp.param(3,dtype,(16,)).index(index),*load.src[1:]))))
+  gathers=_runtime_gathers(RKImage(tuple(context.scratch),tuple(context.program)))
+  assert len(gathers)==4 and len({first.arg,*(value.arg for value in changed)})==4
+  assert gathers[0].index==gathers[1].index==gathers[3].index and gathers[2].index!=gathers[0].index
+  assert [g.fill_bits for g in gathers]==[0,1,0,0] and gathers[0].src!=gathers[3].src
+
+
+@pytest.mark.parametrize("count",(7,9))
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int16,dtypes.int))
+@pytest.mark.parametrize("consumer",("direct","add"))
+def test_production_dynamic_load_materialization(count,dtype,consumer,record_property):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",16,dtype,num=95000))
+    indices=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.int,num=95001))
+    selected=source[indices]
+    calls=(selected if consumer=="direct" else selected+1).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  assert _runtime_gathers(image,False) and _assert_decoded_image_bounds(image)==image
+  values=np.arange(16,dtype=np.dtype(dtype.fmt))
+  choices=np.resize(np.asarray((15,0,-1,16,-17,3,-16),dtype="<i4"),count)
+  normalized=np.where(choices<0,choices+16,choices)
+  expected=np.asarray([values[i] if 0<=i<16 else 0 for i in normalized],dtype=values.dtype)
+  if consumer=="add": expected=expected+1
+  bindings={source.uop.buf_uop:values.tobytes(),indices.uop.buf_uop:choices.tobytes()}
+  assert _execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("physical_ops",len(image.program))
+  record_property("scratch_bytes",sum(image.scratch))
+
+
 def test_dynamic_host_gather_is_explicit_and_direct_scatter_fails_closed(monkeypatch):
   monkeypatch.delenv("ROCKCHIP_HOST_GATHER", raising=False)
   indices = UOp.param(2, dtypes.int, (4,))
