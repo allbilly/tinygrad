@@ -1175,8 +1175,9 @@ class RKContext:
     if result.dtype is not expected: raise _RKGenericReject
     if dtype is dtypes.float: self._convert(self.root,result,dtypes.float,dst=self.out); return
     if result.arg == self.out: return
-    if dtype in (dtypes.half,dtypes.int16): self._emit(self._carrier(self.out,expected),result,result,_EW_CFG[Ops.MAX]); return
-    self.program.append(_raw_gather(result.arg,self.out_param.arg.slot,self.count,stride=1 if dtype is dtypes.int else 2,itemsize=dtype.itemsize))  # noqa: E501
+    # BITCAST only changes the carrier interpretation; terminal storage must retain its raw payload.
+    if dtype in (dtypes.half,dtypes.int16) and self.root.op is not Ops.BITCAST: self._emit(self._carrier(self.out,expected),result,result,_EW_CFG[Ops.MAX]); return  # noqa: E501
+    self.program.append(_raw_gather(result.arg,self.out_param.arg.slot,self.count,stride=2 if dtype.itemsize==1 else 1,itemsize=dtype.itemsize))  # noqa: E501
 
   def lower(self, u:UOp) -> UOp:
     if u in self.values: return self.values[u]
@@ -1192,9 +1193,6 @@ class RKContext:
       if {dtype,source.dtype}!={dtypes.half,dtypes.int16} or source.dtype is not u.src[0].dtype.scalar():
         raise _RKGenericReject(f"bitcast {u.src[0].dtype.scalar()}->{dtype}")
       value = self._carrier(source.arg,dtype)
-      if u is self.root and value.arg != self.out:
-        self.program.append(_raw_gather(value.arg,self.out_param.arg.slot,self.count,stride=1,itemsize=2))
-        value = self._carrier(self.out,value.dtype)
     elif u.op is Ops.CAST and len(u.src) == 1: value=self._cast(u)
     elif u.op in GroupOp.Comparison or dtype is dtypes.bool and u.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR,Ops.XOR): value=self._compare(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)

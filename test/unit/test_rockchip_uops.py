@@ -1669,6 +1669,81 @@ def test_production_bitcast_complement_preserves_every_half_bit_pattern(count:in
   assert _execute_raw_dynamic_image(image,count*2,words.tobytes())==(words^0xffff).tobytes()
 
 
+@pytest.mark.parametrize("count",(7,65))
+@pytest.mark.parametrize("source_dtype",(dtypes.half,dtypes.int16))
+@pytest.mark.parametrize("reverse",(False,True))
+def test_materialized_bitcast_binds_existing_carrier(count:int,source_dtype,reverse:bool):
+  """A compiler temporary owns the interpretation, not a redundant copy of the same two-byte words."""
+  dtype=dtypes.int16 if source_dtype is dtypes.half else dtypes.half
+  source=UOp.param(1,source_dtype,(count,))
+  lane=UOp.range(count,0)
+  plan=rockchip_renderer.RKPlan(list(source.toposort()))
+  output=plan.parameter(dtype,count)
+  value=source.index(count-1-lane if reverse else lane).load().bitcast(dtype)
+  context=rockchip_renderer.RKContext((output.index(lane).store(value),output,count,lane,value),plan)
+  carrier=context.lower(value)
+  before=tuple(plan.program)
+  assert carrier.dtype is dtype and all(op.dst!=context.out for op in before)
+  context.finish(materialize=True)
+  assert tuple(plan.program)==before and plan.resolve(context.out)==carrier.arg
+  assert len(before)==int(reverse) and all(isinstance(op,RKGather) for op in before)
+
+
+@pytest.mark.parametrize("count",(7,65))
+@pytest.mark.parametrize("source_dtype",(dtypes.half,dtypes.int16))
+@pytest.mark.parametrize("select",(False,True))
+def test_production_bitcast_output_keeps_raw_storage(count:int,source_dtype,select:bool,record_property):
+  target=dtypes.int16 if source_dtype is dtypes.half else dtypes.half
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,source_dtype,num=69000))
+    mask=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.bool,num=69001))
+    value=mask.where(source,source.flip(0)) if select else source.flip(0)
+    calls=value.bitcast(target).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  words=np.resize(np.asarray((0,0x8000,0x7c00,0xfc00,0x7e31,0xfe55,0xffff,0x3c00),dtype="<u2"),count)
+  flags=np.arange(count)%3==0
+  expected=np.where(flags,words,words[::-1]) if select else words[::-1]
+  bindings={source.uop.buf_uop:words.tobytes(),mask.uop.buf_uop:flags.tobytes()}
+  assert _assert_decoded_image_bounds(image)==image
+  assert _execute_raw_dynamic_image(image,count*2,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  assert isinstance(image.program[-1],RKGather) and image.program[-1].itemsize==2
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("scratch_bytes",sum(image.scratch))
+  record_property("physical_ops",len(image.program))
+
+
+@pytest.mark.parametrize("rows",(8,16))
+@pytest.mark.parametrize("kind",("sum","max","prod"))
+def test_production_reduction_materializes_bitcast_carrier(rows:int,kind:str,monkeypatch,record_property):
+  observed=[]
+  original=rockchip_renderer.RKContext.finish
+  def observe(context,materialize=False):
+    original(context,materialize)
+    if materialize and context.root.op is Ops.BITCAST: observed.append(context.count)
+  monkeypatch.setattr(rockchip_renderer.RKContext,"finish",observe)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",rows*417,dtypes.int16,num=69500)).reshape(rows,417)
+    # A bitcasted LOAD is folded by shared codegen; retain a computed value to exercise materialization.
+    value=(source^-1).bitcast(dtypes.half)
+    output=value.sum(1,dtype=dtypes.half) if kind=="sum" else value.max(1) if kind=="max" else value.prod(1)
+    calls=output.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  assert observed==[rows*417] and _assert_decoded_image_bounds(image)==image
+  values=np.ones((rows,417),dtype="<f2")
+  values[:,-1]=2
+  expected=np.full(rows,418 if kind=="sum" else 2,dtype="<f2")
+  assert _execute_raw_dynamic_image(image,rows*2,(values.view("<u2")^0xffff).tobytes())==expected.tobytes()
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("scratch_bytes",sum(image.scratch))
+  record_property("physical_ops",len(image.program))
+
+
 def test_production_fp16_pair_bitcast_fused_transfer_uses_raw_gather():
   values = np.arange(24,dtype=np.float16).reshape(2,3,4)
   with Context(DEV="ROCKCHIP", DEFAULT_FLOAT="HALF", NOOPT=0):
