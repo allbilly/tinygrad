@@ -618,18 +618,16 @@ def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   if output[1].dtype.scalar() is dtypes.half and 0<output[2]<=_RKIMAGE_U16_MAX and (root:=graph_rewrite(output[4],_pm_selected_load,name="rockchip selected loads")) is not output[4] and plan.lower(list(output[0].replace(src=(output[0].src[0],root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in root.toposort())): return True  # noqa: E501
   return _try(plan,output,dtypes.int,_lower_bounded_int_lookup) or _try(plan,output,(dtypes.half,dtypes.float),_lower_cmac_reduce,uops) or _try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)  # noqa: E501
 
-def _bit_reverse_gather(gathers:list[RKGather], scratch:list[int], source:RKArg, dst:RKArg, groups:int, block:int, fill:int, dst_stride:int=1) -> None:  # noqa: E501
-  """Encode bit reversal with affine axes, padding an existing scratch source when its group count is not a power of two."""
-  size=1<<(groups-1).bit_length(); bits=size.bit_length()-1; source_count=groups*block; compact=size==groups or source.kind is RKBufferKind.SCRATCH  # noqa: E702,E501
-  if compact and source_count<size*block: scratch[source.index]=max(scratch[source.index],source.addend+size*block*2); gathers.append(RKGather(None,source._replace(addend=source.addend+source_count*2),size*block-source_count,values=(fill,)))  # noqa: E701,E702,E501
-  if compact: axes=(((1,block,1),) if block>1 else ())+tuple((block<<bit,2,block<<(bits-1-bit)) for bit in range(bits)); gathers.append(RKGather(source,dst,size*block,axes=axes,fill_bits=fill,dst_stride=dst_stride)); return  # noqa: E701,E702,E501
-  offsets=tuple(index if (index:=int(f"{lane:0{bits}b}"[::-1],2))<groups else -1 for lane in range(size)); offsets=offsets if block==1 else tuple(index*block+row if index>=0 else -1 for index in offsets for row in range(block)); gathers.append(RKGather(source,dst,len(offsets),offsets=offsets,fill_bits=fill,dst_stride=dst_stride))  # noqa: E702,E501
-
-def _reduce_mapped_rows(ops:list[RKEWOp], scratch:list[int], gathers:list[RKGather], source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:  # noqa: E501
+def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
-  block=8 if rows==1 else round_up(rows,8); groups=lanes if rows==1 else lanes//block
-  size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(scratch)+i) for i in range(2)); scratch.extend((_scratch_bytes(size*block),)*2); neutral=0 if cfg==_EW_CFG[Ops.ADD] else (1 if int16 else _storage_bits(1)) if cfg==_EW_CFG[Ops.MUL] else _storage_bits(dtypes.int16.min,dtypes.int16) if int16 else _storage_bits(-math.inf); _bit_reverse_gather(gathers,scratch,source,current,groups,block if rows>1 else 1,neutral,block if rows==1 else 1); first=barrier and not int16  # noqa: E501
-  while size>1: size//=2; count=size*block; ops.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current  # noqa: E501
+  block=8 if rows==1 else round_up(rows,8); groups=lanes if rows==1 else lanes//block; source_block=1 if rows==1 else block
+  size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(2)); plan.scratch.extend((_scratch_bytes(size*block),)*2); neutral=0 if cfg==_EW_CFG[Ops.ADD] else (1 if int16 else _storage_bits(1)) if cfg==_EW_CFG[Ops.MUL] else _storage_bits(dtypes.int16.min,dtypes.int16) if int16 else _storage_bits(-math.inf); first=barrier and not int16  # noqa: E501
+  # Encode bit reversal with affine axes, padding an existing scratch source when its group count is not a power of two.
+  if size==groups or source.kind is RKBufferKind.SCRATCH:
+    if groups<size: plan.scratch[source.index]=max(plan.scratch[source.index],source.addend+size*source_block*2); plan.program.append(RKGather(None,source._replace(addend=source.addend+groups*source_block*2),(size-groups)*source_block,values=(neutral,)))  # noqa: E501
+    plan.program.append(RKGather(source,current,size*source_block,axes=(((1,source_block,1),) if source_block>1 else ())+tuple((source_block<<bit,2,source_block<<(size.bit_length()-2-bit)) for bit in range(size.bit_length()-1)),fill_bits=neutral,dst_stride=block if rows==1 else 1))  # noqa: E501
+  else: offsets=tuple(index if (index:=int(f"{lane:0{size.bit_length()-1}b}"[::-1],2))<groups else -1 for lane in range(size)); offsets=offsets if source_block==1 else tuple(index*source_block+row if index>=0 else -1 for index in offsets for row in range(source_block)); plan.program.append(RKGather(source,current,len(offsets),offsets=offsets,fill_bits=neutral,dst_stride=block if rows==1 else 1))  # noqa: E501
+  while size>1: size//=2; count=size*block; plan.program.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current  # noqa: E501
   return current
 
 def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
@@ -675,11 +673,9 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
     axis=lane.replace(src=(lane.src[0].const_like(groups),))
     contraction=fake.index(axis*block+out_index).load().cast(dtypes.float).reduce(axis,arg=Ops.ADD).cast(dtypes.half).cast(value.dtype)
     return plan.lower(list(store.replace(src=(store.src[0],root.substitute({value:contraction}))).sink().toposort()))
-  direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:]); scratch=plan.scratch; gathers:list[RKGather]=[]; ops:list[RKEWOp]=[]  # noqa: E501
-  reduced=_reduce_mapped_rows(ops,scratch,gathers,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)
+  direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
   # Boolean MUL/MAX preserves INT16 masks in {0,1}; ordinary comparison consumes them without rebuilding HALF storage.
-  plan.program.extend((*gathers,*ops)); scalar=plan.parameter(mapped_dtype,rows,reduced)
-  replacement=scalar.index(out_index).load()
+  replacement=plan.parameter(mapped_dtype,rows,_reduce_mapped_rows(plan,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)).index(out_index).load()  # noqa: E501
   replacement=replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype); replacement=replacement.alu(Ops.MAX,replacement.const_like(bounds[0])) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; replacement=replacement.const_like(0).alu(Ops.SUB,replacement.const_like(0).alu(Ops.SUB,replacement).alu(Ops.MAX,replacement.const_like(-bounds[1]))) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; suffix_root=root.substitute({value:replacement})  # noqa: E501
   return plan.lower(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),chain=direct or integer and value.arg[0] is Ops.MAX and total<32)  # noqa: E501
 

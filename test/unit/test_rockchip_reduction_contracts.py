@@ -1,5 +1,6 @@
 """Reduction movement and physical ownership contracts; hardware acceptance lives in the full backend census."""
 import functools, math
+import hashlib
 import numpy as np
 import pytest
 from tinygrad import Tensor
@@ -10,6 +11,55 @@ from tinygrad.renderer import rockchip as rk
 from tinygrad.renderer.rockchip import RKGather, _lower_uop_program
 from tinygrad.uop.ops import Ops, UOp
 from test.unit.test_rockchip_uops import _execute_raw_dynamic_image
+
+
+def _owned_row_expression(a:Tensor,b:Tensor,kind:str) -> Tensor:
+  if kind=='all': return (a<0).all(1)
+  if kind=='count': return (a<0).cast(dtypes.int).sum(1)
+  selected=(a<0).where(a,b)
+  if kind=='sum': return selected.sum(1,dtype=dtypes.half)
+  if kind=='prod': return selected.prod(1)
+  if kind=='max': return selected.max(1)
+  raise AssertionError(kind)
+
+
+def _owned_row_values(rows:int,width:int,kind:str):
+  left=np.full((rows,width),-1,dtype='<f2')
+  left[1::2,-1]=1
+  right=np.full((rows,width),-2 if kind=='max' else 1,dtype='<f2')
+  selected=np.where(left<0,left,right)
+  expected=np.all(left<0,axis=1) if kind=='all' else np.sum(left<0,axis=1,dtype='<i4') if kind=='count' else (
+    np.sum(selected,axis=1,dtype='<f2') if kind=='sum' else np.prod(selected,axis=1,dtype='<f2') if kind=='prod' else
+    np.max(selected,axis=1))
+  return left,right,expected
+
+
+@pytest.mark.parametrize('rows',(3,9))
+@pytest.mark.parametrize('width',(33,65))
+@pytest.mark.parametrize('kind',('sum','max','prod','all','count'))
+def test_production_owned_row_tree_preserves_ragged_neutrals(rows:int,width:int,kind:str,monkeypatch,record_property):
+  emitted=[]
+  original=rk._reduce_mapped_rows
+  def observe(*args,**kwargs):
+    result=original(*args,**kwargs)
+    emitted.append(result)
+    return result
+  monkeypatch.setattr(rk,'_reduce_mapped_rows',observe)
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    a,b=(Tensor(UOp.new_buffer('ROCKCHIP',rows*width,dtypes.half,num=67500+slot)).reshape(rows,width) for slot in range(2))
+    calls=_owned_row_expression(a,b,kind).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],rk.RockchipRenderer(Target(device='ROCKCHIP'))).src if node.op is Ops.BINARY)
+    image=rk.decode_image(blob)
+  assert emitted and not any(isinstance(op,rk.RKCMAC) for op in image.program)
+  left,right,expected=_owned_row_values(rows,width,kind)
+  bindings={a.uop.buf_uop:left.tobytes(),b.uop.buf_uop:right.tobytes()}
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:])),dtype=expected.dtype)
+  np.testing.assert_array_equal(actual,expected)
+  record_property('image_sha256',hashlib.sha256(blob).hexdigest())
+  record_property('scratch_bytes',sum(image.scratch))
+  record_property('physical_ops',len(image.program))
 
 
 @pytest.mark.parametrize('special', (False, True))
