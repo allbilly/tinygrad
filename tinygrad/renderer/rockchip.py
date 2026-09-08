@@ -1056,14 +1056,12 @@ class RKContext:
     if (pair:=_const_operand(u,Ops.CMPNE,0.0)) is not None and (u is self.root or any(src.op is Ops.INDEX for src in u.src)):
       source=pair[0] if pair[0].op is Ops.LOAD else pair[0].load()
       if source.dtype.scalar() is dtypes.half and source.src[0].op is Ops.INDEX: return self._cast(u.replace(op=Ops.CAST,src=(source,)))
-    if all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):
-      half_sources=tuple(_int_info(src)[1] for src in u.src)
-      if self.int_layout is dtypes.int16 and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
-      if self.int_layout is dtypes.int16: return self._lower_recipe(u,_i16_compare(u.op,*(self._operand(src,dtypes.int) for src in u.src)))  # noqa: E501
-      values=tuple(self._operand(src,dtypes.int) for src in u.src)
+    if (integer16:=all(src.dtype.scalar() is dtypes.int16 for src in u.src)) or all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):  # noqa: E501
+      if not integer16 and self.int_layout is dtypes.int16 and (half_sources:=tuple(_int_info(src)[1] for src in u.src)) and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
+      values=tuple(self._operand(src,dtypes.int16 if integer16 else dtypes.int) for src in u.src)
+      if values[0].dtype is dtypes.int16: return self._lower_recipe(u,_i16_compare(u.op,*values))
       components=tuple(self._unpack_bytes(value) for value in values)
       if u.op is Ops.CMPLT: components=tuple((_sign_bias(parts[3]),*parts[2::-1]) for parts in components)
-    elif all(src.dtype.scalar() is dtypes.int16 for src in u.src): return self._lower_recipe(u,_i16_compare(u.op,*(self._operand(src,dtypes.int16) for src in u.src)))  # noqa: E501
     else:
       half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject

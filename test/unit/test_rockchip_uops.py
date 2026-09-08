@@ -3972,6 +3972,53 @@ def _ordered_byte_values(byte:int, order:int):
   return left,right
 
 
+def _carrier_comparison_inputs(kind:str):
+  if kind in ("int16","promoted"):
+    values=np.asarray((-32768,32767,-257,-256,-1,0,1,255,256,16384),dtype="<i2")
+    dtype=dtypes.int16
+  elif kind=="half_recipe":
+    values=np.asarray((-127.75,-1.5,-0.5,-0.0,0.0,0.5,1.5,127.75),dtype="<f2")
+    dtype=dtypes.half
+  elif kind=="bool_recipe":
+    values=np.asarray((False,True))
+    dtype=dtypes.bool
+  else:
+    values=np.asarray((dtypes.int.min,dtypes.int.max,-65536,-1,0,1,65535,65536),dtype="<i4")
+    dtype=dtypes.int
+  return dtype,np.repeat(values,len(values)),np.tile(values,len(values))
+
+
+def _carrier_comparison_expression(left:Tensor,right:Tensor,kind:str,operation:str,suffix:str) -> Tensor:
+  if kind in ("promoted","half_recipe","bool_recipe"): left,right=left.cast(dtypes.int),right.cast(dtypes.int)
+  result={"eq":operator.eq,"ne":operator.ne,"lt":operator.lt}[operation](left,right)
+  if suffix=="plain": return result
+  return result.where(-7,11).cast(dtypes.int) if suffix=="bounded" else result.where(dtypes.int.min,dtypes.int.max).cast(dtypes.int)
+
+
+@pytest.mark.parametrize("kind",("int16","int32","promoted","half_recipe","bool_recipe"))
+@pytest.mark.parametrize("operation",("eq","ne","lt"))
+@pytest.mark.parametrize("suffix",("plain","bounded","wide"))
+def test_production_integer_comparison_preserves_carrier_boundaries(kind:str,operation:str,suffix:str,record_property):
+  """A semantic INT32 cast may stay INT16, use a HALF recipe, or require exact wide comparison."""
+  dtype,left,right=_carrier_comparison_inputs(kind)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    tensors=tuple(Tensor(UOp.new_buffer("ROCKCHIP",len(left),dtype,num=68000+i)) for i in range(2))
+    calls=_carrier_comparison_expression(*tensors,kind,operation,suffix).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  operands=tuple(value.astype("<i4") for value in (left,right)) if kind in ("promoted","half_recipe","bool_recipe") else (left,right)
+  expected={"eq":operator.eq,"ne":operator.ne,"lt":operator.lt}[operation](*operands)
+  if suffix!="plain": expected=np.where(expected,*((-7,11) if suffix=="bounded" else (dtypes.int.min,dtypes.int.max))).astype("<i4")
+  bindings={tensor.uop.buf_uop:value.tobytes() for tensor,value in zip(tensors,(left,right))}
+  assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
+  assert _execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("scratch_bytes",sum(image.scratch))
+  record_property("physical_ops",len(image.program))
+
+
 @pytest.mark.parametrize('byte,order',((0,0),*((byte,order) for byte in (1,2,3) for order in (-1,0,1))))
 @pytest.mark.parametrize('suffix',('plain','invert','select'))
 def test_production_ordered_comparison_covers_every_byte_pair(byte:int,order:int,suffix:str):
