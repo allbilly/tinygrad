@@ -1,4 +1,5 @@
 import ctypes, functools, hashlib, itertools, math, struct, threading
+import operator
 import numpy as np
 import pytest
 from collections.abc import Callable
@@ -3766,6 +3767,47 @@ def test_production_bounded_lookup_uses_shared_runtime_load(count:int,limit:int,
   inputs=np.resize(np.asarray((-(1<<31),(1<<31)-1,-1,0,limit-1,limit),dtype="<i4"),count)
   expected=np.where((inputs>=0)&(inputs<limit),(inputs%7)*4000+(np.arange(count)%37 if lane_dependent else 0),0).astype("<i4")
   assert _execute_raw_dynamic_image(image,count*4,inputs.tobytes())==expected.tobytes()
+
+
+def _comparison_values(kind:str):
+  if kind=="half":
+    left=np.arange(65536,dtype="<u2").view("<f2")
+    right=np.roll(left,32768).copy()
+    # Equal lanes coexist with opposite-sign zeros, finite extrema and every NaN payload.
+    right[::3]=left[::3]
+    return dtypes.half,left,right
+  if kind=="int16":
+    left=np.arange(65536,dtype="<u2").view("<i2")
+    right=np.resize(np.asarray((0,-32768,32767,-1,1,16384,-16384),dtype="<i2"),len(left))
+    right[::5]=left[::5]
+    return dtypes.int16,left,right
+  if kind=="bool":
+    return dtypes.bool,np.resize(np.asarray((False,False,True,True)),256),np.resize(np.asarray((False,True,False,True)),256)
+  edge=np.asarray((-(1<<31),(1<<31)-1,-1,0,1,255,256,65535,65536,0x12345678,-1431655766,1431655765),dtype="<i4")
+  return dtypes.int,np.repeat(edge,len(edge)),np.tile(edge,len(edge))
+
+
+@pytest.mark.parametrize("kind",("int16","int32","half","bool"))
+@pytest.mark.parametrize("operation",("eq","ne","lt"))
+@pytest.mark.parametrize("suffix",("plain","select"))
+def test_production_shared_comparison_primitives(kind:str,operation:str,suffix:str):
+  """Equality and ordering share exact primitives without losing raw-word or Boolean semantics."""
+  dtype,left,right=_comparison_values(kind)
+  compare={"eq":operator.eq,"ne":operator.ne,"lt":operator.lt}[operation]
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    buffers=[UOp.new_buffer("ROCKCHIP",len(left),dtype,num=63000+i) for i in range(2)]
+    comparison=compare(*(Tensor(buffer) for buffer in buffers))
+    result=comparison if suffix=="plain" else comparison.where(dtypes.int.min,dtypes.int.max).cast(dtypes.int)
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(u.arg for u in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if u.op is Ops.BINARY))
+  with np.errstate(invalid="ignore"): expected=compare(left,right)
+  if suffix=="select": expected=np.where(expected,dtypes.int.min,dtypes.int.max).astype("<i4")
+  bindings={buffer:value.tobytes() for buffer,value in zip(buffers,(left,right))}
+  assert _assert_decoded_image_bounds(image)==image
+  assert _execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
 
 
 def _ordered_byte_values(byte:int, order:int):
