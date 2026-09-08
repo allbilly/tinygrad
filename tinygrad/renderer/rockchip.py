@@ -715,13 +715,16 @@ def _ordered_bits(lhs:Iterable[UOp], rhs:Iterable[UOp]) -> UOp:
   for a,b in reversed(tuple(zip(left,rhs))): less=_i16_bit(b.alu(Ops.SUB,a).alu(Ops.ADD,less))
   return less
 
-def _carry_bytes(values:Iterable[UOp], carry:UOp, subtract:bool=False) -> tuple[tuple[UOp,...],UOp]:
+def _carry_bytes(values:Iterable[UOp], carry:UOp, op:Ops=Ops.ADD) -> tuple[tuple[UOp,...],UOp]:
   """Normalize least-significant-first byte coefficients, retaining the exact carry or borrow recipe."""
   # Addition inputs [0,255] plus carry and subtraction inputs [-255,255] minus borrow fit INT16 exactly.
+  # SHL doubles raw bytes and applies the incoming bit after wrapping, preserving the original shared expression graph.
   result=[]
   for value in values:
-    total=value.alu(Ops.SUB if subtract else Ops.ADD,carry); carry=_i16_bit(total.const_like(0).alu(Ops.SUB,total) if subtract else total.alu(Ops.SUB,total.const_like(255)))  # noqa: E501
-    result.append(total.alu(Ops.ADD if subtract else Ops.SUB,carry.alu(Ops.MUL,total.const_like(256))))
+    total=value.alu(Ops.ADD,value) if op is Ops.SHL else value.alu(Ops.SUB if op is Ops.SUB else Ops.ADD,carry)
+    next_carry=_i16_bit(value.alu(Ops.SUB,value.const_like(127)) if op is Ops.SHL else total.const_like(0).alu(Ops.SUB,total) if op is Ops.SUB else total.alu(Ops.SUB,total.const_like(255)))  # noqa: E501
+    normalized=total.alu(Ops.ADD if op is Ops.SUB else Ops.SUB,next_carry.alu(Ops.MUL,total.const_like(256)))
+    result.append(normalized.alu(Ops.ADD,carry) if op is Ops.SHL else normalized); carry=next_carry
   return tuple(result),carry
 
 def _twos_complement(raw:Iterable[UOp], sign:UOp) -> tuple[UOp, ...]:
@@ -1098,12 +1101,8 @@ class RKContext:
     numerator_bits=tuple(itertools.chain.from_iterable(map(_byte_bits,numerator)))
     zero=numerator[0].const_like(0); remainder,quotient=[zero]*4,[zero]*4
     for bit_index in range(31, -1, -1):
-      shifted,incoming=[],numerator_bits[bit_index]
-      for byte in remainder:
-        carry=_i16_bit(byte.alu(Ops.SUB,byte.const_like(127)))
-        wrapped=byte.alu(Ops.ADD,byte).alu(Ops.SUB,carry.alu(Ops.MUL,byte.const_like(256)))
-        shifted.append(wrapped.alu(Ops.ADD,incoming)); incoming=carry
-      reduced,borrow=_carry_bytes((left.alu(Ops.SUB,right) for left,right in zip(shifted,denominator)),zero,subtract=True)
+      shifted,_=_carry_bytes(remainder,numerator_bits[bit_index],Ops.SHL)
+      reduced,borrow=_carry_bytes((left.alu(Ops.SUB,right) for left,right in zip(shifted,denominator)),zero,Ops.SUB)
       ge=denominator_nonzero.alu(Ops.MUL,one.alu(Ops.SUB,borrow))
       remainder=[left.alu(Ops.ADD,ge.alu(Ops.MUL,right.alu(Ops.SUB,left))) for left,right in zip(shifted,reduced)]; byte_index,weight=bit_index>>3,1<<(bit_index&7)  # noqa: E501
       quotient[byte_index]=quotient[byte_index].alu(Ops.ADD,ge.alu(Ops.MUL,zero.const_like(weight)))

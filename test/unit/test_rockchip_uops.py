@@ -3839,6 +3839,26 @@ def test_production_int32_divmod_preserves_byte_borrows(count:int,kind:str):
   assert actual==np.asarray(expected,dtype='<i4').tobytes()
 
 
+@pytest.mark.parametrize('byte',range(4))
+@pytest.mark.parametrize('fill',(0,0x55555555,0xffffffff))
+def test_production_int32_division_propagates_every_byte_carry(byte:int,fill:int):
+  """Vary every byte through both carry thresholds while quotient and remainder share the restoring core."""
+  words=(np.uint64(fill)&np.uint64(0xffffffff^(255<<(byte*8))))|(np.arange(256,dtype=np.uint64)<<(byte*8))
+  left=words.astype('<u4').view('<i4')
+  right=np.resize(np.asarray((-65536,-257,-255,-128,-3,-1,0,1,3,127,128,255,257,65536),dtype='<i4'),len(left))
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    a,b=(Tensor(UOp.new_buffer('ROCKCHIP',len(left),dtypes.int,num=52000+i)) for i in range(2))
+    calls=(a.div(b,rounding_mode='trunc')+a.fmod(b)).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP')))
+    image=decode_image(next(node.arg for node in program.src if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and not _runtime_gathers(image) and _cmac(image) is None
+  expected=np.asarray([_wrap_int32(sum(_trunc_divmod_int32(lhs,rhs))) for lhs,rhs in zip(left.tolist(),right.tolist())],dtype='<i4')
+  bindings={a.uop.buf_uop:left.tobytes(),b.uop.buf_uop:right.tobytes()}
+  assert _execute_raw_dynamic_image(image,len(left)*4,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+
+
 def test_wide_int32_cdiv_cmod_physical_semantics_and_composition():
   lhs, rhs = _int32_division_samples()
   expressions = (
