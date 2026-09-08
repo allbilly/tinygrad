@@ -1388,13 +1388,9 @@ def _fold_quadratic(root:UOp) -> UOp|None:
   if logarithm is None: return scaled
   result=(magnitude if offset==1 else source).alu(Ops.ADD,scaled).log2().alu(Ops.MUL,_half(math.log(2)))
   return result.alu(Ops.MUL,source.alu(Ops.FDIV,magnitude.alu(Ops.MAX,_half(2**-24)))) if offset==1 else result.alu(Ops.ADD,(valid:=_half(1).alu(Ops.SUB,_finite_positive_mask(_half(1).alu(Ops.SUB,source)))).alu(Ops.FDIV,valid).alu(Ops.SUB,_half(1)))  # noqa: E501
-def _dpu_math_base(source:UOp) -> tuple[UOp, UOp, UOp, Callable[[UOp], UOp]]:
-  source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0)
-  return source, zero, one, _positive_mask if source.op in (Ops.INDEX, Ops.LOAD) else _finite_positive_mask
-
 def _dpu_sqrt(source:UOp) -> UOp:
   """Approximate FP16 sqrt with range-independent Babylonian iterations on DPU EW."""
-  source, zero, one, _ = _dpu_math_base(source); finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)  # noqa: E501
+  source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0); finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)  # noqa: E501
   safe = finite.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))
   estimate = safe.alu(Ops.MAX, one)
   for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
@@ -1431,7 +1427,8 @@ def _dpu_sin(source:UOp) -> UOp:
 
 def _dpu_exp2(source:UOp) -> UOp:
   """Approximate FP16 EXP2 without LUTs using native FLOOR, Horner arithmetic, and exact exponent scaling."""
-  source, zero, one, mask_fn = _dpu_math_base(source)
+  source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0)
+  mask_fn = _positive_mask if source.op in (Ops.INDEX, Ops.LOAD) else _finite_positive_mask
   bounded = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, UOp.const(-24.0, dtypes.half)), UOp.const(15.9921875, dtypes.half)), arg=_NATIVE_MIN)
   integer = UOp(Ops.MAX, dtypes.half, src=(bounded, bounded), arg=_NATIVE_FLOOR)
   # Split n in [-24,15] into normal exponents a>=-14 and b>=-10 with a+b=n.
@@ -1447,7 +1444,7 @@ def _dpu_exp2(source:UOp) -> UOp:
 
 def _dpu_log2(source:UOp) -> UOp:
   """Approximate FP16 LOG2 without LUTs using threshold exponent extraction and an atanh polynomial."""
-  source, zero, one, _ = _dpu_math_base(source); mask_fn=_finite_positive_mask
+  source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0); mask_fn=_finite_positive_mask
   mantissa = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)
   exponent = zero
   for upper,steps in ((True, ((256.0, 8.0), (16.0, 4.0), (4.0, 2.0), (2.0, 1.0))),

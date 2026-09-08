@@ -2199,6 +2199,43 @@ def test_int32_where_constants_convert_at_the_output_boundary():
   assert _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32
 
 
+@pytest.mark.parametrize("kind",("index","load","computed","float_load","float_cast"))
+def test_exp2_predicate_is_selected_after_half_conversion(kind,monkeypatch):
+  lane=UOp.range(8,0,dtype=dtypes.int)
+  source=UOp.param(1,dtypes.float if kind=="float_load" else dtypes.half,(8,)).index(lane)
+  if kind!="index": source=source.load()
+  if kind=="computed": source=source+UOp.const(0.25,dtypes.half)
+  if kind=="float_cast": source=source.cast(dtypes.float)
+  calls=[]
+  for name in ("_positive_mask","_finite_positive_mask"):
+    original=getattr(rockchip_renderer,name)
+    def observe(value,_name=name,_original=original):
+      calls.append(_name)
+      return _original(value)
+    monkeypatch.setattr(rockchip_renderer,name,observe)
+  rockchip_renderer._dpu_exp2(source)
+  assert calls==["_positive_mask" if kind in ("index","load") else "_finite_positive_mask"]*2
+
+
+@pytest.mark.parametrize("count",(7,8))
+@pytest.mark.parametrize("operation",("sqrt","exp2","log2"))
+@pytest.mark.parametrize("consumer",("direct","add","roundtrip"))
+def test_production_math_initialization_composes(count,operation,consumer,record_property):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=94000))
+    operand=source if consumer=="direct" else source+0.25 if consumer=="add" else source.cast(dtypes.float).cast(dtypes.half)
+    result=getattr(operand,operation)()
+    calls=result.schedule_linear().src
+    assert calls
+    to_program_cache.clear()
+    images=[decode_image(next(node.arg for node in to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                             if node.op is Ops.BINARY)) for call in calls]
+  assert all(_assert_decoded_image_bounds(image)==image for image in images)
+  record_property("images",hashlib.sha256(b"".join(encode_image(image) for image in images)).hexdigest())
+  record_property("physical_ops",repr([len(image.program) for image in images]))
+  record_property("scratch_bytes",repr([sum(image.scratch) for image in images]))
+
+
 def test_math_uops_own_multi_stage_recipes():
   source = UOp.param(1, dtypes.half, (4,))
   for op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
