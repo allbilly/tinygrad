@@ -1451,11 +1451,11 @@ def _dpu_log2(source:UOp) -> UOp:
       exponent = exponent.alu(Ops.ADD if upper else Ops.SUB, mask.alu(Ops.MUL, UOp.const(shift, dtypes.half)))
   z = mantissa.alu(Ops.SUB, one).alu(Ops.FDIV, mantissa.alu(Ops.ADD, one))
   result = exponent.alu(Ops.ADD, z.alu(Ops.MUL, polyN(z.alu(Ops.MUL, z), [1/9,1/7,1/5,1/3,1])).alu(Ops.MUL, _half(2/math.log(2))))
-  nonzero = mask_fn(source).alu(Ops.MAX, mask_fn(zero.alu(Ops.SUB, source)))
-  zero_correction, valid = UOp.const(-1.0, dtypes.half).alu(Ops.FDIV, nonzero).alu(Ops.ADD, one), one.alu(Ops.SUB, mask_fn(zero.alu(Ops.SUB, source)))
-  negative_correction, above = valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one), mask_fn(source.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
+  positive, negative, above = (mask_fn(value) for value in (source,zero.alu(Ops.SUB,source),source.alu(Ops.SUB,_half(65504.0))))
+  # For 0/1 sign masks this is zero on positive inputs, -inf on either zero, and 0/0 on negative inputs.
+  domain_correction = negative.alu(Ops.SUB,one).alu(Ops.FDIV,positive).alu(Ops.ADD,one)
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
-  return result.alu(Ops.ADD, zero_correction).alu(Ops.ADD, negative_correction).alu(Ops.ADD, inf_correction)
+  return result.alu(Ops.ADD, domain_correction).alu(Ops.ADD, inf_correction)
 
 _DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin}
 class RockchipRenderer(Renderer):

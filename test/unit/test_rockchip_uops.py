@@ -2236,6 +2236,33 @@ def test_production_math_initialization_composes(count,operation,consumer,record
   record_property("scratch_bytes",repr([sum(image.scratch) for image in images]))
 
 
+@pytest.mark.parametrize("consumer",("direct","offset","reciprocal","abs"))
+def test_production_log2_domain_correction(consumer,record_property):
+  values=np.arange(1<<16,dtype="<u2").view("<f2")
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",len(values),dtypes.half,num=96000))
+    result=(source.abs() if consumer=="abs" else source).log2()
+    if consumer=="offset": result=result+0.25
+    elif consumer=="reciprocal": result=(result+32).reciprocal()
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  assert _assert_decoded_image_bounds(image)==image
+  with np.errstate(all="ignore"):
+    actual=np.frombuffer(_execute_raw_dynamic_image(image,values.nbytes,values.tobytes()),dtype="<f2")
+    expected=np.log2((np.abs(values) if consumer=="abs" else values).astype("<f4")).astype("<f2")
+    if consumer=="offset": expected=(expected+np.float16(0.25)).astype("<f2")
+    elif consumer=="reciprocal": expected=(np.float16(1)/(expected+np.float16(32))).astype("<f2")
+  np.testing.assert_allclose(actual,expected,rtol=5e-3,atol=5e-3,equal_nan=True)
+  record_property("non_nan_sha256",hashlib.sha256(actual[~np.isnan(actual)].tobytes()).hexdigest())
+  record_property("nan_mask_sha256",hashlib.sha256(np.isnan(actual).tobytes()).hexdigest())
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("ew_ops",sum(isinstance(op,RKEWOp) for op in image.program))
+  record_property("scratch_bytes",sum(image.scratch))
+
+
 def test_math_uops_own_multi_stage_recipes():
   source = UOp.param(1, dtypes.half, (4,))
   for op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
