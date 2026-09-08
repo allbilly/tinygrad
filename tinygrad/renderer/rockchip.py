@@ -356,8 +356,7 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
   for destination,value in zip(dst_lanes,expr_lanes):
     dst=int(destination)
     if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
-    if encode is _storage_bits and math.isfinite(fp_value:=float(value)) and abs(fp_value)>=65520: raise OverflowError("float too large to pack with e format")  # noqa: E501
-    encoded=_storage_bits(fp_value) if encode is _storage_bits else int(value) if encode is int else encode(value)
+    encoded=encode(value)
     if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
     result[dst]=encoded
   if any(value is missing for value in result): raise _RKGenericReject("static_index")

@@ -1,5 +1,5 @@
 """Divided-axis reset regressions, including the actual production compiler."""
-import hashlib
+import hashlib,math,struct
 import numpy as np
 import pytest
 from tinygrad import Tensor
@@ -137,6 +137,70 @@ def test_production_masked_gather_at_cache_boundary(count,record_property):
   words=(np.arange(count-1,dtype=np.uint16)*313+41).astype("<u2")
   expected=(np.pad(words,(1,0))^128).astype("<u2").tobytes()
   assert _execute_raw_dynamic_image(image,count*2,words.tobytes())==expected
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("physical_ops",len(image.program))
+  record_property("scratch_bytes",sum(image.scratch))
+
+
+@pytest.mark.parametrize("value",(0.0,-0.0,2**-24,-2**-24,1.1,65504.0,65519.0,math.nextafter(65520.0,0.0),
+                                65520.0,-65520.0,math.inf,-math.inf,math.nan))
+def test_static_half_encoding_owns_rounding_and_overflow(value):
+  lane=UOp.range(4,95100)
+  expression=UOp.const(value,rk.dtypes.double)
+  # Keep the wider semantic constant: pre-rounding to HALF would hide a packing overflow.
+  try: expected=int.from_bytes(struct.pack("<e",value),"little")
+  except OverflowError:
+    with pytest.raises(OverflowError,match="float too large to pack with e format"):
+      rk._static_values(lane,expression,4,rk._storage_bits)
+  else: assert rk._static_values(lane,expression,4,rk._storage_bits)==(expected,)*4
+
+
+@pytest.mark.parametrize("unique",(False,True))
+@pytest.mark.parametrize("value",(65520.0,-65520.0))
+def test_static_half_overwrite_cannot_hide_unencodable_candidate(unique,value):
+  lane=UOp.range(2,95101)
+  expression=(lane<1).where(UOp.const(value,rk.dtypes.double),UOp.const(1.0,rk.dtypes.double))
+  with pytest.raises(OverflowError,match="float too large to pack with e format"):
+    rk._static_values(lane//2,expression,1,rk._storage_bits,unique=unique)
+
+
+def test_static_half_placement_validates_destination_before_encoding():
+  lane=UOp.range(2,95102)
+  with pytest.raises(rk._RKGenericReject,match="static_index"):
+    rk._static_values(lane-1,UOp.const(65520.0,rk.dtypes.double),2,rk._storage_bits)
+
+
+@pytest.mark.parametrize("unique",(False,True))
+def test_static_half_duplicate_destination_distinguishes_signed_zero(unique):
+  lane=UOp.range(2,95103)
+  expression=(lane<1).where(UOp.const(-0.0,rk.dtypes.double),UOp.const(0.0,rk.dtypes.double))
+  if unique:
+    with pytest.raises(rk._RKGenericReject,match="static_index"):
+      rk._static_values(lane//2,expression,1,rk._storage_bits)
+  else: assert rk._static_values(lane//2,expression,1,rk._storage_bits,unique=False)==(0,)
+
+
+@pytest.mark.parametrize("count",(7,8,257))
+@pytest.mark.parametrize("pattern",("ramp","selection","large"))
+def test_production_static_half_encoding_composes(count,pattern,record_property):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,rk.dtypes.half,num=95104))
+    lane=Tensor.arange(count,dtype=rk.dtypes.int)
+    if pattern=="ramp": mapped=(lane%7).cast(rk.dtypes.half)*0.25-1
+    elif pattern=="selection": mapped=(lane%3==0).where(0.5,-0.25)
+    else: mapped=(lane%3==0).where(65504.0,-65504.0)
+    calls=(source+mapped).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],rk.RockchipRenderer(Target(device="ROCKCHIP")))
+    blob=next(node.arg for node in program.src if node.op is Ops.BINARY)
+    image=rk.decode_image(blob)
+  values=(np.arange(count)%7*0.25).astype("<f2")
+  lanes=np.arange(count)
+  mapped=(lanes%7*0.25-1) if pattern=="ramp" else np.where(lanes%3==0,0.5,-0.25) if pattern=="selection" else np.where(lanes%3==0,65504.0,-65504.0)
+  expected=(values+mapped.astype("<f2")).astype("<f2").tobytes()
+  assert any(isinstance(op,rk.RKEWOp) for op in image.program)
+  assert _execute_raw_dynamic_image(image,count*2,values.tobytes())==expected
   record_property("image_sha256",hashlib.sha256(blob).hexdigest())
   record_property("physical_ops",len(image.program))
   record_property("scratch_bytes",sum(image.scratch))
