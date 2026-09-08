@@ -1474,6 +1474,67 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
     assert _execute_raw_dynamic_image(image,48,*(value.tobytes() for value in inputs))==expected.tobytes()
 
 
+def _ordered_emission_expression(a:Tensor,b:Tensor,kind:str) -> Tensor:
+  if kind=="neg": return -a
+  if kind=="reciprocal": return a.reciprocal()
+  if kind=="min": return (a<b).where(a,b)
+  if kind=="max": return (a<b).where(b,a)
+  if kind=="clamp": return a.clip(-1.0,1.0)
+  if kind=="neg_min": return -((a<b).where(a,b))
+  if kind=="recip_max": return ((a<b).where(b,a)).reciprocal()
+  raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("count",(3,17,257))
+@pytest.mark.parametrize("kind",("neg","reciprocal","min","max","clamp","neg_min","recip_max"))
+def test_production_ordered_emission_composes_with_unary_consumers(count:int,kind:str):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    a,b=(Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=67300+slot)) for slot in range(2))
+    calls=_ordered_emission_expression(a,b,kind).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
+  left=np.resize(np.asarray((-4,-2,-1,-0.5,0.5,1,2,4),dtype="<f2"),count)
+  right=np.roll(left,2).copy()
+  expected={"neg":-left,"reciprocal":1/left,"min":np.minimum(left,right),"max":np.maximum(left,right),
+            "clamp":np.clip(left,-1,1),"neg_min":-np.minimum(left,right),"recip_max":1/np.maximum(left,right)}[kind]
+  bindings={a.uop.buf_uop:left.tobytes(),b.uop.buf_uop:right.tobytes()}
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,count*2,*(bindings[arg.buf_uop] for arg in calls[0].src[2:])),dtype="<f2")
+  np.testing.assert_array_equal(actual,expected)
+
+
+@pytest.mark.parametrize("count",(3,17))
+@pytest.mark.parametrize("op,dtype",((Ops.NEG,dtypes.half),(Ops.NEG,dtypes.int16),(Ops.RECIPROCAL,dtypes.half)))
+def test_internal_unary_emitter_preserves_materialization_order(count:int,op:Ops,dtype):
+  # Supplementary UOp coverage: ordinary Tensor negation/reciprocal use MUL/FDIV in production codegen.
+  out,source=UOp.param(0,dtype,(count,)),UOp.param(1,dtype,(count,))
+  axis=UOp.range(count,0)
+  value=UOp(op,dtype,src=(source.index(count-1-axis).load(),))
+  context=rockchip_renderer.RKContext((out.index(axis).store(value),out,count,axis,value))
+  result=context._alu(value)
+  gathers=tuple(node for node in context.program if isinstance(node,RKGather))
+  emitted=context.program[-1]
+  assert isinstance(emitted,RKEWOp) and emitted.dst==result.arg and emitted.count==count
+  assert emitted.mode==(RKEWMode.INT16 if dtype is dtypes.int16 else RKEWMode.BOUNDED if op is Ops.RECIPROCAL else RKEWMode.HALF)
+  assert emitted.submit_barrier==(op is Ops.RECIPROCAL)
+  assert gathers[0].src==RKArg(RKBufferKind.ARG,1) and emitted.rhs==gathers[0].dst
+  if op is Ops.RECIPROCAL:
+    assert len(gathers)==2 and gathers[1].values==(0x3c00,) and emitted.lhs==gathers[1].dst
+    assert emitted.ew_cfg==_EW_CFG[Ops.FDIV]
+  else:
+    assert len(gathers)==1 and emitted.lhs==emitted.rhs and emitted.ew_cfg==rockchip_renderer._EW_CFG_NEG
+  assert len(context.program)==len(gathers)+1
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int16))
+def test_ordered_selection_ties_keep_maximum_precedence(dtype):
+  value=UOp.param(1,dtype,(4,)).index(UOp.range(4,0)).load()
+  selected=UOp(Ops.WHERE,dtype,src=(value<value,value.rtag("yes"),value.rtag("no")))
+  assert rockchip_renderer._pm_ordered_where.rewrite(selected)==value.alu(Ops.MAX,value)
+
+
 def test_static_nested_load_default_materializes_as_ordered_partial_gathers():
   fallback, selected = UOp.param(1, dtypes.half, (6,)), UOp.param(2, dtypes.half, (6,))
   image = _lower_uop_program(_program(dtypes.half, lambda i:

@@ -961,30 +961,29 @@ class RKContext:
 
   def _alu(self, u:UOp) -> UOp:
     if u.op in (Ops.RECIPROCAL, Ops.NEG):
-      src = self.lower(u.src[0])
-      if u.op is Ops.RECIPROCAL:
-        one = self.lower(UOp.const(1.0, dtypes.half))
-        return self._emit(self._scratch(dtypes.half,u=u),one,src,_EW_CFG[Ops.FDIV])
-      return self._emit(self._scratch(src.dtype,u=u),src,src,_EW_CFG_NEG)
-    if len(u.src) != 2: raise _RKGenericReject
-    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
-    if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
-      return self.lower(recipe)
-    dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
-    bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
-    if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
-    expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
-    sources=tuple(UOp.const(-65504.0,dtypes.half) if finite_min and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg)<0 else src for src in u.src)  # noqa: E501
-    lhs,rhs=(self._operand(src,dtype,finite_min) for src in sources)
-    if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:
-      if expected is not dtypes.half: raise _RKGenericReject
-      zero=lhs.const_like(0.0)
-      return self._lower_recipe(u,_positive_mask(lhs).alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,lhs))))
-    if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
-      if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
-      zero=lhs.const_like(0.0)
-      return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
-    cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]  # noqa: E501
+      rhs = self.lower(u.src[0])
+      lhs = self.lower(UOp.const(1.0, dtypes.half)) if u.op is Ops.RECIPROCAL else rhs
+      expected,cfg = lhs.dtype,_EW_CFG[Ops.FDIV] if u.op is Ops.RECIPROCAL else _EW_CFG_NEG
+    else:
+      if len(u.src) != 2: raise _RKGenericReject
+      if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
+      if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
+        return self.lower(recipe)
+      dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
+      bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
+      if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
+      expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
+      sources=tuple(UOp.const(-65504.0,dtypes.half) if finite_min and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg)<0 else src for src in u.src)  # noqa: E501
+      lhs,rhs=(self._operand(src,dtype,finite_min) for src in sources)
+      if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:
+        if expected is not dtypes.half: raise _RKGenericReject
+        zero=lhs.const_like(0.0)
+        return self._lower_recipe(u,_positive_mask(lhs).alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,lhs))))
+      if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
+        if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
+        zero=lhs.const_like(0.0)
+        return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
+      cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]  # noqa: E501
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
     return self._emit(self._scratch(expected,u=u),lhs,rhs,cfg,compare=compare)
 
@@ -1342,9 +1341,8 @@ _pm_ordered_where=PatternMatcher([
   (((UPat.var("upper")<UPat(Ops.MAX,name="maximum"))|UPat(Ops.CMPLT,name="lower")).where(UPat.cvar("constant"),_native_value),
    lambda upper,maximum,lower,constant,value:UOp(Ops.MAX,maximum.dtype,src=(maximum,constant),arg=_NATIVE_MIN) if upper.key==constant.key==lower.src[1].key and lower.src[0].key==value.key and {node.key for node in maximum.src}=={value.key,constant.key} else None),  # noqa: E501
   ((_native_value<_native_other).where(_native_yes,_native_no),
-   lambda value,other,yes,no:value.alu(Ops.MAX,other) if (yes.key,no.key)==(other.key,value.key) else None),
-  ((_native_value<_native_other).where(_native_yes,_native_no),
-   lambda value,other,yes,no:UOp(Ops.MAX,value.dtype,src=(value,other),arg=_NATIVE_MIN) if (yes.key,no.key)==(value.key,other.key) else None)])
+   lambda value,other,yes,no:value.alu(Ops.MAX,other) if (yes.key,no.key)==(other.key,value.key) else
+     _native_min(value,other) if (yes.key,no.key)==(value.key,other.key) else None)])
 
 def _unwrap_condition(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype.scalar() in (dtypes.bool, dtypes.half, dtypes.float): u = u.src[0]
