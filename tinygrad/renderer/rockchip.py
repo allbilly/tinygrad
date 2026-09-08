@@ -771,13 +771,10 @@ def _has_runtime_address(root:UOp) -> bool:
 
 def _fp32_expr_to_half(u:UOp) -> UOp:
   """Represent a float ADD/MUL expression with a three-half expansion at its FP16 storage boundary."""
-  if u.dtype.scalar() is dtypes.half or u.op is Ops.CONST and u.dtype.scalar() is dtypes.weakfloat: return u if u.dtype.scalar() is dtypes.half else UOp.const(float(u.arg),dtypes.half)  # noqa: E501
+  if u.dtype.scalar() is dtypes.half or u.op is Ops.CONST and u.dtype.scalar() in (dtypes.weakfloat,dtypes.float): return u if u.dtype.scalar() is dtypes.half else UOp.const(float(u.arg),dtypes.half)  # noqa: E501
   if u.dtype.scalar() is not dtypes.float: raise _RKGenericReject
-  if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.half: return u.src[0]
-  if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() in (dtypes.int, dtypes.int16, dtypes.bool): return u.src[0].cast(dtypes.half)
-  if u.op is Ops.LOAD: return u.cast(dtypes.half)
-  if u.op is Ops.CONST: return UOp.const(float(u.arg), dtypes.half)
-  if _is_static_expr(u) and u.op is not Ops.WHERE: return u.cast(dtypes.half)
+  if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() in (dtypes.half,dtypes.int,dtypes.int16,dtypes.bool): return u.src[0].cast(dtypes.half)  # noqa: E501
+  if u.op is Ops.LOAD or _is_static_expr(u) and u.op is not Ops.WHERE: return u.cast(dtypes.half)
   if ((u.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN, Ops.NEG) and len(u.src) == 1) or (u.op in (Ops.MUL, Ops.SUB, Ops.MAX) and len(u.src) == 2) or
       (u.op is Ops.WHERE and len(u.src) == 3 and _is_static_expr(u.src[0]))):
     return UOp(u.op, dtypes.half, src=(u.src[0],*tuple(_fp32_expr_to_half(src) for src in u.src[1:])) if u.op is Ops.WHERE else tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg if u.op not in (Ops.MUL, Ops.NEG) else None)  # noqa: E501

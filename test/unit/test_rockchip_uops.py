@@ -3271,6 +3271,47 @@ def test_accurate_add_recipe_keeps_explicit_half_casts_opaque():
   assert rockchip_renderer._accurate_add_recipe(boundary+UOp.const(2**-11,dtypes.half)) is None
 
 
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float,dtypes.weakfloat))
+@pytest.mark.parametrize("value",(0.0,-0.0,2**-24,1.1,65504.0,65520.0,math.inf,-math.inf,math.nan))
+def test_storage_leaf_constant_preserves_canonical_half(dtype,value):
+  source=UOp.const(value,dtype)
+  expected=source if dtype is dtypes.half else UOp.const(float(source.arg),dtypes.half)
+  assert _fp32_expr_to_half(source) is expected
+
+
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int,dtypes.int16,dtypes.bool))
+@pytest.mark.parametrize("width",(1,2))
+def test_storage_leaf_cast_preserves_source_and_width(dtype,width):
+  source=UOp(Ops.NOOP,dtype,src=(UOp.const(1,dtype),)).broadcast(width)
+  boundary=source.cast(dtypes.float)
+  assert _fp32_expr_to_half(boundary) is (source if dtype is dtypes.half else source.cast(dtypes.half))
+
+
+@pytest.mark.parametrize("dtype",(dtypes.int,dtypes.uint,dtypes.bool,dtypes.double,dtypes.weakint))
+def test_storage_leaf_rejects_other_constant_domains(dtype):
+  with pytest.raises(rockchip_renderer._RKGenericReject): _fp32_expr_to_half(UOp.const(1,dtype))
+
+
+@pytest.mark.parametrize("count",(7,8))
+@pytest.mark.parametrize("consumer",("exp2","sqrt","masked","roundtrip"))
+def test_production_storage_leaf_composition(count,consumer,record_property):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=93000)).cast(dtypes.float)
+    if consumer=="exp2": result=(source*0.5).exp2()+0.25
+    elif consumer=="sqrt": result=(source+0.5).sqrt()*0.5
+    elif consumer=="masked": result=source.pad(((1,1),)).exp2()
+    else: result=source.exp2().cast(dtypes.half).cast(dtypes.float)+source.exp2()
+    calls=result.cast(dtypes.half).schedule_linear().src
+    assert calls
+    to_program_cache.clear()
+    images=[decode_image(next(node.arg for node in to_program(call.src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                             if node.op is Ops.BINARY)) for call in calls]
+  assert all(_assert_decoded_image_bounds(image)==image for image in images)
+  record_property("images",hashlib.sha256(b"".join(encode_image(image) for image in images)).hexdigest())
+  record_property("physical_ops",repr([len(image.program) for image in images]))
+  record_property("scratch_bytes",repr([sum(image.scratch) for image in images]))
+
+
 def test_fp32_math_uop_converts_at_half_storage_boundary():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
