@@ -386,8 +386,7 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
     load_index=gate.where(address if address.vmin>=0 else (address<0).where(address.const_like(-2),address),address.const_like(-1))
   return _static_values(out_index,load_index,count,int,unique=False,minimum=-1 if gate is not None else 0)
 
-@functools.lru_cache(maxsize=2048)
-def _small_gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int,...]: return _gather_offsets(out_index,load_index,gate,count)  # noqa: E501
+_small_gather_offsets=functools.lru_cache(maxsize=2048)(_gather_offsets)
 
 def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None: ordered=tuple(sorted(affine[1].items(),key=lambda item:abs(item[1]))); limits=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered); return tuple((r,abs(stride),limit) for (r,stride),limit in zip(ordered,limits)) if all(limit>0 and abs(stride)==math.prod(limits[:i]) for i,((_,stride),limit) in enumerate(zip(ordered,limits))) and math.prod(limits)==count and affine[0]==sum((limit-1)*-min(stride,0) for (_,stride),limit in zip(ordered,limits)) else None  # noqa: E702,E501
 
