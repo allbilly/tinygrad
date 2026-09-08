@@ -3233,6 +3233,37 @@ def test_production_boolean_reduction_consumes_int16_masks(rows:int,width:int,in
     assert all(stage.mode is RKEWMode.INT16 for stage in stages[terminal_product+1:])
 
 
+@pytest.mark.parametrize('rows',(3,9))
+@pytest.mark.parametrize('width',(33,65))
+@pytest.mark.parametrize('view',('transpose','reverse','two_sources'))
+def test_production_boolean_rows_share_general_index_mapping(rows:int,width:int,view:str):
+  """Boolean masks use ordinary indexed mapping, including multiple sources and non-row-major loads."""
+  words=np.resize(np.asarray((0x3c00,0xbc00,0x7c00,0xfc00,1,0x8001),dtype='<u2'),rows*width).reshape(rows,width)
+  if view!='two_sources':
+    for row in range(1,rows): words[row,row*17%width]=0 if row%2 else 0x8000
+  values=words.view('<f2')
+  arrays=[values.T.copy() if view=='transpose' else values]
+  if view=='two_sources':
+    other=np.zeros_like(values)
+    for row in range(1,rows): other[row,0]=values[row,0]
+    arrays.append(other)
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    sources=[Tensor(UOp.new_buffer('ROCKCHIP',array.size,dtypes.half,num=55100+i)).reshape(array.shape)
+             for i,array in enumerate(arrays)]
+    source=sources[0].transpose() if view=='transpose' else sources[0].flip(1) if view=='reverse' else sources[0]
+    result=(source!=sources[1] if view=='two_sources' else source!=0).all(1)
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP'))).src
+                            if node.op is Ops.BINARY))
+  expected=np.all(values!=arrays[1] if view=='two_sources' else values!=0,axis=1)
+  bindings={source.uop.buf_uop:array.tobytes() for source,array in zip(sources,arrays)}
+  assert _execute_raw_dynamic_image(image,rows,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  assert _assert_decoded_image_bounds(image)==image and not _runtime_gathers(image) and not _cmac(image)
+  assert len(_ew_ops(image))<400  # A rejected general map must not be hidden by scalar unrolling.
+
+
 def test_dependent_scalar_extrema_uses_direct_native_lowering():
   for extents in ((4,), (45,65)):
     count=math.prod(extents)
