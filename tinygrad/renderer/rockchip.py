@@ -1013,7 +1013,7 @@ class RKContext:
     else: raise _RKGenericReject(f"convert {source.dtype}->{target}")
     self.program.append(RKEWOp(result.arg,source.arg,rhs,self.count,cfg,barrier and pair==(dtypes.half,dtypes.int16),mode)); return result
 
-  def _integer_bitwise(self, u:UOp) -> UOp:
+  def _integer_bits(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
     layout=self._layout(u.dtype.scalar())
     if (pair:=_const_operand(u,Ops.XOR,-1)) is not None:
@@ -1023,30 +1023,27 @@ class RKContext:
       return self._pack_bytes(inverted,dtypes.int,u=u)
     if self.count<1 or layout is dtypes.int and self.count*4>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
     # Fuse the semantic bitwise subgraph before allocating carriers: AND=ab, OR=a+b-ab, XOR=a+b-2ab.
+    # Shifts permute these same planes, using five masked amount bits and sign extension only for signed SHR.
     @functools.cache
     def bits(node:UOp) -> tuple[UOp,...]:
       if node.op is Ops.CONST: return tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8))
-      if node.op not in (Ops.AND,Ops.OR,Ops.XOR) or node.dtype is not u.dtype: return self._bitplanes(self.lower(node))
+      if node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype: return self._bitplanes(self.lower(node))
+      if node.op in (Ops.SHL,Ops.SHR):
+        if node.dtype.scalar() not in (dtypes.int,dtypes.uint) or node.src[1].dtype.scalar() not in (dtypes.int,dtypes.uint) or self.int_layout is not dtypes.int or 16*((self.count*2+63)&-64)>_MAX_EW_ELEMS_FP16:  # noqa: E501
+          raise _RKGenericReject
+        current=bits(node.src[0]); masks=() if node.src[1].op is Ops.CONST else bits(node.src[1])[:5]
+        for bit,amount in enumerate((1,2,4,8,16)):
+          if not masks and not (int(node.src[1].arg)&amount): continue
+          fill=current[31] if node.op is Ops.SHR and node.dtype.scalar() is dtypes.int else current[0].const_like(0)
+          shifted=tuple(current[index-amount] if node.op is Ops.SHL and index>=amount else
+            current[index+amount] if node.op is Ops.SHR and index+amount<32 else fill for index in range(32))
+          current=shifted if not masks else tuple(old.alu(Ops.ADD,masks[bit].alu(Ops.MUL,new.alu(Ops.SUB,old)))
+            for old,new in zip(current,shifted))
+        return current
       lhs,rhs=(bits(source) for source in node.src)
       return tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
         for left,right in zip(lhs,rhs))
     return self._pack_bits(bits(u),layout,u)
-
-  def _int32_shift(self, u:UOp) -> UOp:
-    if len(u.src) != 2 or u.dtype.scalar() not in (dtypes.int, dtypes.uint) or u.src[1].dtype.scalar() not in (dtypes.int, dtypes.uint) or self.int_layout is not dtypes.int:  # noqa: E501
-      raise _RKGenericReject
-    value=self.lower(u.src[0])
-    if self.count<1 or 16*((self.count*2+63)&-64)>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    current=self._bitplanes(value); signed=u.op is Ops.SHR and u.dtype.scalar() is dtypes.int
-    masks=() if u.src[1].op is Ops.CONST else self._bitplanes(self.lower(u.src[1]))[:5]
-    for bit,amount in enumerate((1,2,4,8,16)):
-      if not masks and not (int(u.src[1].arg)&amount): continue
-      fill=current[31] if signed else current[0].const_like(0)
-      shifted=tuple(current[index-amount] if u.op is Ops.SHL and index>=amount else
-        current[index+amount] if u.op is Ops.SHR and index+amount<32 else fill for index in range(32))
-      current=shifted if not masks else tuple(old.alu(Ops.ADD,masks[bit].alu(Ops.MUL,new.alu(Ops.SUB,old)))
-        for old,new in zip(current,shifted))
-    return self._pack_bits(current,dtypes.int,u)
 
   def _compare(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
@@ -1211,8 +1208,7 @@ class RKContext:
     elif u.op is Ops.CAST and len(u.src) == 1: value=self._cast(u)
     elif u.op in GroupOp.Comparison or dtype is dtypes.bool and u.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR,Ops.XOR): value=self._compare(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
-    elif u.op in (Ops.AND,Ops.OR,Ops.XOR) and dtype in (dtypes.int16,dtypes.int): value=self._integer_bitwise(u)
-    elif u.op in (Ops.SHL, Ops.SHR) and dtype in (dtypes.int, dtypes.uint): value = self._int32_shift(u)
+    elif u.op in (Ops.AND,Ops.OR,Ops.XOR) and dtype in (dtypes.int16,dtypes.int) or u.op in (Ops.SHL,Ops.SHR) and dtype in (dtypes.int,dtypes.uint): value=self._integer_bits(u)  # noqa: E501
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is dtypes.int16 and (recipe:=_int_info(u)[1]) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
     elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not dtypes.int16): value=self._int32_divmod(u)  # noqa: E501
     elif u.op is Ops.WHERE: value = self._where(u)

@@ -3983,6 +3983,37 @@ def test_int32_shift_uops_compose_over_signed_and_unsigned_raw_bytes():
                                     expected(op, dtype, shifts, inner_expected))
 
 
+@pytest.mark.parametrize('count',(8,17,257))
+@pytest.mark.parametrize('unsigned',(False,True))
+@pytest.mark.parametrize('kind',('nested_shift','shifted_mask','bitwise_shift','shifted_amount'))
+def test_production_shift_and_bitwise_composition(count:int,unsigned:bool,kind:str):
+  """Keep signed extension, masked counts and cast boundaries while sharing exact bit-plane recipes."""
+  words=np.resize(np.asarray((0,1,0xffffffff,0x80000000,0x7fffffff,0x55aa55aa,0x12345678,0xdeadbeef),dtype='<u4'),count)
+  amount=np.resize(np.asarray((0,1,7,8,15,16,31,32,33,63,2147483647,-1,-2147483648),dtype='<i4'),count)
+  arrays=(words,amount.view('<u4')) if unsigned else (words.view('<i4'),amount)
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    buffers=[UOp.new_buffer('ROCKCHIP',count,dtypes.uint if unsigned else dtypes.int,num=58000+slot) for slot in range(2)]
+    a,b=(Tensor(buffer) for buffer in buffers)
+    if kind=='nested_shift': result=((a<<1)>>b).cast(dtypes.int)
+    elif kind=='shifted_mask': result=((a>>b).cast(dtypes.int)^0x13579bdf)&(a.cast(dtypes.int)|0x55555555)
+    elif kind=='bitwise_shift': result=((a.cast(dtypes.int)^0x13579bdf)<<(b.cast(dtypes.int)&31))>>3
+    else: result=(a>>((b.cast(dtypes.int)>>1)&31).cast(a.dtype)).cast(dtypes.int)
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP'))).src
+                            if node.op is Ops.BINARY))
+  shifts=amount.astype(np.uint32)&31
+  if kind=='nested_shift': expected=((words.astype(np.uint64)<<1).astype('<u4').view(arrays[0].dtype)>>shifts).astype('<u4')
+  elif kind=='shifted_mask': expected=((arrays[0]>>shifts).astype('<u4')^np.uint32(0x13579bdf))&(words|np.uint32(0x55555555))
+  elif kind=='bitwise_shift':
+    expected=(((words^np.uint32(0x13579bdf)).astype(np.uint64)<<shifts).astype('<u4').view('<i4')>>3).astype('<u4')
+  else: expected=(arrays[0]>>((amount>>1).astype(np.uint32)&31)).astype('<u4')
+  bindings={buffer:array.tobytes() for buffer,array in zip(buffers,arrays)}
+  assert _execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  assert _assert_decoded_image_bounds(image)==image and not _runtime_gathers(image) and not _cmac(image)
+
+
 def test_cmod_range_keeps_expanded_parity_arithmetic_in_exact_fp16_lanes():
   source = UOp.param(1, dtypes.half, (4,))
   def parity(i):
