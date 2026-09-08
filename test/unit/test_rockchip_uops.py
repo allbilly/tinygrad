@@ -3391,6 +3391,38 @@ def test_packed_bool_load_uses_canonical_int16_lanes():
   assert _ew_ops(image)[-1].mode==RKEWMode.INT16_TO_INT32
 
 
+def _boolean_load_view(source, layout:str):
+  if layout=="transpose": return source.T
+  if layout=="stride": return source[:,::2]
+  if layout=="reverse": return source.flip((0,1))
+  if layout=="broadcast": return source[:,:1].expand(source.shape)
+  if layout=="masked": return source.pad(((1,1),(1,2)),value=True)
+  return source
+
+
+@pytest.mark.parametrize("width",(5,17,257,1367))
+@pytest.mark.parametrize("layout",("contiguous","transpose","stride","reverse","broadcast","masked"))
+def test_production_boolean_loads_share_affine_gather_plans(width:int,layout:str):
+  """Boolean bytes share typed indexing; the gather alone widens their storage to canonical INT16 lanes."""
+  values=(np.arange(3*width).reshape(3,width)%5<2)
+  expected={"contiguous":values,"transpose":values.T,"stride":values[:,::2],"reverse":values[::-1,::-1],
+            "broadcast":np.broadcast_to(values[:,:1],values.shape),"masked":np.pad(values,((1,1),(1,2)),constant_values=True)}[layout]
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",values.size,dtypes.bool,num=64100)).reshape(values.shape)
+    output=_boolean_load_view(source,layout).cast(dtypes.int)+1
+    calls=output.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  gathers=_initial_gathers(image)
+  assert len(gathers)==(3 if layout=="masked" else 1) and gathers[0].itemsize==1 and gathers[0].dst_stride==2
+  if layout!="masked": assert gathers[0].axes and not gathers[0].offsets
+  else: assert gathers[0].offsets and gathers[0].fill_bits==0 and [g.partial for g in gathers]==[False,False,True]
+  assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
+  assert _execute_raw_dynamic_image(image,expected.size*4,values.tobytes())==(expected.astype("<i4")+1).tobytes()
+
+
 def test_fp16_predicate_prefix_executes_generic_uops():
   source = UOp.param(1, dtypes.half, (4,))
   def prefix(lane:UOp) -> UOp:

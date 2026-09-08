@@ -898,8 +898,7 @@ class RKContext:
       0 if default is None else default.arg,dtype if dtype.itemsize>1 else dtypes.int)
     if address_loads:
       return self._host_address_load(param,index,gate,address_loads,dtype,layout,fill_bits)
-    if (plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=fill_bits,
-                              require_offsets=dtype is dtypes.bool)) is None: raise _RKGenericReject
+    if (plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=fill_bits)) is None: raise _RKGenericReject
     if dtype not in (dtypes.float,dtypes.bool) and gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
       return self._carrier(RKArg(RKBufferKind.ARG,param.arg.slot),layout)
     physical=dtype if dtype is dtypes.float else layout
