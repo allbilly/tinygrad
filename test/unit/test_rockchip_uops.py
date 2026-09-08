@@ -925,11 +925,18 @@ def test_compact_affine_gather_preserves_full_raw_movement(itemsize,partial,alia
       values=(np.arange(size,dtype=np.uint64)*173+37).astype(f'<u{itemsize}')
       gather=rockchip_renderer.RKGather(rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.ARG,0),rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.SCRATCH,0),count,
                         offsets=offsets,fill_bits=19,partial=partial,dst_stride=2,dst_addend=dst_addend,itemsize=itemsize)
-      compact=rockchip_renderer._compact_gather(gather,shape)
+      axes=tuple(UOp.range(extent,200+i,dtype=dtypes.int) for i,extent in enumerate(shape))
+      zero=UOp.const(0,dtypes.int)
+      destination=sum((axis*stride for axis,stride in zip(axes,strides_for_shape(shape))),zero)
+      address=sum((axis*stride for axis,stride in zip(axes,strides)),zero)-min(raw)+3
+      gate=(destination%3).ne(0) if kind=='masked' else None
+      if kind=='irregular' and count>2: address=destination.eq(count-1).where(address+1,address)
+      compact=rockchip_renderer._gather_plan(0,0,destination,address,gate,count,gather.fill_bits)._replace(
+        partial=partial,dst_stride=gather.dst_stride,dst_addend=dst_addend,itemsize=itemsize)
       assert compact._replace(base=gather.base,axes=gather.axes,offsets=gather.offsets)==gather
       actual=compact.offsets or tuple(compact.base+sum(lane//d%extent*stride for d,extent,stride in compact.axes) for lane in range(count))
       assert actual==offsets
-      if kind=='masked': assert compact is gather
+      if kind=='masked': assert compact.offsets==gather.offsets and not compact.axes
       outputs=[]
       for movement in (gather,compact):
         source=_mapped_values(values,0x4000)
@@ -966,9 +973,10 @@ def test_raw_offset_copy_preserves_snapshot_fill_and_partial_lanes(itemsize,part
 
 
 @pytest.mark.parametrize('shape',((),(0,),(-1,-4),(3,2),(1,1,1)))
-def test_compact_gather_rejects_incompatible_physical_shape(shape):
-  gather=rockchip_renderer.RKGather(rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.ARG,0),rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.SCRATCH,0),4,offsets=(1,2,3,4))
-  assert rockchip_renderer._compact_gather(gather,shape) is gather
+def test_gather_plan_rejects_incompatible_static_domain(shape):
+  axes=tuple(UOp.range(extent,200+i,dtype=dtypes.int) for i,extent in enumerate(shape))
+  destination=sum((axis*stride for axis,stride in zip(axes,strides_for_shape(shape))),UOp.const(0,dtypes.int))
+  with pytest.raises(rockchip_renderer._RKGenericReject): rockchip_renderer._gather_plan(0,0,destination,destination+1,None,4)
 
 
 def test_runtime_index_gather_uses_signed_indices_and_fill_bits():
@@ -1342,15 +1350,15 @@ def test_typed_load_dependencies_cover_masked_address_variation():
   source=UOp.param(1,dtypes.half,(64,))
   row,column=UOp.range(3,0),UOp.range(5,1)
   output_index=row*5+column
-  for index,gate in ((row,None),(column,None),(row,column<2),((row+column)%3,row<2),
-                     ((row*5+column).cast(dtypes.ushort),None),(row.const_like(0),column%2<1)):
+  for index,gate,expected in ((row,None,tuple(r for r in range(3) for _ in range(5))),
+                              (column,None,tuple(c for _ in range(3) for c in range(5))),
+                              (row,column<2,tuple(r if c<2 else -1 for r in range(3) for c in range(5))),
+                              ((row+column)%3,row<2,tuple((r+c)%3 if r<2 else -1 for r in range(3) for c in range(5))),
+                              ((row*5+column).cast(dtypes.ushort),None,tuple(range(15))),
+                              (row.const_like(0),column%2<1,tuple(0 if c%2<1 else -1 for _ in range(3) for c in range(5)))):
     load=source.index(index).load() if gate is None else source.index(index).load(UOp.const(0.0,dtypes.half),gate)
     plan=rockchip_renderer._typed_load_plan(load,dtypes.half,output_index,15,require_offsets=True)
-    assert plan is not None and plan.axes<={row,column}
-    selected={}
-    for lane,address in enumerate(plan.gather.offsets):
-      key=tuple(value for axis,value in zip((row,column),divmod(lane,5)) if axis in plan.axes)
-      assert selected.setdefault(key,address)==address
+    assert plan is not None and plan.offsets==expected
 
 
 def test_physical_half_recipe_materializes_strong_float_constant_at_boundary():
@@ -2259,6 +2267,32 @@ def test_production_cmac_permuted_output_composes_source_coordinates(order):
     assert _execute_raw_dynamic_image(image,expected.nbytes,lhs_values.tobytes(),rhs_values.tobytes())==expected.tobytes()
 
 
+@pytest.mark.parametrize("view",("reverse_rows","reverse_columns","transpose","reshape_reverse"))
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float))
+def test_production_cmac_preserves_reversed_destination_coordinates(view,dtype):
+  """Writing a reversed view must reverse its logical coordinates, not round through an EW fallback."""
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    lhs=Tensor(UOp.new_buffer("ROCKCHIP",15,dtypes.half,num=51000)).reshape(3,5)
+    rhs=Tensor(UOp.new_buffer("ROCKCHIP",20,dtypes.half,num=51001)).reshape(5,4)
+    out=Tensor(UOp.new_buffer("ROCKCHIP",12,dtype,num=51002))
+    destination=out.reshape(4,3).T if view=="transpose" else out.flip(0).reshape(3,4) if view=="reshape_reverse" else \
+      out.reshape(3,4).flip(0 if view=="reverse_rows" else 1)
+    calls=destination.assign((lhs@rhs).cast(dtype)).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  assert (cmac:=_cmac(image)) is not None and (cmac.m,cmac.n,cmac.k)==(3,4,5)
+  assert not _ew_ops(image) and not _runtime_gathers(image) and _assert_decoded_image_bounds(image)==image
+  for seed in range(3):
+    rng=np.random.default_rng(seed)
+    left,right=(rng.integers(-3,4,shape).astype("<f2") for shape in ((3,5),(5,4)))
+    product=left.astype("<f4")@right.astype("<f4")
+    expected=(product.T if view=="transpose" else product.flatten()[::-1] if view=="reshape_reverse" else
+              product[::-1] if view=="reverse_rows" else product[:,::-1]).astype("<f2" if dtype is dtypes.half else "<f4")
+    assert _execute_raw_dynamic_image(image,expected.nbytes,left.tobytes(),right.tobytes())==expected.tobytes()
+
+
 @pytest.mark.parametrize(("m","k","n"), ((256,256,256),(192,256,160),(64,384,384),(512,128,128)))
 def test_large_affine_matmul_keeps_cmac_planning_compact(m:int, k:int, n:int):
   with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
@@ -2398,7 +2432,7 @@ def test_batched_zero_gated_convolution_reorders_one_production_cmac():
     for x in range(9)] for y in range(9)] for oc in range(4)] for batch in range(2)],dtype=np.float32)
   np.testing.assert_array_equal(packed_weight[:,:36].astype(np.float32)@packed_source[:162,:36].T.astype(np.float32),
                                 expected.transpose(1,0,2,3).reshape(4,162))
-  assert _output_gathers(image)[0].offsets == tuple(oc*384+(batch*81+lane)//16*32+(batch*81+lane)%16
+  assert _gather_lanes(_output_gathers(image)[0]) == tuple(oc*384+(batch*81+lane)//16*32+(batch*81+lane)%16
     for batch in range(2) for oc in range(4) for lane in range(81))
   assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
 
@@ -2499,7 +2533,7 @@ def test_literal_fp32_bias_and_large_broadcast_share_cmac_candidate_planner():
   physical = np.zeros(_cmac(image).m*ao*2,dtype=np.float16)
   for row in range(_cmac(image).m):
     for col in range(_cmac(image).n): physical[row*ao*2+col//16*32+col%16] = result[row,col]
-  got = physical[np.asarray(_output_gathers(image)[0].offsets)]
+  got = physical[np.asarray(_gather_lanes(_output_gathers(image)[0]))]
   expected = (source_values[:,None]+np.float16(3)).repeat(64,axis=1).reshape(-1)
   np.testing.assert_array_equal(got,expected)
   assert decode_image(encode_image(image)) == image and not _runtime_gathers(image)
@@ -2590,7 +2624,7 @@ def test_static_dot_reduce_owns_accurate_physical_recipe():
   reduced = UOp(Ops.REDUCE, dtypes.half, src=(term, axis), arg=(Ops.ADD,0))
   image = _lower_uop_program(list(out.index(row).store(reduced).end(row, axis).sink().toposort()))
   assert image is not None and _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (2,2,3)
-  assert _output_gathers(image)[0].offsets == (0, 65) and not _ew_ops(image)
+  assert _gather_lanes(_output_gathers(image)[0]) == (0, 65) and not _ew_ops(image)
 
 
 def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
@@ -4472,7 +4506,7 @@ def test_nonaffine_scalar_dot_uses_cmac_static_packing():
   image = _lower_uop_program(list(out.index(UOp.const(0, dtypes.int)).store(value).sink().toposort()))
   assert image is not None and _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (1,1,groups)
   assert any(gather.offsets[:groups] == permutation for gather in _initial_gathers(image))
-  assert not _ew_ops(image) and _output_gathers(image)[0].offsets == (0,)
+  assert not _ew_ops(image) and _gather_lanes(_output_gathers(image)[0]) == (0,)
   assert decode_image(encode_image(image)) == image
 
 

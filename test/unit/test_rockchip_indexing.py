@@ -61,3 +61,48 @@ def test_production_tiled_view_resets_modulo_axis(rows,width,divisor):
   words=np.arange(divisor,dtype=np.uint16)*313+41
   expected=(np.tile(words,groups)[:width][None,:].repeat(rows,axis=0)^128).astype("<u2").tobytes()
   assert _execute_raw_dynamic_image(image,rows*width*2,words.astype("<u2").tobytes())==expected
+
+@pytest.mark.parametrize("rows",(1,3))
+@pytest.mark.parametrize("width",(7,8,9,12,31,32,33))
+@pytest.mark.parametrize("divisor",(2,4))
+@pytest.mark.parametrize("operations",((Ops.CDIV,Ops.CMOD),(Ops.FLOORDIV,Ops.FLOORMOD)))
+def test_periodic_divided_axes_compose_without_crossing_row_resets(rows,width,divisor,operations):
+  row,col=UOp.range(rows,0,dtype=rk.dtypes.int),UOp.range(width,1,dtype=rk.dtypes.int)
+  quotient=col.alu(operations[0],col.const_like(divisor))
+  address=row*32+17-quotient.alu(operations[1],col.const_like(3))*7+col.alu(operations[1],col.const_like(3))
+  gather=rk._gather_plan(1,0,row*width+col,address,None,rows*width)
+  actual=gather.offsets or tuple(gather.base+sum(lane//step%limit*stride for step,limit,stride in gather.axes) for lane in range(gather.count))
+  assert actual==tuple(r*32+17-(c//divisor%3)*7+c%3 for r in range(rows) for c in range(width))
+  if rows==1 or width%(divisor*3)==0: assert gather.axes and not gather.offsets
+
+@pytest.mark.parametrize("rows",(1,3))
+@pytest.mark.parametrize("width",(7,8,9,12,31,32,33))
+@pytest.mark.parametrize("divisor",(2,4))
+def test_production_tiled_repeated_view_composes_periodic_division(rows,width,divisor):
+  period=3
+  groups=ceildiv(width,period*divisor)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",period,rk.dtypes.half,num=19900)).reshape(1,1,period,1)
+    view=source.expand(rows,groups,period,divisor).reshape(rows,groups*period*divisor)[:,:width]
+    calls=(view.bitcast(rk.dtypes.int16)^128).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],rk.RockchipRenderer(Target(device="ROCKCHIP")))
+    image=rk.decode_image(next(node.arg for node in program.src if node.op is Ops.BINARY))
+  words=np.asarray((0x8000,0x7c00,0x7e55),dtype="<u2")
+  expected=(np.tile(np.repeat(words,divisor),groups)[:width][None,:].repeat(rows,axis=0)^128).astype("<u2").tobytes()
+  assert _execute_raw_dynamic_image(image,rows*width*2,words.tobytes())==expected
+
+@pytest.mark.parametrize("dtype",(rk.dtypes.int16,rk.dtypes.int32,rk.dtypes.uint32,rk.dtypes.int64))
+def test_lossless_weak_integer_address_cast_keeps_affine_gather(dtype):
+  lane=UOp.range(17,0,dtype=dtype)
+  address=(lane*3+1).cast(rk.dtypes.weakint)
+  gather=rk._gather_plan(1,0,lane,address,None,17)
+  assert gather.axes and not gather.offsets
+  assert tuple(gather.base+sum(i//step%limit*stride for step,limit,stride in gather.axes) for i in range(17))==tuple(i*3+1 for i in range(17))
+
+def test_weak_integer_address_cast_preserves_float_rounding():
+  lane=UOp.range(7,0,dtype=rk.dtypes.int32)
+  address=(lane.cast(rk.dtypes.float)*0.75+0.5).cast(rk.dtypes.weakint)
+  gather=rk._gather_plan(1,0,lane,address,None,7)
+  assert gather.offsets==tuple(int(i*0.75+0.5) for i in range(7))
