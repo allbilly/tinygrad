@@ -1256,11 +1256,10 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   return rewrite(root)
 
 def _finite_int_max_neutrals(root:UOp) -> UOp:
-  """Canonicalize finite physical neutrals for FP selectors and exact INT32 MAX arithmetic."""
+  """Canonicalize finite FP selector neutrals and simplify integer MAX without changing its semantic constants."""
   if root.op is Ops.MAX: root=root.substitute({u:u.replace(src=(u.src[0],u.src[1].const_like(-65504.0),u.src[2])) for u in root.toposort() if u.op is Ops.WHERE and u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() in (dtypes.half,dtypes.float) and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0.0})  # noqa: E501
-  nodes=root.toposort()
-  neutrals={u:u.const_like(-2048) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int and int(u.arg)==dtypes.int.min}
-  return root.substitute({maximum:maximum.substitute(neutrals) for maximum in reversed(nodes) if maximum.op is Ops.MAX and maximum.dtype.scalar() is dtypes.int})  # noqa: E501
+  # Apply shared MAX identities only at integer MAX nodes, leaving arithmetic beneath their operands unchanged.
+  return root.substitute({u:folded for u in root.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int and (folded:=sym.rewrite(u)) is not None})  # noqa: E501
 
 def _fold_static_terms(op:Ops, dtype:DType, terms:list[UOp], balanced:bool) -> UOp:
   while balanced and len(terms)>1: terms=[UOp(op,dtype,src=(terms[i],terms[i+1])) for i in range(0,len(terms)-1,2)]+(terms[-1:] if len(terms)&1 else [])  # noqa: E501

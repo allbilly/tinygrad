@@ -3148,6 +3148,48 @@ def test_boolean_reductions_are_physically_executed():
       assert decode_image(encode_image(image))==image
 
 
+@pytest.mark.parametrize("width",(2,7,32))
+@pytest.mark.parametrize("kind",("raw","half_cast","int16_cast"))
+def test_production_negative_integer_max(width:int,kind:str):
+  """An integer reduction identity must not clip real values below -2048."""
+  dtype=dtypes.int if kind=="raw" else dtypes.half if kind=="half_cast" else dtypes.int16
+  fmt="<i4" if kind=="raw" else "<f2" if kind=="half_cast" else "<i2"
+  values=np.resize(np.asarray((-30000,-3008,-4096,-32768),dtype=fmt),3*width).reshape(3,width)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",values.size,dtype,num=61000)).reshape(values.shape)
+    result=(source if kind=="raw" else source.cast(dtypes.int)).max(1)
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  expected=values.astype("<i4").max(axis=1).astype("<i4")
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,expected.nbytes,values.tobytes()),dtype="<i4")
+  np.testing.assert_array_equal(actual,expected)
+  assert _assert_decoded_image_bounds(image)==image
+
+
+@pytest.mark.parametrize("kind",("integer_add","float_carrier"))
+def test_production_max_preserves_operand_constants(kind:str):
+  """MAX legalization cannot replace constants inside arithmetic or narrow a physical HALF minimum to INT16."""
+  integer=kind=="integer_add"
+  dtype,values=(dtypes.int,np.asarray((0,1,2,7),dtype="<i4")) if integer else (
+    dtypes.half,np.asarray((-65504,-50016,-40000,-33024),dtype="<f2"))
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",4,dtype,num=62000))
+    result=(source+dtypes.int.min).maximum(dtypes.int.min+5) if integer else (
+      source.cast(dtypes.float).maximum(Tensor(-65504,dtype=dtypes.float)))
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                            if node.op is Ops.BINARY))
+  expected=np.maximum(values.astype(np.int64)+dtypes.int.min,dtypes.int.min+5).astype("<i4") if integer else values.astype("<f4")
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,expected.nbytes,values.tobytes()),dtype=expected.dtype)
+  np.testing.assert_array_equal(actual,expected)
+  assert _assert_decoded_image_bounds(image)==image
+
+
 def test_boolean_arg_extrema_keeps_integer_suffix_together():
   renderer=RockchipRenderer(Target(device="ROCKCHIP"))
   for data,fxn,expected in (([False,True],Tensor.argmax,1),([True,False],Tensor.argmin,1)):
