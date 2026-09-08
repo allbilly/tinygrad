@@ -662,8 +662,7 @@ def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatc
     if not accepted: return reject(*args)
     return True
   monkeypatch.setattr(rockchip_renderer,"_lower_bounded_int_lookup",reject)
-  monkeypatch.setattr(rockchip_renderer,"_lower_one_hot_gather",reject)
-  monkeypatch.setattr(rockchip_renderer,"_lower_cmac_reduce",lambda *_:None)
+  monkeypatch.setattr(rockchip_renderer,"_lower_cmac_reduce",reject)
   monkeypatch.setattr(rockchip_renderer,"_lower_mapped_reduce",final_attempt)
   assert rockchip_renderer._lower_reduction(output,[],plan) is accepted
   assert _transaction_state(plan)==before
@@ -698,20 +697,20 @@ def test_production_program_is_unchanged_after_rejected_mutation(operation:str,m
       return tuple(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY) for call in calls)
     expected=binaries()
     mutations=[]
-    def wrapped(original):
-      def attempt(*args):
-        accepted=original(*args)
-        if not accepted:
-          plan=args[-1]
-          parameter=plan.parameter(dtypes.half,9)
-          slot=plan.resolve(RKArg(RKBufferKind.ARG,parameter.arg.slot))
-          plan.program.append(RKGather(None,slot,9,values=(0x4400,)))
-          plan.scratch[0]+=64
-          mutations.append(slot)
-        return accepted
-      return attempt
-    for name in ("_lower_bounded_int_lookup","_lower_one_hot_gather"):
-      monkeypatch.setattr(rockchip_renderer,name,wrapped(getattr(rockchip_renderer,name)))
+    original_try=rockchip_renderer._try
+    def with_rejected_predecessor(plan,*args):
+      before=_transaction_state(plan)
+      def reject():
+        parameter=plan.parameter(dtypes.half,9)
+        slot=plan.resolve(RKArg(RKBufferKind.ARG,parameter.arg.slot))
+        plan.program.append(RKGather(None,slot,9,values=(0x4400,)))
+        plan.scratch[0]+=64
+        mutations.append(slot)
+        return False
+      assert not plan.lower(reject)
+      assert _transaction_state(plan)==before
+      return original_try(plan,*args)
+    monkeypatch.setattr(rockchip_renderer,"_try",with_rejected_predecessor)
     assert binaries()==expected
     assert mutations
 

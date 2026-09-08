@@ -36,6 +36,33 @@ def test_range_selected_load_preserves_axis_cast_and_raw_payload(special:bool, d
   assert _execute_raw_dynamic_image(image,count*2,payload.tobytes(),coordinates.tobytes())==expected
 
 
+@pytest.mark.parametrize('special',(False,True))
+@pytest.mark.parametrize('wide',(False,True))
+@pytest.mark.parametrize('bits',(0x8000,0x7e31,0x7c00,0xfc00))
+@pytest.mark.parametrize('swap',(False,True))
+def test_composed_selected_reductions_preserve_raw_load_payloads(special:bool,wide:bool,bits:int,swap:bool):
+  """This compiler-level fixture retains two REDUCE nodes; ordinary Tensor indexing can collapse them earlier."""
+  count=6
+  out,left,right,indices=(UOp.param(slot,dtype,(size,)) for slot,dtype,size in
+                          ((0,dtypes.half,count),(1,dtypes.half,3),(2,dtypes.half,5),(3,dtypes.int,count*2)))
+  lane=UOp.range(count,0,dtype=dtypes.int)
+  reductions=[]
+  for i,(source,size) in enumerate(((left,3),(right,5))):
+    axis=UOp.special(size,f'selected{i}',dtypes.int) if special else UOp.range(size,i+1,dtype=dtypes.int)
+    index=indices.index(lane+i*count).load()
+    body=((axis!=index)!=UOp.const(True,dtypes.bool)).where(source.index(axis).load(),UOp.const(0.0,dtypes.half))
+    reductions.append((body.cast(dtypes.float) if wide else body).reduce(axis,arg=Ops.ADD).cast(dtypes.half))
+  value=(lane%2).eq(int(swap)).where(*reductions)
+  image=_lower_uop_program(list(out.index(lane).store(value).sink().toposort()))
+  assert image is not None and sum(isinstance(op,RKGather) and op.index is not None for op in image.program)==2
+  payloads=(np.full(3,bits,dtype='<u2'),np.full(5,0xbc00,dtype='<u2'))
+  choices=np.asarray(((0,2,-1,3,-(1<<31),(1<<31)-1),(4,0,5,-1,(1<<31)-1,-(1<<31))),dtype='<i4')
+  selected=[np.asarray([payload[index] if 0<=index<len(payload) else 0 for index in choice],dtype='<u2')
+            for payload,choice in zip(payloads,choices)]
+  expected=np.where(np.arange(count)%2==int(swap),*selected).astype('<u2').tobytes()
+  assert _execute_raw_dynamic_image(image,count*2,*(payload.tobytes() for payload in payloads),choices.tobytes())==expected
+
+
 @pytest.mark.parametrize('kind',('dense','padded','coefficient_table','raw_pair'))
 @pytest.mark.parametrize('failure',('false','reject','bug'))
 def test_production_owned_emission_rejection_preserves_the_following_program(kind:str, failure:str, monkeypatch):
