@@ -3066,7 +3066,8 @@ def test_production_sparse_label_smoothing_stages_nested_reductions(smoothing:fl
     for call in calls:
       to_program_cache.clear()
       images.append(decode_image(next(u.arg for u in to_program(call.src[0],renderer).src if u.op is Ops.BINARY)))
-  assert len(images)==3 and len(_ew_ops(images[2]))==106 and len(images[2].program)<180
+  # Native-word INT32 equality removes nine EW stages; the numerical loss hashes below stay unchanged.
+  assert len(images)==3 and len(_ew_ops(images[2]))==97 and len(images[2].program)<180
   assert not _typed_ops(images[2],RKCMAC)
   assert not _runtime_gathers(images[2]) and all(_assert_decoded_image_bounds(image)==image for image in images)
   digest=hashlib.sha256()
@@ -3879,10 +3880,11 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
 
   coordinate = images[-1]
   # Bounded counts use the shared mapped INT16 reduction after exact INT32 predicates and raw narrowing.
-  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (120,108,7765,1)
+  # Resource/image goldens track native-word comparisons; all coordinate-output hashes remain unchanged.
+  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (116,120,7726,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="779978a6def3589de6d22197d99c88bac532baf7ee2516ee44b94defcdc3b4a0"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="9ef6db947ed3ff1e0e9bc213eb91cb2e30c93d7c0ce8d29e3d2e6dce766df3ca"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -3898,9 +3900,9 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   assert (len(prefix.scratch),len(_static_gathers(prefix)),len(_ew_ops(prefix)),len(_output_gathers(prefix))) == (11,13,40,0)
   assert not _typed_ops(prefix,RKCMAC)
   assert (len(mapped_coordinate.scratch),len(_static_gathers(mapped_coordinate)),len(_ew_ops(mapped_coordinate)),
-          len(_output_gathers(mapped_coordinate))) == (14,20,39,0)
+          len(_output_gathers(mapped_coordinate))) == (11,17,30,0)
   assert (len(large_coordinate.scratch),len(_static_gathers(large_coordinate)),len(_ew_ops(large_coordinate)),
-          len(_output_gathers(large_coordinate))) == (114,102,7764,1)
+          len(_output_gathers(large_coordinate))) == (110,114,7757,1)
   assert not _typed_ops(large_coordinate,RKCMAC)
   values=np.random.default_rng(1001).uniform(-1,1,size=320).astype("<f2")
   assert hashlib.sha256(_execute_raw_dynamic_image(prefix,768*4,values.tobytes())).hexdigest() == \
@@ -4863,7 +4865,7 @@ def test_production_sort_maps_short_bounded_integer_sums():
       expected.append(sum(index<position+1 and row[index]==row[position] for index in range(6)))
     np.testing.assert_array_equal(actual,np.asarray(expected,dtype=np.int32))
     assert _assert_decoded_image_bounds(image)==image and decode_image(encode_image(image))==image
-  assert len(weighted)==1 and weighted[0][0]==384 and len(_ew_ops(weighted[0][1]))==64
+  assert len(weighted)==1 and weighted[0][0]==384 and len(_ew_ops(weighted[0][1]))==55
   weighted_image=weighted[0][1]
   assert not _typed_ops(weighted_image,RKCMAC)
   assert not any(op.mode==RKEWMode.HALF_TO_INT32 for op in _ew_ops(weighted_image))

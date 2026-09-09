@@ -678,7 +678,6 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   return plan.lower(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),chain=direct or integer and value.arg[0] is Ops.MAX and total<32)  # noqa: E501
 
 def _i16_bit(value:UOp) -> UOp: return _native_min(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
-def _sign_bias(value:UOp) -> UOp: return value.alu(Ops.ADD,value.const_like(128)).alu(Ops.SUB,_i16_bit(value.alu(Ops.SUB,value.const_like(127))).alu(Ops.MUL,value.const_like(256)))  # noqa: E501
 
 def _i16_compare(op:Ops, lhs:UOp, rhs:UOp, *, byte_domain:bool=False) -> UOp:
   delta=(rhs if op is Ops.CMPLT else lhs).alu(Ops.SUB,lhs if op is Ops.CMPLT else rhs)
@@ -698,14 +697,15 @@ def _byte_bits(value:UOp) -> tuple[UOp, ...]:
     remainder=remainder.alu(Ops.SUB,flag.alu(Ops.MUL,value.const_like(1<<bit)))
   result[0]=remainder; return typing_cast(tuple[UOp,...],tuple(result))
 
-def _compare_bytes(op:Ops, lhs:Iterable[UOp], rhs:Iterable[UOp]) -> UOp:
-  """Compare equal-width byte components; ordered inputs arrive most-significant first."""
-  # A higher unequal byte overrides the lower decision; an equal byte preserves it.
-  # Byte differences plus the 0/1 carry stay in [-255,256], exact in the INT16 carrier.
-  pairs=tuple(zip(lhs,rhs)); result=pairs[0][0].const_like(0 if op is Ops.CMPLT else 1)
-  for a,b in reversed(pairs) if op is Ops.CMPLT else pairs:
-    result=_i16_bit(b.alu(Ops.SUB,a).alu(Ops.ADD,result)) if op is Ops.CMPLT else result.alu(Ops.MUL,_i16_compare(Ops.CMPEQ,a,b,byte_domain=True))
-  return result.const_like(1).alu(Ops.SUB,result) if op is Ops.CMPNE else result
+def _compare_int32_words(op:Ops, lhs:tuple[UOp,...], rhs:tuple[UOp,...]) -> UOp:
+  """Compare low/high INT16 words: signed high-word order, then unsigned low-word order."""
+  # The old byte comparison carried lower decisions through equal higher bytes in [-255,256].
+  # Here every decision is a 0/1 mask; a differing low-word sign decides unsigned order directly.
+  equal=tuple(_i16_compare(Ops.CMPEQ,left,right) for left,right in zip(lhs,rhs))
+  if op is not Ops.CMPLT: return equal[0].const_like(1).alu(Ops.SUB,equal[0].alu(Ops.MUL,equal[1])) if op is Ops.CMPNE else equal[0].alu(Ops.MUL,equal[1])  # noqa: E501
+  signs=tuple(_i16_bit(parts[0].const_like(0).alu(Ops.SUB,parts[0])) for parts in (lhs,rhs))
+  low=_i16_select(_i16_compare(Ops.CMPEQ,*signs),_i16_compare(Ops.CMPLT,lhs[0],rhs[0]),signs[1])
+  return _i16_compare(Ops.CMPLT,lhs[1],rhs[1]).alu(Ops.ADD,equal[1].alu(Ops.MUL,low))
 
 def _carry_bytes(values:Iterable[UOp], carry:UOp, op:Ops=Ops.ADD) -> tuple[tuple[UOp,...],UOp]:
   """Normalize least-significant-first byte coefficients, retaining the exact carry or borrow recipe."""
@@ -1043,8 +1043,7 @@ class RKContext:
       if not integer16 and self.int_layout is dtypes.int16 and (half_sources:=tuple(_int_info(src)[1] for src in u.src)) and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
       values=tuple(self._operand(src,dtypes.int16 if integer16 else dtypes.int) for src in u.src)
       if values[0].dtype is dtypes.int16: return self._lower_recipe(u,_i16_compare(u.op,*values))
-      components=tuple(self._unpack_bytes(value) for value in values)
-      if u.op is Ops.CMPLT: components=tuple((_sign_bias(parts[3]),*parts[2::-1]) for parts in components)
+      components=tuple(tuple(self._slot(RKGather(source.arg,RKArg(RKBufferKind.SCRATCH,0),self.count,base=word,axes=((1,self.count,2),)),dtypes.int16) for word in (0,1)) for source in (self._emit(self._scratch(dtypes.int),value,value,_EW_CFG[Ops.MAX]) for value in values))  # noqa: E501
     else:
       half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
@@ -1056,7 +1055,7 @@ class RKContext:
       classified=tuple(self._fp16_order(self._operand(src,dtypes.half)) if u.op is Ops.CMPLT else classify(src) for src in typing_cast(tuple[UOp,UOp],half_sources))  # noqa: E501
       result=_i16_compare(Ops.CMPEQ if u.op is Ops.CMPNE else u.op,classified[0][0],classified[1][0]); result=result.alu(Ops.MUL,result.const_like(1).alu(Ops.SUB,classified[0][1].alu(Ops.MAX,classified[1][1])))  # noqa: E501
       return self.lower(result.const_like(1).alu(Ops.SUB,result) if u.op is Ops.CMPNE else result)
-    return self.lower(_compare_bytes(u.op,*components))
+    return self.lower(_compare_int32_words(u.op,*components))
 
   def _int32_divmod(self, u:UOp) -> UOp:
     if len(u.src) != 2 or not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
