@@ -1140,13 +1140,11 @@ class RKContext:
        dtype is dtypes.int and source_dtype is dtypes.float: raise _RKGenericReject(f"cast {source_dtype}->{dtype}")
     source_u=u.src[0]
     # FP16 Boolean conversion (including nonzero comparisons) uses ABS then positivity, exact for zero, infinity and NaN.
-    if dtype is dtypes.uchar:
-      if (relu:=_relu_operand(source_u)) is not None: source_u=relu.alu(Ops.MAX,UOp.const(0.0,dtypes.half))
-      truncated=_fold_trunc(UOp(Ops.TRUNC,dtypes.half,src=(source_u,)))
-      source_u=truncated.alu(Ops.SUB,_native_same(truncated.alu(Ops.MUL,UOp.const(1.0/256.0,dtypes.half)),_NATIVE_FLOOR).alu(
-        Ops.MUL,UOp.const(256.0,dtypes.half)))
+    if dtype is dtypes.uchar and (relu:=_relu_operand(source_u)) is not None: source_u=relu.alu(Ops.MAX,UOp.const(0.0,dtypes.half))
+    if source_dtype is dtypes.half and dtype in (dtypes.uchar,dtypes.int): source_u=_fold_trunc(UOp(Ops.TRUNC,dtypes.half,src=(source_u,)))
+    if dtype is dtypes.uchar: source_u=source_u.alu(Ops.SUB,_native_same(source_u.alu(Ops.MUL,UOp.const(1.0/256.0,dtypes.half)),
+      _NATIVE_FLOOR).alu(Ops.MUL,UOp.const(256.0,dtypes.half)))
     elif dtype is dtypes.bool: source_u=_positive_mask(UOp(Ops.MAX,dtypes.half,src=(source_u,source_u),arg=_NATIVE_ABS))
-    elif dtype is dtypes.int and source_dtype is dtypes.half: source_u=_fold_trunc(UOp(Ops.TRUNC,dtypes.half,src=(source_u,)))
     elif source_dtype is dtypes.bool and dtype in (dtypes.half,dtypes.float): source_u=source_u.where(UOp.const(1.0,dtypes.half),UOp.const(0.0,dtypes.half))  # noqa: E501
     if dtype is dtypes.half and source_dtype is dtypes.float:
       if _is_static_expr(u.src[0]): return self._static(u)
