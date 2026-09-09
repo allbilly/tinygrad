@@ -1330,8 +1330,7 @@ def _fold_relu_cap(x:UOp) -> UOp|None:
   for positive, negative in (x.src, x.src[::-1]):
     source, scaled = _relu_operand(positive), _const_operand(negative, Ops.MUL, -1.0)
     if source is None or scaled is None or (upper:=_relu_operand(scaled[0])) is None: continue
-    source_base, source_shift = (source, 0.0) if (term:=_const_operand(source, Ops.ADD)) is None else (term[0], float(term[1].arg))
-    upper_base, upper_shift = (upper, 0.0) if (term:=_const_operand(upper, Ops.ADD)) is None else (term[0], float(term[1].arg))
+    (source_base, source_shift), (upper_base, upper_shift) = ((value, 0.0) if (term:=_const_operand(value, Ops.ADD)) is None else (term[0], float(term[1].arg)) for value in (source, upper))  # noqa: E501
     if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: continue
     if cap == 6.0: return UOp(Ops.MAX, x.dtype, src=(source, UOp.const(0.0, dtypes.half)), arg=_NATIVE_RELU6)
     return UOp(Ops.MAX, positive.dtype, src=(positive, UOp.const(cap, dtypes.half)), arg=_NATIVE_MIN)
