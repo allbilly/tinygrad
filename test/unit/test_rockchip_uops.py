@@ -3431,7 +3431,12 @@ def test_independent_fp32_reductions_are_committed_before_outer_half_division():
   ratio = UOp(Ops.FDIV, dtypes.half, src=(numerator.cast(dtypes.half), denominator.cast(dtypes.half)))
   image = _lower_uop_program(_program(dtypes.half, lambda _i:ratio, count=1))
   assert image is not None and _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k) == (1,1,4)
-  assert len(_ew_ops(image)) == 55 and _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG
+  assert len(_ew_ops(image)) == 45 and _ew_ops(image)[-1].dst.kind is RKBufferKind.ARG
+  # Canonical physical ADD markers share repeated instructions; neither HALF boundary may disappear with them.
+  for a,b in (((1,0,0,0),(1,2**-11,0,0)),((1,2**-11,0,0),(1,1,1,0))):
+    left,right=np.asarray(a,dtype="<f2"),np.asarray(b,dtype="<f2")
+    expected=np.float16(np.float16(np.sum((left*right).astype("<f4")))/np.float16(np.sum(right.astype("<f4"))))
+    assert _execute_raw_dynamic_image(image,2,left.tobytes(),right.tobytes())==expected.tobytes()
 
 
 @pytest.mark.parametrize("width",(7,8,9))
@@ -3452,6 +3457,17 @@ def test_production_ratio_honors_both_half_cast_boundaries(width:int):
   expected=np.float16(np.float16(np.sum(values[0].astype(np.float32)*values[1].astype(np.float32)))/
                       np.float16(np.sum(values[2].astype(np.float32)*values[3].astype(np.float32))))
   assert _execute_raw_dynamic_image(image,2,*(value.tobytes() for value in values))==expected.tobytes()
+
+
+@pytest.mark.parametrize("terms",(7,8,9,15,16,17))
+def test_storage_physical_adds_survive_second_accuracy_pass(terms):
+  left,right=(UOp.param(slot,dtypes.half,(terms,)) for slot in (1,2))
+  products=[left.index(i).load().cast(dtypes.float)*right.index(i).load().cast(dtypes.float) for i in range(terms)]
+  physical=rockchip_renderer._canonical_half_storage(functools.reduce(lambda a,b:a+b,products))
+  assert any(node.op is Ops.ADD for node in physical.toposort())
+  assert all(node.arg==rockchip_renderer._NATIVE_PRECISE_ADD for node in physical.toposort()
+             if node.op is Ops.ADD and node.dtype.scalar() is dtypes.half)
+  assert rockchip_renderer._expand_math_uops(physical) is physical
 
 
 def test_accurate_add_recipe_keeps_explicit_half_casts_opaque():

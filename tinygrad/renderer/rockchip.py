@@ -788,7 +788,9 @@ _pm_half_storage_algebra = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPa
 def _canonical_half_storage(source:UOp) -> UOp:
   """Commit one FP32 storage expression, then reuse Tinygrad's ordinary algebra on its now-identical half values."""
   converted = _fp32_expr_to_half(source)
-  return converted if len(source.toposort()) > 64 else graph_rewrite(graph_rewrite(converted,_pm_half_storage_algebra+sym,name="rockchip half storage algebra"),pm_commit_weak,name="rockchip commit storage constants")  # noqa: E501
+  semantic = tuple(node for node in source.toposort() if node.dtype.scalar() is dtypes.half)
+  # Algebra may rebuild physical ADDs without their markers; never compensate those instructions a second time.
+  return _tag_precise_adds(converted if len(source.toposort()) > 64 else graph_rewrite(graph_rewrite(converted,_pm_half_storage_algebra+sym,name="rockchip half storage algebra"),pm_commit_weak,name="rockchip commit storage constants"),semantic)  # noqa: E501
 
 def _accurate_add_recipe(u:UOp, pure:bool=False) -> UOp|None:
   # Convert only this sum's FLOAT terms; a HALF cast is an opaque rounding boundary.
@@ -1266,11 +1268,9 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   strict_output, local_output = (_admit(output, accepted) for output in (strict_output, local_output))
   if vectorize_reductions and (_try(plan,local_output,dtypes.float,_lower_linear_contraction) or _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops) or _try(plan,strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops)): return True  # noqa: E501
   if _try(plan,strict_output,dtypes.int,_lower_raw_fp16_bitcast): return True
-  storage_precision,storage_product_adds=any(u.dtype.scalar() is dtypes.float for u in uops),False
-  if storage_precision and (storage_output:=_admit(local_output,dtypes.half)) is not None:
+  if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
     try:
-      storage_root=storage_output[4]; storage_product_adds=any((boundary is not storage_root or len(boundary.src[0].toposort())>64) and _accurate_add_recipe(boundary.src[0]) is not None for boundary in storage_root.toposort() if _typed_cast_source(boundary,dtypes.half,dtypes.float) is not None and boundary.src[0].op is Ops.ADD)  # noqa: E501
-      storage_root=_expand_math_uops(storage_root,accurate_adds=False); local_output=(storage_output[0].replace(src=(storage_output[0].src[0],storage_root)),*storage_output[1:4],storage_root)  # noqa: E501
+      storage_root=_expand_math_uops(storage_output[4],accurate_adds=False); local_output=(storage_output[0].replace(src=(storage_output[0].src[0],storage_root)),*storage_output[1:4],storage_root)  # noqa: E501
     except _RKGenericReject: pass
   if (output:=local_output) is None or len(output[0].src)!=2: raise _RKGenericReject("output store")
   if output[2]<=0: return True
@@ -1278,7 +1278,7 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
           set(affine[1]) == set(_index_ranges(output[3])) and _affine_output_axes(affine, output[2]) is not None) and \
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
   root=_finite_int_max_neutrals(_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4])
-  root = _expand_math_uops(root,accurate_adds=not storage_precision or storage_product_adds) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
+  root = _expand_math_uops(root) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
   if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject(f"expanded nodes {len(n)}")
   if root is not output[4]: output = (output[0].replace(src=(output[0].src[0], root)), *output[1:4], root)
   RKContext(output,plan).finish(materialize)
