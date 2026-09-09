@@ -366,6 +366,45 @@ def test_cmac_codec_and_body_match_the_proven_gemm_contract():
     RKEWOp(RKArg(RKBufferKind.ARG,0),cmac.dst,cmac.dst,1,_EW_CFG[Ops.ADD])))
   assert decode_image(encode_image(mixed)) == mixed
 
+@pytest.mark.parametrize("m,n,k,accepted",((1,32,4096,True),(1,32,4097,False),(2,32,384,True),(2,32,385,False),
+  (2047,32,32,True),(2048,32,32,False),(1,416,384,True),(2,416,384,False),(1,448,32,False),
+  (1280,32,128,True),(1281,32,128,False),(426,32,384,True),(427,32,384,False),(0,32,32,False)))
+@pytest.mark.parametrize("fp16",(False,True))
+def test_cmac_image_keeps_existing_shape_budget(m,n,k,accepted,fp16):
+  ai,ao,_=rockchip_renderer._cmac_layout(n,k)
+  args=tuple(RKArg(RKBufferKind.SCRATCH,index) for index in range(3))
+  image=RKImage(tuple(max(64,size) for size in (m*ao*4,m*ai*2,ao*ai*2)),(RKCMAC(*args,m,n,k,fp16),))
+  assert rockchip_renderer._cmac_shape_supported(m,ai,ao) is accepted
+  if accepted: assert decode_image(encode_image(image))==image
+  else:
+    with pytest.raises(ValueError,match="CMAC shape out of range"): encode_image(image)
+
+
+@pytest.mark.parametrize("count",(4,6))
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float))
+@pytest.mark.parametrize("product_first",(False,True))
+def test_production_cmac_rejects_partial_term_orientations(count,dtype,product_first,record_property):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    a,b,c=(Tensor(UOp.new_buffer("ROCKCHIP",count,dtypes.half,num=95600+slot)) for slot in range(3))
+    product=a.cast(dtypes.float)*b.cast(dtypes.float)
+    result=(product+c.cast(dtypes.float) if product_first else c.cast(dtypes.float)+product).cast(dtype)
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    blob=next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  # The addend can be oriented alone, but the product varies on both sides. Never silently discard that product.
+  cmac=_cmac(image)
+  assert cmac is not None and (cmac.m,cmac.n,cmac.k)==(count,count,2)
+  values=tuple(np.resize(np.asarray(row,dtype="<f2"),count) for row in ((1,2,-3,4),(0.5,-1.25,2,0.25),(8,-16,32,-4)))
+  expected=(values[0].astype("<f4")*values[1].astype("<f4")+values[2].astype("<f4")).astype("<f2" if dtype is dtypes.half else "<f4")
+  bindings={source.uop.buf_uop:value.tobytes() for source,value in zip((a,b,c),values)}
+  assert _execute_raw_dynamic_image(image,expected.nbytes,*(bindings[arg.buf_uop] for arg in calls[0].src[2:]))==expected.tobytes()
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("scratch_bytes",sum(image.scratch))
+  record_property("physical_ops",len(image.program))
+
+
 def test_image_codec_rejects_malformed_and_trailing_payloads():
   blob = encode_image(RKImage((64,)))
   scratch = RKArg(RKBufferKind.SCRATCH,0)

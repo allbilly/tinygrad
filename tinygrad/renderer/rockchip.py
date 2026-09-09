@@ -120,7 +120,12 @@ def _validate_image(image:RKImage) -> None:
   gathers=tuple(op for op in image.program if isinstance(op,RKGather)); hosts=tuple(op for op in gathers if op.index is not None); static=tuple(op for op in gathers if op.index is None); ew_ops=tuple(op for op in image.program if isinstance(op,RKEWOp)); cmacs=tuple(op for op in image.program if isinstance(op,RKCMAC))  # noqa: E501
   if len(image.scratch)>_RKIMAGE_U16_MAX or any(type(op) not in (RKGather,RKEWOp,RKCMAC) for op in image.program) or any(not _fits((size,)) for size in image.scratch): raise ValueError("invalid RKImage header")  # noqa: E501
   if len(cmacs)>1 or cmacs and hosts: raise ValueError("invalid CMAC schedule")
-  if cmacs: _validate_cmac(cmacs[0],image.scratch)
+  for op in cmacs:
+    ai,ao,_ = _cmac_layout(op.n,op.k)
+    if not _cmac_shape_supported(op.m,ai,ao): raise ValueError("CMAC shape out of range")
+    args,needs,alignments = (op.lhs,op.rhs,op.dst),(op.m*ai*2,ao*ai*2,op.m*ao*4),(2,2,2 if op.out_fp16 else 4)
+    if any(arg.kind is not RKBufferKind.SCRATCH or arg.addend < 0 or arg.addend%alignment for arg,alignment in zip(args,alignments)): raise ValueError("CMAC requires aligned scratch buffers")  # noqa: E501
+    if any(not 0 <= arg.index < len(image.scratch) or arg.addend+need > image.scratch[arg.index] for arg,need in zip(args,needs)): raise ValueError("CMAC exceeds scratch buffer")  # noqa: E501
   if any(g.itemsize not in (1,2,4) or (g.src is None) != bool(g.values) or not _fits((g.count,g.fill_bits,g.dst_stride)) or not _fits((g.base,g.dst_addend),signed=True) or g.dst_stride < 1 or g.dst_addend < 0 or len(g.axes)>255 or bool(g.values)+bool(g.offsets)+bool(g.axes)>1 or g.values and (len(g.values) not in (1,g.count) or not _fits(g.values,g.itemsize*8)) or g.offsets and (len(g.offsets)!=g.count or not _fits(g.offsets,signed=True)) or any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes) for g in static): raise ValueError("invalid RKGather")  # noqa: E501
   if any(h.src is None or h.index is None or h.dst.kind is not RKBufferKind.SCRATCH or h.values or h.offsets or h.axes or h.partial or h.base or h.dst_stride!=1 or h.dst_addend or h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.count,h.fill_bits)) or not _fits((h.src.addend,h.index.addend,h.dst.addend),signed=True) for h in hosts): raise ValueError("invalid runtime RKGather")  # noqa: E501
   if any(not _fits((arg.index,),16) for op in image.program for arg in _op_args(op)): raise ValueError("invalid RKArg")
@@ -168,12 +173,7 @@ def _cmac_layout(n:int, k:int) -> tuple[int, int, int]: aligned_k,align_out=max(
 
 # RK3588 accepts wide K when M=1; 4096 covers every compensated mapped path while multi-row K remains CBUF-limited.
 _MAX_CMAC_K=128*32
-def _validate_cmac(op:RKCMAC, scratch:tuple[int, ...]|None=None) -> None:
-  ai,ao,_ = _cmac_layout(op.n,op.k)
-  if not 0 < op.m <= 0x7ff or ai > _MAX_CMAC_K or ao > 0x3fff or op.m*ai*2 > 10*32768 or ao*ai*2 > 11*32768 or ai > 12*32 and op.m != 1: raise ValueError("CMAC shape out of range")  # noqa: E501
-  args,needs,alignments = (op.lhs,op.rhs,op.dst),(op.m*ai*2,ao*ai*2,op.m*ao*4),(2,2,2 if op.out_fp16 else 4)
-  if any(arg.kind is not RKBufferKind.SCRATCH or arg.addend < 0 or arg.addend%alignment for arg,alignment in zip(args,alignments)): raise ValueError("CMAC requires aligned scratch buffers")  # noqa: E501
-  if scratch is not None and any(not 0 <= arg.index < len(scratch) or arg.addend+need > scratch[arg.index] for arg,need in zip(args,needs)): raise ValueError("CMAC exceeds scratch buffer")  # noqa: E501
+def _cmac_shape_supported(m:int, ai:int, ao:int) -> bool: return 0<m<=0x7ff and ai<=_MAX_CMAC_K and ao<=0x3fff and m*ai*2<=10*32768 and ao*ai*2<=11*32768 and (m==1 or ai<=12*32)  # noqa: E501
 
 def emit_cmac_stage(op:RKCMAC, address:Callable[[RKArg],int]) -> tuple[int, ...]:
   """Emit the 45-qword GEMM body; terminal BS ReLU preserves the runtime-owned four-qword PC tail."""
@@ -540,16 +540,16 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   load_axes={load:frozenset((*_index_ranges(load.src[0].src[1]),*(() if len(load.src)<3 else _index_ranges(load.src[2]))))-frozenset(ranges) for pair in parsed for load in pair[:2] if load is not None}  # noqa: E501
   load_pairs=tuple(typing_cast(tuple[UOp,UOp],pair[:2]) for pair in parsed) if all(pair[0] is not None and pair[1] is not None for pair in parsed) else ()  # noqa: E501
   all_axes=frozenset(_index_ranges(out_index))
-  def align(row_axes:frozenset[UOp]) -> tuple[tuple[UOp|None,UOp|None,float],...]|None:
+  def align(row_axes:frozenset[UOp]) -> tuple[tuple[UOp|None,UOp|None,float],...]:
     # Each factor may vary along only one side of the contraction; constants can occupy either side.
-    aligned=tuple(next(((lhs,rhs,weight) for lhs,rhs in ((left,right),(right,left)) if (lhs is None or load_axes[lhs]<=row_axes) and (rhs is None or load_axes[rhs]<=all_axes-row_axes)),None) for left,right,weight in parsed)  # noqa: E501
-    return None if None in aligned else typing_cast(tuple[tuple[UOp|None,UOp|None,float],...],aligned)
+    # Candidate admission below requires every term; an incomplete orientation must never be emitted.
+    return tuple(aligned for left,right,weight in parsed for aligned in (next(((lhs,rhs,weight) for lhs,rhs in ((left,right),(right,left)) if (lhs is None or load_axes[lhs]<=row_axes) and (rhs is None or load_axes[rhs]<=all_axes-row_axes)),None),) if aligned is not None)  # noqa: E501
   out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()  # noqa: E501
   # Keep the existing candidate set; aligned contraction ties preserve the first input's orientation.
   partitions=(all_axes,frozenset(),*sorted((axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+[load_axes[load] for load in (load_pairs[0] if load_pairs and rows>_MAX_GENERIC_UNROLL else ())]) if axes and axes<all_axes),key=lambda axes: bool(groups%32==0 and load_pairs and axes!=load_axes[load_pairs[0][0]])))  # noqa: E501
-  candidates=[(m,n,axes,aligned,ai,ao) for index,axes in enumerate(partitions) for m in (rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes),) for n in (rows//m,) for ai,ao,_ in (_cmac_layout(n,groups),) if m<=0x7ff and ai<=_MAX_CMAC_K and ao<=0x3fff and m*ai*2<=10*32768 and ao*ai*2<=11*32768 and (m==1 or ai<=12*32) for aligned in (align(axes),) if aligned]  # noqa: E501
+  candidates=[(m,n,axes,aligned,ai,ao) for index,axes in enumerate(partitions) for m in (rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes),) for n in (rows//m,) for ai,ao,_ in (_cmac_layout(n,groups),) if _cmac_shape_supported(m,ai,ao) for aligned in (align(axes),) if len(aligned)==len(parsed)]  # noqa: E501
   diagonal=not candidates; m,n,row_axes,shape_terms,ai,ao=min(candidates,key=lambda shape:(shape[0]==1 and rows>1,shape[0]*shape[4]+shape[5]*shape[4]+2*shape[0]*shape[5])) if candidates else (rows,rows,None,tuple(parsed),*_cmac_layout(rows,groups)[:2])  # noqa: E501
-  if m>0x7ff or ai>_MAX_CMAC_K or ao>0x3fff or m*ai*2>10*32768 or ao*ai*2>11*32768 or m!=1 and ai>12*32: return False
+  if not _cmac_shape_supported(m,ai,ao): return False
   fields=tuple((stride,limit,math.prod(extent for previous,_,extent in output_axes[:i] if (previous in row_axes)==(axis in row_axes))*(n if axis in row_axes else 1)) for i,(axis,stride,limit) in enumerate(output_axes)) if row_axes and row_axes<all_axes else ()  # noqa: E501
   gathers=[]
   # Compose physical tile coordinates with the original typed LOADs; static WHERE supplies exact irregular fallback.
