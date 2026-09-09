@@ -160,7 +160,7 @@ _DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4
 (_BS_BN_BYPASS, _BS_OW_FP32_SCALAR, _BS_CFG_COMPARE, _BS_ALU_COMPARE, _BS_MUL_COMPARE, _BN_CFG_COMPARE, _BN_MUL_COMPARE,
  _BN_RELUX_COMPARE) = (1|(1<<1)|(1<<4)|(1<<6), (1<<8)|(1<<5)|(1<<2)|(1<<1), 0x40040, 0x33800000, 0x40000000, 0x40082, 0x7c000000, 0x3f800000)
 (_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK, _NATIVE_PRECISE_ADD,
- _NATIVE_RELU6, _NATIVE_SIGN) = tuple("rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add relu6 sign".split())
+ _NATIVE_RELU6) = tuple("rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add relu6".split())
 _NATIVE_HALF_TO_INT16 = "rockchip_integral_half_to_int16"
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,2<<16), (Ops.SUB,4<<16), (Ops.MUL,_EW_OP_CVT_BYPASS|1<<2), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|3<<16))}  # noqa: E501
@@ -954,13 +954,10 @@ class RKContext:
       if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
       expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
       lhs,rhs=(self._operand(src,dtype,finite_min) for src in u.src)
-      if (u.op,u.arg) in ((Ops.SUB,_NATIVE_SIGN),(Ops.MAX,_NATIVE_MIN)):
-        if expected is not dtypes.half:
-          if u.op is Ops.SUB: raise _RKGenericReject
-          return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
+      if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
+        if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
         zero=lhs.const_like(0.0)
-        return self._lower_recipe(u,_positive_mask(lhs).alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,lhs))) if u.op is Ops.SUB else
-          zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
+        return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
       cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]  # noqa: E501
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
     return self._emit(self._scratch(expected,u=u),lhs,rhs,cfg,compare=compare)

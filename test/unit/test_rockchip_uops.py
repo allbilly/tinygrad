@@ -10,7 +10,7 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import Context, Target, strides_for_shape
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather,
-  _EW_CFG, _EW_CFG_ABS, _EW_CFG_CEIL, _EW_CFG_FLOOR, _EW_CFG_MIN, _NATIVE_SIGN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
+  _EW_CFG, _EW_CFG_ABS, _EW_CFG_CEIL, _EW_CFG_FLOOR, _EW_CFG_MIN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
   _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _static_lanes,
   _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
@@ -2406,14 +2406,32 @@ def test_quadratic_math_rewrite_requires_one_shared_log_source():
   assert rockchip_renderer._fold_quadratic((unrelated+radical).log2()*scale) is None
 
 
-def test_generic_sign_recipe_owns_tagged_semantics():
-  source = UOp.param(1, dtypes.half, (4,))
-  def sign(i):
-    value = source.index(i).load()
-    return UOp(Ops.SUB, dtypes.half, src=(value, value), arg=_NATIVE_SIGN)
-  image = _lower_uop_program(_program(dtypes.half, sign))
-  assert image is not None and len(_ew_ops(image)) == 4
-  assert sum(op.mode==RKEWMode.COMPARE for op in _ew_ops(image)) == 2
+@pytest.mark.parametrize('dtype',(dtypes.half,dtypes.int16,dtypes.int))
+@pytest.mark.parametrize('count',(17,513,65536))
+@pytest.mark.parametrize('consumer',('output','bias','nested'))
+def test_production_sign_uses_ordinary_comparison_and_selection(dtype,count,consumer,record_property):
+  # The retired private sign tag had no production producer. Exercise Tensor.sign and its consumers instead.
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    source=Tensor(UOp.new_buffer('ROCKCHIP',count,dtype,num=79400))
+    result=source.sign()
+    result=result+2 if consumer=='bias' else result.sign() if consumer=='nested' else result
+    calls=result.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP')))
+    blob=next(node.arg for node in program.src if node.op is Ops.BINARY)
+    image=decode_image(blob)
+  if dtype is dtypes.half: values=np.resize(np.arange(65536,dtype='<u2').view('<f2'),count)
+  else: values=np.resize(np.asarray((dtype.min,dtype.min+1,-1,0,1,dtype.max-1,dtype.max),dtype=f'<{dtype.fmt}'),count)
+  # Match Tensor.sign's two comparisons explicitly, including its NaN -> +1 behavior.
+  expected=np.where(values!=0,np.where(values<0,-1,1),0).astype(values.dtype)
+  if consumer=='bias': expected+=2
+  assert _ew_ops(image) and _assert_decoded_image_bounds(image)==image
+  actual=np.frombuffer(_execute_raw_dynamic_image(image,expected.nbytes,values.tobytes()),dtype=values.dtype)
+  np.testing.assert_array_equal(actual,expected)
+  record_property('image_sha256',hashlib.sha256(blob).hexdigest())
+  record_property('scratch_bytes',sum(image.scratch))
+  record_property('physical_ops',len(image.program))
 
 
 def test_unrolled_math_reduction_vectorizes_periodic_indices():
