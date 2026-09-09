@@ -97,10 +97,9 @@ def _reuse_linear_scratch(image:RKImage) -> RKImage:
     # A padding write cannot make a previously produced surface available before its producer.
     if not preload: written.add(op.dst._replace(addend=0)); ready.discard(op.dst.index) if op.dst.kind is RKBufferKind.SCRATCH else None
   image=image._replace(program=tuple(prelude+body))
-  events:dict[int, tuple[int, int]] = {}
-  for event,args in enumerate(map(_op_args,image.program)):
-    events.update((arg.index, (events.get(arg.index, (event, event))[0], event))
-                  for arg in args if arg.kind is RKBufferKind.SCRATCH)
+  events:dict[int,list[int]]={}
+  for event,arg in ((event,arg) for event,args in enumerate(map(_op_args,image.program)) for arg in args if arg.kind is RKBufferKind.SCRATCH):
+    events.setdefault(arg.index,[event,event])[1]=event
   if any(not 0 <= slot < len(image.scratch) for slot in events) or not _fits(image.scratch): raise ValueError("invalid virtual scratch allocation")
   # Physical IDs are inserted densely; capacity updates retain their serialization order.
   remap:dict[int,int]={}; physical:dict[int,int]={}; active:list[tuple[int,int]]=[]
