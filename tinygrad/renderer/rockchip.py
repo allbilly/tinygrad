@@ -959,14 +959,13 @@ class RKContext:
       expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
       sources=tuple(UOp.const(-65504.0,dtypes.half) if finite_min and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg)<0 else src for src in u.src)  # noqa: E501
       lhs,rhs=(self._operand(src,dtype,finite_min) for src in sources)
-      if u.op is Ops.SUB and u.arg == _NATIVE_SIGN:
-        if expected is not dtypes.half: raise _RKGenericReject
+      if (u.op,u.arg) in ((Ops.SUB,_NATIVE_SIGN),(Ops.MAX,_NATIVE_MIN)):
+        if expected is not dtypes.half:
+          if u.op is Ops.SUB: raise _RKGenericReject
+          return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
         zero=lhs.const_like(0.0)
-        return self._lower_recipe(u,_positive_mask(lhs).alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,lhs))))
-      if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
-        if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
-        zero=lhs.const_like(0.0)
-        return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
+        return self._lower_recipe(u,_positive_mask(lhs).alu(Ops.SUB,_positive_mask(zero.alu(Ops.SUB,lhs))) if u.op is Ops.SUB else
+          zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
       cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]  # noqa: E501
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
     return self._emit(self._scratch(expected,u=u),lhs,rhs,cfg,compare=compare)
