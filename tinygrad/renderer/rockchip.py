@@ -250,8 +250,8 @@ def emit_ew_stage(op:RKEWOp, address:Callable[[RKArg],int]) -> tuple[int, ...]:
 
 def _root_param(u:UOp) -> UOp|None: return root if (root:=u.buf_uop).op is Ops.PARAM else None
 
-def _strip_cast(u:UOp) -> UOp:
-  while u.op is Ops.CAST: u = u.src[0]
+def _strip_cast(u:UOp, allowed:tuple[DType,...]|None=None) -> UOp:
+  while u.op is Ops.CAST and (allowed is None or u.dtype.scalar() in allowed): u = u.src[0]
   return u
 
 def _typed_cast_source(u:UOp, dtype:DType, source:DType) -> UOp|None:
@@ -1320,9 +1320,7 @@ _pm_ordered_where=PatternMatcher([
    lambda value,other,yes,no:value.alu(Ops.MAX,other) if (yes.key,no.key)==(other.key,value.key) else
      _native_min(value,other) if (yes.key,no.key)==(value.key,other.key) else None)])
 
-def _unwrap_condition(u:UOp) -> UOp:
-  while u.op is Ops.CAST and u.dtype.scalar() in (dtypes.bool, dtypes.half, dtypes.float): u = u.src[0]
-  return u
+def _unwrap_condition(u:UOp) -> UOp: return _strip_cast(u,(dtypes.bool,dtypes.half,dtypes.float))
 
 def _finite_positive_mask(u:UOp) -> UOp:
   """Map finite binary16 values to `u > 0` without the stateful DPU compare path."""
