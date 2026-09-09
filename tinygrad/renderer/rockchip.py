@@ -668,14 +668,13 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   if not plan.lower(list(graph_rewrite(sink,pm_lower_index_dtype,ctx={}).toposort() if integer else sink.toposort()),vectorize_reductions=False,materialize=True): return False  # noqa: E501
   source=plan.resolve(RKArg(RKBufferKind.ARG,fake.arg.slot))
   if any(isinstance(op,RKCMAC) for op in plan.program[start:]) or mapped_cmac and any(isinstance(op,RKCMAC) for op in plan.program): return False
+  direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
   # Reduce materialized HALF terms in CACC's wide accumulator, then retain the existing HALF rounding boundary for consumers.
   if mapped_cmac:
     axis=lane.replace(src=(lane.src[0].const_like(groups),))
-    contraction=fake.index(axis*block+out_index).load().cast(dtypes.float).reduce(axis,arg=Ops.ADD).cast(dtypes.half).cast(value.dtype)
-    return plan.lower(list(store.replace(src=(store.src[0],root.substitute({value:contraction}))).sink().toposort()))
-  direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
+    replacement=fake.index(axis*block+out_index).load().cast(dtypes.float).reduce(axis,arg=Ops.ADD).cast(dtypes.half)
+  else: replacement=plan.parameter(mapped_dtype,rows,_reduce_mapped_rows(plan,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)).index(out_index).load()  # noqa: E501
   # Boolean MUL/MAX preserves INT16 masks in {0,1}; ordinary comparison consumes them without rebuilding HALF storage.
-  replacement=plan.parameter(mapped_dtype,rows,_reduce_mapped_rows(plan,source,lanes,_EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)).index(out_index).load()  # noqa: E501
   replacement=replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype); replacement=replacement.alu(Ops.MAX,replacement.const_like(bounds[0])) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; replacement=replacement.const_like(0).alu(Ops.SUB,replacement.const_like(0).alu(Ops.SUB,replacement).alu(Ops.MAX,replacement.const_like(-bounds[1]))) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; suffix_root=root.substitute({value:replacement})  # noqa: E501
   return plan.lower(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),chain=direct or integer and value.arg[0] is Ops.MAX and total<32)  # noqa: E501
 
