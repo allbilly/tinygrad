@@ -1324,8 +1324,8 @@ def _unwrap_condition(u:UOp) -> UOp: return _strip_cast(u,(dtypes.bool,dtypes.ha
 
 def _finite_positive_mask(u:UOp) -> UOp:
   """Map finite binary16 values to `u > 0` without the stateful DPU compare path."""
-  magnitude = u.alu(Ops.MAX, UOp.const(0.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half)).alu(Ops.MUL, UOp.const(256.0, dtypes.half))  # noqa: E501
-  return UOp(Ops.MAX, magnitude.dtype, src=(magnitude, UOp.const(1.0, dtypes.half)), arg=_NATIVE_MIN)
+  # Retain all three typed scaling stages and their rounding boundaries in the physical recipe.
+  return _native_min(functools.reduce(lambda value,factor:value.alu(Ops.MUL,factor),(_half(256.0),)*3,u.alu(Ops.MAX,_half(0.0))),_half(1.0))
 
 def _fold_relu_cap(x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
