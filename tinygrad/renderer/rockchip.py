@@ -947,8 +947,10 @@ class RKContext:
     else:
       if len(u.src) != 2: raise _RKGenericReject
       if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
-      if u.op is Ops.FDIV and (recipe:=_preserve_infinite_division_sign(u)) is not None:
-        return self.lower(recipe)
+      # RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates.
+      if u.op is Ops.FDIV and u.src[0].op is Ops.CONST and math.isinf(numerator:=float(u.src[0].arg)):
+        signed_one=UOp.const(-1.0 if numerator < 0 else 1.0,dtypes.half)
+        return self.lower(signed_one.alu(Ops.FDIV,u.src[1]).alu(Ops.FDIV,UOp.const(0.0,dtypes.half)))
       dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
       bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
       if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
@@ -1358,12 +1360,6 @@ def _fold_trunc(x:UOp) -> UOp:
   source, zero = x.src[0], UOp.const(0.0, dtypes.half)
   negative = zero.alu(Ops.SUB, zero.alu(Ops.SUB, source).alu(Ops.MAX, zero))
   return _native_same(source.alu(Ops.MAX, zero), _NATIVE_FLOOR).alu(Ops.ADD, _native_same(negative, _NATIVE_CEIL))
-
-def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
-  """RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates."""
-  numerator, denominator = x.src
-  if numerator.op is not Ops.CONST or not math.isinf(value:=float(numerator.arg)): return None
-  return UOp.const(-1.0 if value < 0 else 1.0, dtypes.half).alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
 
 def _fold_quadratic(root:UOp) -> UOp|None:
   """Scale sqrt(x*x +/- 1), and stabilize its canonical natural-log envelope."""
