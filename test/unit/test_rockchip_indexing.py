@@ -142,6 +142,47 @@ def test_production_masked_gather_at_cache_boundary(count,record_property):
   record_property("scratch_bytes",sum(image.scratch))
 
 
+@pytest.mark.parametrize("dtype",(rk.dtypes.int8,rk.dtypes.int16,rk.dtypes.int32,rk.dtypes.int64,rk.dtypes.uint8,rk.dtypes.uint32))
+@pytest.mark.parametrize("operation",(Ops.CDIV,Ops.CMOD,Ops.FLOORDIV,Ops.FLOORMOD))
+@pytest.mark.parametrize("form",("left","right","both"))
+def test_static_divmod_uses_committed_integer_operands(dtype,operation,form):
+  lane=UOp.range(7,95300,dtype=dtype)
+  wrapped=lane+UOp.const(dtype.max,dtype)
+  left,right=(wrapped,lane.const_like(7)) if form=="left" else (lane.const_like(13),wrapped) if form=="right" else (wrapped,wrapped-1)
+  root=left.alu(operation,right)
+  # Scalar exec_alu commits each intermediate; vector shortcuts must agree, including a wrapped zero divisor.
+  expected=tuple(rk._eval_static(root,{lane:index}) for index in range(7))
+  assert rk._eval_static(root,{lane:tuple(range(7))})==expected
+  assert rk._static_lanes((lane,),root,dependencies=False)==(expected,)
+
+
+@pytest.mark.parametrize("count,limit",((7,9),(128,513)))
+@pytest.mark.parametrize("operation",("mod","fmod","trunc_div","floor_div"))
+def test_production_lookup_preserves_wrapped_integer_arithmetic(count,limit,operation,record_property):
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    source=Tensor(UOp.new_buffer("ROCKCHIP",count,rk.dtypes.int,num=95301))
+    lane=Tensor.arange(count,dtype=rk.dtypes.int)
+    wrapped=source*2147483647+lane
+    mapped=wrapped.mod(7) if operation=="mod" else wrapped.fmod(7) if operation=="fmod" else wrapped.div(
+      7,rounding_mode="trunc" if operation=="trunc_div" else "floor").mod(7)
+    calls=((source>=0)&(source<limit)).where(mapped+16,0).schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    program=to_program(calls[0].src[0],rk.RockchipRenderer(Target(device="ROCKCHIP")))
+    blob=next(node.arg for node in program.src if node.op is Ops.BINARY)
+    image=rk.decode_image(blob)
+  inputs=np.resize(np.asarray((-(1<<31),(1<<31)-1,-1,0,1,limit-1,limit),dtype="<i4"),count)
+  wrapped=(inputs.astype(np.int64)*2147483647+np.arange(count)).astype(np.int32).astype(np.int64)
+  quotient=np.abs(wrapped)//7*np.where(wrapped<0,-1,1)
+  mapped=wrapped%7 if operation=="mod" else wrapped-quotient*7 if operation=="fmod" else (quotient if operation=="trunc_div" else wrapped//7)%7
+  expected=np.where((inputs>=0)&(inputs<limit),mapped+16,0).astype("<i4").tobytes()
+  assert any(isinstance(op,rk.RKGather) and op.index is not None for op in image.program)
+  assert _execute_raw_dynamic_image(image,count*4,inputs.tobytes())==expected
+  record_property("image_sha256",hashlib.sha256(blob).hexdigest())
+  record_property("physical_ops",len(image.program))
+  record_property("scratch_bytes",sum(image.scratch))
+
+
 @pytest.mark.parametrize("value",(0.0,-0.0,2**-24,-2**-24,1.1,65504.0,65519.0,math.nextafter(65520.0,0.0),
                                 65520.0,-65520.0,math.inf,-math.inf,math.nan))
 def test_static_half_encoding_owns_rounding_and_overflow(value):

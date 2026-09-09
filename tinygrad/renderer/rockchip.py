@@ -290,12 +290,11 @@ def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
   count=len(vectors[0])
   if any(len(value)!=count for value in vectors): raise _RKGenericReject("static_index")
   expanded=tuple(value if isinstance(value,tuple) else itertools.repeat(value,count) for value in operands)
-  if node.op in (Ops.CMOD,Ops.FLOORMOD) and node.src[0].vmin>=0 and node.src[0].vmax<node.src[1].vmin: result=operands[0] if isinstance(operands[0],tuple) else (operands[0],)*count  # noqa: E501
-  elif node.op in (Ops.CDIV,Ops.FLOORDIV) and node.src[1].vmin==node.src[1].vmax==1: result=operands[0] if isinstance(operands[0],tuple) else (operands[0],)*count  # noqa: E501
-  else:
-    direct_div=node.src[1].vmin>0 and (node.op is Ops.FLOORDIV or node.src[0].vmin>=0) if node.op in (Ops.CDIV,Ops.FLOORDIV) else False; direct_mod=node.src[1].vmin>0 and (node.op is Ops.FLOORMOD or node.src[0].vmin>=0) if node.op in (Ops.CMOD,Ops.FLOORMOD) else False  # noqa: E702,E501
-    result=tuple(map(operator.floordiv if direct_div else operator.mod if direct_mod else python_alu[node.op],*expanded))
-  if dtypes.is_bool(scalar:=node.dtype.scalar()) or dtypes.is_int(scalar) and scalar.min<=int(node.vmin)<=int(node.vmax)<=scalar.max: return result
+  # Symbolic bounds describe pre-wrap arithmetic; only committed operands justify native division shortcuts.
+  minima=tuple(min(value,default=0) if isinstance(value,tuple) else value for value in operands) if node.op in (Ops.CDIV,Ops.CMOD,Ops.FLOORDIV,Ops.FLOORMOD) else ()  # noqa: E501
+  direct=bool(minima) and dtypes.is_int(node.dtype.scalar()) and minima[1]>0 and (node.op in (Ops.FLOORDIV,Ops.FLOORMOD) or minima[0]>=0)
+  result=tuple(map(operator.floordiv if direct and node.op in (Ops.CDIV,Ops.FLOORDIV) else operator.mod if direct else python_alu[node.op],*expanded))  # noqa: E501
+  if dtypes.is_bool(scalar:=node.dtype.scalar()) or dtypes.is_int(scalar) and scalar.min<=min(result,default=0)<=max(result,default=0)<=scalar.max: return result  # noqa: E501
   return _commit_static(node.dtype,result)
 
 def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None=None) -> RKStatic:
