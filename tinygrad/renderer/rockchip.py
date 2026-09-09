@@ -1232,26 +1232,28 @@ def _fold_static_terms(op:Ops, dtype:DType, terms:list[UOp], balanced:bool) -> U
   while balanced and len(terms)>1: terms=[UOp(op,dtype,src=(terms[i],terms[i+1])) for i in range(0,len(terms)-1,2)]+(terms[-1:] if len(terms)&1 else [])  # noqa: E501
   return terms[0] if balanced else functools.reduce(lambda value,term:UOp(op,dtype,src=(value,term)),terms[1:],terms[0])
 
+def _unroll_reduce(ctx:tuple[bool,bool], u:UOp) -> UOp:
+  precise,half_storage=ctx
+  reduce_op,ranges=u.arg[0],list(u.src[1:])
+  if reduce_op not in (Ops.ADD,Ops.MAX,Ops.MUL) or not ranges or any(r.op not in (Ops.RANGE,Ops.SPECIAL) for r in ranges): raise _RKGenericReject  # noqa: E501
+  lanes=_static_lanes(tuple(ranges),*ranges,limit=_MAX_GENERIC_UNROLL,dependencies=False)
+  if len(lanes[0])*len(u.src[0].toposort())>_MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
+  terms=[UOp.const(identity_element(reduce_op,u.dtype),u.dtype)]
+  terms.extend(u.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for values in zip(*lanes))
+  fold_dtype=dtypes.half if half_storage and reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float else u.dtype
+  if fold_dtype is dtypes.half and u.dtype.scalar() is dtypes.float: terms=[_fp32_expr_to_half(term) for term in terms]
+  nonzero=[term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)] if reduce_op is Ops.ADD and fold_dtype.scalar() is dtypes.half else []  # noqa: E501
+  if precise and nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero): reduced=_precise_mul_sum(nonzero)  # noqa: E501
+  elif precise and nonzero and u.dtype.scalar() is dtypes.float and any(axis not in ranges for axis in u.src[0].toposort() if axis.op in (Ops.RANGE,Ops.SPECIAL)): reduced=_kahan_sum(nonzero)  # noqa: E501
+  else: reduced=_fold_static_terms(reduce_op,fold_dtype,terms,reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float or reduce_op is Ops.MAX and u.dtype.scalar() is dtypes.int)  # noqa: E501
+  return reduced.cast(u.dtype) if fold_dtype is not u.dtype else reduced
+
+_pm_unroll_static_reduce=PatternMatcher([(UPat(Ops.REDUCE,name="u"),_unroll_reduce)])
+
 def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
   """Interpret canonical static REDUCE structure; horizontal reductions retain their specified order."""
-  cache:dict[UOp, UOp] = {}; half_storage=root.dtype.scalar() is dtypes.half
-  for u in root.toposort():
-    if (mapped:=u.replace(src=tuple(cache[src] for src in u.src))).op is Ops.REDUCE:
-      reduce_op,ranges=mapped.arg[0],list(mapped.src[1:])
-      if reduce_op not in (Ops.ADD,Ops.MAX,Ops.MUL) or not ranges or any(r.op not in (Ops.RANGE,Ops.SPECIAL) for r in ranges): raise _RKGenericReject  # noqa: E501
-      lanes=_static_lanes(tuple(ranges),*ranges,limit=_MAX_GENERIC_UNROLL,dependencies=False)
-      if len(lanes[0])*len(mapped.src[0].toposort())>_MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
-      terms=[UOp.const(identity_element(reduce_op,u.dtype),u.dtype)]
-      terms.extend(mapped.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for values in zip(*lanes))
-      fold_dtype=dtypes.half if half_storage and reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float else u.dtype
-      if fold_dtype is dtypes.half and u.dtype.scalar() is dtypes.float: terms=[_fp32_expr_to_half(term) for term in terms]
-      nonzero=[term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)] if reduce_op is Ops.ADD and fold_dtype.scalar() is dtypes.half else []  # noqa: E501
-      if precise and nonzero and all(term.op is Ops.MUL and term.dtype.scalar() is dtypes.half for term in nonzero): reduced=_precise_mul_sum(nonzero)  # noqa: E501
-      elif precise and nonzero and u.dtype.scalar() is dtypes.float and any(axis not in ranges for axis in mapped.src[0].toposort() if axis.op in (Ops.RANGE,Ops.SPECIAL)): reduced=_kahan_sum(nonzero)  # noqa: E501
-      else: reduced=_fold_static_terms(reduce_op,fold_dtype,terms,reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float or reduce_op is Ops.MAX and u.dtype.scalar() is dtypes.int)  # noqa: E501
-      mapped=reduced.cast(u.dtype) if fold_dtype is not u.dtype else reduced
-    cache[u] = mapped
-  result=cache[root].substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}))) for u in cache[root].toposort() if _is_static_expr(u) and not _index_ranges(u)},walk=True)  # noqa: E501
+  # Rewrite original children before their parent, without traversing the replacement recipes a second time.
+  result=(expanded:=graph_rewrite(root,_pm_unroll_static_reduce,ctx=(precise,root.dtype.scalar() is dtypes.half),walk=True,enter_calls=True)).substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}))) for u in expanded.toposort() if _is_static_expr(u) and not _index_ranges(u)},walk=True)  # noqa: E501
   return result.substitute({u:u.replace(src=(u.src[0],u.src[1].simplify(),*u.src[2:])) for u in result.toposort() if u.op is Ops.INDEX and len(u.src)>1},walk=True)  # noqa: E501
 
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKImage|None:
