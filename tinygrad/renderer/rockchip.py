@@ -1441,8 +1441,7 @@ def _dpu_log2(source:UOp) -> UOp:
 _DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin}
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4, direct_reduces = False, False, False, True
-  code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None,
-                 Ops.FDIV: lambda: None, Ops.SQRT: lambda: None, Ops.EXP2: lambda: None, Ops.LOG2: lambda: None, Ops.SIN: lambda: None}
+  code_for_op = dict.fromkeys((*_EW_CFG,*_DPU_MATH), lambda: None)
   compiler = RockchipCompiler("rockchip")
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
