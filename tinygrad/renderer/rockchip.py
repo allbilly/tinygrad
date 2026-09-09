@@ -307,7 +307,8 @@ def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None
 def _eval_static_block(u:UOp, axes:tuple[UOp,...], bounds:tuple[int,...], start:int, stop:int) -> RKStatic:
   if u in axes:
     stride=strides_for_shape(bounds)[axes.index(u)]; bound=bounds[axes.index(u)]
-    return (0,)*(stop-start) if bound==1 else tuple(range(start,stop)) if stride==1 and stop<=bound else tuple(lane//stride%bound for lane in range(start,stop))  # noqa: E501
+    # Keep block-constant coordinates scalar; singleton axes have a canonical zero stride.
+    return 0 if bound==1 else start//stride%bound if start//stride==(stop-1)//stride else tuple(range(start,stop)) if stride==1 and stop<=bound else tuple(lane//stride%bound for lane in range(start,stop))  # noqa: E501
   return _exec_static(u,tuple(_eval_static_block(source,axes,bounds,start,stop) for source in u.src))
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
@@ -326,38 +327,41 @@ def _admit(o,d)->RKOutput|None: return o if o is not None and o[1].dtype.scalar(
 def _try(plan:RKPlan,o,d,f,*a)->bool: return (o:=_admit(o,d)) is not None and o[2]>0 and plan.lower(lambda:f(o,*a,plan))
 
 
-@functools.lru_cache(maxsize=2)
-def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True) -> tuple[tuple[RKScalar,...],...]:
-  """Enumerate one bounded static lane space and evaluate all requested roots in it."""
+def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True, block:int=4096) -> Iterable[tuple[tuple[RKScalar,...],...]]:  # noqa: E501
+  """Enumerate one bounded static lane space, yielding requested roots one block at a time."""
   ranges,roots=(_static_ranges(index) or (),(index,*roots)) if isinstance(index,UOp) else (index,roots)
   axes=tuple(dict.fromkeys(node for root in ranges for node in root.toposort() if node.op in (Ops.RANGE,Ops.SPECIAL))) if dependencies else ranges  # noqa: E501
   bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in axes); count=math.prod(bounds)
   if any(bound<0 for bound in bounds) or count>limit: raise _RKGenericReject("static_index_budget")
   if any((used:=_static_ranges(root)) is None or any(r not in ranges for r in used) for root in roots): raise _RKGenericReject("static_index")  # noqa: E501
-  output:list[list[RKScalar]]=[[] for _ in roots]
-  for start in range(0,count,4096):
-    stop=min(start+4096,count)
-    for values,root in zip(output,roots):
-      value=_eval_static_block(root,axes,bounds,start,stop); values.extend(value if isinstance(value,tuple) else (value,)*(stop-start))
-  return tuple(tuple(values) for values in output)
+  # Validate eagerly, before callers allocate their destination; only evaluation is lazy.
+  return (tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (_eval_static_block(root,axes,bounds,start,stop),))  # noqa: E501
+    for start in range(0,count,block) for stop in (min(start+block,count),))
+
+@functools.lru_cache(maxsize=2)
+def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True, block:int=4096) -> tuple[tuple[RKScalar,...],...]:  # noqa: E501
+  """Enumerate one bounded static lane space and evaluate all requested roots in it."""
+  blocks=tuple(_static_blocks(index,*roots,limit=limit,dependencies=dependencies,block=block))
+  return tuple(tuple(itertools.chain.from_iterable(column)) for column in zip(*blocks)) if blocks else ((),)*(len(roots)+isinstance(index,UOp))
 
 def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_static_ranges(out_index) or (); bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges); affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); return ranges if affine is not None and affine[0]==0 and count==math.prod(bounds) and all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None  # noqa: E702,E501
 
-def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int], *, unique:bool=True, minimum:int|None=None) -> tuple[int, ...]:  # noqa: E501
+def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[int, ...]:  # noqa: E501
   """Place compiler-bound values by destination; validate every candidate before a later write can hide it."""
   if encode is int and (dtypes.is_int(scalar:=expr.dtype.scalar()) or dtypes.is_bool(scalar)) and \
      (ranges:=_dense_ranges(out_index,count)) is not None:
-    values=_static_lanes(ranges,expr,dependencies=False)[0]
+    values=_static_lanes(ranges,expr,dependencies=False,limit=limit,block=block)[0]
     if minimum is not None and min(values,default=0)<minimum: raise _RKGenericReject("gather_index")
     return tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else typing_cast(tuple[int,...],values)
-  dst_lanes,expr_lanes=_static_lanes(out_index,expr)
+  blocks=_static_blocks(out_index,expr,limit=limit,block=block)
   missing=object(); result:list[int|object]=[missing]*count
-  for destination,value in zip(dst_lanes,expr_lanes):
-    dst=int(destination)
-    if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
-    encoded=encode(value)
-    if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
-    result[dst]=encoded
+  for dst_lanes,expr_lanes in blocks:
+    for destination,value in zip(dst_lanes,expr_lanes):
+      dst=int(destination)
+      if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
+      encoded=encode(value)
+      if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
+      result[dst]=encoded
   if any(value is missing for value in result): raise _RKGenericReject("static_index")
   return typing_cast(tuple[int,...],tuple(result))
 
@@ -600,9 +604,8 @@ def _lower_bounded_int_lookup(output:RKOutput, plan:RKPlan) -> bool:
   if not 0<limit<=_FP16_EXACT_INTEGER or tuple(node for node in root.toposort() if node.op is Ops.LOAD)!=(source,): return False
   try:
     static_value=not any(node.op in (Ops.RANGE,Ops.SPECIAL) for node in value.toposort(gate=lambda item:item is not source))
-    entries=_eval_static(value,{source:tuple(range(limit))}) if static_value else tuple(item for candidate in range(limit)
-      for item in _static_values(out_index,value.substitute({source:source.const_like(candidate)},walk=True),count,int))
-    values=tuple(map(int,entries if isinstance(entries,tuple) else (entries,)*limit))
+    candidate=UOp.range(limit,1+max((node.arg[0] for node in root.toposort() if node.op is Ops.RANGE),default=-1),dtype=source.dtype)
+    values=_static_values(candidate if static_value else candidate*count+out_index,value.substitute({source:candidate},walk=True),limit if static_value else limit*count,int,limit=_MAX_STATIC_RANGE_ENVS*limit,block=4096 if static_value else count)  # noqa: E501
   except (_RKGenericReject,ValueError,OverflowError): return False
   if any(not 0<=item<=32767 for item in values): return False
   table=plan.parameter(dtypes.int16,len(values))

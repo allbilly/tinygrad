@@ -245,3 +245,53 @@ def test_production_static_half_encoding_composes(count,pattern,record_property)
   record_property("image_sha256",hashlib.sha256(blob).hexdigest())
   record_property("physical_ops",len(image.program))
   record_property("scratch_bytes",sum(image.scratch))
+
+
+@pytest.mark.parametrize("roots",(0,1,2))
+@pytest.mark.parametrize("empty",(False,True))
+def test_static_collection_preserves_empty_columns(roots,empty):
+  size=0 if empty else 7
+  lane=UOp.range(size,99705,dtype=rk.dtypes.int)
+  assert rk._static_lanes((lane,),*(lane,lane+1)[:roots],dependencies=False)==tuple(tuple(i+j for i in range(size)) for j in range(roots))
+
+
+@pytest.mark.parametrize("failure",("conflict","minimum","encoding","missing"))
+def test_static_placement_validates_across_block_boundaries(failure):
+  lane=UOp.range(8,99706,dtype=rk.dtypes.int)
+  expression=lane if failure=="conflict" else (lane<4).where(-1,lane%4) if failure=="minimum" else (lane<4).where(
+    UOp.const(65520.0,rk.dtypes.double),UOp.const(1.0,rk.dtypes.double)) if failure=="encoding" else lane%4
+  with pytest.raises(OverflowError if failure=="encoding" else rk._RKGenericReject):
+    rk._static_values(lane%4,expression,5 if failure=="missing" else 4,rk._storage_bits if failure=="encoding" else int,
+                      unique=failure=="conflict",minimum=0 if failure=="minimum" else None,block=4)
+
+
+def test_streaming_lookup_preserves_repeated_output_environments(monkeypatch,record_property):
+  """A table's entry count is not its static environment count; placement must remain bounded."""
+  count,limit=2048,2048
+  lane=UOp.range(count+1,99701,dtype=rk.dtypes.int)
+  output_index=lane%count
+  output,source=(UOp.param(slot,rk.dtypes.int,(count,)) for slot in (0,1))
+  index=source.index(output_index).load()
+  root=((index>=0)&(index<limit)).where((index%7)*4000+output_index%37,0)
+  store=output.index(output_index).store(root)
+  plan=rk.RKPlan(list(store.sink().toposort()))
+  blocks=[]
+  original=rk._static_blocks
+  def observe(*args,**kwargs):
+    for block in original(*args,**kwargs):
+      blocks.append(len(block[0]) if block else 0)
+      yield block
+  monkeypatch.setattr(rk,"_static_blocks",observe)
+  assert rk._lower_bounded_int_lookup((store,output,count,output_index,root),plan)
+  assert max(blocks)<=4096 and sum(blocks)>=limit*(count+1)
+  table,=[op.values for op in plan.program if isinstance(op,rk.RKGather) and len(op.values)==count*limit]
+  np.testing.assert_array_equal(np.fromiter(table,dtype=np.int16).reshape(limit,count),
+                                (np.arange(limit)%7*4000)[:,None]+np.arange(count)%37)
+  record_property("table_entries",len(table))
+  record_property("max_block_lanes",max(blocks))
+
+
+def test_static_domain_rejection_precedes_iteration():
+  lane=UOp.range(rk._MAX_STATIC_RANGE_ENVS+1,99800,dtype=rk.dtypes.int)
+  # No next()/list()/tuple(): validation must run before returning an iterator.
+  with pytest.raises(rk._RKGenericReject,match="static_index_budget"): rk._static_blocks(lane)
