@@ -355,8 +355,7 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
   blocks=_static_blocks(out_index,expr,limit=limit,block=block)
   missing=object(); result:list[int|object]=[missing]*count
   for dst_lanes,expr_lanes in blocks:
-    for destination,value in zip(dst_lanes,expr_lanes):
-      dst=int(destination)
+    for dst,value in zip(map(int,dst_lanes),expr_lanes):
       if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
       encoded=encode(value)
       if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
