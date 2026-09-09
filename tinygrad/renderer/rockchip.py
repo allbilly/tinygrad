@@ -750,10 +750,10 @@ def _int_info(u:UOp) -> tuple[tuple[int, int]|None, UOp|None]:
     u.op is Ops.CMOD and len(u.src)==2 and (right:=_int_info(u.src[1])[0]) is not None and right[0]==right[1]!=0 or u.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX) and len(u.src)==2 and all(_int_info(node)[0] is not None for node in bounds_src))  # noqa: E501
   bounds=((0,max(0,high)) if u.op is Ops.RANGE else (low,high)) if valid and dtype.min <= (low:=int(u.vmin)) <= (high:=int(u.vmax)) <= dtype.max else None  # noqa: E501
   if u.op is Ops.CONST: recipe=UOp.const(float(u.arg),dtypes.half)
-  elif (source:=_typed_cast_source(u,dtypes.int,dtypes.half)) is not None: recipe=_fold_trunc(UOp(Ops.TRUNC,dtypes.half,src=(source,)))
+  elif (source:=_typed_cast_source(u,dtypes.int,dtypes.half)) is not None: recipe=_dpu_trunc(source)
   elif (source:=_typed_cast_source(u,dtypes.int,dtypes.bool)) is not None: recipe=source.cast(dtypes.half)
   elif u.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.CMOD) and len(u.src)==2 and (mapped:=tuple(_int_info(src)[1] for src in u.src)) and all(x is not None for x in mapped):  # noqa: E501
-    lhs,rhs=typing_cast(tuple[UOp,UOp],mapped); recipe=lhs.alu(Ops.SUB,_fold_trunc(UOp(Ops.TRUNC,dtypes.half,src=(lhs.alu(Ops.FDIV,rhs),))).alu(Ops.MUL,rhs)) if u.op is Ops.CMOD else u.replace(dtype=dtypes.half,src=(lhs,rhs))  # noqa: E501
+    lhs,rhs=typing_cast(tuple[UOp,UOp],mapped); recipe=lhs.alu(Ops.SUB,_dpu_trunc(lhs.alu(Ops.FDIV,rhs)).alu(Ops.MUL,rhs)) if u.op is Ops.CMOD else u.replace(dtype=dtypes.half,src=(lhs,rhs))  # noqa: E501
   elif u.op is Ops.WHERE and len(u.src)==3:
     condition=u.src[0]; compared=tuple(_int_info(src)[1] for src in condition.src) if condition.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.int for src in condition.src) else (); condition=condition.replace(src=typing_cast(tuple[UOp,...],compared)) if compared and all(x is not None for x in compared) else condition  # noqa: E501
     arms=tuple(_int_info(src)[1] for src in u.src[1:]); recipe=UOp(Ops.WHERE,dtypes.half,src=(condition,*typing_cast(tuple[UOp,...],arms))) if all(x is not None for x in arms) and (not compared or all(x is not None for x in compared)) else None  # noqa: E501
@@ -1131,7 +1131,7 @@ class RKContext:
     source_u=u.src[0]
     # FP16 Boolean conversion (including nonzero comparisons) uses ABS then positivity, exact for zero, infinity and NaN.
     if dtype is dtypes.uchar and (relu:=_relu_operand(source_u)) is not None: source_u=relu.alu(Ops.MAX,UOp.const(0.0,dtypes.half))
-    if source_dtype is dtypes.half and dtype in (dtypes.uchar,dtypes.int): source_u=_fold_trunc(UOp(Ops.TRUNC,dtypes.half,src=(source_u,)))
+    if source_dtype is dtypes.half and dtype in (dtypes.uchar,dtypes.int): source_u=_dpu_trunc(source_u)
     if dtype is dtypes.uchar: source_u=source_u.alu(Ops.SUB,_native_same(source_u.alu(Ops.MUL,UOp.const(1.0/256.0,dtypes.half)),
       _NATIVE_FLOOR).alu(Ops.MUL,UOp.const(256.0,dtypes.half)))
     elif dtype is dtypes.bool: source_u=_positive_mask(UOp(Ops.MAX,dtypes.half,src=(source_u,source_u),arg=_NATIVE_ABS))
@@ -1176,7 +1176,7 @@ class RKContext:
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is dtypes.int16 and (recipe:=_int_info(u)[1]) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
     elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not dtypes.int16): value=self._int32_divmod(u)  # noqa: E501
     elif u.op is Ops.WHERE: value = self._where(u)
-    elif u.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN) and len(u.src) == 1 and dtype is dtypes.half:
+    elif u.op in _DPU_MATH and len(u.src) == 1 and dtype is dtypes.half:
       value = self.lower(_tag_precise_adds(_DPU_MATH[u.op](u.src[0]),(u.src[0],)))
     else: raise _RKGenericReject(f"uop {u.op.name} {dtype}")
     return self.values.setdefault(u, value)
@@ -1211,11 +1211,9 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
     if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped): mapped=UOp(Ops.WHERE,dtypes.half,src=(mapped.src[0],mapped.src[1].cast(dtypes.half),mapped.src[2].cast(dtypes.half)),arg=mapped.arg) if mapped.op is Ops.WHERE else mapped.src[0].cast(dtypes.half).alu(mapped.op,mapped.src[1].cast(dtypes.half))  # noqa: E501
     if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half: mapped=mapped.src[0]  # noqa: E501
     if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
-    if mapped.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN):
+    if mapped.op in _DPU_MATH and (mapped.op is not Ops.TRUNC or mapped.dtype.scalar() is dtypes.half and not _is_static_expr(mapped)):
       if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
       mapped = rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
-    elif mapped.op is Ops.TRUNC and mapped.dtype.scalar() is dtypes.half and not _is_static_expr(mapped):
-      mapped = rewrite(_fold_trunc(mapped))
     return mapped
   return rewrite(root)
 
@@ -1343,9 +1341,9 @@ def _fold_where_abs(x:UOp) -> UOp|None:
   if x.op is not Ops.WHERE or len(x.src)!=3 or x.dtype.scalar() is not dtypes.half: return None
   return _pm_where_abs.rewrite(x.replace(src=(_strip_cast(x.src[0]),_strip_cast(x.src[1]),x.src[2])))
 
-def _fold_trunc(x:UOp) -> UOp:
+def _dpu_trunc(source:UOp) -> UOp:
   """Compose truncation from native floor/ceil without mask multiplication on infinities."""
-  source, zero = x.src[0], UOp.const(0.0, dtypes.half)
+  zero = UOp.const(0.0, dtypes.half)
   negative = zero.alu(Ops.SUB, zero.alu(Ops.SUB, source).alu(Ops.MAX, zero))
   return _native_same(source.alu(Ops.MAX, zero), _NATIVE_FLOOR).alu(Ops.ADD, _native_same(negative, _NATIVE_CEIL))
 
@@ -1432,7 +1430,7 @@ def _dpu_log2(source:UOp) -> UOp:
   inf_correction = one.alu(Ops.FDIV, one.alu(Ops.SUB, above)).alu(Ops.SUB, one)
   return result.alu(Ops.ADD, domain_correction).alu(Ops.ADD, inf_correction)
 
-_DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin}
+_DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin, Ops.TRUNC:_dpu_trunc}
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4, direct_reduces = False, False, False, True
   code_for_op = dict.fromkeys((*_EW_CFG,*_DPU_MATH), lambda: None)
