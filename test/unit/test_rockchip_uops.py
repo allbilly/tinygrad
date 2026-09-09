@@ -5044,6 +5044,30 @@ def test_scratch_reuse_follows_the_ordered_program_lifetime():
   assert runtime._scratch_offsets == (0,4096,12288,16384)
 
 
+@pytest.mark.parametrize("sizes",((64,128,256,512),(4096,2048,128,64),(64,)*4,(1024,64,4096,128)))
+@pytest.mark.parametrize("addend",(0,16))
+def test_scratch_capacity_tracks_dense_slot_creation_and_reuse(sizes,addend):
+  external=RKArg(RKBufferKind.ARG,0)
+  slots=tuple(RKArg(RKBufferKind.SCRATCH,index,addend) for index in (4,1,7,0))
+  capacities=[8192]*9
+  for arg,size in zip(slots,sizes): capacities[arg.index]=size
+  program=tuple(RKEWOp(dst,external if i==0 else slots[i-1],external,1,_EW_CFG[Ops.ADD]) for i,dst in enumerate(slots))
+  result=_reuse_linear_scratch(RKImage(tuple(capacities),program+(RKEWOp(external,slots[-1],external,1,_EW_CFG[Ops.MAX]),)))
+  # Adjacent lifetimes overlap at the consuming event: alternate two dense physical IDs, even with sparse virtual IDs.
+  assert result.scratch==(max(sizes[::2]),max(sizes[1::2]))
+  assert tuple(op.dst for op in result.program[:-1])==tuple(RKArg(RKBufferKind.SCRATCH,i%2,addend) for i in range(4))
+  assert tuple(op.lhs for op in result.program[1:])==tuple(op.dst for op in result.program[:-1])
+  assert all(op.rhs==external for op in result.program)
+  assert decode_image(encode_image(result))==result
+
+
+@pytest.mark.parametrize("capacities",((),(64,),(64,4096,128)))
+def test_scratch_capacity_drops_only_unreferenced_allocations(capacities):
+  external=RKArg(RKBufferKind.ARG,0)
+  operation=RKEWOp(external,external,external,1,_EW_CFG[Ops.MAX])
+  assert _reuse_linear_scratch(RKImage(capacities,(operation,)))==RKImage((),(operation,))
+
+
 def test_scratch_padding_cannot_hoist_a_gather_before_its_producer():
   source,computed,padded,copied=(RKArg(RKBufferKind.SCRATCH,i) for i in range(4))
   image=RKImage((64,)*4,(

@@ -102,14 +102,14 @@ def _reuse_linear_scratch(image:RKImage) -> RKImage:
     events.update((arg.index, (events.get(arg.index, (event, event))[0], event))
                   for arg in args if arg.kind is RKBufferKind.SCRATCH)
   if any(not 0 <= slot < len(image.scratch) for slot in events) or not _fits(image.scratch): raise ValueError("invalid virtual scratch allocation")
-  remap:dict[int,int]={}; physical:list[int]=[]; active:list[tuple[int,int]]=[]
+  # Physical IDs are inserted densely; capacity updates retain their serialization order.
+  remap:dict[int,int]={}; physical:dict[int,int]={}; active:list[tuple[int,int]]=[]
   for start,end,slot in sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2])):
     spec,target=image.scratch[slot],heapq.heappop(active)[1] if active and active[0][0]<start else len(physical)
-    if target == len(physical): physical.append(0)
-    physical[target] = max(physical[target], spec)
+    physical[target] = max(physical.get(target,0), spec)
     heapq.heappush(active, (end, target))
     remap[slot] = target
-  return _map_image_args(image,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)._replace(scratch=tuple(physical))  # noqa: E501
+  return _map_image_args(image,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)._replace(scratch=tuple(physical.values()))  # noqa: E501
 
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
