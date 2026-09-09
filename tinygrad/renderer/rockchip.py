@@ -1384,16 +1384,6 @@ def _dpu_sqrt(source:UOp) -> UOp:
   for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
   valid = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, source))); return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one))  # noqa: E501
 
-def _dpu_periodic_reduce(source:UOp, reciprocal_period:float, split:tuple[float, ...]) -> tuple[UOp,UOp]:
-  """Reduce a finite FP16 angle with split constants so large products retain their residual."""
-  half,one=dtypes.half,UOp.const(1.0,dtypes.half); reduced=UOp(Ops.MAX,half,src=(source.cast(half).alu(Ops.MAX,UOp.const(-10000.0,half)),UOp.const(10000.0,half)),arg=_NATIVE_MIN); correction=UOp.const(0.0,half)  # noqa: E501
-  # A second quotient removes the small residual left by the rounded FP16 bulk quotient.
-  for _ in range(2):
-    quotient=reduced.alu(Ops.MUL,UOp.const(reciprocal_period,half)); magnitude=UOp(Ops.MAX,half,src=(quotient,quotient),arg=_NATIVE_ABS)
-    multiple=_native_same(magnitude.alu(Ops.ADD,UOp.const(0.5,half)),_NATIVE_FLOOR).alu(Ops.MUL,_finite_positive_mask(quotient).alu(Ops.MUL,UOp.const(2.0,half)).alu(Ops.SUB,one))  # noqa: E501
-    reduced,correction=_precise_add_parts([reduced,correction,*(multiple.alu(Ops.MUL,UOp.const(-coefficient,half)) for coefficient in split)])
-  return reduced,correction
-
 def _dpu_sin(source:UOp) -> UOp:
   """Lower SIN and Tinygrad's COS phase spelling to one bounded FP16 DPU polynomial."""
   cosine=False
@@ -1402,7 +1392,14 @@ def _dpu_sin(source:UOp) -> UOp:
     base=_typed_cast_source(negative[0],dtypes.float,dtypes.half) if negative is not None else None
     source,cosine=(base,True) if base is not None else (_canonical_half_storage(source),False)
   source=source.cast(dtypes.half); one=UOp.const(1.0,dtypes.half); split=(4.0,2.0,0.25,0.03125,2*math.pi-6.28125)
-  reduced,reduction_error=_dpu_periodic_reduce(source,1/(2*math.pi),split); invalid=source.alu(Ops.MUL,UOp.const(0.0,dtypes.half))
+  # Reduce a finite FP16 angle with split constants so large products retain their residual.
+  reduced=UOp(Ops.MAX,dtypes.half,src=(source.alu(Ops.MAX,UOp.const(-10000.0,dtypes.half)),UOp.const(10000.0,dtypes.half)),arg=_NATIVE_MIN); reduction_error=UOp.const(0.0,dtypes.half)  # noqa: E501
+  # A second quotient removes the small residual left by the rounded FP16 bulk quotient.
+  for _ in range(2):
+    quotient=reduced.alu(Ops.MUL,UOp.const(1/(2*math.pi),dtypes.half)); magnitude=UOp(Ops.MAX,dtypes.half,src=(quotient,quotient),arg=_NATIVE_ABS)
+    multiple=_native_same(magnitude.alu(Ops.ADD,UOp.const(0.5,dtypes.half)),_NATIVE_FLOOR).alu(Ops.MUL,_finite_positive_mask(quotient).alu(Ops.MUL,UOp.const(2.0,dtypes.half)).alu(Ops.SUB,one))  # noqa: E501
+    reduced,reduction_error=_precise_add_parts([reduced,reduction_error,*(multiple.alu(Ops.MUL,UOp.const(-coefficient,dtypes.half)) for coefficient in split)])  # noqa: E501
+  invalid=source.alu(Ops.MUL,UOp.const(0.0,dtypes.half))
   magnitude=UOp(Ops.MAX,dtypes.half,src=(reduced,reduced),arg=_NATIVE_ABS); reflected=_finite_positive_mask(magnitude.alu(Ops.SUB,UOp.const(math.pi/2,dtypes.half)))  # noqa: E501
   pi_minus=UOp.const(3.0,dtypes.half).alu(Ops.SUB,magnitude).alu(Ops.ADD,UOp.const(0.140625,dtypes.half)).alu(Ops.ADD,UOp.const(math.pi-3.140625,dtypes.half)); angle=magnitude.alu(Ops.MUL,one.alu(Ops.SUB,reflected)).alu(Ops.ADD,pi_minus.alu(Ops.MUL,reflected))  # noqa: E501
   if cosine:
