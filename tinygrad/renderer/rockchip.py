@@ -1270,7 +1270,7 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   if _try(plan,strict_output,dtypes.int,_lower_raw_fp16_bitcast): return True
   if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
     try:
-      storage_root=_expand_math_uops(storage_output[4],accurate_adds=False); local_output=(storage_output[0].replace(src=(storage_output[0].src[0],storage_root)),*storage_output[1:4],storage_root)  # noqa: E501
+      storage_root=_expand_math_uops(storage_output[4],accurate_adds=False); local_output=(*storage_output[:4],storage_root)
     except _RKGenericReject: pass
   if (output:=local_output) is None or len(output[0].src)!=2: raise _RKGenericReject("output store")
   if output[2]<=0: return True
@@ -1280,8 +1280,8 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   root=_finite_int_max_neutrals(_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4])
   root = _expand_math_uops(root) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
   if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject(f"expanded nodes {len(n)}")
-  if root is not output[4]: output = (output[0].replace(src=(output[0].src[0], root)), *output[1:4], root)
-  RKContext(output,plan).finish(materialize)
+  # Rebuild the STORE only after all root rewrites, keeping the physical context's output consistent.
+  RKContext((output[0].replace(src=(output[0].src[0],root)),*output[1:4],root),plan).finish(materialize)
   return True
 
 
