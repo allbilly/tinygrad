@@ -928,8 +928,7 @@ class RKContext:
   def _pack_bits(self, bits:Iterable[UOp], layout:DType, u:UOp) -> UOp:
     planes=tuple(bits)
     if len(planes)!=layout.itemsize*8: raise _RKGenericReject
-    raw=tuple(sum((planes[byte*8+bit].alu(Ops.MUL,planes[byte*8+bit].const_like(1<<bit)) for bit in range(1,8)),planes[byte*8])
-      for byte in range(layout.itemsize))
+    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(planes,8))  # noqa: E501
     # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
     # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
     # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
