@@ -284,16 +284,15 @@ def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
   return tuple(map(lane,value)) if isinstance(value,tuple) else lane(value)
 
 def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
-  if node.op is Ops.CONST: return _commit_static(node.dtype,typing_cast(RKScalar,node.arg))
-  if node.op is Ops.CAST: return _commit_static(node.dtype,operands[0])
+  if node.op in (Ops.CONST,Ops.CAST): return _commit_static(node.dtype,typing_cast(RKScalar,node.arg) if node.op is Ops.CONST else operands[0])  # noqa: E501
   if not (vectors:=tuple(value for value in operands if isinstance(value,tuple))): return typing_cast(RKStatic,exec_alu(node.op,node.dtype.scalar(),operands))  # noqa: E501
-  count=len(vectors[0])
-  if any(len(value)!=count for value in vectors): raise _RKGenericReject("static_index")
-  expanded=tuple(value if isinstance(value,tuple) else itertools.repeat(value,count) for value in operands)
+  if any(len(value)!=len(vectors[0]) for value in vectors): raise _RKGenericReject("static_index")
   # Symbolic bounds describe pre-wrap arithmetic; only committed operands justify native division shortcuts.
   minima=tuple(min(value,default=0) if isinstance(value,tuple) else value for value in operands) if node.op in (Ops.CDIV,Ops.CMOD,Ops.FLOORDIV,Ops.FLOORMOD) else ()  # noqa: E501
   direct=bool(minima) and dtypes.is_int(node.dtype.scalar()) and minima[1]>0 and (node.op in (Ops.FLOORDIV,Ops.FLOORMOD) or minima[0]>=0)
-  result=tuple(map(operator.floordiv if direct and node.op in (Ops.CDIV,Ops.FLOORDIV) else operator.mod if direct else python_alu[node.op],*expanded))  # noqa: E501
+  # At least one validated vector bounds scalar repeats, including an empty vector.
+  result=tuple(map(operator.floordiv if direct and node.op in (Ops.CDIV,Ops.FLOORDIV) else operator.mod if direct else python_alu[node.op],
+    *(value if isinstance(value,tuple) else itertools.repeat(value) for value in operands)))
   if dtypes.is_bool(scalar:=node.dtype.scalar()) or dtypes.is_int(scalar) and scalar.min<=min(result,default=0)<=max(result,default=0)<=scalar.max: return result  # noqa: E501
   return _commit_static(node.dtype,result)
 
