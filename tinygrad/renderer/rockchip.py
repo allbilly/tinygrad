@@ -970,9 +970,10 @@ class RKContext:
     # Integer narrowing keeps the low two bytes; the source arithmetic was already evaluated on the NPU.
     if pair==(dtypes.int,dtypes.int16):
       self.program.append(RKGather(source.arg,result.arg,self.count,axes=((1,self.count,2),))); return result
-    mode={(dtypes.float,dtypes.half):RKEWMode.FLOAT_TO_HALF,(dtypes.half,dtypes.float):RKEWMode.HALF_TO_FLOAT,
-          (dtypes.half,dtypes.int):RKEWMode.HALF_TO_INT32,(dtypes.int,dtypes.half):RKEWMode.INT32_TO_HALF}.get(pair)
-    if mode is not None:
+    if (mode:={(dtypes.float,dtypes.half):RKEWMode.FLOAT_TO_HALF,(dtypes.half,dtypes.float):RKEWMode.HALF_TO_FLOAT,
+               (dtypes.half,dtypes.int):RKEWMode.HALF_TO_INT32,(dtypes.int,dtypes.half):RKEWMode.INT32_TO_HALF,
+               (dtypes.half,dtypes.int16):RKEWMode.HALF_TO_INT16,(dtypes.int16,dtypes.int):RKEWMode.INT16_TO_INT32}.get(pair)) is None: raise _RKGenericReject(f"convert {source.dtype}->{target}")  # noqa: E501
+    if mode not in (RKEWMode.HALF_TO_INT16,RKEWMode.INT16_TO_INT32):
       if target is dtypes.float and dst is None: raise _RKGenericReject("nonterminal FP32 carrier")
       stride=64 if dtypes.int in pair else 16; atoms=tuple((start,min(4,self.count-start),start//4*stride) for start in range(0,self.count,4))
       packed=self._scratch(dtypes.half if source.dtype is dtypes.float else source.dtype,len(atoms)*stride); tile=source if source.dtype is dtypes.float else packed  # noqa: E501
@@ -983,10 +984,8 @@ class RKContext:
         (arg:=tile.arg._replace(addend=tile.arg.addend+offset)),zero.arg if source.dtype is dtypes.float else arg,count,cfg,mode=mode) for start,count,offset in atoms)  # noqa: E501
       if target is not dtypes.float: self.program.append(RKGather(packed.arg,result.arg,self.count,axes=((4,len(atoms),stride//target.itemsize),(1,4,1)),itemsize=target.itemsize))  # noqa: E501
       return result
-    if pair == (dtypes.half,dtypes.int16): rhs,mode=source.arg,RKEWMode.HALF_TO_INT16
-    elif pair == (dtypes.int16,dtypes.int): rhs,mode,cfg=self._constant(UOp.const(0,dtypes.int16)).arg,RKEWMode.INT16_TO_INT32,_EW_CFG[Ops.ADD]  # noqa: E501
-    else: raise _RKGenericReject(f"convert {source.dtype}->{target}")
-    self.program.append(RKEWOp(result.arg,source.arg,rhs,self.count,cfg,barrier and pair==(dtypes.half,dtypes.int16),mode)); return result
+    rhs=self._constant(UOp.const(0,dtypes.int16)).arg if mode is RKEWMode.INT16_TO_INT32 else source.arg
+    self.program.append(RKEWOp(result.arg,source.arg,rhs,self.count,_EW_CFG[Ops.ADD] if mode is RKEWMode.INT16_TO_INT32 else cfg,barrier and pair==(dtypes.half,dtypes.int16),mode)); return result  # noqa: E501
 
   def _integer_bits(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
