@@ -799,6 +799,8 @@ def _accurate_add_recipe(u:UOp, pure:bool=False) -> UOp|None:
   if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2 or any(any(node.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN) for node in term.toposort()) for term in terms) or pure and any(not (term.op is Ops.MUL and term.dtype.scalar() is dtypes.half or term.op is Ops.CONST and float(term.arg) == 0.0) for term in terms): return None  # noqa: E501
   return _precise_mul_sum([term for term in terms if term.op is not Ops.CONST or float(term.arg) != 0.0])
 
+_FIXED_LAYOUTS = {dtypes.half:dtypes.half, dtypes.float:dtypes.half, dtypes.int16:dtypes.int16, dtypes.uchar:dtypes.int16, dtypes.bool:dtypes.int16, dtypes.uint:dtypes.int}  # noqa: E501
+
 class RKContext:
   """Typed physical lowering context. UOps remain the only semantic IR."""
   def __init__(self, output:RKOutput, plan:RKPlan|None=None):
@@ -817,9 +819,7 @@ class RKContext:
     self.int_layout = dtypes.int16 if narrow_int else dtypes.int
 
   def _layout(self, dtype:DType) -> DType:
-    if (layout:={dtypes.half:dtypes.half, dtypes.float:dtypes.half, dtypes.int16:dtypes.int16,
-      dtypes.uchar:dtypes.int16, dtypes.bool:dtypes.int16, dtypes.uint:dtypes.int}.get(
-        dtype,self.int_layout if dtype is dtypes.int else None)) is None: raise _RKGenericReject(f"layout {dtype}")
+    if (layout:=_FIXED_LAYOUTS.get(dtype,self.int_layout if dtype is dtypes.int else None)) is None: raise _RKGenericReject(f"layout {dtype}")
     return layout
 
   def _carrier(self, arg:RKArg, dtype:DType) -> UOp: return UOp(Ops.NOOP,dtype,src=(UOp.const(0,dtype),),arg=arg)
