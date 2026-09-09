@@ -679,11 +679,10 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
 
 def _i16_bit(value:UOp) -> UOp: return _native_min(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
 
-def _i16_compare(op:Ops, lhs:UOp, rhs:UOp, *, byte_domain:bool=False) -> UOp:
+def _i16_compare(op:Ops, lhs:UOp, rhs:UOp) -> UOp:
   delta=(rhs if op is Ops.CMPLT else lhs).alu(Ops.SUB,lhs if op is Ops.CMPLT else rhs)
-  positive=delta if op is Ops.CMPLT else _native_same(delta,_NATIVE_ABS)
-  # Byte differences stay in [-255,255], so ABS is exact and already nonnegative. Preserve the general signed clamp otherwise.
-  result=_native_min(positive,delta.const_like(1)) if byte_domain and op is not Ops.CMPLT else _i16_bit(positive)
+  # The former byte shortcut relied on differences in [-255,255]; every current caller needs the full signed-word clamp.
+  result=_i16_bit(delta if op is Ops.CMPLT else _native_same(delta,_NATIVE_ABS))
   return result.const_like(1).alu(Ops.SUB,result) if op is Ops.CMPEQ else result
 
 def _i16_select(selector:UOp, yes:UOp, no:UOp) -> UOp:
