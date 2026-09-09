@@ -694,6 +694,50 @@ def test_rejected_plan_restores_complete_state(stage:str,failure:str,debug:bool,
   assert _transaction_state(plan)==_transaction_state(fresh)
 
 
+@pytest.mark.parametrize("dtype",(dtypes.half,dtypes.int))
+@pytest.mark.parametrize("debug",(None,"0","1","unexpected"))
+@pytest.mark.parametrize("margin",(-1,0,1))
+def test_production_expansion_budget_uses_plan_rejection(dtype,debug,margin:int,monkeypatch):
+  if debug is None: monkeypatch.delenv("ROCKCHIP_UOPS_DEBUG",raising=False)
+  else: monkeypatch.setenv("ROCKCHIP_UOPS_DEBUG",debug)
+  roots,rejections=[],[]
+  finish,lower=rockchip_renderer.RKContext.finish,rockchip_renderer.RKPlan.lower
+  def observe_root(context,*args,**kwargs):
+    roots.append(context.root)
+    return finish(context,*args,**kwargs)
+  def observe_plan(plan,*args,**kwargs):
+    before=_transaction_state(plan)
+    try: accepted=lower(plan,*args,**kwargs)
+    except rockchip_renderer._RKGenericReject:
+      assert _transaction_state(plan)==before
+      rejections.append(before)
+      raise
+    if not accepted:
+      assert _transaction_state(plan)==before
+      rejections.append(before)
+    return accepted
+  monkeypatch.setattr(rockchip_renderer.RKContext,"finish",observe_root)
+  monkeypatch.setattr(rockchip_renderer.RKPlan,"lower",observe_plan)
+  with Context(DEV="ROCKCHIP",DEFAULT_FLOAT="HALF",NOOPT=0):
+    a,b=(Tensor(UOp.new_buffer("ROCKCHIP",17,dtype,num=72000+i)) for i in range(2))
+    calls=(a*3+b).schedule_linear().src
+    assert len(calls)==1
+    def compile_image():
+      to_program_cache.clear()
+      return next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src
+                  if node.op is Ops.BINARY)
+    expected=compile_image()
+    assert len(roots)==1 and _assert_decoded_image_bounds(decode_image(expected))==decode_image(expected)
+    count=len(roots[0].toposort())
+    monkeypatch.setattr(rockchip_renderer,"_MAX_GENERIC_EXPANDED_NODES",count+margin)
+    rejections.clear()
+    if margin<0:
+      error,message=(rockchip_renderer._RKGenericReject,f"expanded nodes {count}") if debug=="1" else (RuntimeError,"RKPLAN_REJECT")
+      with pytest.raises(error,match=message): compile_image()
+      assert rejections
+    else: assert compile_image()==expected
+
+
 def test_plan_finalization_failure_restores_checkpoint(monkeypatch):
   plan=_seed_transaction_plan()
   before=_transaction_state(plan)

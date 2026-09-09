@@ -1286,8 +1286,7 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
   root=_finite_int_max_neutrals(_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4])
   root = _expand_math_uops(root,accurate_adds=not storage_precision or storage_product_adds) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
-  if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES and os.getenv("ROCKCHIP_UOPS_DEBUG", "0") == "1": raise _RKGenericReject(f"expanded nodes {len(n)}")  # noqa: E501
-  if len(n) > _MAX_GENERIC_EXPANDED_NODES: return False
+  if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject(f"expanded nodes {len(n)}")
   if root is not output[4]: output = (output[0].replace(src=(output[0].src[0], root)), *output[1:4], root)
   RKContext(output,plan).finish(materialize)
   return True
