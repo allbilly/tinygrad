@@ -646,8 +646,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   out_index=graph_rewrite(sum((axis*stride for axis,stride in zip(axes,strides_for_shape(shape))),out_index.const_like(0)),sym)
   loaded_indices={node.src[0] for node in body.toposort() if node.op is Ops.LOAD}; body=body.substitute({node:node.load() for node in body.toposort() if node.op is Ops.INDEX and node not in loaded_indices},walk=True); extents=tuple(int(axis.src[0].arg) for axis in ranges); total=math.prod(extents); graph=body.toposort(); loads=_semantic_loads(body); unit_sum=total<=_FP16_EXACT_INTEGER and (candidate:=_strip_cast(body)).op is Ops.WHERE and _is_static_expr(candidate.src[0]) and all(src.op is Ops.CONST for src in candidate.src[1:]) and {float(src.arg) for src in candidate.src[1:]}<={0.0,1.0}  # noqa: E501
   if not 2<=total<=_MAX_GENERIC_UNROLL or rows>16 and out.dtype.scalar() is dtypes.half and value.arg[0] is Ops.ADD and total>416 and (total*round_up(rows,8)>_MAX_GENERIC_UNROLL or not (any(node.op is Ops.WHERE and _is_static_expr(node.src[0]) for node in graph) or any(len(load.src)>2 and _is_static_expr(load.src[2]) for load in loads))) or not loads and not unit_sum: return False  # noqa: E501
-  try: converted=body if out.dtype.scalar() in (dtypes.int,dtypes.bool) else _fp32_expr_to_half(body); product=body if out.dtype.scalar() in (dtypes.int,dtypes.bool) else _strip_cast(converted)  # noqa: E501
-  except _RKGenericReject: product=_strip_cast(body)
+  product=body if out.dtype.scalar() in (dtypes.int,dtypes.bool) else _strip_cast(converted if (converted:=_try_fp32_expr_to_half(body)) is not None else body)  # noqa: E501
   boolean=product.dtype.scalar() is dtypes.bool; short_math=value.arg[0] is Ops.ADD and total==16 and rows<=4096 and body.op is Ops.EXP2 and body.dtype.scalar() is dtypes.float and product.op is Ops.EXP2 and product.dtype.scalar() is dtypes.half; square=product.op is Ops.MUL and product.src[0] is product.src[1]; integer=boolean or dtypes.is_int(product.dtype.scalar()); bounds=(0,1) if boolean else (int(product.vmin),int(product.vmax)) if product.dtype.scalar() is dtypes.int16 else _int_info(product)[0] if integer else None; bounded_sum=value.arg[0] is Ops.ADD and rows>1 and out.dtype.scalar() is dtypes.int and bounds is not None and -32768<=total*bounds[0]<=total*bounds[1]<=32767  # noqa: E501
   if boolean and out.dtype.scalar() is not dtypes.bool or product.dtype.scalar() is not dtypes.half and (bounds is None or not -32768<=bounds[0]<=bounds[1]<=32767) or len(reductions)==1 and (total<32 and not bounded_sum and not short_math and not (integer and value.arg[0] is Ops.MAX) or not (rows>1 and out.dtype.scalar() is dtypes.int or total>416 or len(loads)>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN,Ops.CMPLT,Ops.CMPNE,Ops.WHERE) for node in graph))): return False  # noqa: E501
   mapped_dtype=dtypes.int16 if integer else dtypes.half; gated=_gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product; mapped_terms:tuple[UOp,...]=(gated if gated is not product or unit_sum else body,); product=gated  # noqa: E501
@@ -778,11 +777,12 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
     terms=[_fp32_expr_to_half(x) for x in _iter_binary(u,Ops.ADD,dtypes.float)]; masks=[term for term in terms if _is_static_expr(term) and any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float) and not math.isfinite(float(node.arg)) for node in term.toposort())]; return functools.reduce(lambda value,mask:value.alu(Ops.ADD,mask),masks,_precise_mul_sum([term for term in terms if term not in masks]))  # noqa: E501
   raise _RKGenericReject
 
-def _nested_fp32_storage_cast(x:UOp) -> UOp|None:
+def _try_fp32_expr_to_half(x:UOp) -> UOp|None:
+  """Share the optional conversion boundary between storage patterns and mapped reduction analysis."""
   try: return _fp32_expr_to_half(x)
   except _RKGenericReject: return None
 
-_pm_half_storage_algebra = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.float, name="x"),)), _nested_fp32_storage_cast),
+_pm_half_storage_algebra = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.float, name="x"),)), _try_fp32_expr_to_half),
   (UPat(Ops.FDIV, dtypes.half, src=(UPat.var("x"), UPat.var("y"))), lambda x,y:x.alu(Ops.MUL, UOp(Ops.RECIPROCAL, dtypes.half, src=(y,))))])
 
 def _canonical_half_storage(source:UOp) -> UOp:
