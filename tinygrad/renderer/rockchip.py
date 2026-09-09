@@ -688,8 +688,7 @@ def _i16_compare(op:Ops, lhs:UOp, rhs:UOp, *, byte_domain:bool=False) -> UOp:
   return result.const_like(1).alu(Ops.SUB,result) if op is Ops.CMPEQ else result
 
 def _i16_select(selector:UOp, yes:UOp, no:UOp) -> UOp:
-  one=selector.const_like(1)
-  return selector.alu(Ops.MUL,yes).alu(Ops.ADD,one.alu(Ops.SUB,selector).alu(Ops.MUL,no))
+  return selector.alu(Ops.MUL,yes).alu(Ops.ADD,selector.const_like(1).alu(Ops.SUB,selector).alu(Ops.MUL,no))
 
 def _byte_bits(value:UOp) -> tuple[UOp, ...]:
   """Split one unsigned byte expression into exact least-significant-first INT16 bit planes."""
