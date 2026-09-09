@@ -4526,8 +4526,39 @@ def test_embedded_int32_not_preserves_all_raw_bytes_before_wide_arithmetic():
   source = UOp.param(1, dtypes.int, (4,))
   image = _lower_uop_program(_program(dtypes.int, lambda i:
     UOp(Ops.XOR, dtypes.int, src=(source.index(i).load(), UOp.const(-1, dtypes.int)))+1))
-  assert image is not None and len(_ew_ops(image)) == 6 and len(_intermediate_gathers(image)) == 8
-  assert sum(op.mode==RKEWMode.INT32 for op in _ew_ops(image)) == 2
+  # Complement the two raw INT16 words without byte gathers, then run the existing wide ADD.
+  assert image is not None and len(_ew_ops(image)) == 2 and len(_intermediate_gathers(image)) == 0
+  assert sum(op.mode==RKEWMode.INT32 for op in _ew_ops(image)) == 1
+  assert _ew_ops(image)[0].mode==RKEWMode.INT16 and _ew_ops(image)[0].count==8
+  values=np.asarray((dtypes.int.min+1,-1,0,dtypes.int.max),dtype='<i4')
+  np.testing.assert_array_equal(_execute_integer_image(image,values),-values)
+
+
+@pytest.mark.parametrize('dtype',(dtypes.int16,dtypes.int))
+@pytest.mark.parametrize('count',(17,513,65536))
+@pytest.mark.parametrize('kind',('plain','maximum','predicate','selection'))
+def test_production_integer_complement_preserves_word_extrema(dtype,count:int,kind:str):
+  # Native INT32 SUB gives the wrong complement at INT32_MIN. Use every INT16 pattern and full-width INT32 samples.
+  fmt=f'<i{dtype.itemsize}'
+  values=np.random.default_rng(0x2608+dtype.itemsize+count).integers(dtype.min,dtype.max,count,dtype=np.int64,endpoint=True).astype(fmt)
+  edges=(dtype.min,dtype.min+1,-257,-256,-255,-1,0,1,255,256,257,dtype.max-1,dtype.max)
+  values[:len(edges)]=edges
+  if dtype is dtypes.int16 and count==65536: values=np.arange(65536,dtype='<u2').view('<i2')
+  inverted=np.bitwise_not(values)
+  expected=(inverted if kind=='plain' else np.maximum(inverted,0) if kind=='maximum' else inverted<0 if kind=='predicate' else
+            np.where(values<0,inverted,values))
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    source=Tensor(UOp.new_buffer('ROCKCHIP',count,dtype,num=49000))
+    complement=source^-1
+    output=(complement if kind=='plain' else complement.maximum(0) if kind=='maximum' else complement<0 if kind=='predicate' else
+            (source<0).where(complement,source))
+    calls=output.schedule_linear().src
+    assert len(calls)==1
+    to_program_cache.clear()
+    image=decode_image(next(node.arg for node in to_program(calls[0].src[0],RockchipRenderer(Target(device='ROCKCHIP'))).src
+                            if node.op is Ops.BINARY))
+  assert _assert_decoded_image_bounds(image)==image and _ew_ops(image)
+  assert _execute_raw_dynamic_image(image,expected.nbytes,values.tobytes())==expected.tobytes()
 
 
 def test_int32_shift_uops_compose_over_signed_and_unsigned_raw_bytes():

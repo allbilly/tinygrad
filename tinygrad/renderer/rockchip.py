@@ -996,9 +996,9 @@ class RKContext:
     layout=self._layout(u.dtype.scalar())
     if (pair:=_const_operand(u,Ops.XOR,-1)) is not None:
       value=self.lower(pair[0])
-      if value.dtype is dtypes.int16: return self._lower_recipe(u,UOp.const(-1,dtypes.int16).alu(Ops.SUB,value))
-      inverted=tuple(self.lower(component.const_like(255).alu(Ops.SUB,component)) for component in self._unpack_bytes(value))
-      return self._pack_bytes(inverted,dtypes.int,u=u)
+      # Native INT32 SUB mishandles INT32_MIN. Complement raw INT16 words, where -1-x preserves every bit without overflow.
+      result=self._scratch(value.dtype,u=u)
+      self.program.append(RKEWOp(result.arg,self._slot((_storage_bits(-1,value.dtype),),value.dtype).arg,value.arg,self.count*value.dtype.itemsize//2,_EW_CFG[Ops.SUB],mode=RKEWMode.INT16)); return result  # noqa: E501
     if self.count<1 or layout is dtypes.int and self.count*4>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
     # Fuse the semantic bitwise subgraph before allocating carriers: AND=ab, OR=a+b-ab, XOR=a+b-2ab.
     # Shifts permute these same planes, using five masked amount bits and sign extension only for signed SHR.
