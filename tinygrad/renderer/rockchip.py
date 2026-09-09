@@ -838,13 +838,13 @@ class RKContext:
       self.program.append(plan._replace(dst=value.arg))
     return self.materialized_values[cache_key]
 
-  def _constant(self, u:UOp, dtype_hint:DType|None=None) -> UOp:
+  def _constant(self, u:UOp, dtype_hint:DType|None=None, finite_min:bool=False) -> UOp:
     layout = self._layout(dtype_hint or u.dtype.scalar())
-    return self._slot((_storage_bits(u.arg,layout),),layout)
+    return self._slot((_storage_bits(-65504.0 if finite_min and math.isinf(float(u.arg)) and float(u.arg)<0 else u.arg,layout),),layout)
 
   def _operand(self, u:UOp, dtype:DType, finite_min:bool=False) -> UOp:
     if finite_min and u.op is Ops.LOAD and len(u.src)>2 and u.src[1].op is Ops.CONST and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0 and _is_static_expr(u.src[2]): return self._load(u,_storage_bits(-65504.0))  # noqa: E501
-    return self._constant(u, dtype) if u.op is Ops.CONST and (u.dtype.scalar() in dtypes.weaks or dtype is dtypes.half and u.dtype.scalar() is dtypes.float) else self.lower(u)  # noqa: E501
+    return self._constant(u,dtype,finite_min) if u.op is Ops.CONST and (u.dtype.scalar() in dtypes.weaks or dtype is dtypes.half and (u.dtype.scalar() is dtypes.float or finite_min and float(u.arg)==-math.inf)) else self.lower(u)  # noqa: E501
 
   def _static(self, u:UOp) -> UOp:
     dtype, layout = u.dtype.scalar(), self._layout(u.dtype.scalar())
@@ -956,8 +956,7 @@ class RKContext:
       bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
       if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
       expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
-      sources=tuple(UOp.const(-65504.0,dtypes.half) if finite_min and src.op is Ops.CONST and math.isinf(float(src.arg)) and float(src.arg)<0 else src for src in u.src)  # noqa: E501
-      lhs,rhs=(self._operand(src,dtype,finite_min) for src in sources)
+      lhs,rhs=(self._operand(src,dtype,finite_min) for src in u.src)
       if (u.op,u.arg) in ((Ops.SUB,_NATIVE_SIGN),(Ops.MAX,_NATIVE_MIN)):
         if expected is not dtypes.half:
           if u.op is Ops.SUB: raise _RKGenericReject
