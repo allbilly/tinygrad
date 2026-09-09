@@ -924,9 +924,6 @@ class RKContext:
   def _lower_recipe(self, owner:UOp, recipe:UOp) -> UOp:
     self.recipe_owners[recipe]=owner; return self.lower(recipe)
 
-  def _bitplanes(self, value:UOp) -> tuple[UOp, ...]:
-    return tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(value,copy_wide=False))))
-
   def _pack_bits(self, bits:Iterable[UOp], layout:DType, u:UOp) -> UOp:
     planes=tuple(bits)
     if len(planes)!=layout.itemsize*8: raise _RKGenericReject
@@ -1010,7 +1007,8 @@ class RKContext:
     @functools.cache
     def bits(node:UOp) -> tuple[UOp,...]:
       if node.op is Ops.CONST: return tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8))
-      if node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype: return self._bitplanes(self.lower(node))
+      if node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype:
+        return tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(self.lower(node),copy_wide=False))))
       if node.op in (Ops.SHL,Ops.SHR):
         if node.dtype.scalar() not in (dtypes.int,dtypes.uint) or node.src[1].dtype.scalar() not in (dtypes.int,dtypes.uint) or self.int_layout is not dtypes.int or 16*((self.count*2+63)&-64)>_MAX_EW_ELEMS_FP16:  # noqa: E501
           raise _RKGenericReject
