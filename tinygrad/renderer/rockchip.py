@@ -417,33 +417,32 @@ def _relu_operand(u:UOp) -> UOp|None:
   return pair[0] if u.op is Ops.MAX and u.arg is None and u.dtype.scalar() in (dtypes.half,dtypes.float) and (pair:=_const_operand(u.replace(src=u.src[::-1]),Ops.MAX,0.0)) is not None else None  # noqa: E501
 
 
-def _sub_half(lhs:UOp, rhs:UOp, neg_one:UOp) -> UOp: return lhs.alu(Ops.ADD, rhs.alu(Ops.MUL, neg_one))
+# Keep the ADD/MUL residual graph: replacing it with SUB changes generated weighted recipes.
+def _sub_half(lhs:UOp, rhs:UOp) -> UOp: return lhs.alu(Ops.ADD, rhs.alu(Ops.MUL, UOp.const(-1.0,dtypes.half)))
 
-def _split_half(x:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
-  scaled = x.alu(Ops.MUL, splitter)
-  high = _sub_half(scaled, _sub_half(scaled, x, neg_one), neg_one); return high, _sub_half(x, high, neg_one)
+def _split_half(x:UOp) -> tuple[UOp, UOp]:
+  scaled = x.alu(Ops.MUL, UOp.const(65.0,dtypes.half))
+  high = _sub_half(scaled, _sub_half(scaled, x)); return high, _sub_half(x, high)
 
-def _two_product(term:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
-  lhs_high, lhs_low, rhs_high, rhs_low = (*_split_half(term.src[0], neg_one, splitter), *_split_half(term.src[1], neg_one, splitter))
-  error = _sub_half(lhs_high.alu(Ops.MUL, rhs_high), term, neg_one); error = error.alu(Ops.ADD, lhs_high.alu(Ops.MUL, rhs_low)).alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_high))  # noqa: E501
+def _two_product(term:UOp) -> tuple[UOp, UOp]:
+  lhs_high, lhs_low, rhs_high, rhs_low = (*_split_half(term.src[0]), *_split_half(term.src[1]))
+  error = _sub_half(lhs_high.alu(Ops.MUL, rhs_high), term); error = error.alu(Ops.ADD, lhs_high.alu(Ops.MUL, rhs_low)).alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_high))  # noqa: E501
   return term, error.alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_low))
 
-def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
+def _two_sum(lhs:UOp, rhs:UOp) -> tuple[UOp, UOp]:
   total = lhs.alu(Ops.ADD, rhs)
-  rhs_virtual = _sub_half(total, lhs, neg_one)
-  return total, _sub_half(lhs, _sub_half(total, rhs_virtual, neg_one), neg_one).alu(Ops.ADD, _sub_half(rhs, rhs_virtual, neg_one))
+  rhs_virtual = _sub_half(total, lhs)
+  return total, _sub_half(lhs, _sub_half(total, rhs_virtual)).alu(Ops.ADD, _sub_half(rhs, rhs_virtual))
 
 def _precise_add_parts(terms:tuple[UOp, ...]|list[UOp]) -> tuple[UOp, UOp]:
   """Recover FP16 addition residuals as a high lane plus a low correction lane."""
-  zero, neg_one = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half)
-  high, middle, low = terms[0], zero, zero
-  for part in terms[1:]: high,error=_two_sum(high,part,neg_one); middle,error=_two_sum(middle,error,neg_one); low=low.alu(Ops.ADD,error)  # noqa: E501
+  high, middle, low = terms[0], UOp.const(0.0,dtypes.half), UOp.const(0.0,dtypes.half)
+  for part in terms[1:]: high,error=_two_sum(high,part); middle,error=_two_sum(middle,error); low=low.alu(Ops.ADD,error)  # noqa: E501
   return high, middle.alu(Ops.ADD, low)
 
 def _product_terms(terms:tuple[UOp,...]|list[UOp]) -> tuple[UOp,...]:
   """Keep product highs before TwoProduct residuals; non-product terms have no correction lane."""
-  neg_one,splitter=UOp.const(-1.0,dtypes.half),UOp.const(65.0,dtypes.half)
-  return tuple(terms)+tuple(_two_product(term,neg_one,splitter)[1] for term in terms if term.op is Ops.MUL)
+  return tuple(terms)+tuple(_two_product(term)[1] for term in terms if term.op is Ops.MUL)
 
 def _tag_precise_adds(root:UOp, opaque:tuple[UOp,...]=()) -> UOp:
   """Mark physical ADDs so the generic accuracy pass does not expand an already compensated recipe."""

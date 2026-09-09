@@ -3032,7 +3032,7 @@ def test_product_terms_keep_highs_before_only_product_residuals(count:int):
   products=[term for term in terms if term.op is Ops.MUL]
   assert len(expanded)==count+len(products)
   for residual,term in zip(expanded[count:],products):
-    assert residual is rockchip_renderer._two_product(term,left.const_like(-1),left.const_like(65))[1]
+    assert residual is rockchip_renderer._two_product(term)[1]
   assert rockchip_renderer._product_terms(tuple(terms))==expanded
 
 
