@@ -938,10 +938,10 @@ class RKContext:
       for part,(offset,factors) in zip(raw,affines)),layout,u=u)
 
   def _alu(self, u:UOp) -> UOp:
-    if u.op in (Ops.RECIPROCAL, Ops.NEG):
-      rhs = self.lower(u.src[0])
-      lhs = self.lower(UOp.const(1.0, dtypes.half)) if u.op is Ops.RECIPROCAL else rhs
-      expected,cfg = lhs.dtype,_EW_CFG[Ops.FDIV] if u.op is Ops.RECIPROCAL else _EW_CFG_NEG
+    # Materialize the reciprocal's denominator first, then reuse ordinary division with the original output owner.
+    if u.op is Ops.RECIPROCAL: return self._lower_recipe(self.recipe_owners.get(u,u),u.replace(op=Ops.FDIV,src=(UOp.const(1.0,dtypes.half),self.lower(u.src[0]))))  # noqa: E501
+    if u.op is Ops.NEG:
+      lhs=rhs=self.lower(u.src[0]); expected,cfg=lhs.dtype,_EW_CFG_NEG
     else:
       if len(u.src) != 2: raise _RKGenericReject
       if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
