@@ -2864,7 +2864,8 @@ def test_output_padded_transpose_convolution_avoids_stateful_vector_reduction():
     ast = source.conv_transpose2d(weight,bias,output_padding=(1,1),stride=(2,3)).schedule_linear().src[0].src[0]
     to_program_cache.clear()
     image = decode_image(next(u for u in to_program(ast,RockchipRenderer(Target(device="ROCKCHIP"))).src if u.op is Ops.BINARY).arg)
-  assert _cmac(image) is None and len(_ew_ops(image)) == 2214 and len(_initial_gathers(image)) == 125 and not _intermediate_gathers(image)
+  # On-demand static values omit 52 unused per-lane constant tables; the ordered EW computation is unchanged.
+  assert _cmac(image) is None and len(_ew_ops(image)) == 2214 and len(_initial_gathers(image)) == 73 and not _intermediate_gathers(image)
   assert not any(op.submit_barrier or op.mode != RKEWMode.HALF for op in _ew_ops(image)) and not _runtime_gathers(image)
   source_values,weight_values,bias_values=np.ones((2,4,6,5),dtype=np.float16),np.ones((4,4,3,3),dtype=np.float16),np.ones(4,dtype=np.float16)
   expected=np.ones((2,4,14,16),dtype=np.float16)

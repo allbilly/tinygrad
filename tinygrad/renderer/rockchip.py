@@ -1155,14 +1155,15 @@ class RKContext:
     if dtype in (dtypes.half,dtypes.int16) and self.root.op is not Ops.BITCAST: self._emit(self._carrier(self.out,expected),result,result,_EW_CFG[Ops.MAX]); return  # noqa: E501
     self.program.append(_raw_gather(result.arg,self.out_param.arg.slot,self.count,stride=2 if dtype.itemsize==1 else 1,itemsize=dtype.itemsize))  # noqa: E501
 
+  def _is_static_value(self, u:UOp) -> bool:
+    return u.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.int,dtypes.uint,dtypes.bool,dtypes.uchar) and u in self.semantic_nodes and _is_static_expr(u) and not any(isinstance(node.arg,str) and node.arg.startswith("rockchip_") for node in u.toposort())  # noqa: E501
+
   def lower(self, u:UOp) -> UOp:
     if u in self.values: return self.values[u]
     if u.op is Ops.NOOP and isinstance(u.arg,RKArg): return u
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
-    elif (dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.uint, dtypes.bool, dtypes.uchar) and u in self.semantic_nodes and _is_static_expr(u) and  # noqa: E501
-          not any(isinstance(node.arg, str) and node.arg.startswith("rockchip_") for node in u.toposort())):
-      value = self._static(u)
+    elif self._is_static_value(u): value = self._static(u)
     elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
     elif u.op is Ops.BITCAST and len(u.src) == 1:
       source = self.lower(u.src[0])
@@ -1182,16 +1183,15 @@ class RKContext:
     return self.values.setdefault(u, value)
 
   def finish(self, materialize:bool=False) -> None:
-    nodes=self.root.toposort(); raw_predicate_inputs={src for node in nodes if node.op in (Ops.CMPNE,Ops.CMPEQ) for src in node.src if src.dtype.scalar() is dtypes.half and (src.op is Ops.MAX and src.arg is None and len(src.src)==2 or src.op is Ops.MUL and any(term.op is Ops.CONST and float(term.arg)==-1.0 for term in src.src))}; predicated=any(node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node) for node in nodes); blocked:set[UOp]=set(); typed_loads={load for load in set(itertools.chain.from_iterable(map(_semantic_loads,nodes))) if load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None} if len(nodes)>800 else set()  # noqa: E501
+    nodes=self.root.toposort(); pending:list[UOp]=[]; dtype=self.out_param.dtype.scalar(); raw_predicate_inputs={src for node in nodes if node.op in (Ops.CMPNE,Ops.CMPEQ) for src in node.src if src.dtype.scalar() is dtypes.half and (src.op is Ops.MAX and src.arg is None and len(src.src)==2 or src.op is Ops.MUL and any(term.op is Ops.CONST and float(term.arg)==-1.0 for term in src.src))}; predicated=any(node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node) for node in nodes); blocked:set[UOp]=set(); typed_loads={load for load in set(itertools.chain.from_iterable(map(_semantic_loads,nodes))) if load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None} if len(nodes)>800 else set()  # noqa: E501
     # A dynamic predicate taints only its consumers; independent FP16 arithmetic can form one physical prelude.
     if len(nodes)>800:
       for node in nodes:
         if (node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node)) or any(src in blocked for src in node.src): blocked.add(node)  # noqa: E501
         # A maximal compensated ADD owns its prefixes; eagerly lowering each prefix only creates unused physical copies.
-        elif ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and node not in raw_predicate_inputs and all(load in typed_loads for load in _semantic_loads(node)))): self.lower(node)  # noqa: E501
-      for node in nodes:
-        if node.dtype.scalar() is dtypes.bool and node.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR): self.lower(node)
-    result, dtype = self.lower(self.root), self.out_param.dtype.scalar()
+        elif not self._is_static_value(node) and ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and node not in raw_predicate_inputs and all(load in typed_loads for load in _semantic_loads(node)))): pending.append(node)  # noqa: E501
+      pending.extend(node for node in nodes if node.dtype.scalar() is dtypes.bool and node.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR) and not self._is_static_value(node))  # noqa: E501
+    for node in (*pending,self.root): result=self.lower(node)
     if materialize and dtype in (dtypes.half,dtypes.int16,dtypes.int) and result.dtype is dtype and result.arg!=self.out:
       self.plan.bindings[self.out.index]=result.arg
     else: self._finish_value(result,dtype)
