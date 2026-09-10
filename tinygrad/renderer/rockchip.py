@@ -233,8 +233,8 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
   regs += pipeline + ((_RDMA,R.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
     (_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
     (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
-  rdma_precision = 5 if fp32_input else 4 if int32_input else 1 if mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) else 2
-  rdma_feature = (rdma_precision<<15)|(15<<11)|(rdma_precision<<5)|(0 if is_div or mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) or fp32_input else 1<<3)|1  # noqa: E501
+  # The DPU input precision at bits 26..28 feeds both nonoverlapping RDMA precision fields (15..17 and 5..7).
+  rdma_feature = ((data_format>>26)&7)*((1<<15)|(1<<5))|(15<<11)|(0 if is_div or mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) or fp32_input else 1<<3)|1  # noqa: E501
   return tuple(_cmd(*reg) for reg in regs), rdma_feature
 
 def emit_ew_stage(op:RKEWOp, address:Callable[[RKArg],int]) -> tuple[int, ...]:
