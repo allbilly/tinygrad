@@ -923,7 +923,7 @@ class RKContext:
     if u.op is Ops.NEG:
       source=self.lower(u.src[0]); return self._emit(self._scratch(source.dtype,u=u),source,source,_EW_CFG_NEG)
     if len(u.src) != 2: raise _RKGenericReject
-    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
+    if u.op is Ops.ADD and (recipe:=_pm_relu_cap.rewrite(u)) is not None: return self.lower(recipe)
     # RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates.
     if u.op is Ops.FDIV and u.src[0].op is Ops.CONST and math.isinf(numerator:=float(u.src[0].arg)):
       signed_one=UOp.const(-1.0 if numerator < 0 else 1.0,dtypes.half)
@@ -1172,13 +1172,14 @@ class RKContext:
     return self.values.setdefault(u, value)
 
   def finish(self, materialize:bool=False) -> None:
-    nodes=self.root.toposort(); pending:list[UOp]=[]; dtype=self.out_param.dtype.scalar(); raw_predicate_inputs={src for node in nodes if node.op in (Ops.CMPNE,Ops.CMPEQ) for src in node.src if src.dtype.scalar() is dtypes.half and (src.op is Ops.MAX and src.arg is None and len(src.src)==2 or src.op is Ops.MUL and any(term.op is Ops.CONST and float(term.arg)==-1.0 for term in src.src))}; predicated=any(node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node) for node in nodes); blocked:set[UOp]=set(); typed_loads={load for load in set(itertools.chain.from_iterable(map(_semantic_loads,nodes))) if load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None} if len(nodes)>800 else set()  # noqa: E501
+    nodes=self.root.toposort(); pending:list[UOp]=[]; dtype=self.out_param.dtype.scalar(); raw_predicate_inputs={src for node in nodes if node.op in (Ops.CMPNE,Ops.CMPEQ) for src in node.src if src.dtype.scalar() is dtypes.half and (src.op is Ops.MAX and src.arg is None and len(src.src)==2 or src.op is Ops.MUL and any(term.op is Ops.CONST and float(term.arg)==-1.0 for term in src.src))}; predicated=any(node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node) for node in nodes); blocked:set[UOp]=set(); typed_loads={load for load in nodes if load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None} if len(nodes)>800 else set()  # noqa: E501
     # A dynamic predicate taints only its consumers; independent FP16 arithmetic can form one physical prelude.
     if len(nodes)>800:
-      for node in nodes:
+      # Warm semantic-load caches in postorder, including blocked nodes, before emitting deep physical graphs.
+      for node,loads in zip(nodes,map(_semantic_loads,nodes)):
         if (node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node)) or any(src in blocked for src in node.src): blocked.add(node)  # noqa: E501
         # A maximal compensated ADD owns its prefixes; eagerly lowering each prefix only creates unused physical copies.
-        elif not self._is_static_value(node) and ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and node not in raw_predicate_inputs and all(load in typed_loads for load in _semantic_loads(node)))): pending.append(node)  # noqa: E501
+        elif not self._is_static_value(node) and ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and node not in raw_predicate_inputs and all(load in typed_loads for load in loads))): pending.append(node)  # noqa: E501
       pending.extend(node for node in nodes if node.dtype.scalar() is dtypes.bool and node.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR) and not self._is_static_value(node))  # noqa: E501
     for node in (*pending,self.root): result=self.lower(node)
     if materialize and dtype in (dtypes.half,dtypes.int16,dtypes.int) and result.dtype is dtype and result.arg!=self.out:
@@ -1301,16 +1302,15 @@ def _finite_positive_mask(u:UOp) -> UOp:
   # Retain all three typed scaling stages and their rounding boundaries in the physical recipe.
   return _native_min(functools.reduce(lambda value,factor:value.alu(Ops.MUL,factor),(_half(256.0),)*3,u.alu(Ops.MAX,_half(0.0))),_half(1.0))
 
-def _fold_relu_cap(x:UOp) -> UOp|None:
+def _relu_cap(positive:UOp, upper_relu:UOp, x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
-  for positive, negative in (x.src, x.src[::-1]):
-    source, scaled = _relu_operand(positive), _const_operand(negative, Ops.MUL, -1.0)
-    if source is None or scaled is None or (upper:=_relu_operand(scaled[0])) is None: continue
-    (source_base, source_shift), (upper_base, upper_shift) = ((value, 0.0) if (term:=_const_operand(value, Ops.ADD)) is None else (term[0], float(term[1].arg)) for value in (source, upper))  # noqa: E501
-    if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: continue
-    if cap == 6.0: return UOp(Ops.MAX, x.dtype, src=(source, UOp.const(0.0, dtypes.half)), arg=_NATIVE_RELU6)
-    return UOp(Ops.MAX, positive.dtype, src=(positive, UOp.const(cap, dtypes.half)), arg=_NATIVE_MIN)
-  return None
+  if (source:=_relu_operand(positive)) is None or (upper:=_relu_operand(upper_relu)) is None: return None
+  (source_base, source_shift), (upper_base, upper_shift) = ((value, 0.0) if (term:=_const_operand(value, Ops.ADD)) is None else (term[0], float(term[1].arg)) for value in (source, upper))  # noqa: E501
+  if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: return None
+  if cap == 6.0: return UOp(Ops.MAX, x.dtype, src=(source, UOp.const(0.0, dtypes.half)), arg=_NATIVE_RELU6)
+  return UOp(Ops.MAX, positive.dtype, src=(positive, UOp.const(cap, dtypes.half)), arg=_NATIVE_MIN)
+
+_pm_relu_cap=PatternMatcher([((UPat.var("positive")+UPat.var("upper_relu")*UPat.const(-1)).named("x"),_relu_cap)])
 
 _abs_ratio=UPat(Ops.FDIV,src=(UPat.cvar("positive"),UPat.var("denominator")),name="value")
 _pm_where_abs=PatternMatcher([
