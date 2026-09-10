@@ -463,7 +463,7 @@ def _lower_cmac_storage_epilogue(output:RKOutput, uops:list[UOp], plan:RKPlan) -
   """Commit one output-shaped FP32 contraction to HALF on CMAC before its ordinary HALF epilogue."""
   store,out,count,index,root=output
   for boundary in (u for u in root.toposort() if u is not root and _typed_cast_source(u,dtypes.half,dtypes.float) is not None):
-    source=typing_cast(UOp,_typed_cast_source(boundary,dtypes.half,dtypes.float)); terms=tuple(_strip_cast(term) for term in _iter_binary(source,Ops.ADD)) if source.op is Ops.ADD else ()  # noqa: E501
+    source=boundary.src[0]; terms=tuple(_strip_cast(term) for term in _iter_binary(source,Ops.ADD)) if source.op is Ops.ADD else ()
     if any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])==8 for node in boundary.toposort()) or len(terms) == 8 and all(term.op is Ops.MUL and term.arg is None and all(src.dtype.scalar() is dtypes.half and _strip_cast(src).op is Ops.LOAD for src in term.src) for term in terms): continue  # noqa: E501
     def append() -> bool:
       fake=plan.parameter(dtypes.half,count); prefix=fake.index(index).store(boundary)
@@ -509,7 +509,8 @@ def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
   table=plan.parameter(dtypes.half,k*n); plan.program.append(RKGather(None,plan.resolve(RKArg(RKBufferKind.ARG,table.arg.slot)),k*n,values=tuple(_storage_bits(value) for row in matrix for value in row)))  # noqa: E501
   axis=UOp.range(k,1+max((node.arg[0] for node in root.toposort() if node.op is Ops.RANGE),default=-1),dtype=dtypes.int); row=functools.reduce(lambda address,dim:address*dim.src[0]+dim,dense[:-1],out_index.const_like(0))  # noqa: E501
   value=(param.index(row*k+axis).load().cast(dtypes.float)*table.index(axis*n+dense[-1]).load().cast(dtypes.float)).reduce(axis,arg=Ops.ADD)
-  return _try(plan,(store,out,rows,out_index,value),dtypes.float,_lower_cmac_reduce,list(value.toposort()))
+  # CMAC reads the structured output directly; only mapped reduction needs a separate UOp inventory.
+  return _try(plan,(store,out,rows,out_index,value),dtypes.float,_lower_cmac_reduce,[])
 
 def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Append a separable contraction directly to the shared physical plan; mapped reduction owns other bounded shapes."""
@@ -520,10 +521,9 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   root=_strip_cast(relu_root if relu_root is not None else root); additive=root.op is Ops.ADD and root.dtype.scalar() is dtypes.float or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD for node in root.toposort())  # noqa: E501
   # Keep a single mapped product/identity structured; irregular additive bodies retain bounded normalization.
   ranges=root.src[1:] if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and all(axis.op in (Ops.RANGE,Ops.SPECIAL) and axis.src and axis.src[0].op is Ops.CONST for axis in root.src[1:]) and all(node.op in (Ops.LOAD,Ops.CONST) for node in map(_strip_cast,_iter_binary(_gate_zero_term(root.src[0]),Ops.MUL,plain=True))) else ()  # noqa: E501
-  try: root = root if ranges else _unroll_static_reduces(root, precise=False)
-  except (_RKGenericReject, RuntimeError, ValueError): return False
+  if (normalized:=root if ranges else _optional_rewrite(functools.partial(_unroll_static_reduces,precise=False),root,errors=(_RKGenericReject,RuntimeError,ValueError))) is None: return False  # noqa: E501
   scale,exact_scale=1.0,True
-  while (pair:=_const_operand(root:=_strip_cast(root),Ops.MUL)) is not None: root,factor=pair[0],float(pair[1].arg); scale*=factor; exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale  # noqa: E501
+  while (pair:=_const_operand(root:=_strip_cast(normalized),Ops.MUL)) is not None: normalized,factor=pair[0],float(pair[1].arg); scale*=factor; exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale  # noqa: E501
   bounds=tuple(int(axis.src[0].arg) for axis in ranges); reduction_size=math.prod(bounds); root=_gate_zero_term(root.src[0]) if ranges else root
   terms=tuple(_gate_zero_term(term) for term in _iter_binary(root,Ops.ADD)) if root.op is Ops.ADD else (_gate_zero_term(root),) if additive else (); terms=tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)); groups=reduction_size*len(terms)  # noqa: E501
   if groups < (1 if additive else 4) or groups>_MAX_CMAC_K: return False
@@ -771,10 +771,10 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
     terms=[_fp32_expr_to_half(x) for x in _iter_binary(u,Ops.ADD,dtypes.float)]; masks=[term for term in terms if _is_static_expr(term) and any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float) and not math.isfinite(float(node.arg)) for node in term.toposort())]; return functools.reduce(lambda value,mask:value.alu(Ops.ADD,mask),masks,_precise_mul_sum([term for term in terms if term not in masks]))  # noqa: E501
   raise _RKGenericReject
 
-def _optional_rewrite(rewrite:Callable[[UOp],UOp], source:UOp) -> UOp|None:
+def _optional_rewrite(rewrite:Callable[[UOp],UOp], source:UOp, *, errors:tuple[type[Exception],...]=(_RKGenericReject,)) -> UOp|None:
   """Share expected rewrite rejection across storage legalization and mapped reduction analysis."""
   try: return rewrite(source)
-  except _RKGenericReject: return None
+  except errors: return None
 
 _pm_half_storage_algebra = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.float, name="x"),)), lambda x:_optional_rewrite(_fp32_expr_to_half,x)),  # noqa: E501
   (UPat(Ops.FDIV, dtypes.half, src=(UPat.var("x"), UPat.var("y"))), lambda x,y:x.alu(Ops.MUL, UOp(Ops.RECIPROCAL, dtypes.half, src=(y,))))])
