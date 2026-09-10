@@ -921,24 +921,23 @@ class RKContext:
     # Materialize the reciprocal's denominator first, then reuse ordinary division with the original output owner.
     if u.op is Ops.RECIPROCAL: return self._lower_recipe(self.recipe_owners.get(u,u),u.replace(op=Ops.FDIV,src=(UOp.const(1.0,dtypes.half),self.lower(u.src[0]))))  # noqa: E501
     if u.op is Ops.NEG:
-      lhs=rhs=self.lower(u.src[0]); expected,cfg=lhs.dtype,_EW_CFG_NEG
-    else:
-      if len(u.src) != 2: raise _RKGenericReject
-      if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
-      # RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates.
-      if u.op is Ops.FDIV and u.src[0].op is Ops.CONST and math.isinf(numerator:=float(u.src[0].arg)):
-        signed_one=UOp.const(-1.0 if numerator < 0 else 1.0,dtypes.half)
-        return self.lower(signed_one.alu(Ops.FDIV,u.src[1]).alu(Ops.FDIV,UOp.const(0.0,dtypes.half)))
-      dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
-      bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
-      if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
-      expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
-      lhs,rhs=(self._operand(src,dtype,finite_min) for src in u.src)
-      if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
-        if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
-        zero=lhs.const_like(0.0)
-        return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
-      cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]  # noqa: E501
+      source=self.lower(u.src[0]); return self._emit(self._scratch(source.dtype,u=u),source,source,_EW_CFG_NEG)
+    if len(u.src) != 2: raise _RKGenericReject
+    if u.op is Ops.ADD and (recipe:=_fold_relu_cap(u)) is not None: return self.lower(recipe)
+    # RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates.
+    if u.op is Ops.FDIV and u.src[0].op is Ops.CONST and math.isinf(numerator:=float(u.src[0].arg)):
+      signed_one=UOp.const(-1.0 if numerator < 0 else 1.0,dtypes.half)
+      return self.lower(signed_one.alu(Ops.FDIV,u.src[1]).alu(Ops.FDIV,UOp.const(0.0,dtypes.half)))
+    dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
+    bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
+    if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
+    expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
+    lhs,rhs=(self._operand(src,dtype,finite_min) for src in u.src)
+    if u.op is Ops.MAX and u.arg == _NATIVE_MIN:
+      if expected is not dtypes.half: return self._emit(self._scratch(dtypes.int16,u=u),lhs,rhs,_EW_CFG_MIN)
+      zero=lhs.const_like(0.0)
+      return self._lower_recipe(u,zero.alu(Ops.SUB,zero.alu(Ops.SUB,lhs).alu(Ops.MAX,zero.alu(Ops.SUB,rhs))))
+    cfg = _EW_CFG_ABS if u.op is Ops.MAX and u.arg == _NATIVE_ABS else _EW_CFG_FLOOR if u.op is Ops.MAX and u.arg == _NATIVE_FLOOR else _EW_CFG_CEIL if u.op is Ops.MAX and u.arg == _NATIVE_CEIL else _EW_CFG_RELU6 if u.op is Ops.MAX and u.arg == _NATIVE_RELU6 else _EW_CFG[u.op]  # noqa: E501
     compare = u.op is Ops.MAX and u.arg == _NATIVE_POSITIVE_MASK
     return self._emit(self._scratch(expected,u=u),lhs,rhs,cfg,compare=compare)
 
