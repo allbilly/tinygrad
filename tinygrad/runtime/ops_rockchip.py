@@ -64,15 +64,14 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
     assert gather.src is not None
     fill=not gather.partial and bool(gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
     if fill and not bounded and gather.count: raise IndexError("RKGather destination exceeds buffer")
-    if gather.index is None and not offsets and bounded and (payload:=_regular_gather_payload(gather,src)) is not None:
-      dst.mv[span]=payload
-      continue
     # Build one raw payload before assignment; inactive partial lanes retain their existing destination bits.
-    if gather.index is None and offsets and bounded:
-      picked=operator.itemgetter(*offsets)(src.mv) if gather.count>1 and min(offsets)>=0 and max(offsets)<src_limit else (
-        src.mv[index] if 0<=index<src_limit else dst.mv[begin+lane*step] if gather.partial else gather.fill_bits for lane,index in enumerate(offsets))  # noqa: E501
-      dst.mv[span]=array.array(code,picked)
-      continue
+    if gather.index is None and bounded:
+      payload=_regular_gather_payload(gather,src) if not offsets else array.array(code,
+        operator.itemgetter(*offsets)(src.mv) if gather.count>1 and min(offsets)>=0 and max(offsets)<src_limit else
+        (src.mv[index] if 0<=index<src_limit else dst.mv[begin+lane*step] if gather.partial else gather.fill_bits for lane,index in enumerate(offsets)))  # noqa: E501
+      if payload is not None:
+        dst.mv[span]=payload
+        continue
     source_indices=offsets or (gather.base+sum((lane//divisor%limit)*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
     writes=((begin+lane*step,src.mv[index] if 0<=index<src_limit else gather.fill_bits) for lane,index in enumerate(source_indices) if 0<=begin+lane*step<dst_limit and (fill or 0<=index<src_limit))  # noqa: E501
     for lane,value in writes: dst.mv[lane]=value
