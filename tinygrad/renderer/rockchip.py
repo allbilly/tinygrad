@@ -1250,10 +1250,9 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
-  accepted = (dtypes.half, dtypes.float, dtypes.int16, dtypes.int, dtypes.bool, dtypes.uchar)
   strict_output, local_output, output_stores = _outs(uops)
   if len(output_stores)>1: return all(plan.lower(list(store.sink().toposort()),vectorize_reductions=vectorize_reductions) for store in output_stores)  # noqa: E501
-  strict_output, local_output = (_admit(output, accepted) for output in (strict_output, local_output))
+  local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
   if vectorize_reductions and (_try(plan,local_output,dtypes.float,_lower_linear_contraction) or _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops) or _try(plan,strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops)): return True  # noqa: E501
   if _try(plan,strict_output,dtypes.int,_lower_raw_fp16_bitcast): return True
   if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
