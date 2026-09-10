@@ -1209,10 +1209,9 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
     if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped): mapped=UOp(Ops.WHERE,dtypes.half,src=(mapped.src[0],mapped.src[1].cast(dtypes.half),mapped.src[2].cast(dtypes.half)),arg=mapped.arg) if mapped.op is Ops.WHERE else mapped.src[0].cast(dtypes.half).alu(mapped.op,mapped.src[1].cast(dtypes.half))  # noqa: E501
     if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half: mapped=mapped.src[0]  # noqa: E501
     if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
-    if mapped.op in _DPU_MATH and (mapped.op is not Ops.TRUNC or mapped.dtype.scalar() is dtypes.half and not _is_static_expr(mapped)):
-      if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
-      mapped = rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
-    return mapped
+    if mapped.op not in _DPU_MATH or mapped.op is Ops.TRUNC and (mapped.dtype.scalar() is not dtypes.half or _is_static_expr(mapped)): return mapped
+    if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
+    return rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
   return rewrite(root)
 
 def _finite_int_max_neutrals(root:UOp) -> UOp:
