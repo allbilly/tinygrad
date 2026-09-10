@@ -419,9 +419,9 @@ def _split_half(x:UOp) -> tuple[UOp, UOp]:
   high = _sub_half(scaled, _sub_half(scaled, x)); return high, _sub_half(x, high)
 
 def _two_product(term:UOp) -> tuple[UOp, UOp]:
-  lhs_high, lhs_low, rhs_high, rhs_low = (*_split_half(term.src[0]), *_split_half(term.src[1]))
-  error = _sub_half(lhs_high.alu(Ops.MUL, rhs_high), term); error = error.alu(Ops.ADD, lhs_high.alu(Ops.MUL, rhs_low)).alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_high))  # noqa: E501
-  return term, error.alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_low))
+  # Cartesian order is HH, HL, LH, LL; retain the original product and each residual rounding boundary.
+  products=(lhs.alu(Ops.MUL,rhs) for lhs,rhs in itertools.product(_split_half(term.src[0]),_split_half(term.src[1])))
+  return term,functools.reduce(lambda error,product:error.alu(Ops.ADD,product),products,_sub_half(next(products),term))
 
 def _two_sum(lhs:UOp, rhs:UOp) -> tuple[UOp, UOp]:
   total = lhs.alu(Ops.ADD, rhs)
