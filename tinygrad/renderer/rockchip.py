@@ -1218,8 +1218,8 @@ def _unroll_reduce(ctx:tuple[bool,bool], u:UOp) -> UOp:
   precise,half_storage=ctx
   reduce_op,ranges=u.arg[0],list(u.src[1:])
   if reduce_op not in (Ops.ADD,Ops.MAX,Ops.MUL) or not ranges or any(r.op not in (Ops.RANGE,Ops.SPECIAL) for r in ranges): raise _RKGenericReject  # noqa: E501
-  blocks=_static_blocks(tuple(ranges),*ranges,limit=_MAX_GENERIC_UNROLL,dependencies=False)
-  if math.prod(int(axis.src[0].arg) for axis in ranges)*len(u.src[0].toposort())>_MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
+  # Domain cardinality owns both the iteration limit and the body-expansion budget, before any coordinate evaluation.
+  blocks=_static_blocks(tuple(ranges),*ranges,limit=min(_MAX_GENERIC_UNROLL,_MAX_GENERIC_EXPANDED_NODES//len(u.src[0].toposort())),dependencies=False)  # noqa: E501
   terms=[UOp.const(identity_element(reduce_op,u.dtype),u.dtype)]
   # Consume bounded coordinate blocks in the same row order, without assembling full columns first.
   terms.extend(u.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for block in blocks for values in zip(*block))  # noqa: E501
