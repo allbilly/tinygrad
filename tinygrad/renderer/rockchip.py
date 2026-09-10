@@ -267,7 +267,6 @@ def _static_ranges(u:UOp) -> tuple[UOp, ...]|None:
   return None if any(x is None for x in sources) else tuple(dict.fromkeys(itertools.chain.from_iterable(typing_cast(tuple[tuple[UOp,...],...],sources))))  # noqa: E501
 
 def _is_static_expr(u:UOp) -> bool: return _static_ranges(u) is not None
-def _index_ranges(u:UOp) -> list[UOp]: return list(_static_ranges(u) or ())
 
 RKScalar = int|float|bool; RKStatic = RKScalar|tuple[RKScalar,...]
 
@@ -532,9 +531,9 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
     factors=tuple(map(_strip_cast,_iter_binary(_strip_cast(term),Ops.MUL,plain=True))); constants=tuple(node for node in factors if node.op is Ops.CONST); loads=tuple(node for node in factors if node.op is not Ops.CONST); weight=scale*math.prod(float(node.arg) for node in constants)  # noqa: E501
     if len(constants)>2 or len(constants)>1 and term.dtype.scalar() is not dtypes.float or len(loads)>2 or not exact_scale or any(float_to_fp16(float(node.arg))!=float(node.arg) for node in constants) or not math.isfinite(weight) or len(loads)<2 and float_to_fp16(weight)!=weight or len(loads)==2 and weight!=1.0 or out.dtype.scalar() is dtypes.float and rows==1 and len(loads)==1 and weight==1.0 or any(load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX or _root_param(load.src[0]) is None or len(load.src)>1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg)!=0.0 or math.copysign(1.0,float(load.src[1].arg))<0.0) for load in loads): return False  # noqa: E501
     parsed.append((loads[0] if loads else None,loads[1] if len(loads)>1 else None,weight))
-  load_axes={load:frozenset((*_index_ranges(load.src[0].src[1]),*(() if len(load.src)<3 else _index_ranges(load.src[2]))))-frozenset(ranges) for pair in parsed for load in pair[:2] if load is not None}  # noqa: E501
+  load_axes={load:frozenset((*(_static_ranges(load.src[0].src[1]) or ()),*(() if len(load.src)<3 else (_static_ranges(load.src[2]) or ()))))-frozenset(ranges) for pair in parsed for load in pair[:2] if load is not None}  # noqa: E501
   load_pairs=tuple(typing_cast(tuple[UOp,UOp],pair[:2]) for pair in parsed) if all(pair[0] is not None and pair[1] is not None for pair in parsed) else ()  # noqa: E501
-  all_axes=frozenset(_index_ranges(out_index))
+  all_axes=frozenset(_static_ranges(out_index) or ())
   def align(row_axes:frozenset[UOp]) -> tuple[tuple[UOp|None,UOp|None,float],...]:
     # Each factor may vary along only one side of the contraction; constants can occupy either side.
     # Candidate admission below requires every term; an incomplete orientation must never be emitted.
@@ -633,7 +632,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   while (nested_value:=next((node for node in body.toposort() if node.op is Ops.REDUCE),None)) is not None:
     value=nested_value; body=value.src[0]; ranges=list(value.src[1:])
   # Materialize precisely the body's external axes, preserving consumer order where they overlap.
-  axes=tuple(dict.fromkeys(axis for axis in (*_index_ranges(out_index),*body.toposort()) if axis.op in (Ops.RANGE,Ops.SPECIAL) and axis not in ranges and axis in body.toposort()))  # noqa: E501
+  axes=tuple(dict.fromkeys(axis for axis in (*(_static_ranges(out_index) or ()),*body.toposort()) if axis.op in (Ops.RANGE,Ops.SPECIAL) and axis not in ranges and axis in body.toposort()))  # noqa: E501
   if not ranges or any(axis.op not in (Ops.RANGE,Ops.SPECIAL) or not axis.src or axis.src[0].op is not Ops.CONST for axis in (*ranges,*axes)): return False  # noqa: E501
   shape=tuple(int(axis.src[0].arg) for axis in axes); rows=math.prod(shape)
   if rows<1: return False
@@ -840,7 +839,7 @@ class RKContext:
 
   def _static(self, u:UOp) -> UOp:
     dtype, layout = u.dtype.scalar(), self._layout(u.dtype.scalar())
-    if not _index_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{})),dtype))
+    if not _static_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{})),dtype))
     values = _static_values(self.out_index,u,self.count,_storage_bits if layout is dtypes.half else int)
     if dtype is dtypes.int and layout is dtypes.int16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
     encoded = values if layout is dtypes.half else tuple(map(operator.and_,values,itertools.repeat(0xffffffff if layout is dtypes.int else 0xffff)))
@@ -1241,7 +1240,7 @@ _pm_unroll_static_reduce=PatternMatcher([(UPat(Ops.REDUCE,name="u"),_unroll_redu
 def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
   """Interpret canonical static REDUCE structure; horizontal reductions retain their specified order."""
   # Rewrite original children before their parent, without traversing the replacement recipes a second time.
-  result=(expanded:=graph_rewrite(root,_pm_unroll_static_reduce,ctx=(precise,root.dtype.scalar() is dtypes.half),walk=True,enter_calls=True)).substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}))) for u in expanded.toposort() if _is_static_expr(u) and not _index_ranges(u)},walk=True)  # noqa: E501
+  result=(expanded:=graph_rewrite(root,_pm_unroll_static_reduce,ctx=(precise,root.dtype.scalar() is dtypes.half),walk=True,enter_calls=True)).substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}))) for u in expanded.toposort() if _is_static_expr(u) and not _static_ranges(u)},walk=True)  # noqa: E501
   return result.substitute({u:u.replace(src=(u.src[0],u.src[1].simplify(),*u.src[2:])) for u in result.toposort() if u.op is Ops.INDEX and len(u.src)>1},walk=True)  # noqa: E501
 
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKImage|None:
@@ -1268,7 +1267,7 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   if (output:=local_output) is None or len(output[0].src)!=2: raise _RKGenericReject("output store")
   if output[2]<=0: return True
   if not ((affine:=typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(output[3]))) is not None and affine[0] == 0 and
-          set(affine[1]) == set(_index_ranges(output[3])) and _affine_output_axes(affine, output[2]) is not None) and \
+          set(affine[1]) == set(_static_ranges(output[3]) or ()) and _affine_output_axes(affine, output[2]) is not None) and \
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
   root=_finite_int_max_neutrals(_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4])
   root = _expand_math_uops(root) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
