@@ -271,10 +271,10 @@ def _is_static_expr(u:UOp) -> bool: return _static_ranges(u) is not None
 RKScalar = int|float|bool; RKStatic = RKScalar|tuple[RKScalar,...]
 
 def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
-  scalar,commit=dtype.scalar(),truncate.get(dtype.scalar())
+  scalar,commit=dtype.scalar(),truncate.get(dtype.scalar(),lambda value:value)
   if isinstance(value,tuple) and scalar in (dtypes.half,dtypes.float) and not any(isinstance(item,float) and math.isnan(item) for item in value) and all(not isinstance(item,int) or item.bit_length()<1024 for item in value) and (scalar is dtypes.float or all(not math.isfinite(float(item)) or abs(float(item))<65520 for item in value)): return typing_cast(tuple[RKScalar,...],struct.unpack(f"{len(value)}{scalar.fmt}",struct.pack(f"{len(value)}{scalar.fmt}",*value)))  # noqa: E501
-  def lane(value:RKScalar) -> RKScalar: value=typing_cast(RKScalar,scalar.const(value)); return value if commit is None else commit(value)  # noqa: E702
-  return tuple(map(lane,value)) if isinstance(value,tuple) else lane(value)
+  # Coerce before truncating: DType.const canonicalizes NaNs and preserves signed zero.
+  return typing_cast(RKStatic,tuple(map(commit,map(scalar.const,value))) if isinstance(value,tuple) else commit(scalar.const(value)))
 
 def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
   if node.op in (Ops.CONST,Ops.CAST): return _commit_static(node.dtype,typing_cast(RKScalar,node.arg) if node.op is Ops.CONST else operands[0])  # noqa: E501
