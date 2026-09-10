@@ -31,12 +31,12 @@ def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|N
   low,high=(gather.base+sum(fn((limit-1)*stride,0) for _,limit,stride in axes) for fn in (min,max))
   if gather.count%periods[-1] or any(divisor%period for period,(divisor,_,_) in zip(periods,axes[1:])) or \
      low<0 or high>=len(src): return None
-  def block(index:int, base:int) -> array.array:
+  def block(index:int, base:int) -> bytes|bytearray:
     divisor,limit,stride=axes[index]
-    if index==0 and divisor==1: return array.array(code,src.mv[base::stride][:limit].tobytes())
-    chunks=(array.array(code,[value]) for value in src.mv[base::stride][:limit]) if index==0 else (block(index-1,base+i*stride) for i in range(limit))  # noqa: E501
-    return functools.reduce(operator.iadd,(chunk*(divisor//(periods[index-1] if index else 1)) for chunk in chunks),array.array(code))
-  return block(len(axes)-1,gather.base)*(gather.count//periods[-1])
+    if index==0 and divisor==1: return src.mv[base::stride][:limit].tobytes()
+    # Stream byte blocks; joining them would retain one allocation per repeated source word.
+    return functools.reduce(operator.iadd,((src.mv[base+i*stride:base+i*stride+1].tobytes() if index==0 else block(index-1,base+i*stride))*(divisor//(periods[index-1] if index else 1)) for i in range(limit)),bytearray())  # noqa: E501
+  return array.array(code,block(len(axes)-1,gather.base)*(gather.count//periods[-1]))
 
 def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBufferKind,int],HCQBuffer]) -> None:
   """Apply host-addressed raw-lane movement; all numeric tensor operations remain on the NPU."""

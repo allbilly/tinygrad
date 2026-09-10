@@ -370,7 +370,8 @@ def _linear_index(u:UOp, divided:bool=False, *, opaque:bool=False) -> tuple[int,
   if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL) or opaque and u.arg is not None: return (0,{u:1}) if opaque else None
   if (lhs:=_linear_index(u.src[0],divided,opaque=opaque)) is None or (rhs:=_linear_index(u.src[1],divided,opaque=opaque)) is None or u.op is Ops.MUL and lhs[1] and rhs[1]: return (0,{u:1}) if opaque else None  # noqa: E501
   if u.op is Ops.MUL: scale,affine=(lhs[0],rhs) if not lhs[1] else (rhs[0],lhs); return affine[0]*scale,{key:coefficient*scale for key,coefficient in affine[1].items() if not opaque or coefficient*scale}  # noqa: E701,E702,E501
-  sign=-1 if u.op is Ops.SUB else 1; return lhs[0]+sign*rhs[0],{key:value for key in lhs[1].keys()|rhs[1].keys() if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}  # noqa: E702,E501
+  # Keep first-seen term order: a set union makes byte-reconstruction schedules depend on UOp allocation identities.
+  sign=-1 if u.op is Ops.SUB else 1; return lhs[0]+sign*rhs[0],{key:value for key in {**lhs[1],**rhs[1]} if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}  # noqa: E702,E501
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   # Reserve -1 for an inactive lane; an active negative address must still reject the plan.
