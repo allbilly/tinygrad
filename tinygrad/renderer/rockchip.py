@@ -403,7 +403,7 @@ def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bi
   gate,fill_bits=load.src[2] if len(load.src)>2 else None,fill_bits if fill_bits is not None else _storage_bits(load.src[1].arg if len(load.src)>1 else 0) if dtype is dtypes.half else 0  # noqa: E501
   try:
     gather=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits)
-    _validate_gather_bounds(gather,int(param.src[0].arg)); return gather._replace(base=0,axes=(),offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count)) if require_offsets else gather  # noqa: E501
+    _validate_gather_bounds(gather,int(param.src[0].arg)); return gather._replace(base=0,axes=(),offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count)) if require_offsets and not gather.offsets else gather  # noqa: E501
   except _RKGenericReject: return None
 
 def _relu_operand(u:UOp) -> UOp|None:

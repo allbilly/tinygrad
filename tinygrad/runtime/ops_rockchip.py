@@ -174,11 +174,9 @@ class RockchipProgram(Program['RockchipDevice']):
     arena=self.dev._ensure_buffer("scratch",self._scratch_offsets[-1],self._scratch_offsets[-1]) if self._scratch_offsets[-1] else None
     scratch=tuple(arena.offset(offset,size) for offset,size in zip(self._scratch_offsets,self.image.scratch)) if arena is not None else ()
     def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
-      if kind is RKBufferKind.ARG:
-        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
-        return bufs[index]
-      if index >= len(scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
-      return scratch[index]
+      storage,label,missing=(bufs,"argument","bound") if kind is RKBufferKind.ARG else (scratch,"scratch","declared")
+      if index >= len(storage): raise RuntimeError(f"RKImage {label} slot {index} is not {missing}")
+      return storage[index]
     self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather)),len(self.image.program))
     _apply_gathers(self.image.program[:cursor],buffer)  # type: ignore[arg-type]
