@@ -1092,15 +1092,14 @@ class RKContext:
       return self.lower(source.alu(Ops.MAX,UOp.const(0.0,dtypes.half)).cast(dtypes.uchar))
     # A static selection produces one physical value, including when another UOp consumes it.
     if u.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.int,dtypes.uint) and _is_static_expr(u.src[0]):
-      dtype,leaves=u.dtype.scalar(),list[UOp]()
-      def route(node:UOp) -> UOp:
-        if node.op is Ops.WHERE and _is_static_expr(node.src[0]): return node.src[0].where(route(node.src[1]),route(node.src[2]))
-        leaves.append(node)
-        return UOp.const(len(leaves)-1,dtypes.int)
-      # Leaf IDs are compile-time data. Sort active occurrences before deduplicating their physical values.
-      markers=_static_values(self.out_index,route(u),self.count,int)
+      dtype,leaf_ids,routes=u.dtype.scalar(),dict[UOp,int](),dict[UOp,UOp]()
+      for node in u.toposort(gate=lambda node:node.op is Ops.WHERE and node.dtype.scalar() is not dtypes.bool and _is_static_expr(node.src[0])):
+        routes[node]=node.src[0].where(*(routes[arm] if arm in routes else UOp.const(leaf_ids.setdefault(arm,len(leaf_ids)),dtypes.int) for arm in node.src[1:]))  # noqa: E501
+      leaves=tuple(leaf_ids)
+      # Leaf IDs are compile-time data. Share value branches; original Boolean conditions remain opaque.
+      markers=_static_values(self.out_index,routes[u],self.count,int)
       result=self._scratch(self._layout(dtype),u=u); itemsize,commits=result.dtype.itemsize,list[RKGather]()
-      for leaf in dict.fromkeys(leaves[marker] for marker in sorted(set(markers))):
+      for leaf in (leaves[marker] for marker in sorted(set(markers))):
         value=self._operand(leaf,dtype,u is self.root and dtype is dtypes.half and leaf.op is Ops.LOAD and (param:=_root_param(leaf.src[0])) is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg)<self.count)  # noqa: E501
         if value.dtype is not result.dtype: raise _RKGenericReject("static selection carrier")
         offsets=tuple(lane+value.arg.addend//itemsize if leaves[marker] is leaf else -1 for lane,marker in enumerate(markers))
