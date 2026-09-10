@@ -997,9 +997,8 @@ class RKContext:
       lhs,rhs=(bits(source) for source in node.src)
       return tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
         for left,right in zip(lhs,rhs))
-    planes=bits(u)
-    if len(planes)!=layout.itemsize*8: raise _RKGenericReject
-    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(planes,8))  # noqa: E501
+    # Expansion always produces whole bytes; _pack_bytes validates their count against the destination layout.
+    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(bits(u),8))  # noqa: E501
     # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
     # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
     # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
