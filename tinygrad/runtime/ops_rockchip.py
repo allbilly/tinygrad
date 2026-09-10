@@ -206,11 +206,9 @@ class RockchipDevice(Compiled):
     if self._poisoned: raise RuntimeError("RKNPU is unavailable after a submit timeout; platform NPU reset or power cycle required")
   def _ensure_buffer(self, attr:str, size:int, minimum:int, flags:int=0) -> HCQBuffer:
     if (buf:=self._buffers.get(attr)) is None or buf.size < size:
-      new = self._gpu_alloc(max(size, minimum), flags)
-      self._buffers[attr] = new
+      self._buffers[attr] = self._gpu_alloc(max(size, minimum), flags)
       if buf is not None: self._gpu_free(buf)
-      return new
-    return buf
+    return self._buffers[attr]
   def _replace_submit_buffers(self, cmd_size:int, task_size:int) -> tuple[HCQBuffer,HCQBuffer]:
     old=tuple(self._buffers.get(name) for name in ("cmd","task")); fresh=(self._gpu_alloc(max(cmd_size,_CMD_BUF_MIN)),self._gpu_alloc(max(task_size,_TASK_BUF_MIN),rk.RKNPU_MEM_KERNEL_MAPPING))  # noqa: E501,E702
     self._buffers.update(zip(("cmd","task"),fresh))
