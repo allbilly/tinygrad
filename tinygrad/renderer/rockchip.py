@@ -944,7 +944,7 @@ class RKContext:
   def _convert(self, u:UOp|None, source:UOp, target:DType, barrier:bool=False, dst:RKArg|None=None) -> UOp:
     """Cross one physical carrier boundary using the native DPU conversion stage."""
     if source.dtype is target: return source
-    pair, cfg = (source.dtype,target), _EW_CFG[Ops.MAX]
+    pair, cfg = (source.dtype,target), _EW_CFG[Ops.ADD if source.dtype in (dtypes.float,dtypes.int16) else Ops.MAX]
     result=self._carrier(dst,target) if dst is not None else self._scratch(target,u=None if target is dtypes.half else u)
     # Integer narrowing keeps the low two bytes; the source arithmetic was already evaluated on the NPU.
     if pair==(dtypes.int,dtypes.int16):
@@ -952,19 +952,19 @@ class RKContext:
     if (mode:={(dtypes.float,dtypes.half):RKEWMode.FLOAT_TO_HALF,(dtypes.half,dtypes.float):RKEWMode.HALF_TO_FLOAT,
                (dtypes.half,dtypes.int):RKEWMode.HALF_TO_INT32,(dtypes.int,dtypes.half):RKEWMode.INT32_TO_HALF,
                (dtypes.half,dtypes.int16):RKEWMode.HALF_TO_INT16,(dtypes.int16,dtypes.int):RKEWMode.INT16_TO_INT32}.get(pair)) is None: raise _RKGenericReject(f"convert {source.dtype}->{target}")  # noqa: E501
-    if mode not in (RKEWMode.HALF_TO_INT16,RKEWMode.INT16_TO_INT32):
-      if target is dtypes.float and dst is None: raise _RKGenericReject("nonterminal FP32 carrier")
-      stride=64 if dtypes.int in pair else 16; atoms=tuple((start,min(4,self.count-start),start//4*stride) for start in range(0,self.count,4))
-      packed=self._scratch(dtypes.half if source.dtype is dtypes.float else source.dtype,len(atoms)*stride); tile=source if source.dtype is dtypes.float else packed  # noqa: E501
-      if source.dtype is dtypes.float:
-        zero=self._scratch(dtypes.float,16); self.program.append(RKGather(None,zero.arg,4,values=(0,)*4,itemsize=4)); cfg=_EW_CFG[Ops.ADD]
-      else: self.program.extend(RKGather(source.arg._replace(addend=source.arg.addend+start*source.dtype.itemsize),packed.arg._replace(addend=offset),count,axes=((1,count,1),),itemsize=source.dtype.itemsize) for start,count,offset in atoms)  # noqa: E501
-      self.program.extend(RKEWOp(result.arg._replace(addend=result.arg.addend+start*4) if target is dtypes.float else packed.arg._replace(addend=offset),  # noqa: E501
-        (arg:=tile.arg._replace(addend=tile.arg.addend+offset)),zero.arg if source.dtype is dtypes.float else arg,count,cfg,mode=mode) for start,count,offset in atoms)  # noqa: E501
-      if target is not dtypes.float: self.program.append(RKGather(packed.arg,result.arg,self.count,axes=((4,len(atoms),stride//target.itemsize),(1,4,1)),itemsize=target.itemsize))  # noqa: E501
-      return result
-    rhs=self._constant(UOp.const(0,dtypes.int16)).arg if mode is RKEWMode.INT16_TO_INT32 else source.arg
-    self.program.append(RKEWOp(result.arg,source.arg,rhs,self.count,_EW_CFG[Ops.ADD] if mode is RKEWMode.INT16_TO_INT32 else cfg,barrier and pair==(dtypes.half,dtypes.int16),mode)); return result  # noqa: E501
+    wide=mode not in (RKEWMode.HALF_TO_INT16,RKEWMode.INT16_TO_INT32)
+    if target is dtypes.float and dst is None: raise _RKGenericReject("nonterminal FP32 carrier")
+    # Native INT16 conversions are one tile; packed conversions retain their four-lane physical atoms.
+    stride=64 if dtypes.int in pair else 16; atoms=tuple((start,min(4,self.count-start),start//4*stride) for start in range(0,self.count,4)) if wide else ((0,self.count,0),)  # noqa: E501
+    packed=self._scratch(dtypes.half if source.dtype is dtypes.float else source.dtype,len(atoms)*stride) if wide else result; tile=source if not wide or source.dtype is dtypes.float else packed  # noqa: E501
+    if source.dtype is dtypes.float:
+      rhs=self._scratch(dtypes.float,16); self.program.append(RKGather(None,rhs.arg,4,values=(0,)*4,itemsize=4))
+    else: rhs=self._constant(UOp.const(0,dtypes.int16)) if mode is RKEWMode.INT16_TO_INT32 else tile
+    if wide and source.dtype is not dtypes.float: self.program.extend(RKGather(source.arg._replace(addend=source.arg.addend+start*source.dtype.itemsize),packed.arg._replace(addend=offset),count,axes=((1,count,1),),itemsize=source.dtype.itemsize) for start,count,offset in atoms)  # noqa: E501
+    self.program.extend(RKEWOp(result.arg._replace(addend=result.arg.addend+start*4) if target is dtypes.float else packed.arg._replace(addend=packed.arg.addend+offset),  # noqa: E501
+      (arg:=tile.arg._replace(addend=tile.arg.addend+offset)),rhs.arg if cfg==_EW_CFG[Ops.ADD] else arg,count,cfg,barrier and mode is RKEWMode.HALF_TO_INT16,mode) for start,count,offset in atoms)  # noqa: E501
+    if wide and target is not dtypes.float: self.program.append(RKGather(packed.arg,result.arg,self.count,axes=((4,len(atoms),stride//target.itemsize),(1,4,1)),itemsize=target.itemsize))  # noqa: E501
+    return result
 
   def _integer_bits(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
