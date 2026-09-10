@@ -916,20 +916,6 @@ class RKContext:
   def _lower_recipe(self, owner:UOp, recipe:UOp) -> UOp:
     self.recipe_owners[recipe]=owner; return self.lower(recipe)
 
-  def _pack_bits(self, bits:Iterable[UOp], layout:DType, u:UOp) -> UOp:
-    planes=tuple(bits)
-    if len(planes)!=layout.itemsize*8: raise _RKGenericReject
-    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(planes,8))  # noqa: E501
-    # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
-    # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
-    # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
-    affines=(typing_cast(tuple[int,dict[UOp,int]],_linear_index(part,opaque=True)) for part in raw)
-    return self._pack_bytes(tuple(self.lower(part if
-      abs(offset)+sum(abs(scale)*(255 if term.op is Ops.NOOP else 1) for term,scale in factors.items())>32767 else _fold_static_terms(Ops.ADD,dtypes.int16,  # noqa: E501
-      [term if scale==1 else term.alu(Ops.MUL,term.const_like(scale)) for term,scale in factors.items()] +
-      ([UOp.const(offset,dtypes.int16)] if offset or not factors else []),False))
-      for part,(offset,factors) in zip(raw,affines)),layout,u=u)
-
   def _alu(self, u:UOp) -> UOp:
     # Materialize the reciprocal's denominator first, then reuse ordinary division with the original output owner.
     if u.op is Ops.RECIPROCAL: return self._lower_recipe(self.recipe_owners.get(u,u),u.replace(op=Ops.FDIV,src=(UOp.const(1.0,dtypes.half),self.lower(u.src[0]))))  # noqa: E501
@@ -1010,7 +996,18 @@ class RKContext:
       lhs,rhs=(bits(source) for source in node.src)
       return tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
         for left,right in zip(lhs,rhs))
-    return self._pack_bits(bits(u),layout,u)
+    planes=bits(u)
+    if len(planes)!=layout.itemsize*8: raise _RKGenericReject
+    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(planes,8))  # noqa: E501
+    # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
+    # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
+    # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
+    affines=(typing_cast(tuple[int,dict[UOp,int]],_linear_index(part,opaque=True)) for part in raw)
+    return self._pack_bytes(tuple(self.lower(part if
+      abs(offset)+sum(abs(scale)*(255 if term.op is Ops.NOOP else 1) for term,scale in factors.items())>32767 else _fold_static_terms(Ops.ADD,dtypes.int16,  # noqa: E501
+      [term if scale==1 else term.alu(Ops.MUL,term.const_like(scale)) for term,scale in factors.items()] +
+      ([UOp.const(offset,dtypes.int16)] if offset or not factors else []),False))
+      for part,(offset,factors) in zip(raw,affines)),layout,u=u)
 
   def _compare(self, u:UOp) -> UOp:
     if len(u.src) != 2: raise _RKGenericReject
