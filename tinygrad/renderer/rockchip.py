@@ -137,9 +137,8 @@ def encode_image(image:RKImage, *, validate:bool=True) -> bytes:
 def decode_image(blob:bytes) -> RKImage:
   try:
     if blob[:4] != RKIMAGE_MAGIC or struct.unpack_from("<H", blob, 4)[0] != RKIMAGE_VERSION: raise ValueError
-    codec=zlib.decompressobj(); payload=codec.decompress(blob[6:])
-    stream=io.BytesIO(payload)
-    if codec.unused_data or not codec.eof or type(image:=pickle.load(stream)) is not RKImage or stream.tell()!=len(payload): raise ValueError
+    codec=zlib.decompressobj(); stream=io.BytesIO(codec.decompress(blob[6:]))
+    if codec.unused_data or not codec.eof or type(image:=pickle.load(stream)) is not RKImage or stream.read(1): raise ValueError
     _validate_image(image); return image
   except Exception: raise ValueError("invalid RKImage") from None
 
