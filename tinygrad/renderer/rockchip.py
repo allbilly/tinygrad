@@ -615,10 +615,9 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
   block=8 if rows==1 else round_up(rows,8); groups=lanes if rows==1 else lanes//block; source_block=1 if rows==1 else block
   size=1<<(groups-1).bit_length(); current,target=(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(2)); plan.scratch.extend((_scratch_bytes(size*block),)*2); neutral=0 if cfg==_EW_CFG[Ops.ADD] else (1 if int16 else _storage_bits(1)) if cfg==_EW_CFG[Ops.MUL] else _storage_bits(dtypes.int16.min,dtypes.int16) if int16 else _storage_bits(-math.inf); first=barrier and not int16  # noqa: E501
   # Encode bit reversal with affine axes, padding an existing scratch source when its group count is not a power of two.
-  if size==groups or source.kind is RKBufferKind.SCRATCH:
-    if groups<size: plan.scratch[source.index]=max(plan.scratch[source.index],source.addend+size*source_block*2); plan.program.append(RKGather(None,source._replace(addend=source.addend+groups*source_block*2),(size-groups)*source_block,values=(neutral,)))  # noqa: E501
-    plan.program.append(RKGather(source,current,size*source_block,axes=(((1,source_block,1),) if source_block>1 else ())+tuple((source_block<<bit,2,source_block<<(size.bit_length()-2-bit)) for bit in range(size.bit_length()-1)),fill_bits=neutral,dst_stride=block if rows==1 else 1))  # noqa: E501
-  else: offsets=tuple(index if (index:=int(f"{lane:0{size.bit_length()-1}b}"[::-1],2))<groups else -1 for lane in range(size)); offsets=offsets if source_block==1 else tuple(index*source_block+row if index>=0 else -1 for index in offsets for row in range(source_block)); plan.program.append(RKGather(source,current,len(offsets),offsets=offsets,fill_bits=neutral,dst_stride=block if rows==1 else 1))  # noqa: E501
+  if groups<size and source.kind is RKBufferKind.SCRATCH: plan.scratch[source.index]=max(plan.scratch[source.index],source.addend+size*source_block*2); plan.program.append(RKGather(None,source._replace(addend=source.addend+groups*source_block*2),(size-groups)*source_block,values=(neutral,)))  # noqa: E501
+  offsets=tuple(index if (index:=int(f"{lane:0{size.bit_length()-1}b}"[::-1],2))<groups else -1 for lane in range(size)) if groups<size and source.kind is not RKBufferKind.SCRATCH else (); offsets=offsets if source_block==1 else tuple(index*source_block+row if index>=0 else -1 for index in offsets for row in range(source_block))  # noqa: E501
+  plan.program.append(RKGather(source,current,size*source_block,offsets=offsets,axes=() if offsets else (((1,source_block,1),) if source_block>1 else ())+tuple((source_block<<bit,2,source_block<<(size.bit_length()-2-bit)) for bit in range(size.bit_length()-1)),fill_bits=neutral,dst_stride=block if rows==1 else 1))  # noqa: E501
   while size>1: size//=2; count=size*block; plan.program.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,submit_barrier=first,mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF)); first=False; current,target=target,current  # noqa: E501
   return current
 
@@ -977,27 +976,28 @@ class RKContext:
     if self.count<1 or layout is dtypes.int and self.count*4>_MAX_EW_ELEMS_FP16: raise _RKGenericReject
     # Fuse the semantic bitwise subgraph before allocating carriers: AND=ab, OR=a+b-ab, XOR=a+b-2ab.
     # Shifts permute these same planes, using five masked amount bits and sign extension only for signed SHR.
-    @functools.cache
-    def bits(node:UOp) -> tuple[UOp,...]:
-      if node.op is Ops.CONST: return tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8))
-      if node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype:
-        return tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(self.lower(node),copy_wide=False))))
+    planes:dict[UOp,tuple[UOp,...]]={}
+    # Seed opaque inputs in operand order; only unseeded fusion nodes enter postorder.
+    def visit(node:UOp) -> bool:
+      if node not in planes and (node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype): planes[node]=tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8)) if node.op is Ops.CONST else tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(self.lower(node),copy_wide=False))))  # noqa: E501
+      return node not in planes
+    for node in u.toposort(gate=visit):
       if node.op in (Ops.SHL,Ops.SHR):
         if node.dtype.scalar() not in (dtypes.int,dtypes.uint) or node.src[1].dtype.scalar() not in (dtypes.int,dtypes.uint) or self.int_layout is not dtypes.int or 16*((self.count*2+63)&-64)>_MAX_EW_ELEMS_FP16:  # noqa: E501
           raise _RKGenericReject
-        current=bits(node.src[0]); masks=() if node.src[1].op is Ops.CONST else bits(node.src[1])[:5]
+        current=planes[node.src[0]]; masks=() if node.src[1].op is Ops.CONST else planes[node.src[1]][:5]
         for bit,amount in enumerate((1,2,4,8,16)):
           if not masks and not (int(node.src[1].arg)&amount): continue
           fill=current[31] if node.op is Ops.SHR and node.dtype.scalar() is dtypes.int else current[0].const_like(0)
           shifted=(fill,)*amount+current[:-amount] if node.op is Ops.SHL else current[amount:]+(fill,)*amount
           current=shifted if not masks else tuple(old.alu(Ops.ADD,masks[bit].alu(Ops.MUL,new.alu(Ops.SUB,old)))
             for old,new in zip(current,shifted))
-        return current
-      lhs,rhs=(bits(source) for source in node.src)
-      return tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
+        planes[node]=current; continue
+      lhs,rhs=(planes[source] for source in node.src)
+      planes[node]=tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
         for left,right in zip(lhs,rhs))
     # Expansion always produces whole bytes; _pack_bytes validates their count against the destination layout.
-    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(bits(u),8))  # noqa: E501
+    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(planes[u],8))  # noqa: E501
     # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
     # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
     # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
