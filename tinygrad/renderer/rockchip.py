@@ -198,10 +198,6 @@ def emit_cmac_stage(op:RKCMAC, address:Callable[[RKArg],int]) -> tuple[int, ...]
     (D,rk.REG_DPU_EW_CFG,0x383), (D,rk.REG_DPU_OUT_CVT_SCALE,(1<<16)|1 if op.out_fp16 else 0), (D,rk.REG_DPU_SURFACE_ADD,4<<4))
   return tuple(_cmd(*reg) for reg in regs)
 
-def _raw_gather(source:RKArg, out_slot:int, count:int, stride:int=2, itemsize:int=1, dst_stride:int=1, dst_addend:int=0, offsets:tuple[int, ...]=()) -> RKGather:  # noqa: E501
-  return RKGather(source,RKArg(RKBufferKind.ARG,out_slot),count,axes=() if offsets else ((1,count,stride),),offsets=offsets,
-                  dst_stride=dst_stride,dst_addend=dst_addend,itemsize=itemsize)
-
 @functools.lru_cache(maxsize=256)
 def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple[tuple[int, ...], int]:
   """Emit either a self-initializing DPU EW body or a lean FP16 continuation body."""
@@ -1151,7 +1147,8 @@ class RKContext:
     if result.arg == self.out: return
     # BITCAST only changes the carrier interpretation; terminal storage must retain its raw payload.
     if dtype in (dtypes.half,dtypes.int16) and self.root.op is not Ops.BITCAST: self._emit(self._carrier(self.out,expected),result,result,_EW_CFG[Ops.MAX]); return  # noqa: E501
-    self.program.append(_raw_gather(result.arg,self.out_param.arg.slot,self.count,stride=2 if dtype.itemsize==1 else 1,itemsize=dtype.itemsize))  # noqa: E501
+    self.program.append(RKGather(result.arg,RKArg(RKBufferKind.ARG,self.out_param.arg.slot),self.count,
+      axes=((1,self.count,2 if dtype.itemsize==1 else 1),),itemsize=dtype.itemsize))
 
   def _is_static_value(self, u:UOp) -> bool:
     return u.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.int,dtypes.uint,dtypes.bool,dtypes.uchar) and u in self.semantic_nodes and _is_static_expr(u) and not any(isinstance(node.arg,str) and node.arg.startswith("rockchip_") for node in u.toposort())  # noqa: E501
