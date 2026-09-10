@@ -1133,7 +1133,9 @@ class RKContext:
     if dtype in (dtypes.int16,dtypes.uint) and source.dtype is not self._layout(dtype) and (source.dtype,dtype)!=(dtypes.int,dtypes.int16) and not ((source.dtype,dtype)==(dtypes.half,dtypes.int16) and u.arg==_NATIVE_HALF_TO_INT16): raise _RKGenericReject  # noqa: E501
     return self._convert(u,source,self._layout(dtype),dtype in (dtypes.bool,dtypes.uchar) or u.arg==_NATIVE_HALF_TO_INT16)
 
-  def _finish_value(self, result:UOp, dtype:DType) -> None:
+  def _finish_value(self, result:UOp, dtype:DType, materialize:bool=False) -> None:
+    """Bind an exact temporary carrier or commit its value to the declared output storage."""
+    if materialize and dtype in (dtypes.half,dtypes.int16,dtypes.int) and result.dtype is dtype and result.arg!=self.out: self.plan.bindings[self.out.index]=result.arg; return  # noqa: E501
     expected=dtypes.int if dtype is dtypes.int else self._layout(dtype)
     if dtype is dtypes.int and result.dtype is dtypes.int16: result=self._convert(self.root,result,expected)
     if result.dtype is not expected: raise _RKGenericReject
@@ -1182,9 +1184,7 @@ class RKContext:
         elif not self._is_static_value(node) and ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and node not in raw_predicate_inputs and all(load in typed_loads for load in loads))): pending.append(node)  # noqa: E501
       pending.extend(node for node in nodes if node.dtype.scalar() is dtypes.bool and node.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR) and not self._is_static_value(node))  # noqa: E501
     for node in (*pending,self.root): result=self.lower(node)
-    if materialize and dtype in (dtypes.half,dtypes.int16,dtypes.int) and result.dtype is dtype and result.arg!=self.out:
-      self.plan.bindings[self.out.index]=result.arg
-    else: self._finish_value(result,dtype)
+    self._finish_value(result,dtype,materialize)
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
@@ -1219,10 +1219,11 @@ def _unroll_reduce(ctx:tuple[bool,bool], u:UOp) -> UOp:
   precise,half_storage=ctx
   reduce_op,ranges=u.arg[0],list(u.src[1:])
   if reduce_op not in (Ops.ADD,Ops.MAX,Ops.MUL) or not ranges or any(r.op not in (Ops.RANGE,Ops.SPECIAL) for r in ranges): raise _RKGenericReject  # noqa: E501
-  lanes=_static_lanes(tuple(ranges),*ranges,limit=_MAX_GENERIC_UNROLL,dependencies=False)
-  if len(lanes[0])*len(u.src[0].toposort())>_MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
+  blocks=_static_blocks(tuple(ranges),*ranges,limit=_MAX_GENERIC_UNROLL,dependencies=False)
+  if math.prod(int(axis.src[0].arg) for axis in ranges)*len(u.src[0].toposort())>_MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject
   terms=[UOp.const(identity_element(reduce_op,u.dtype),u.dtype)]
-  terms.extend(u.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for values in zip(*lanes))
+  # Consume bounded coordinate blocks in the same row order, without assembling full columns first.
+  terms.extend(u.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for block in blocks for values in zip(*block))  # noqa: E501
   fold_dtype=dtypes.half if half_storage and reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float else u.dtype
   if fold_dtype is dtypes.half and u.dtype.scalar() is dtypes.float: terms=[_fp32_expr_to_half(term) for term in terms]
   nonzero=[term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)] if reduce_op is Ops.ADD and fold_dtype.scalar() is dtypes.half else []  # noqa: E501
