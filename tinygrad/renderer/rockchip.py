@@ -492,14 +492,14 @@ def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
   """Normalize a row-reused linear expression to indexed loads, retaining its rounded coefficient matrix."""
   store,out,rows,out_index,root=output; dense=_dense_ranges(out_index,rows); one=UOp.const(1.0,dtypes.float)
   if dense is None or len(dense)<2 or any(isinstance(op,RKCMAC) for op in plan.program): return False
-  def expand(node:UOp,scale:UOp) -> tuple[tuple[UOp,UOp],...]:
+  def expand(node:UOp,scale:UOp) -> Iterable[tuple[UOp,UOp]]:
     node=_strip_cast(node)
-    if node.op in (Ops.ADD,Ops.SUB): return expand(node.src[0],scale)+expand(node.src[1],scale if node.op is Ops.ADD else scale.alu(Ops.MUL,one.const_like(-1.0)))  # noqa: E501
-    if node.op is Ops.MUL and (pair:=next(((dynamic,factor) for dynamic,factor in (node.src,node.src[::-1]) if _is_static_expr(factor)),None)) is not None: return expand(pair[0],scale.alu(Ops.MUL,pair[1].cast(dtypes.float)))  # noqa: E501
-    if node.op is Ops.LOAD and _typed_load_plan(node,dtypes.half,out_index,rows) is not None: return ((node,scale),)
-    raise _RKGenericReject
+    if node.op in (Ops.ADD,Ops.SUB): yield from expand(node.src[0],scale); yield from expand(node.src[1],scale if node.op is Ops.ADD else scale.alu(Ops.MUL,one.const_like(-1.0)))  # noqa: E501
+    elif node.op is Ops.MUL and (pair:=next(((dynamic,factor) for dynamic,factor in (node.src,node.src[::-1]) if _is_static_expr(factor)),None)) is not None: yield from expand(pair[0],scale.alu(Ops.MUL,pair[1].cast(dtypes.float)))  # noqa: E501
+    else: yield node,scale
   try:
-    if not 2<=len(terms:=expand(root,one))<=4: return False
+    # A fifth term rejects the candidate without expanding the rest of a shared expression.
+    if not 2<=len(terms:=tuple(itertools.islice(expand(root,one),5)))<=4 or any(load.op is not Ops.LOAD or _typed_load_plan(load,dtypes.half,out_index,rows) is None for load,_ in terms): return False  # noqa: E501
     mappings=tuple((_gather_offsets(out_index,load.src[0].src[1],load.src[2] if len(load.src)>2 else None,rows),typing_cast(tuple[float,...],_static_lanes(dense,weight,dependencies=False)[0])) for load,weight in terms)  # noqa: E501
   except (_RKGenericReject,RuntimeError,ValueError,OverflowError): return False
   n=int(dense[-1].src[0].arg); m=rows//n; param=typing_cast(UOp,_root_param(terms[0][0].src[0])); source_count=int(param.src[0].arg); k=source_count//m if m and source_count%m==0 else 0; columns=tuple((offsets[:n],weights[:n]) for offsets,weights in mappings)  # noqa: E501
