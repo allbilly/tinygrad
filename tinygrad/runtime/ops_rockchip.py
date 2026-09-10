@@ -120,15 +120,14 @@ class RockchipProgram(Program['RockchipDevice']):
     if not sizes or not all(0<s<1<<16 for s in sizes) or standalone and n!=1 or cmac and not standalone: raise ValueError("invalid NPU command body")  # noqa: E501
     tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(round_up(size+tail_size,2) for size in sizes)); cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E501,E702
     cmd,task=self.dev._replace_submit_buffers(cmd_size,n*_TASK_DESC_BYTES)
-    ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd); words=array.array("Q"); descs=[]  # noqa: E702
+    ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd); words=to_mv(int(cmd.va_addr),cmd_size).cast("Q"); descs=(rk.struct_rknpu_task*n).from_address(int(task.va_addr))  # noqa: E501,E702
     for i,(body,size) in enumerate(zip(bodies,sizes)):
-      base=offsets[i]; words.extend(itertools.repeat(0,base-len(words))); words.extend(body)  # noqa: E702
+      # Write each body and descriptor directly into the zeroed mapped batch; padding stays untouched.
       # REGISTER_AMOUNTS=0 terminates a chain. Keep its speculative base-address fetch inside the mapped
       # zero-filled guard page: RK3588 can otherwise race completion with an IOMMU read from address zero.
       next_addr=(base_dma+(offsets[i+1] if i+1<n else offsets[-1])*8)&0xfffffff0; next_amount=sizes[i+1] if i+1<n else 0  # noqa: E702
       tail=(_pc(0x0001,0),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd)) if cmac else (_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18),) if standalone else (_pc(rk.TARGET_PC_REG,rk.REG_PC_BASE_ADDRESS,next_addr),_pc(rk.TARGET_PC_REG,rk.REG_PC_REGISTER_AMOUNTS,next_amount),_pc(rk.TARGET_VERSION,0),_pc(rk.TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18))  # noqa: E501
-      words.extend(tail); descs.append(rk.struct_rknpu_task(0,0 if cmac else 4,0xd if cmac else 0x18,0x300,0x1ffff,0,size if cmac else size+len(tail),0,base_dma+base*8))  # noqa: E501,E702
-    ctypes.memmove(int(cmd.va_addr),words.buffer_info()[0],len(words)*8); packed_tasks=(rk.struct_rknpu_task*n)(*descs); ctypes.memmove(int(task.va_addr),ctypes.addressof(packed_tasks),n*_TASK_DESC_BYTES)  # noqa: E501,E702
+      words[offsets[i]:offsets[i]+size+len(tail)]=array.array("Q",body+tail); descs[i]=rk.struct_rknpu_task(0,0 if cmac else 4,0xd if cmac else 0x18,0x300,0x1ffff,0,size if cmac else size+len(tail),0,base_dma+offsets[i]*8)  # noqa: E501,E702
     if standalone and not getattr(self.dev,"_npu_clean",False): self.dev.reset_npu()
     try: self._submit(cmd,task,n,standalone=standalone)
     finally:
@@ -162,8 +161,7 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
     for start in range(0, max(1,op.count), limit):
-      args=tuple(arg._replace(addend=arg.addend+start*itemsize*(dst_step if i==0 else src_step)) for i,arg in enumerate((op.dst,op.lhs,op.rhs)))  # noqa: E501
-      yield emit_ew_stage(op._replace(dst=args[0],lhs=args[1],rhs=args[2],count=min(limit,op.count-start),**flags),address)
+      yield emit_ew_stage(op._replace(count=min(limit,op.count-start),**flags),address,(start*itemsize*dst_step,start*itemsize*src_step))
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs

@@ -237,10 +237,11 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
   rdma_feature = ((data_format>>26)&7)*((1<<15)|(1<<5))|(15<<11)|(0 if is_div or mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) or fp32_input else 1<<3)|1  # noqa: E501
   return tuple(_cmd(*reg) for reg in regs), rdma_feature
 
-def emit_ew_stage(op:RKEWOp, address:Callable[[RKArg],int]) -> tuple[int, ...]:
+def emit_ew_stage(op:RKEWOp, address:Callable[[RKArg],int], offsets:tuple[int,int]=(0,0)) -> tuple[int, ...]:
   """Build one DPU EW command body without its PC-chain tail."""
+  # Tile byte offsets belong to destination/source roles, even when their RKArgs alias.
   commands,feature = _stage_template(op.count,op.ew_cfg,op.mode)
-  return commands+tuple(_cmd(target,reg,address(arg)) for target,reg,arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,op.dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,op.lhs),(_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,op.rhs)))+(_cmd(_RDMA,rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,feature),)  # noqa: E501
+  return commands+tuple(_cmd(target,reg,address(arg)+offset) for target,reg,arg,offset in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,op.dst,offsets[0]),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,op.lhs,offsets[1]),(_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,op.rhs,offsets[1])))+(_cmd(_RDMA,rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,feature),)  # noqa: E501
 
 def _root_param(u:UOp) -> UOp|None: return root if (root:=u.buf_uop).op is Ops.PARAM else None
 
@@ -519,6 +520,8 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   slots=tuple(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(3))
   relu_root=_relu_operand(fp32_root if (fp32_root:=_typed_cast_source(root,dtypes.half,dtypes.float)) is not None else root)
   root=_strip_cast(relu_root if relu_root is not None else root); additive=root.op is Ops.ADD and root.dtype.scalar() is dtypes.float or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD for node in root.toposort())  # noqa: E501
+  # Unrolling a non-additive MAX yields MAX or a constant, neither of which can supply contraction terms.
+  if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and not additive: return False
   # Keep a single mapped product/identity structured; irregular additive bodies retain bounded normalization.
   ranges=root.src[1:] if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and all(axis.op in (Ops.RANGE,Ops.SPECIAL) and axis.src and axis.src[0].op is Ops.CONST for axis in root.src[1:]) and all(node.op in (Ops.LOAD,Ops.CONST) for node in map(_strip_cast,_iter_binary(_gate_zero_term(root.src[0]),Ops.MUL,plain=True))) else ()  # noqa: E501
   if (normalized:=root if ranges else _optional_rewrite(functools.partial(_unroll_static_reduces,precise=False),root,errors=(_RKGenericReject,RuntimeError,ValueError))) is None: return False  # noqa: E501
