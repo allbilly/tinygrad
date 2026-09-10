@@ -152,8 +152,8 @@ _EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
   _EW_CFG_COMMON|flags for flags in (1<<10, _EW_RELU_BYPASS|(1<<16), _EW_RELU_BYPASS|(5<<16),
   _EW_RELU_BYPASS|(6<<16), _EW_RELU_BYPASS|(7<<16), _EW_RELU_BYPASS|(8<<16)))
 # DPU data-format registers, indexed by RKEWMode.
-_DPU_DATA_FORMATS = ((5<<29)|(2<<26)|2, (2<<29)|(5<<26)|2, (1<<29)|(1<<26)|1, (4<<29)|(4<<26)|4,
-  (4<<29)|(1<<26)|1, (4<<29)|(2<<26)|2, (1<<29)|(2<<26)|2, (2<<29)|(4<<26)|4)+(((2<<29)|(2<<26)|2),)*3
+_DPU_PRECISION_DTYPES = {1:dtypes.int16,2:dtypes.half,4:dtypes.int,5:dtypes.float}
+_DPU_DATA_FORMATS = tuple((output<<29)|(source<<26)|(2 if source==5 else source) for output,source in ((5,2),(2,5),(1,1),(4,4),(4,1),(4,2),(1,2),(2,4))+((2,2),)*3)  # noqa: E501
 # Batch-size and batch-normalization registers used by compare stages.
 (_BS_BN_BYPASS, _BS_OW_FP32_SCALAR, _BS_CFG_COMPARE, _BS_ALU_COMPARE, _BS_MUL_COMPARE, _BN_CFG_COMPARE, _BN_MUL_COMPARE,
  _BN_RELUX_COMPARE) = (1|(1<<1)|(1<<4)|(1<<6), (1<<8)|(1<<5)|(1<<2)|(1<<1), 0x40040, 0x33800000, 0x40000000, 0x40082, 0x7c000000, 0x3f800000)
@@ -951,9 +951,8 @@ class RKContext:
     # Integer narrowing keeps the low two bytes; the source arithmetic was already evaluated on the NPU.
     if pair==(dtypes.int,dtypes.int16):
       self.program.append(RKGather(source.arg,result.arg,self.count,axes=((1,self.count,2),))); return result
-    if (mode:={(dtypes.float,dtypes.half):RKEWMode.FLOAT_TO_HALF,(dtypes.half,dtypes.float):RKEWMode.HALF_TO_FLOAT,
-               (dtypes.half,dtypes.int):RKEWMode.HALF_TO_INT32,(dtypes.int,dtypes.half):RKEWMode.INT32_TO_HALF,
-               (dtypes.half,dtypes.int16):RKEWMode.HALF_TO_INT16,(dtypes.int16,dtypes.int):RKEWMode.INT16_TO_INT32}.get(pair)) is None: raise _RKGenericReject(f"convert {source.dtype}->{target}")  # noqa: E501
+    # Identity modes cannot reach this lookup; raw integer narrowing was handled above.
+    if (mode:=next((RKEWMode(index) for index,fmt in enumerate(_DPU_DATA_FORMATS) if pair==(_DPU_PRECISION_DTYPES[(fmt>>26)&7],_DPU_PRECISION_DTYPES[fmt>>29])),None)) is None: raise _RKGenericReject(f"convert {source.dtype}->{target}")  # noqa: E501
     wide=mode not in (RKEWMode.HALF_TO_INT16,RKEWMode.INT16_TO_INT32)
     if target is dtypes.float and dst is None: raise _RKGenericReject("nonterminal FP32 carrier")
     # Native INT16 conversions are one tile; packed conversions retain their four-lane physical atoms.
