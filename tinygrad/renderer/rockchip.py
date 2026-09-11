@@ -57,17 +57,17 @@ class RKPlan:
   """One virtual scratch namespace for every physical value in a compiled program."""
   def __init__(self, uops:list[UOp]):
     self.scratch:list[int]=[]; self.program:list[RKGather|RKEWOp|RKCMAC]=[]
-    # Compiler-only parameters bind physical carriers; an integer is a lazy scratch byte count.
-    self.bindings:dict[int,RKArg|int]={}; self.slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=-1)
+    # Compiler-only parameters bind physical carriers; lifetime coloring drops unused reservations.
+    self.bindings:dict[int,RKArg]={}; self.slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=-1)
 
   def parameter(self, dtype:DType, count:int, source:RKArg|None=None) -> UOp:
-    slot=self.slot; self.slot+=1; self.bindings[slot]=max(64,round_up(count,8)*dtype.itemsize) if source is None else source
+    slot=self.slot; self.slot+=1; self.bindings[slot]=RKArg(RKBufferKind.SCRATCH,len(self.scratch)) if source is None else source
+    if source is None: self.scratch.append(max(64,round_up(count,8)*dtype.itemsize))
     return UOp.param(slot,dtype,(count,))
 
   def resolve(self, arg:RKArg) -> RKArg:
     if arg.kind is not RKBufferKind.ARG or arg.index not in self.bindings: return arg
-    if isinstance(target:=self.bindings[arg.index],int): self.scratch.append(target); target=RKArg(RKBufferKind.SCRATCH,len(self.scratch)-1)
-    target=self.resolve(target); self.bindings[arg.index]=target
+    target=self.resolve(self.bindings[arg.index]); self.bindings[arg.index]=target
     return target._replace(addend=target.addend+arg.addend)
 
   def lower(self, uops:list[UOp]|Callable[[],bool], *, vectorize_reductions:bool=True, materialize:bool=False, chain:bool=False) -> bool:
@@ -1244,8 +1244,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
   """Finalize one physical plan for the production renderer; unsupported semantics fail closed."""
   plan=RKPlan(uops)
   if not plan.lower(uops,vectorize_reductions=vectorize_reductions): return None
-  image=_map_image_args(RKImage(program=tuple(plan.program)),plan.resolve)
-  image=_reuse_linear_scratch(image._replace(scratch=tuple(plan.scratch)))
+  image=_reuse_linear_scratch(_map_image_args(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve))
   _validate_image(image) if len(image.scratch)<=_RKIMAGE_U16_MAX else None
   return image if len(image.scratch)<=_RKIMAGE_U16_MAX else None
 
