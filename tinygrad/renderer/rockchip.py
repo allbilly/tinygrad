@@ -200,41 +200,40 @@ def emit_cmac_stage(op:RKCMAC, address:Callable[[RKArg],int]) -> tuple[int, ...]
 @functools.lru_cache(maxsize=256)
 def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple[tuple[int, ...], int]:
   """Emit either a self-initializing DPU EW body or a lean FP16 continuation body."""
-  D, R = _DPU, rk
-  native_int16,int16_to_int32,fp32_output,fp32_input = (mode == x for x in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_FLOAT,RKEWMode.FLOAT_TO_HALF))  # noqa: E501
-  int32_output,int32_input = mode in (RKEWMode.INT32,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT32), mode in (RKEWMode.INT32,RKEWMode.INT32_TO_HALF)  # noqa: E501
-  special,compare = mode != RKEWMode.HALF, mode == RKEWMode.COMPARE
-  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if mode==RKEWMode.INT32 else _EW_ELEMS_32BIT if int32_output or int32_input or fp32_output or fp32_input else _MAX_EW_ELEMS_FP16  # noqa: E501
+  D, R, data_format = _DPU, rk, _DPU_DATA_FORMATS[mode]
+  output_dtype,input_dtype = (_DPU_PRECISION_DTYPES[(data_format>>shift)&7] for shift in (29,26))
+  special,compare,int16_to_int32 = mode != RKEWMode.HALF, mode == RKEWMode.COMPARE, mode == RKEWMode.INT16_TO_INT32
+  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if mode==RKEWMode.INT32 else _EW_ELEMS_32BIT if output_dtype.itemsize==4 or input_dtype.itemsize==4 else _MAX_EW_ELEMS_FP16  # noqa: E501
   if not 0 < count <= limit: raise ValueError(f"{'initialized EW' if special else 'EW fp16'} count {count} out of range")
-  lanes, is_div = (4 if int32_input or fp32_input else 8), ew_cfg == _EW_CFG[Ops.FDIV]
-  width, data_format = (count + lanes-1) // lanes - 1, _DPU_DATA_FORMATS[mode]
+  lanes, is_div = (4 if input_dtype.itemsize==4 else 8), ew_cfg == _EW_CFG[Ops.FDIV]
+  width = (count + lanes-1) // lanes - 1
   regs:tuple[tuple[int, int, int], ...] = ((D,R.REG_DPU_S_POINTER,0xe),(D,R.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
-    (D,R.REG_DPU_DATA_FORMAT,data_format)) + (((D,R.REG_DPU_DST_SURF_STRIDE,1<<4),) if int16_to_int32 or fp32_output else ()) + (
+    (D,R.REG_DPU_DATA_FORMAT,data_format)) + (((D,R.REG_DPU_DST_SURF_STRIDE,1<<4),) if int16_to_int32 or output_dtype is dtypes.float else ()) + (
     (D,R.REG_DPU_DATA_CUBE_WIDTH,width),(D,R.REG_DPU_DATA_CUBE_HEIGHT,0),(D,R.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
-    (D,R.REG_DPU_DATA_CUBE_CHANNEL,0 if fp32_output and count == 1 else ((lanes-1)<<16)|(lanes-1)))
+    (D,R.REG_DPU_DATA_CUBE_CHANNEL,0 if output_dtype is dtypes.float and count == 1 else ((lanes-1)<<16)|(lanes-1)))
   if special:
     pipeline = (((D,R.REG_DPU_BS_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BN_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BS_ALU_CFG,0),(D,R.REG_DPU_BS_MUL_CFG,0),
-      (D,R.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 or fp32_output and count == 1 else 2),
-      (D,R.REG_DPU_WDMA_SIZE_0,0 if fp32_output and count == 1 else 3 if fp32_output else lanes-1),(D,R.REG_DPU_WDMA_SIZE_1,width),
+      (D,R.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 or output_dtype is dtypes.float and count == 1 else 2),
+      (D,R.REG_DPU_WDMA_SIZE_0,(0 if count == 1 else 3) if output_dtype is dtypes.float else lanes-1),(D,R.REG_DPU_WDMA_SIZE_1,width),
       (D,R.REG_DPU_BN_MUL_CFG,0),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,0))
       + (((D,R.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(D,R.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),(D,R.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),
       (D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),
       (D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE)) if compare else ())
       + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ())
-      + ((D,R.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else \
-      ew_cfg & ~_EW_OP_CVT_BYPASS if native_int16 or int16_to_int32 else ew_cfg),
+      + ((D,R.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if input_dtype is dtypes.int else \
+      ew_cfg & ~_EW_OP_CVT_BYPASS if input_dtype is dtypes.int16 else ew_cfg),
       (D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),
-      (D,R.REG_DPU_OUT_CVT_SCALE,0 if fp32_output else 1 if int32_output or mode in (RKEWMode.INT16,RKEWMode.HALF_TO_INT16) or is_div else (1<<16)|1),  # noqa: E501
-      (D,R.REG_DPU_OUT_CVT_SHIFT,0),(D,R.REG_DPU_SURFACE_ADD,(2 if native_int16 or int16_to_int32 else 4)<<4)))
+      (D,R.REG_DPU_OUT_CVT_SCALE,0 if output_dtype is dtypes.float else 1 if dtypes.is_int(output_dtype) or is_div else (1<<16)|1),
+      (D,R.REG_DPU_OUT_CVT_SHIFT,0),(D,R.REG_DPU_SURFACE_ADD,(2 if input_dtype is dtypes.int16 else 4)<<4)))
   else:
     pipeline = ((D,R.REG_DPU_EW_CFG,ew_cfg),) + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ()) + (
       ((D,R.REG_DPU_EW_CVT_SCALE_VALUE,1),(D,R.REG_DPU_OUT_CVT_OFFSET,0),(D,R.REG_DPU_OUT_CVT_SHIFT,0),
        (D,R.REG_DPU_SURFACE_ADD,1<<6)) if is_div else ()) + ((D,R.REG_DPU_OUT_CVT_SCALE,1 if is_div else (1<<16)|1),)
   regs += pipeline + ((_RDMA,R.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
     (_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
-    (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input or fp32_input else 2)<<2)))
+    (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if input_dtype.itemsize==4 else 2)<<2)))
   # The DPU input precision at bits 26..28 feeds both nonoverlapping RDMA precision fields (15..17 and 5..7).
-  rdma_feature = ((data_format>>26)&7)*((1<<15)|(1<<5))|(15<<11)|(0 if is_div or mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32) or fp32_input else 1<<3)|1  # noqa: E501
+  rdma_feature = ((data_format>>26)&7)*((1<<15)|(1<<5))|(15<<11)|(0 if is_div or input_dtype in (dtypes.int16,dtypes.float) else 1<<3)|1  # noqa: E501
   return tuple(_cmd(*reg) for reg in regs), rdma_feature
 
 def emit_ew_stage(op:RKEWOp, address:Callable[[RKArg],int], offsets:tuple[int,int]=(0,0)) -> tuple[int, ...]:
