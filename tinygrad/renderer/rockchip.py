@@ -105,7 +105,8 @@ def _reuse_linear_scratch(image:RKImage) -> RKImage:
   remap:dict[int,int]={}; physical:dict[int,int]={}; active:list[tuple[int,int]]=[]
   for start,end,slot in sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2])):
     spec,target=image.scratch[slot],heapq.heappop(active)[1] if active and active[0][0]<start else len(physical)
-    physical[target] = max(physical.get(target,0), spec)
+    # One physical slot can back byte, half-word and word views over disjoint lifetimes.
+    physical[target] = round_up(max(physical.get(target,0), spec),4)
     heapq.heappush(active, (end, target))
     remap[slot] = target
   return _map_image_args(image,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)._replace(scratch=tuple(physical.values()))  # noqa: E501
@@ -957,8 +958,7 @@ class RKContext:
     # Native INT16 conversions are one tile; packed conversions retain their four-lane physical atoms.
     stride=64 if dtypes.int in pair else 16; atoms=tuple((start,min(4,self.count-start),start//4*stride) for start in range(0,self.count,4)) if wide else ((0,self.count,0),)  # noqa: E501
     packed=self._scratch(dtypes.half if source.dtype is dtypes.float else source.dtype,len(atoms)*stride) if wide else result; tile=source if not wide or source.dtype is dtypes.float else packed  # noqa: E501
-    if source.dtype is dtypes.float:
-      rhs=self._scratch(dtypes.float,16); self.program.append(RKGather(None,rhs.arg,4,values=(0,)*4,itemsize=4))
+    if source.dtype is dtypes.float: rhs=self._slot(RKGather(None,self.out,4,values=(0,)*4,itemsize=4),dtypes.float,16)
     else: rhs=self._constant(UOp.const(0,dtypes.int16)) if mode is RKEWMode.INT16_TO_INT32 else tile
     if wide and source.dtype is not dtypes.float: self.program.extend(RKGather(source.arg._replace(addend=source.arg.addend+start*source.dtype.itemsize),packed.arg._replace(addend=offset),count,axes=((1,count,1),),itemsize=source.dtype.itemsize) for start,count,offset in atoms)  # noqa: E501
     self.program.extend(RKEWOp(result.arg._replace(addend=result.arg.addend+start*4) if target is dtypes.float else packed.arg._replace(addend=packed.arg.addend+offset),  # noqa: E501
