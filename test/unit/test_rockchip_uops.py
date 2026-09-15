@@ -4873,11 +4873,11 @@ def test_cmac_extent_bound_rejects_before_static_unroll(monkeypatch):
     assert output is not None
     return output,uops
   output,uops=reduction(4096)
-  assert rockchip_renderer._lower_cmac_reduce(output,uops,rockchip_renderer.RKPlan(uops))
+  assert rockchip_renderer._lower_cmac_reduce(output,rockchip_renderer.RKPlan(uops))
   def forbidden(*_args,**_kwargs): raise AssertionError("oversized CMAC candidate was statically unrolled")
   monkeypatch.setattr(rockchip_renderer,"_unroll_static_reduces",forbidden)
   output,uops=reduction(4097)
-  assert not rockchip_renderer._lower_cmac_reduce(output,uops,rockchip_renderer.RKPlan(uops))
+  assert not rockchip_renderer._lower_cmac_reduce(output,rockchip_renderer.RKPlan(uops))
 
 
 def test_wide_mapped_where_sum_routes_production_cacc():

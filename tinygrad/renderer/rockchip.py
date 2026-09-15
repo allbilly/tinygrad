@@ -498,24 +498,23 @@ def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
   axis=UOp.range(k,1+max((node.arg[0] for node in root.toposort() if node.op is Ops.RANGE),default=-1),dtype=dtypes.int); row=functools.reduce(lambda address,dim:address*dim.src[0]+dim,dense[:-1],out_index.const_like(0))  # noqa: E501
   value=(param.index(row*k+axis).load().cast(dtypes.float)*table.index(axis*n+dense[-1]).load().cast(dtypes.float)).reduce(axis,arg=Ops.ADD)
   # CMAC reads the structured output directly; only mapped reduction needs a separate UOp inventory.
-  return _try(plan,(store,out,rows,out_index,value),dtypes.float,_lower_cmac_reduce,[])
+  return _try(plan,(store,out,rows,out_index,value),dtypes.float,_lower_cmac_reduce)
 
-def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
+def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   """Append a separable contraction directly to the shared physical plan; mapped reduction owns other bounded shapes."""
   _,out,rows,out_index,root=output
   if any(isinstance(op,RKCMAC) for op in plan.program) or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])>_MAX_CMAC_K for node in root.toposort()): return False  # noqa: E501
   slots=tuple(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(3))
   relu_root=_relu_operand(fp32_root if (fp32_root:=_typed_cast_source(root,dtypes.half,dtypes.float)) is not None else root)
   root=_strip_cast(relu_root if relu_root is not None else root); additive=root.op is Ops.ADD and root.dtype.scalar() is dtypes.float or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD for node in root.toposort())  # noqa: E501
-  # Unrolling a non-additive MAX yields MAX or a constant, neither of which can supply contraction terms.
-  if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and not additive: return False
   # Keep a single mapped product/identity structured; irregular additive bodies retain bounded normalization.
   ranges=root.src[1:] if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and all(axis.op in (Ops.RANGE,Ops.SPECIAL) and axis.src and axis.src[0].op is Ops.CONST for axis in root.src[1:]) and all(node.op in (Ops.LOAD,Ops.CONST) for node in map(_strip_cast,_gate_zero_term(root.src[0]).split_uop(Ops.MUL,lambda node:node.arg is None))) else ()  # noqa: E501
-  if (normalized:=root if ranges else _optional_rewrite(functools.partial(_unroll_static_reduces,precise=False),root,errors=(_RKGenericReject,RuntimeError,ValueError))) is None: return False  # noqa: E501
+  # A non-additive MAX rejects before the fallback unroll; neither it nor its constant result can supply contraction terms.
+  if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and not additive or (normalized:=root if ranges else _optional_rewrite(functools.partial(_unroll_static_reduces,precise=False),root,errors=(_RKGenericReject,RuntimeError,ValueError))) is None: return False  # noqa: E501
   scale,exact_scale=1.0,True
   while (pair:=_const_operand(root:=_strip_cast(normalized),Ops.MUL)) is not None: normalized,factor=pair[0],float(pair[1].arg); scale*=factor; exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale  # noqa: E501
-  bounds=tuple(int(axis.src[0].arg) for axis in ranges); reduction_size=math.prod(bounds); root=_gate_zero_term(root.src[0]) if ranges else root
-  terms=tuple(_gate_zero_term(term) for term in root.split_uop(Ops.ADD)) if root.op is Ops.ADD else (_gate_zero_term(root),) if additive else (); terms=tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)); groups=reduction_size*len(terms)  # noqa: E501
+  bounds=tuple(int(axis.src[0].arg) for axis in ranges); root=_gate_zero_term(root.src[0]) if ranges else root
+  terms=tuple(_gate_zero_term(term) for term in root.split_uop(Ops.ADD)) if root.op is Ops.ADD else (_gate_zero_term(root),) if additive else (); terms=tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)); groups=math.prod(bounds)*len(terms)  # noqa: E501
   if groups < (1 if additive else 4) or groups>_MAX_CMAC_K: return False
   parsed:list[tuple[UOp|None,UOp|None,float]]=[]
   for term in terms:
@@ -557,10 +556,10 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
         if (load_plan:=_typed_load_plan(source.index(selected).load() if gate.op is Ops.CONST and gate.arg else source.index(selected).load(UOp.const(0,dtypes.half),gate),dtypes.half,destination,count)) is None: return False  # noqa: E501
         gathers.append(load_plan._replace(dst=slots[side],partial=seeded)); seeded=True
   if sum(gather.count for gather in gathers)+rows>_MAX_DYNAMIC_SELECTOR_CELLS: return False
-  fp16=out.dtype.scalar() is dtypes.half; cmac=RKCMAC(slots[2],slots[0],slots[1],m,n,groups,fp16,relu_root is not None)  # noqa: E501
+  cmac=RKCMAC(slots[2],slots[0],slots[1],m,n,groups,out.dtype.scalar() is dtypes.half,relu_root is not None)
   # Compose in weak integer arithmetic so shared symbolic rules retain the periodic physical address map.
   lane=UOp.range(rows,0); position=lane*(rows+1) if diagonal else sum((lane//stride%limit*coefficient for stride,limit,coefficient in fields),lane.const_like(0)) if fields else lane  # noqa: E501
-  commit=_gather_plan(0,0,lane,(position//n*ao*(2 if fp16 else 1)+position%n+(position%n//16*16 if fp16 else 0)).simplify(),None,rows)._replace(src=cmac.dst,dst=RKArg(RKBufferKind.ARG,out.arg.slot),itemsize=2 if fp16 else 4)  # noqa: E501
+  commit=_gather_plan(0,0,lane,(position//n*ao*(2 if cmac.out_fp16 else 1)+position%n+(position%n//16*16 if cmac.out_fp16 else 0)).simplify(),None,rows)._replace(src=cmac.dst,dst=RKArg(RKBufferKind.ARG,out.arg.slot),itemsize=2 if cmac.out_fp16 else 4)  # noqa: E501
   plan.scratch.extend((m*ai*2,ao*ai*2,m*ao*4)); plan.program.extend((*gathers,cmac,commit))
   return True
 
@@ -597,7 +596,7 @@ def _lower_bounded_int_lookup(output:RKOutput, plan:RKPlan) -> bool:
 def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Prefer one dynamic gather or contraction, then map and reduce every remaining bounded reduction on the DPU."""
   if output[1].dtype.scalar() is dtypes.half and output[2]<=_RKIMAGE_U16_MAX and (root:=graph_rewrite(output[4],_pm_selected_load,name="rockchip selected loads")) is not output[4] and plan.lower(list(output[0].replace(src=(output[0].src[0],root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in root.toposort())): return True  # noqa: E501
-  return _try(plan,output,dtypes.int,_lower_bounded_int_lookup) or _try(plan,output,(dtypes.half,dtypes.float),_lower_cmac_reduce,uops) or _try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)  # noqa: E501
+  return _try(plan,output,dtypes.int,_lower_bounded_int_lookup) or _try(plan,output,(dtypes.half,dtypes.float),_lower_cmac_reduce) or _try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)  # noqa: E501
 
 def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
