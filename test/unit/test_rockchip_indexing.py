@@ -151,8 +151,8 @@ def test_static_divmod_uses_committed_integer_operands(dtype,operation,form):
   left,right=(wrapped,lane.const_like(7)) if form=="left" else (lane.const_like(13),wrapped) if form=="right" else (wrapped,wrapped-1)
   root=left.alu(operation,right)
   # Scalar exec_alu commits each intermediate; vector shortcuts must agree, including a wrapped zero divisor.
-  expected=tuple(rk._eval_static(root,{lane:index}) for index in range(7))
-  assert rk._eval_static(root,{lane:tuple(range(7))})==expected
+  expected=tuple(rk._eval_static(root,(lane,),(7,),index,index+1) for index in range(7))
+  assert rk._eval_static(root,(lane,),(7,),0,7)==expected
   assert rk._static_lanes((lane,),root,dependencies=False)==(expected,)
 
 
