@@ -156,33 +156,31 @@ class RockchipProgram(Program['RockchipDevice']):
       yield emit_ew_stage(op._replace(count=min(limit,op.count-start),**flags),address,(start*itemsize*dst_step,start*itemsize*src_step))
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
-    with self.dev._lock: return self._run(bufs,wait)
-
-  def _run(self, bufs:tuple[HCQBuffer, ...], wait:bool):
-    arena=self.dev._ensure_buffer("scratch",self._scratch_offsets[-1],self._scratch_offsets[-1]) if self._scratch_offsets[-1] else None
-    scratch=tuple(arena.offset(offset,size) for offset,size in zip(self._scratch_offsets,self.image.scratch)) if arena is not None else ()
-    def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
-      storage,label,missing=(bufs,"argument","bound") if kind is RKBufferKind.ARG else (scratch,"scratch","declared")
-      if index >= len(storage): raise RuntimeError(f"RKImage {label} slot {index} is not {missing}")
-      return storage[index]
-    self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-    cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather)),len(self.image.program))
-    _apply_gathers(self.image.program[:cursor],buffer)  # type: ignore[arg-type]
-    self.dev._sync_buffers((*bufs,*((arena,) if arena is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE); addresses:dict[RKArg,int]={}  # noqa: E702
-    def address(arg:RKArg) -> int: return addresses[arg] if arg in addresses else addresses.setdefault(arg,self._dma(buffer(arg.kind,arg.index))+arg.addend)  # noqa: E501
-    start = time.perf_counter()
-    ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
-    if ew_ops and self.dev._native_int16 and not any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops): self.dev.reset_npu()  # noqa: E501
-    for index,group in enumerate(groups:=tuple(tuple(items) for _,items in itertools.groupby(self.image.program[cursor:],type))):
-      rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (isinstance(next_op:=groups[index+2][0],RKEWOp) and next_op.mode==RKEWMode.BOUNDED or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
-      if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
-      elif isinstance(current,RKEWOp): self._run_ew_ops(address,group,rearm)  # type: ignore[arg-type]
-      else:
-        self.dev._sync_buffers(tuple(buffer(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None),rk.RKNPU_MEM_SYNC_FROM_DEVICE)  # type: ignore[union-attr]  # noqa: E501
-        _apply_gathers(group,buffer)  # type: ignore[arg-type]
-        self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in group),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # type: ignore[union-attr]  # noqa: E501
-    if ew_ops: self.dev._native_int16 = ew_ops[-1].mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16)
-    return time.perf_counter()-start if wait else None
+    with self.dev._lock:
+      arena=self.dev._ensure_buffer("scratch",self._scratch_offsets[-1],self._scratch_offsets[-1]) if self._scratch_offsets[-1] else None
+      scratch=tuple(arena.offset(offset,size) for offset,size in zip(self._scratch_offsets,self.image.scratch)) if arena is not None else ()
+      def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
+        storage,label,missing=(bufs,"argument","bound") if kind is RKBufferKind.ARG else (scratch,"scratch","declared")
+        if index >= len(storage): raise RuntimeError(f"RKImage {label} slot {index} is not {missing}")
+        return storage[index]
+      self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      cursor=next((i for i,op in enumerate(self.image.program) if not isinstance(op,RKGather)),len(self.image.program))
+      _apply_gathers(self.image.program[:cursor],buffer)  # type: ignore[arg-type]
+      self.dev._sync_buffers((*bufs,*((arena,) if arena is not None else ())),rk.RKNPU_MEM_SYNC_TO_DEVICE); addresses:dict[RKArg,int]={}  # noqa: E702
+      def address(arg:RKArg) -> int: return addresses[arg] if arg in addresses else addresses.setdefault(arg,self._dma(buffer(arg.kind,arg.index))+arg.addend)  # noqa: E501
+      start = time.perf_counter()
+      ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
+      if ew_ops and self.dev._native_int16 and not any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops): self.dev.reset_npu()  # noqa: E501
+      for index,group in enumerate(groups:=tuple(tuple(items) for _,items in itertools.groupby(self.image.program[cursor:],type))):
+        rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (isinstance(next_op:=groups[index+2][0],RKEWOp) and next_op.mode==RKEWMode.BOUNDED or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
+        if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
+        elif isinstance(current,RKEWOp): self._run_ew_ops(address,group,rearm)  # type: ignore[arg-type]
+        else:
+          self.dev._sync_buffers(tuple(buffer(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None),rk.RKNPU_MEM_SYNC_FROM_DEVICE)  # type: ignore[union-attr]  # noqa: E501
+          _apply_gathers(group,buffer)  # type: ignore[arg-type]
+          self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in group),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # type: ignore[union-attr]  # noqa: E501
+      if ew_ops: self.dev._native_int16 = ew_ops[-1].mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16)
+      return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
