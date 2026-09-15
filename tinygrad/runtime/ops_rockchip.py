@@ -80,12 +80,12 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
   def _copyin(self, dest:HCQBuffer, src:memoryview):
     ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
-    self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    self.dev._sync_buffers((dest,), rk.RKNPU_MEM_SYNC_TO_DEVICE)
   def _copyout(self, dest:memoryview, src:HCQBuffer):
-    self.dev._sync_buffer(src, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    self.dev._sync_buffers((src,), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     ctypes.memmove(from_mv(dest), int(src.va_addr), dest.nbytes)
   def _as_buffer(self, src:HCQBuffer):
-    self.dev._sync_buffer(src, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    self.dev._sync_buffers((src,), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     return to_mv(int(src.va_addr), src.size)
   def _offset(self, buf:HCQBuffer, size:int, offset:int): return buf.offset(offset, size)
   def _free(self, buf:HCQBuffer, options:BufferSpec): self.dev._gpu_free(buf)
@@ -102,7 +102,7 @@ class RockchipProgram(Program['RockchipDevice']):
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
     self.dev._check_healthy()
     try:
-      for buffer in (cmd, task): self.dev._sync_buffer(buffer, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.dev._sync_buffers((cmd,task), rk.RKNPU_MEM_SYNC_TO_DEVICE)
       rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
         flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
         task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
@@ -221,10 +221,8 @@ class RockchipDevice(Compiled):
       except (OSError, RuntimeError): pass
       raise MemoryError(f"RKNPU GEM mapping failed for {alloc} bytes") from exc
     return HCQBuffer(mapped,size,meta=meta,view=MMIOInterface(mapped,size))
-  def _sync_buffer(self, buf:HCQBuffer, flags:int):
-    self._check_healthy() or rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
-    for buf in {buf.meta.obj_addr:buf for buf in bufs}.values(): self._sync_buffer(buf,flags)
+    for buf in {buf.meta.obj_addr:buf for buf in bufs}.values(): self._check_healthy() or rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)  # noqa: E501
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     if not self._poisoned: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)

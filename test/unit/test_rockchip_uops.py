@@ -1196,7 +1196,7 @@ def test_submit_timeout_poison_prevents_driver_retry(monkeypatch):
     fd_ctl, submit_count, task_count, timeout_retries, _poisoned = object(), 0, 0, 0, False
     def _check_healthy(self):
       if self._poisoned: raise RuntimeError("poisoned")
-    def _sync_buffer(self, _buffer, _flags): self._check_healthy()
+    def _sync_buffers(self, _buffers, _flags): self._check_healthy()
   program = object.__new__(rockchip_runtime.RockchipProgram)
   program.dev = FakeDevice()
   buffer = SimpleNamespace(meta=SimpleNamespace(obj_addr=1))
