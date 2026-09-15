@@ -81,9 +81,7 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _copyin(self, dest:HCQBuffer, src:memoryview):
     ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
     self.dev._sync_buffers((dest,), rk.RKNPU_MEM_SYNC_TO_DEVICE)
-  def _copyout(self, dest:memoryview, src:HCQBuffer):
-    self.dev._sync_buffers((src,), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-    ctypes.memmove(from_mv(dest), int(src.va_addr), dest.nbytes)
+  def _copyout(self, dest:memoryview, src:HCQBuffer): ctypes.memmove(from_mv(dest),from_mv(self._as_buffer(src)),dest.nbytes)
   def _as_buffer(self, src:HCQBuffer):
     self.dev._sync_buffers((src,), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     return to_mv(int(src.va_addr), src.size)
@@ -100,7 +98,6 @@ class RockchipProgram(Program['RockchipDevice']):
   def _submit(self, cmd:HCQBuffer, task:HCQBuffer, n:int, standalone:bool=False) -> None:
     if not 0<n<=_MAX_PC_TASKS: raise ValueError("invalid NPU task count")
     subcores = ((0, n),) if standalone else ((0, n), (n, 0), (n, 0))
-    self.dev._check_healthy()
     try:
       self.dev._sync_buffers((cmd,task), rk.RKNPU_MEM_SYNC_TO_DEVICE)
       rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
