@@ -345,9 +345,8 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
     values=_static_lanes(ranges,expr,dependencies=False,limit=limit,block=block)[0]
     if minimum is not None and min(values,default=0)<minimum: raise _RKGenericReject("gather_index")
     return tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else typing_cast(tuple[int,...],values)
-  blocks=_static_blocks(out_index,expr,limit=limit,block=block)
   missing=object(); result:list[int|object]=[missing]*count
-  for dst_lanes,expr_lanes in blocks:
+  for dst_lanes,expr_lanes in _static_blocks(out_index,expr,limit=limit,block=block):
     for dst,value in zip(map(int,dst_lanes),expr_lanes):
       if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
       encoded=encode(value)
@@ -603,8 +602,7 @@ def _lower_bounded_int_lookup(output:RKOutput, plan:RKPlan) -> bool:
   if any(not 0<=item<=32767 for item in values): return False
   table=plan.parameter(dtypes.int16,len(values))
   plan.program.append(RKGather(None,plan.resolve(RKArg(RKBufferKind.ARG,table.arg.slot)),len(values),values=values))
-  address=source if static_value else source*count+out_index
-  selected=table.index(address).load(UOp.const(0,dtypes.int16),gate).cast(dtypes.int)
+  selected=table.index(source if static_value else source*count+out_index).load(UOp.const(0,dtypes.int16),gate).cast(dtypes.int)
   return plan.lower(list(store.replace(src=(store.src[0],selected)).sink().toposort()),vectorize_reductions=False)
 
 def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
@@ -1038,8 +1036,7 @@ class RKContext:
 
   def _int32_divmod(self, u:UOp) -> UOp:
     if not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    values = tuple(self._operand(src, dtypes.int) for src in u.src)
-    raw=tuple(self._unpack_bytes(value) for value in values)
+    raw=tuple(self._unpack_bytes(self._operand(src,dtypes.int)) for src in u.src)
     signs=tuple(_i16_bit(value[3].alu(Ops.SUB,value[3].const_like(127))) for value in raw)
     numerator,denominator=(_twos_complement(value,sign) for value,sign in zip(raw,signs))
     denominator_nonzero=functools.reduce(lambda x,y:x.alu(Ops.MAX,y),map(_i16_bit,denominator)); one=denominator_nonzero.const_like(1)
@@ -1215,10 +1212,9 @@ def _unroll_reduce(ctx:tuple[bool,bool], u:UOp) -> UOp:
   reduce_op,ranges=u.arg[0],list(u.src[1:])
   if reduce_op not in (Ops.ADD,Ops.MAX,Ops.MUL) or not ranges or any(r.op not in (Ops.RANGE,Ops.SPECIAL) for r in ranges): raise _RKGenericReject  # noqa: E501
   # Domain cardinality owns both the iteration limit and the body-expansion budget, before any coordinate evaluation.
-  blocks=_static_blocks(tuple(ranges),*ranges,limit=min(_MAX_GENERIC_UNROLL,_MAX_GENERIC_EXPANDED_NODES//len(u.src[0].toposort())),dependencies=False)  # noqa: E501
   terms=[UOp.const(identity_element(reduce_op,u.dtype),u.dtype)]
   # Consume bounded coordinate blocks in the same row order, without assembling full columns first.
-  terms.extend(u.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for block in blocks for values in zip(*block))  # noqa: E501
+  terms.extend(u.src[0].substitute({r:r.const_like(int(value)) for r,value in zip(ranges,values)},walk=True) for block in _static_blocks(tuple(ranges),*ranges,limit=min(_MAX_GENERIC_UNROLL,_MAX_GENERIC_EXPANDED_NODES//len(u.src[0].toposort())),dependencies=False) for values in zip(*block))  # noqa: E501
   fold_dtype=dtypes.half if half_storage and reduce_op is Ops.ADD and u.dtype.scalar() is dtypes.float else u.dtype
   if fold_dtype is dtypes.half and u.dtype.scalar() is dtypes.float: terms=[_fp32_expr_to_half(term) for term in terms]
   nonzero=[term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)] if reduce_op is Ops.ADD and fold_dtype.scalar() is dtypes.half else []  # noqa: E501
