@@ -152,8 +152,7 @@ class RockchipProgram(Program['RockchipDevice']):
             if precision>=64 and not rearm or precision>=0 and reset and (start+1)*capacity>=len(bodies) and (precision!=128 or len(bodies)%16): self.dev.reset_npu()  # noqa: E501
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
-    for start in range(0, max(1,op.count), limit):
-      yield emit_ew_stage(op._replace(count=min(limit,op.count-start),**flags),address,(start*itemsize*dst_step,start*itemsize*src_step))
+    yield from (emit_ew_stage(op._replace(count=min(limit,op.count-start),**flags),address,(start*itemsize*dst_step,start*itemsize*src_step)) for start in range(0,max(1,op.count),limit))  # noqa: E501
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     with self.dev._lock:

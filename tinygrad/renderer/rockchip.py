@@ -346,12 +346,11 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|floa
     if minimum is not None and min(values,default=0)<minimum: raise _RKGenericReject("gather_index")
     return tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else typing_cast(tuple[int,...],values)
   missing=object(); result:list[int|object]=[missing]*count
-  for dst_lanes,expr_lanes in _static_blocks(out_index,expr,limit=limit,block=block):
-    for dst,value in zip(map(int,dst_lanes),expr_lanes):
-      if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
-      encoded=encode(value)
-      if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
-      result[dst]=encoded
+  for dst,value in itertools.chain.from_iterable(zip(map(int,dst_lanes),expr_lanes) for dst_lanes,expr_lanes in _static_blocks(out_index,expr,limit=limit,block=block)):  # noqa: E501
+    if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
+    encoded=encode(value)
+    if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
+    result[dst]=encoded
   if any(value is missing for value in result): raise _RKGenericReject("static_index")
   return typing_cast(tuple[int,...],tuple(result))
 
