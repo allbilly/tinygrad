@@ -390,10 +390,6 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
     if all((bound:=int(axis.src[0].arg))*out_affine[1][axis]%(step*limit)==0 or bound*out_affine[1][axis]==count for step,limit,_,axis in axes): return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,linear[0],tuple((step,limit,stride) for step,limit,stride,_ in axes),fill_bits=fill_bits)  # noqa: E501
   return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=(_small_gather_offsets if count<=4096 else _gather_offsets)(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
 
-def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
-  low,high=(min(plan.offsets,default=0),max(plan.offsets,default=-1)) if plan.offsets else tuple(plan.base+sum(fn((limit-1)*stride,0) for _,limit,stride in plan.axes) for fn in (min,max))  # noqa: E501
-  if low < (0 if not plan.offsets else -1) or high >= source_count: raise _RKGenericReject("gather_index")
-
 def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None, require_offsets:bool=False) -> RKGather|None:
   """Validate a typed source and return its physical affine or exact-offset gather."""
   if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX or len(load.src)>1 and load.src[1].op is not Ops.CONST and fill_bits is None: return None  # noqa: E501
@@ -401,7 +397,8 @@ def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bi
   gate,fill_bits=load.src[2] if len(load.src)>2 else None,fill_bits if fill_bits is not None else _storage_bits(load.src[1].arg if len(load.src)>1 else 0) if dtype is dtypes.half else 0  # noqa: E501
   try:
     gather=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits)
-    _validate_gather_bounds(gather,int(param.src[0].arg)); return gather._replace(base=0,axes=(),offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count)) if require_offsets and not gather.offsets else gather  # noqa: E501
+    if (bounds:=(min(gather.offsets,default=0),max(gather.offsets,default=-1)) if gather.offsets else tuple(gather.base+sum(fn((limit-1)*stride,0) for _,limit,stride in gather.axes) for fn in (min,max)))[0] < (0 if not gather.offsets else -1) or bounds[1] >= int(param.src[0].arg): raise _RKGenericReject("gather_index")  # noqa: E501
+    return gather._replace(base=0,axes=(),offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count)) if require_offsets and not gather.offsets else gather  # noqa: E501
   except _RKGenericReject: return None
 
 def _relu_operand(u:UOp) -> UOp|None:

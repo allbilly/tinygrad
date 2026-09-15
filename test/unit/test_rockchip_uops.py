@@ -4097,30 +4097,19 @@ def test_production_multi_fancy_one_hot_uses_one_runtime_gather():
   np.testing.assert_array_equal(got,expected)
 
 
-def test_affine_gather_bounds_reject_negative_low_but_keep_offset_sentinel():
+def test_typed_load_bounds_reject_out_of_range_but_keep_offset_sentinel():
   for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
     for count in (1, 2):
-      invalid = RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),count,base=-1,axes=((1,count,1),),itemsize=dtype.itemsize)
-      try: rockchip_renderer._validate_gather_bounds(invalid, count)
-      except rockchip_renderer._RKGenericReject: pass
-      else: raise AssertionError(f"negative affine low admitted for {dtype} lane{count}")
-      rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),count,axes=((1,count,1),),itemsize=dtype.itemsize),count)
-      rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),count,offsets=(-1,)+(0,)*(count-1)),1)
-      try: rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),
-        count,offsets=(-2,0)[:count]),count)
-      except rockchip_renderer._RKGenericReject: pass
-      else: raise AssertionError(f"offset below sentinel admitted for {dtype} lane{count}")
+      lane,source=UOp.range(count,12700),UOp.param(1,dtype,(count,))
+      default=UOp.const(0.0,dtype) if dtype is dtypes.half else UOp.const(0,dtype)
+      def typed(index:UOp, gate:UOp|None=None):
+        load=source.index(index).load() if gate is None else source.index(index).load(default,gate)
+        return rockchip_renderer._typed_load_plan(load,dtype,lane,count)
+      assert typed(lane-1) is None and typed(lane+1) is None
+      assert typed(lane) is not None and (sentinel:=typed(lane-1,lane>0)) is not None and sentinel.offsets==(-1,*range(count-1))
+      assert typed((lane!=0).where(0,-2)) is None
       if dtype is not dtypes.bool:
         assert _lower_uop_program(_dynamic_load_program(count=count, dtype=dtype, normalized=True)) is not None
-
-
-def test_scalar_gather_bounds_reject_negative_low_for_all_typed_lanes():
-  for dtype in (dtypes.half, dtypes.int16, dtypes.int, dtypes.bool):
-    try: rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),1,
-      base=-1,itemsize=dtype.itemsize),1)
-    except rockchip_renderer._RKGenericReject: pass
-    else: raise AssertionError(f"negative scalar low admitted for {dtype}")
-    rockchip_renderer._validate_gather_bounds(RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),1,itemsize=dtype.itemsize),1)
 
 
 def test_gather_offsets_reject_true_gate_negative_and_allow_false_sentinel():
