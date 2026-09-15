@@ -61,14 +61,13 @@ class RKPlan:
     self.bindings:dict[int,RKArg]={}; self.slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=-1)
 
   def parameter(self, dtype:DType, count:int, source:RKArg|None=None) -> UOp:
-    slot=self.slot; self.slot+=1; self.bindings[slot]=RKArg(RKBufferKind.SCRATCH,len(self.scratch)) if source is None else source
+    slot=self.slot; self.slot+=1; self.bindings[slot]=RKArg(RKBufferKind.SCRATCH,len(self.scratch)) if source is None else self.resolve(source)
     if source is None: self.scratch.append(max(64,round_up(count,8)*dtype.itemsize))
     return UOp.param(slot,dtype,(count,))
 
   def resolve(self, arg:RKArg) -> RKArg:
     if arg.kind is not RKBufferKind.ARG or arg.index not in self.bindings: return arg
-    target=self.resolve(self.bindings[arg.index]); self.bindings[arg.index]=target
-    return target._replace(addend=target.addend+arg.addend)
+    return (target:=self.bindings[arg.index])._replace(addend=target.addend+arg.addend)
 
   def lower(self, uops:list[UOp]|Callable[[],bool], *, vectorize_reductions:bool=True, materialize:bool=False, chain:bool=False) -> bool:
     # Preserve existing entries as well as appends; contexts retain references to these lists.
@@ -1112,7 +1111,7 @@ class RKContext:
 
   def _finish_value(self, result:UOp, dtype:DType, materialize:bool=False) -> None:
     """Bind an exact temporary carrier or commit its value to the declared output storage."""
-    if materialize and dtype in (dtypes.half,dtypes.int16,dtypes.int) and result.dtype is dtype and result.arg!=self.out: self.plan.bindings[self.out.index]=result.arg; return  # noqa: E501
+    if materialize and dtype in (dtypes.half,dtypes.int16,dtypes.int) and result.dtype is dtype and result.arg!=self.out: self.plan.bindings[self.out.index]=self.plan.resolve(result.arg); return  # noqa: E501
     expected=dtypes.int if dtype is dtypes.int else self._layout(dtype)
     if dtype is dtypes.int and result.dtype is dtypes.int16: result=self._convert(self.root,result,expected)
     if result.dtype is not expected: raise _RKGenericReject

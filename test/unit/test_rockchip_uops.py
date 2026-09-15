@@ -835,13 +835,16 @@ def test_production_specialized_lowerers_receive_admitted_outputs(operation,monk
 
 
 @pytest.mark.parametrize("failure",("false","reject","key"))
-def test_rejected_plan_restores_existing_lazy_binding(failure:str):
+def test_rejected_plan_restores_existing_direct_binding(failure:str):
   plan=_seed_transaction_plan()
   lazy=plan.parameter(dtypes.half,17)
-  alias=plan.parameter(dtypes.half,17,RKArg(RKBufferKind.ARG,lazy.arg.slot))
+  physical=plan.resolve(RKArg(RKBufferKind.ARG,lazy.arg.slot))
+  alias=plan.parameter(dtypes.half,17,RKArg(RKBufferKind.ARG,lazy.arg.slot,4))
+  assert plan.bindings[alias.arg.slot]==physical._replace(addend=4)
   before=_transaction_state(plan)
   def attempt():
-    plan.resolve(RKArg(RKBufferKind.ARG,alias.arg.slot))
+    nested=plan.parameter(dtypes.half,17,RKArg(RKBufferKind.ARG,alias.arg.slot,6))
+    assert plan.bindings[nested.arg.slot]==physical._replace(addend=10)
     if failure=="reject": raise rockchip_renderer._RKGenericReject
     if failure=="key": raise KeyError("binding bug")
     return False
