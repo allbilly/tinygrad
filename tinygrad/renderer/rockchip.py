@@ -995,7 +995,6 @@ class RKContext:
         less=self.lower(typing_cast(UOp,expression)); unordered=tuple(self._fp16_order(self._operand(src,dtypes.half))[1] for src in typing_cast(tuple[UOp,UOp],sources)); one=less.const_like(1)  # noqa: E501
         return self._lower_recipe(u,one.alu(Ops.SUB,less).alu(Ops.MUL,one.alu(Ops.SUB,unordered[0].alu(Ops.MAX,unordered[1]))))
       lhs,rhs=(self.lower(src) for src in u.src); op=Ops.AND if u.op is Ops.MUL else Ops.OR if u.op is Ops.MAX else u.op
-      if op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.CMPNE,Ops.CMPEQ,Ops.CMPLT): raise _RKGenericReject
       complement=next((other for source,other in zip(u.src,(rhs,lhs)) if op in (Ops.XOR,Ops.CMPNE) and source.op is Ops.CONST and bool(source.arg)),None)  # noqa: E501
       result=lhs.const_like(1).alu(Ops.SUB,complement) if complement is not None else lhs.alu(Ops.MUL if op is Ops.AND else Ops.MAX,rhs) if op in (Ops.AND,Ops.OR) else _i16_compare(op,lhs,rhs)  # noqa: E501
       return self._lower_recipe(u,result)
