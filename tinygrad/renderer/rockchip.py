@@ -3,7 +3,7 @@ from __future__ import annotations
 import array, base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
 from typing import Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
-from tinygrad.device import Compiler
+from tinygrad.device import Base64Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
 from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
 from tinygrad.renderer import Renderer
@@ -1261,9 +1261,6 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   return True
 
 
-class RockchipCompiler(Compiler):
-  def compile(self, src:str) -> bytes: return base64.b64decode(src)
-
 def _const_operand(u:UOp, op:Ops, value:float|None=None) -> tuple[UOp, UOp]|None: return None if u.op is not op else next(
   ((a, b) for a,b in (u.src, u.src[::-1]) if b.op is Ops.CONST and (value is None or float(b.arg) == value)), None)
 
@@ -1407,7 +1404,7 @@ _DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4, direct_reduces = False, False, False, True
   code_for_op = dict.fromkeys((*_EW_CFG,*_DPU_MATH), lambda: None)
-  compiler = RockchipCompiler("rockchip")
+  compiler = Base64Compiler("rockchip")
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501

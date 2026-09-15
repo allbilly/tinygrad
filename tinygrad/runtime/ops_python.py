@@ -7,7 +7,7 @@ import pickle, base64, itertools, time, sys, functools
 from dataclasses import replace
 from tinygrad.dtype import bitcast, DType, dtypes, AddrSpace, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
 from tinygrad.helpers import all_same, getenv, flatten, Target, IMAGE, is_image_shape, cpu_profile
-from tinygrad.device import Buffer, Compiled, Compiler, Allocator, Program, TinyELF
+from tinygrad.device import Buffer, Compiled, Base64Compiler, Allocator, Program, TinyELF
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
 from tinygrad.renderer import Renderer
@@ -199,12 +199,9 @@ class PythonProgram(Program['PythonDevice']):
         i += 1
     return time.perf_counter() - st
 
-class PythonCompiler(Compiler):
-  def compile(self, src:str) -> bytes: return base64.b64decode(src)
-
 class PythonRenderer(Renderer):
   code_for_op = python_alu
-  compiler = PythonCompiler()
+  compiler = Base64Compiler()
 
   def __init__(self, target:Target):
     assert (emu:=getenv("EMULATE", "")) == "", ("EMULATE is deprecated, use DEV=PYTHON::" +
