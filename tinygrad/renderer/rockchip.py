@@ -781,9 +781,9 @@ _pm_half_storage_algebra = PatternMatcher([(UPat(Ops.CAST, dtypes.half, src=(UPa
 def _canonical_half_storage(source:UOp) -> UOp:
   """Commit one FP32 storage expression, then reuse Tinygrad's ordinary algebra on its now-identical half values."""
   converted = _fp32_expr_to_half(source)
-  semantic = tuple(node for node in source.toposort() if node.dtype.scalar() is dtypes.half)
-  # Algebra may rebuild physical ADDs without their markers; never compensate those instructions a second time.
-  return _tag_precise_adds(converted if len(source.toposort()) > 64 else graph_rewrite(graph_rewrite(converted,_pm_half_storage_algebra+sym,name="rockchip half storage algebra"),pm_commit_weak,name="rockchip commit storage constants"),semantic)  # noqa: E501
+  # Original topology owns both algebra admission and opaque HALF boundaries. Algebra may rebuild physical ADDs
+  # without their markers; never compensate those instructions a second time.
+  return _tag_precise_adds(converted if len(graph:=source.toposort()) > 64 else graph_rewrite(graph_rewrite(converted,_pm_half_storage_algebra+sym,name="rockchip half storage algebra"),pm_commit_weak,name="rockchip commit storage constants"),tuple(node for node in graph if node.dtype.scalar() is dtypes.half))  # noqa: E501
 
 def _accurate_add_recipe(u:UOp, pure:bool=False) -> UOp|None:
   # Convert only this sum's FLOAT terms; a HALF cast is an opaque rounding boundary.
@@ -1183,8 +1183,7 @@ class RKContext:
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  bounded_recipes = len(root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES
-  if bounded_recipes: root=root.substitute({u:recipe for u in root.toposort() if (recipe:=_fold_quadratic(u)) is not None})
+  if (bounded_recipes:=len(nodes:=root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES): root=root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})  # noqa: E501
   @functools.cache
   def rewrite(u:UOp) -> UOp:
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float and not _has_runtime_address(u.src[0]):  # noqa: E501
@@ -1198,7 +1197,8 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
     if mapped.op not in _DPU_MATH or mapped.op is Ops.TRUNC and (mapped.dtype.scalar() is not dtypes.half or _is_static_expr(mapped)): return mapped
     if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
     return rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
-  return rewrite(root)
+  # The returned graph owns its live recipes; do not retain the completed memo through the recursive callback's cycle.
+  result=rewrite(root); rewrite.cache_clear(); return result
 
 def _finite_int_max_neutrals(root:UOp) -> UOp:
   """Canonicalize finite FP selector neutrals and simplify integer MAX without changing its semantic constants."""
