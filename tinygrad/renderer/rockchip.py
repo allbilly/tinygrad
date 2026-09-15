@@ -883,10 +883,9 @@ class RKContext:
 
   def _move_bytes(self, sources:Iterable[UOp], destinations:Iterable[UOp], itemsize:int, unpack:bool) -> None:
     """Move raw bytes between one typed carrier and its INT16 components; each interface owns its cache."""
-    for byte,(src,dest) in enumerate(zip(sources,destinations)):
-      self.program.append(RKGather(src.arg._replace(addend=0),dest.arg._replace(addend=0),self.count,base=src.arg.addend+(byte if unpack else 0),
+    self.program.extend(RKGather(src.arg._replace(addend=0),dest.arg._replace(addend=0),self.count,base=src.arg.addend+(byte if unpack else 0),
         axes=((1,self.count,itemsize if unpack else 2),),dst_stride=2 if unpack else itemsize,
-        dst_addend=0 if unpack else byte,itemsize=1,partial=not unpack and bool(byte)))
+        dst_addend=0 if unpack else byte,itemsize=1,partial=not unpack and bool(byte)) for byte,(src,dest) in enumerate(zip(sources,destinations)))
 
   def _unpack_bytes(self, value:UOp, *, copy_wide:bool=True) -> tuple[UOp,...]:
     """Return the raw INT16 byte components, retaining the required copy before reading a wide carrier."""
