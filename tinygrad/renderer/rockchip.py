@@ -1082,8 +1082,8 @@ class RKContext:
         commits.append(RKGather(value.arg._replace(addend=0),result.arg,self.count,offsets=offsets,partial=bool(commits),itemsize=itemsize))
       self.program.extend(commits)
       return result
-    for fold in (_fold_where_abs, _pm_ordered_where.rewrite):
-      if (recipe:=fold(u)) is not None: return self.lower(recipe)
+    if u.dtype.scalar() is dtypes.half and (recipe:=_fold_where_abs(u)) is not None: return self.lower(recipe)
+    if (recipe:=_pm_ordered_where.rewrite(u)) is not None: return self.lower(recipe)
     return self._raw_where(u)
 
   def _cast(self, u:UOp) -> UOp:
@@ -1175,7 +1175,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
     if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped): mapped=UOp(Ops.WHERE,dtypes.half,src=(mapped.src[0],mapped.src[1].cast(dtypes.half),mapped.src[2].cast(dtypes.half)),arg=mapped.arg) if mapped.op is Ops.WHERE else mapped.src[0].cast(dtypes.half).alu(mapped.op,mapped.src[1].cast(dtypes.half))  # noqa: E501
     if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half: mapped=mapped.src[0]  # noqa: E501
-    if mapped.op is Ops.WHERE and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
+    if mapped.op is Ops.WHERE and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==3 and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)  # noqa: E501
     if mapped.op not in _DPU_MATH or mapped.op is Ops.TRUNC and (mapped.dtype.scalar() is not dtypes.half or _is_static_expr(mapped)): return mapped
     if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
     return rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
@@ -1289,8 +1289,7 @@ _pm_where_abs=PatternMatcher([
    lambda positive,negative,denominator,other_denominator,value,no,root:UOp(Ops.MAX,root.dtype,src=(value,value),arg=_NATIVE_ABS) if value.key==no.key and denominator.key==other_denominator.key and float(positive.arg)==-float(negative.arg) else None)])  # noqa: E501
 
 def _fold_where_abs(x:UOp) -> UOp|None:
-  """Recognize `WHERE(x < 0, -x, x)` before an unselected infinity can contaminate a mask blend."""
-  if x.op is not Ops.WHERE or len(x.src)!=3 or x.dtype.scalar() is not dtypes.half: return None
+  """Recognize a well-formed HALF `WHERE(x < 0, -x, x)` before an unselected infinity can contaminate a mask blend."""
   return _pm_where_abs.rewrite(x.replace(src=(_strip_cast(x.src[0]),_strip_cast(x.src[1]),x.src[2])))
 
 def _dpu_trunc(source:UOp) -> UOp:
