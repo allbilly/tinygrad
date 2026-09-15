@@ -1353,9 +1353,8 @@ def _dpu_exp2(source:UOp) -> UOp:
   # Split n in [-24,15] into normal exponents a>=-14 and b>=-10 with a+b=n.
   # Each (e+15)*1024 is an exact HALF integer in [1024,30720]; its INT16 bits encode 2**e.
   # Their product also represents subnormal powers exactly, without a general float-to-integer cast policy.
-  parts=(integer.alu(Ops.MAX,_half(-14.0)),_native_max(integer.alu(Ops.ADD,_half(14.0)),zero))
   scale=functools.reduce(operator.mul,(UOp(Ops.CAST,dtypes.int16,src=((part+_half(15))*_half(1024),),arg=_NATIVE_HALF_TO_INT16).bitcast(dtypes.half)
-                                     for part in parts))
+                                     for part in (integer.alu(Ops.MAX,_half(-14.0)),_native_max(integer.alu(Ops.ADD,_half(14.0)),zero))))
   result = polyN(bounded.alu(Ops.SUB,integer),[0.0013333558,0.0096181291,0.0555041087,0.2402265069,0.6931471806,1]).alu(Ops.MUL,scale)
   below, above = mask_fn(UOp.const(-24.0, dtypes.half).alu(Ops.SUB, source)), mask_fn(source.alu(Ops.SUB, UOp.const(15.9921875, dtypes.half)))
   finite = UOp(Ops.MUL, dtypes.half, src=(result, one.alu(Ops.SUB, below)), arg=_NATIVE_MASK_MUL)
