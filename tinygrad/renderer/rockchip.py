@@ -676,10 +676,11 @@ def _compare_int32_words(op:Ops, lhs:tuple[UOp,...], rhs:tuple[UOp,...]) -> UOp:
   """Compare low/high INT16 words: signed high-word order, then unsigned low-word order."""
   # The old byte comparison carried lower decisions through equal higher bytes in [-255,256].
   # Here every decision is a 0/1 mask; a differing low-word sign decides unsigned order directly.
+  # Unsigned low-word order is signed_less + rhs_negative - lhs_negative: equal signs cancel,
+  # and opposite signs reverse the signed decision. The correction cannot overflow INT16.
   equal=tuple(_i16_compare(Ops.CMPEQ,left,right) for left,right in zip(lhs,rhs))
   if op is not Ops.CMPLT: return equal[0].const_like(1).alu(Ops.SUB,equal[0].alu(Ops.MUL,equal[1])) if op is Ops.CMPNE else equal[0].alu(Ops.MUL,equal[1])  # noqa: E501
-  signs=tuple(_i16_bit(parts[0].const_like(0).alu(Ops.SUB,parts[0])) for parts in (lhs,rhs))
-  low=_i16_select(_i16_compare(Ops.CMPEQ,*signs),_i16_compare(Ops.CMPLT,lhs[0],rhs[0]),signs[1])
+  low=_i16_compare(Ops.CMPLT,lhs[0],rhs[0]).alu(Ops.ADD,_i16_bit(rhs[0].const_like(0).alu(Ops.SUB,rhs[0]))).alu(Ops.SUB,_i16_bit(lhs[0].const_like(0).alu(Ops.SUB,lhs[0])))  # noqa: E501
   return _i16_compare(Ops.CMPLT,lhs[1],rhs[1]).alu(Ops.ADD,equal[1].alu(Ops.MUL,low))
 
 def _carry_bytes(values:Iterable[UOp], carry:UOp, op:Ops=Ops.ADD) -> tuple[tuple[UOp,...],UOp]:

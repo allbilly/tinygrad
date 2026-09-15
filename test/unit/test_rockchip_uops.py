@@ -3167,14 +3167,14 @@ def test_production_causal_attention_applies_infinite_mask_after_precise_dot():
 
 
 def test_generic_image_allows_many_small_ew_stages():
-  # Carry comparison emits 35 stages per term; retain the test above the 16-bit command-count boundary.
-  count = 1873
+  # Word comparison emits 28 stages per term; retain the test above the 16-bit command-count boundary.
+  count = 2341
   out, lhs, rhs = UOp.param(0, dtypes.half, (1,)), UOp.param(1, dtypes.int, (count,)), UOp.param(2, dtypes.int, (count,))
-  value = UOp.const(0.0, dtypes.half)
-  for index in range(count):
-    value = value + (lhs.index(index).load() < rhs.index(index).load()).where(
-      UOp.const(1.0, dtypes.half), UOp.const(0.0, dtypes.half))
-  uops = list(out.index(0).store(value).sink().toposort())
+  terms=[(lhs.index(index).load()<rhs.index(index).load()).where(UOp.const(1.0,dtypes.half),UOp.const(0.0,dtypes.half)) for index in range(count)]
+  while len(terms)>1:
+    tail=terms[-1:] if len(terms)&1 else []
+    terms=[left+right for left,right in itertools.batched(terms[:-1] if tail else terms,2)]+tail
+  uops = list(out.index(0).store(terms[0]).sink().toposort())
   image = _lower_uop_program(uops)
   assert image is not None and len(_ew_ops(image)) > _RKIMAGE_U16_MAX > _MAX_EW_ELEMS_FP16
   assert decode_image(encode_image(image)) == image
@@ -3960,10 +3960,10 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   coordinate = images[-1]
   # Bounded counts use the shared mapped INT16 reduction after exact INT32 predicates and raw narrowing.
   # Resource/image goldens track native-word comparisons; all coordinate-output hashes remain unchanged.
-  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (116,120,7726,1)
+  assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (116,120,7698,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="9ef6db947ed3ff1e0e9bc213eb91cb2e30c93d7c0ce8d29e3d2e6dce766df3ca"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="f16a6ec1899ef41a46123420da80f130b0e868537cd184d570e2ed5dd78eeab2"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))
@@ -3981,7 +3981,7 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
   assert (len(mapped_coordinate.scratch),len(_static_gathers(mapped_coordinate)),len(_ew_ops(mapped_coordinate)),
           len(_output_gathers(mapped_coordinate))) == (11,17,30,0)
   assert (len(large_coordinate.scratch),len(_static_gathers(large_coordinate)),len(_ew_ops(large_coordinate)),
-          len(_output_gathers(large_coordinate))) == (110,114,7757,1)
+          len(_output_gathers(large_coordinate))) == (110,114,7729,1)
   assert not _typed_ops(large_coordinate,RKCMAC)
   values=np.random.default_rng(1001).uniform(-1,1,size=320).astype("<f2")
   assert hashlib.sha256(_execute_raw_dynamic_image(prefix,768*4,values.tobytes())).hexdigest() == \
