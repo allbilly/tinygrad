@@ -1221,9 +1221,8 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
   """Finalize one physical plan for the production renderer; unsupported semantics fail closed."""
   plan=RKPlan(uops)
   if not plan.lower(uops,vectorize_reductions=vectorize_reductions): return None
-  image=_reuse_linear_scratch(_map_image_args(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve))
-  _validate_image(image) if len(image.scratch)<=_RKIMAGE_U16_MAX else None
-  return image if len(image.scratch)<=_RKIMAGE_U16_MAX else None
+  if len((image:=_reuse_linear_scratch(_map_image_args(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve))).scratch)>_RKIMAGE_U16_MAX: return None  # noqa: E501
+  _validate_image(image); return image
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
