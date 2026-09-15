@@ -1325,8 +1325,7 @@ def _dpu_sqrt(source:UOp) -> UOp:
   """Approximate FP16 sqrt with range-independent Babylonian iterations on DPU EW."""
   source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0); finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)  # noqa: E501
   safe = finite.alu(Ops.MAX, UOp.const(2**-24, dtypes.half))
-  estimate = safe.alu(Ops.MAX, one)
-  for _ in range(14): estimate = estimate.alu(Ops.ADD, safe.alu(Ops.FDIV, estimate)).alu(Ops.MUL, UOp.const(0.5, dtypes.half))
+  estimate = functools.reduce(lambda value,_:value.alu(Ops.ADD,safe.alu(Ops.FDIV,value)).alu(Ops.MUL,UOp.const(0.5,dtypes.half)),range(14),safe.alu(Ops.MAX,one))  # noqa: E501
   valid = one.alu(Ops.SUB, _positive_mask(zero.alu(Ops.SUB, source))); return source.alu(Ops.FDIV, estimate).alu(Ops.ADD, valid.alu(Ops.FDIV, valid).alu(Ops.SUB, one))  # noqa: E501
 
 def _dpu_sin(source:UOp) -> UOp:
