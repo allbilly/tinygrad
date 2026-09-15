@@ -5245,12 +5245,12 @@ def test_dynamic_load_materialization_cache_keeps_descriptor_dependencies(dtype)
   first=context._load(load)
   emitted=len(context.program)
   assert context._load(load).arg==first.arg and len(context.program)==emitted
-  changed=(context._load(load,1),context._load(load.replace(src=(source.index(index+1),*load.src[1:]))),
+  changed=(context._load(load.replace(src=(load.src[0],load.src[1].const_like(1),*load.src[2:]))),context._load(load.replace(src=(source.index(index+1),*load.src[1:]))),
            context._load(load.replace(src=(UOp.param(3,dtype,(16,)).index(index),*load.src[1:]))))
   gathers=_runtime_gathers(RKImage(tuple(context.scratch),tuple(context.program)))
   assert len(gathers)==4 and len({first.arg,*(value.arg for value in changed)})==4
   assert gathers[0].index==gathers[1].index==gathers[3].index and gathers[2].index!=gathers[0].index
-  assert [g.fill_bits for g in gathers]==[0,1,0,0] and gathers[0].src!=gathers[3].src
+  assert [g.fill_bits for g in gathers]==[0,rockchip_renderer._storage_bits(1,dtype),0,0] and gathers[0].src!=gathers[3].src
 
 
 @pytest.mark.parametrize("count",(7,9))

@@ -820,7 +820,7 @@ class RKContext:
     return self._slot((_storage_bits(-65504.0 if finite_min and math.isinf(float(u.arg)) and float(u.arg)<0 else u.arg,layout),),layout)
 
   def _operand(self, u:UOp, dtype:DType, finite_min:bool=False) -> UOp:
-    if finite_min and u.op is Ops.LOAD and len(u.src)>2 and u.src[1].op is Ops.CONST and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0 and _is_static_expr(u.src[2]): return self._load(u,_storage_bits(-65504.0))  # noqa: E501
+    if finite_min and u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and len(u.src)>2 and u.src[1].op is Ops.CONST and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0 and _is_static_expr(u.src[2]): return self._load(u.replace(src=(u.src[0],u.src[1].const_like(-65504.0),*u.src[2:])))  # noqa: E501
     return self._constant(u,dtype,finite_min) if u.op is Ops.CONST and (u.dtype.scalar() in dtypes.weaks or dtype is dtypes.half and (u.dtype.scalar() is dtypes.float or finite_min and float(u.arg)==-math.inf)) else self.lower(u)  # noqa: E501
 
   def _static(self, u:UOp) -> UOp:
@@ -831,7 +831,7 @@ class RKContext:
     encoded = values if layout is dtypes.half else tuple(map(operator.and_,values,itertools.repeat(0xffffffff if layout is dtypes.int else 0xffff)))
     return self._slot(encoded,layout)
 
-  def _load(self, u:UOp, fill_override:int|None=None) -> UOp:
+  def _load(self, u:UOp) -> UOp:
     dtype,layout = u.dtype.scalar(),self._layout(u.dtype.scalar())
     if not u.src or u.src[0].op is not Ops.INDEX or (param:=_root_param(u.src[0])) is None or param.arg.slot == self.out_param.arg.slot or param.src[0].op is not Ops.CONST: raise _RKGenericReject  # noqa: E501
     index,gate = u.src[0].src[1],u.src[2] if len(u.src) > 2 else None
@@ -844,8 +844,7 @@ class RKContext:
       if any(not isinstance(op,RKGather) or op.index is not None for op in self.program[schedule:]): raise _RKGenericReject
       return self.lower(gate.where(u.replace(src=(u.src[0],u.const_like(0),*u.src[2:])),default))
     if dtype in (dtypes.float,dtypes.bool) and address_loads: raise _RKGenericReject
-    fill_bits=fill_override if fill_override is not None and dtype is not dtypes.float else _storage_bits(
-      0 if default is None else default.arg,dtype if dtype.itemsize>1 else dtypes.int)
+    fill_bits=_storage_bits(0 if default is None else default.arg,dtype if dtype.itemsize>1 else dtypes.int)
     if address_loads:
       # Compute a dynamic address and predicate on the NPU, then move only the selected raw lane on the host.
       # The host never interprets tensor arithmetic or a boolean gate: an invalid lane is encoded as index -1 by the
