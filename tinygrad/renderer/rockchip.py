@@ -329,7 +329,6 @@ def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_R
   return (tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (_eval_static_block(root,axes,bounds,start,stop),))  # noqa: E501
     for start in range(0,count,block) for stop in (min(start+block,count),))
 
-@functools.lru_cache(maxsize=2)
 def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True, block:int=4096) -> tuple[tuple[RKScalar,...],...]:  # noqa: E501
   """Enumerate one bounded static lane space and evaluate all requested roots in it."""
   blocks=tuple(_static_blocks(index,*roots,limit=limit,dependencies=dependencies,block=block))
@@ -1386,7 +1385,7 @@ class RockchipRenderer(Renderer):
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
-    for cache in (_semantic_loads,_static_ranges,_eval_static_block,_static_lanes,_small_gather_offsets,_int_info,_linear_index): cache.cache_clear()
+    for cache in (_semantic_loads,_static_ranges,_eval_static_block,_small_gather_offsets,_int_info,_linear_index): cache.cache_clear()
     return base64.b64encode(encode_image(image,validate=False)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):

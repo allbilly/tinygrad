@@ -440,14 +440,14 @@ def _trunc_divmod_int32(lhs:int, rhs:int) -> tuple[int, int]:
   return _wrap_int32(quotient), _wrap_int32(lhs-quotient*rhs)
 
 
-def test_binary_tree_iteration_is_ordered_and_bounded_on_shared_dags():
+def test_associative_split_is_ordered_and_bounded_on_shared_dags():
   leaves = [UOp.const(x, dtypes.int) for x in range(8)]
   root = leaves[0]
   for leaf in leaves[1:]: root = root+leaf
-  assert list(rockchip_renderer._iter_binary(root, Ops.ADD)) == leaves
+  assert list(root.split_uop(Ops.ADD)) == leaves
   shared = root
   for _ in range(30): shared = shared+shared
-  assert len(list(itertools.islice(rockchip_renderer._iter_binary(shared, Ops.ADD), 256))) == 256
+  assert len(list(itertools.islice(shared.split_uop(Ops.ADD), 256))) == 256
 
 
 def test_static_vector_values_match_scalar_typed_evaluation():
@@ -522,10 +522,10 @@ def test_static_vector_commit_matches_scalar_typed_bits():
 def test_renderer_releases_uop_analysis_caches():
   lane=UOp.range(4,103)
   rockchip_renderer._static_lanes((lane,),lane,dependencies=False)
-  assert rockchip_renderer._static_lanes.cache_info().currsize
+  assert rockchip_renderer._eval_static_block.cache_info().currsize
   RockchipRenderer(Target(device="ROCKCHIP")).render(_program(dtypes.half,lambda _:UOp.const(0.0,dtypes.half),1))
   caches=(rockchip_renderer._semantic_loads,rockchip_renderer._static_ranges,rockchip_renderer._eval_static_block,
-          rockchip_renderer._static_lanes,rockchip_renderer._small_gather_offsets,rockchip_renderer._int_info)
+          rockchip_renderer._small_gather_offsets,rockchip_renderer._int_info)
   assert all(cache.cache_info().currsize==0 for cache in caches)
 
 
