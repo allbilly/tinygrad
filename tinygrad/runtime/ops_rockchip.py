@@ -8,7 +8,6 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
 
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN, _MAX_PC_TASKS = 4, 65536, 16384, 0xfff
-_SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
 _MAX_EW_GROUP_OPS = 48
 _EW_MODE_INFO=((128,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(16,_MAX_EW_ELEMS_FP16,2,1,1),(32,_MAX_EW_ELEMS_FP16//2,4,1,1),(0,8,1,4,2),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(-1,_MAX_EW_ELEMS_FP16,2,1,1))  # noqa: E501
 
@@ -99,7 +98,7 @@ class RockchipProgram(Program['RockchipDevice']):
     try:
       self.dev._sync_buffers((cmd,task), rk.RKNPU_MEM_SYNC_TO_DEVICE)
       rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=_SUBMIT_TIMEOUT_MS,
+        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=max(1,int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS","6000"))),
         task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
         regcfg_obj_addr=0, task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
         subcore_task=(rk.struct_rknpu_subcore_task*5)(*(rk.struct_rknpu_subcore_task(*x) for x in subcores)))
