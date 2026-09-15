@@ -1366,9 +1366,8 @@ def _dpu_log2(source:UOp) -> UOp:
   source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0); mask_fn=_finite_positive_mask
   mantissa = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, UOp.const(2**-24, dtypes.half)), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)
   exponent = zero
-  for upper,steps in ((True, ((256.0, 8.0), (16.0, 4.0), (4.0, 2.0), (2.0, 1.0))),
-                      (False, ((256.0, 8.0),)*3+((16.0, 4.0), (4.0, 2.0), (2.0, 1.0)))):
-    for factor,shift in steps:
+  for upper,factor,shift in ((True,256.0,8.0),(True,16.0,4.0),(True,4.0,2.0),(True,2.0,1.0),
+                             *((False,256.0,8.0),)*3,(False,16.0,4.0),(False,4.0,2.0),(False,2.0,1.0)):
       threshold = UOp.const(struct.unpack("<e", struct.pack("<H", _storage_bits(factor)-1))[0] if upper else 2.0/factor, dtypes.half)
       mask = _finite_positive_mask(mantissa.alu(Ops.SUB, threshold) if upper else threshold.alu(Ops.SUB, mantissa))
       multiplier = one.alu(Ops.ADD, mask.alu(Ops.MUL, UOp.const(factor-1.0, dtypes.half)))
