@@ -8,11 +8,9 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
 
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN, _MAX_PC_TASKS = 4, 65536, 16384, 0xfff
-_CMD_PREFETCH_GUARD = mmap.PAGESIZE
 _SUBMIT_TIMEOUT_MS = max(1, int(os.getenv("ROCKCHIP_SUBMIT_TIMEOUT_MS", "6000")))
 _MAX_EW_GROUP_OPS = 48
 _EW_MODE_INFO=((128,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(16,_MAX_EW_ELEMS_FP16,2,1,1),(32,_MAX_EW_ELEMS_FP16//2,4,1,1),(0,8,1,4,2),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(64,0,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(0,_MAX_EW_ELEMS_FP16,2,1,1),(-1,_MAX_EW_ELEMS_FP16,2,1,1))  # noqa: E501
-_TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 
 _RAW_FORMATS, _INDEX_FORMATS = {1:"B",2:"H",4:"I"}, {2:"h",4:"i"}
 
@@ -115,8 +113,8 @@ class RockchipProgram(Program['RockchipDevice']):
     """Materialize one physical command/task batch while retaining each submission ABI."""
     bodies=tuple(bodies); sizes=tuple(map(len,bodies)); n=len(bodies)  # noqa: E702
     if not sizes or not all(0<s<1<<16 for s in sizes) or standalone and n!=1 or cmac and not standalone: raise ValueError("invalid NPU command body")  # noqa: E501
-    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(round_up(size+tail_size,2) for size in sizes)); cmd_size=offsets[-1]*8+_CMD_PREFETCH_GUARD  # noqa: E501,E702
-    cmd,task=self.dev._replace_submit_buffers(cmd_size,n*_TASK_DESC_BYTES)
+    tail_size=_PC_TAIL if cmac or not standalone else 1; offsets=(0,*itertools.accumulate(round_up(size+tail_size,2) for size in sizes)); cmd_size=offsets[-1]*8+mmap.PAGESIZE  # noqa: E501,E702
+    cmd,task=self.dev._replace_submit_buffers(cmd_size,n*ctypes.sizeof(rk.struct_rknpu_task))
     ctypes.memset(int(cmd.va_addr),0,cmd_size); base_dma=self._dma(cmd); words=to_mv(int(cmd.va_addr),cmd_size).cast("Q"); descs=(rk.struct_rknpu_task*n).from_address(int(task.va_addr))  # noqa: E501,E702
     for i,(body,size) in enumerate(zip(bodies,sizes)):
       # Write each body and descriptor directly into the zeroed mapped batch; padding stays untouched.
