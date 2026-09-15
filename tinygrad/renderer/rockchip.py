@@ -142,8 +142,8 @@ def decode_image(blob:bytes) -> RKImage:
   except Exception: raise ValueError("invalid RKImage") from None
 
 # Admission and exact-carrier bounds.
-(_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _EW_ELEMS_32BIT, _FP16_EXACT_INTEGER) = (  # noqa: E501
-  0x1001, 0x2001, 64000, 1 << 14, 1 << 20, 4096, 1 << 20, 1 << 22, 8*dtypes.half.itemsize//dtypes.float.itemsize, 1 << 11)
+(_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _MAX_RECURSIVE_LOWER_DEPTH, _EW_ELEMS_32BIT, _FP16_EXACT_INTEGER) = (  # noqa: E501
+  0x1001, 0x2001, 64000, 1 << 14, 1 << 20, 4096, 1 << 20, 1 << 22, 512, 8*dtypes.half.itemsize//dtypes.float.itemsize, 1 << 11)
 # Native EW register fields.
 _EW_RELU_BYPASS, _EW_OP_CVT_BYPASS = 1 << 9, 1 << 8
 _EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
@@ -1150,16 +1150,13 @@ class RKContext:
     return self.values.setdefault(u, value)
 
   def finish(self, materialize:bool=False) -> None:
-    nodes=self.root.toposort(); pending:list[UOp]=[]; dtype=self.out_param.dtype.scalar(); raw_predicate_inputs={src for node in nodes if node.op in (Ops.CMPNE,Ops.CMPEQ) for src in node.src if src.dtype.scalar() is dtypes.half and (src.op is Ops.MAX and src.arg is None and len(src.src)==2 or src.op is Ops.MUL and any(term.op is Ops.CONST and float(term.arg)==-1.0 for term in src.src))}; predicated=any(node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node) for node in nodes); blocked:set[UOp]=set(); typed_loads={load for load in nodes if load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and _typed_load_plan(load,dtypes.half,self.out_index,self.count) is not None} if len(nodes)>800 else set()  # noqa: E501
-    # A dynamic predicate taints only its consumers; independent FP16 arithmetic can form one physical prelude.
-    if len(nodes)>800:
-      # Warm semantic-load caches in postorder, including blocked nodes, before emitting deep physical graphs.
-      for node,loads in zip(nodes,map(_semantic_loads,nodes)):
-        if (node.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ,Ops.WHERE) and not _is_static_expr(node)) or any(src in blocked for src in node.src): blocked.add(node)  # noqa: E501
-        # A maximal compensated ADD owns its prefixes; eagerly lowering each prefix only creates unused physical copies.
-        elif not self._is_static_value(node) and ((not predicated and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.CONST,Ops.LOAD,Ops.CAST,*GroupOp.ALU)) or (node.dtype.scalar() is dtypes.half and node.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.FDIV,Ops.NEG,Ops.RECIPROCAL) and node not in raw_predicate_inputs and all(load in typed_loads for load in loads))): pending.append(node)  # noqa: E501
-      pending.extend(node for node in nodes if node.dtype.scalar() is dtypes.bool and node.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR) and not self._is_static_value(node))  # noqa: E501
-    for node in (*pending,self.root): result=self.lower(node)
+    nodes=self.root.toposort(); depths:dict[UOp,int]={}; dtype=self.out_param.dtype.scalar()
+    # Bound recursive lowering by committing only deep supported prefixes; wide shallow graphs remain demand-driven.
+    for node in nodes:
+      depth=1+max((depths[source] for source in node.src),default=0)
+      if depth>_MAX_RECURSIVE_LOWER_DEPTH and node.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.bool,dtypes.uchar) and node.op in (Ops.LOAD,Ops.CAST,*GroupOp.ALU) and not self._is_static_value(node): self.lower(node); depth=0  # noqa: E501
+      depths[node]=depth
+    result=self.lower(self.root)
     self._finish_value(result,dtype,materialize)
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
