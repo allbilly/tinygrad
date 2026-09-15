@@ -922,7 +922,6 @@ class RKContext:
     if u.op is Ops.RECIPROCAL: return self._lower_recipe(self.recipe_owners.get(u,u),u.replace(op=Ops.FDIV,src=(UOp.const(1.0,dtypes.half),self.lower(u.src[0]))))  # noqa: E501
     if u.op is Ops.NEG:
       source=self.lower(u.src[0]); return self._emit(self._scratch(source.dtype,u=u),source,source,_EW_CFG_NEG)
-    if len(u.src) != 2: raise _RKGenericReject
     if u.op is Ops.ADD and (recipe:=_pm_relu_cap.rewrite(u)) is not None: return self.lower(recipe)
     # RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates.
     if u.op is Ops.FDIV and u.src[0].op is Ops.CONST and math.isinf(numerator:=float(u.src[0].arg)):
@@ -965,7 +964,6 @@ class RKContext:
     return result
 
   def _integer_bits(self, u:UOp) -> UOp:
-    if len(u.src) != 2: raise _RKGenericReject
     layout=self._layout(u.dtype.scalar())
     if (pair:=_const_operand(u,Ops.XOR,-1)) is not None:
       value=self.lower(pair[0])
@@ -1008,7 +1006,6 @@ class RKContext:
       for part,(offset,factors) in zip(raw,affines)),layout,u=u)
 
   def _compare(self, u:UOp) -> UOp:
-    if len(u.src) != 2: raise _RKGenericReject
     if all(src.dtype.scalar() is dtypes.bool for src in u.src):
       expression=next((v for v,m in (u.src,u.src[::-1]) if u.op is Ops.CMPNE and m.op is Ops.CONST and bool(m.arg) and m.dtype.scalar() is dtypes.bool),None); sources=tuple(_half_backed_value(src) for src in expression.src) if expression is not None and expression.op is Ops.CMPLT else ()  # noqa: E501,E702
       if sources and all(src is not None for src in sources):
@@ -1041,7 +1038,7 @@ class RKContext:
     return self.lower(_compare_int32_words(u.op,*components))
 
   def _int32_divmod(self, u:UOp) -> UOp:
-    if len(u.src) != 2 or not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
+    if not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
     values = tuple(self._operand(src, dtypes.int) for src in u.src)
     raw=tuple(self._unpack_bytes(value) for value in values)
     signs=tuple(_i16_bit(value[3].alu(Ops.SUB,value[3].const_like(127))) for value in raw)
@@ -1086,7 +1083,6 @@ class RKContext:
     return self._carrier(context.lower(recipe).arg,yes.dtype)
 
   def _where(self, u:UOp) -> UOp:
-    if len(u.src) != 3: raise _RKGenericReject
     if u is self.root and u.dtype.scalar() is dtypes.uchar and (source:=_typed_cast_source(u.src[1],dtypes.uchar,dtypes.half)) is not None and (condition:=u.src[0]).op is Ops.CMPLT and condition.src[0].op is Ops.CONST and float(condition.src[0].arg)==0.0 and condition.src[1].key==source.key and u.src[2].op is Ops.CONST and int(u.src[2].arg)==0:  # noqa: E501
       return self.lower(source.alu(Ops.MAX,UOp.const(0.0,dtypes.half)).cast(dtypes.uchar))
     # A static selection produces one physical value, including when another UOp consumes it.
@@ -1150,23 +1146,25 @@ class RKContext:
   def lower(self, u:UOp) -> UOp:
     if u in self.values: return self.values[u]
     if u.op is Ops.NOOP and isinstance(u.arg,RKArg): return u
+    # Validate semantic operands once; internal emitters receive unary, binary or ternary nodes.
+    if u.op in GroupOp.Elementwise and len(u.src)!=(2 if u.op in GroupOp.Binary else 3 if u.op in GroupOp.Ternary else 1): raise _RKGenericReject
     dtype = u.dtype.scalar()
     if u.op is Ops.CONST: value = self._constant(u)
     elif self._is_static_value(u): value = self._static(u)
     elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
-    elif u.op is Ops.BITCAST and len(u.src) == 1:
+    elif u.op is Ops.BITCAST:
       source = self.lower(u.src[0])
       if {dtype,source.dtype}!={dtypes.half,dtypes.int16} or source.dtype is not u.src[0].dtype.scalar():
         raise _RKGenericReject(f"bitcast {u.src[0].dtype.scalar()}->{dtype}")
       value = self._carrier(source.arg,dtype)
-    elif u.op is Ops.CAST and len(u.src) == 1: value=self._cast(u)
+    elif u.op is Ops.CAST: value=self._cast(u)
     elif u.op in GroupOp.Comparison or dtype is dtypes.bool and u.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR,Ops.XOR): value=self._compare(u)
     elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.AND,Ops.OR,Ops.XOR) and dtype in (dtypes.int16,dtypes.int) or u.op in (Ops.SHL,Ops.SHR) and dtype in (dtypes.int,dtypes.uint): value=self._integer_bits(u)  # noqa: E501
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is dtypes.int16 and (recipe:=_int_info(u)[1]) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
     elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not dtypes.int16): value=self._int32_divmod(u)  # noqa: E501
     elif u.op is Ops.WHERE: value = self._where(u)
-    elif u.op in _DPU_MATH and len(u.src) == 1 and dtype is dtypes.half:
+    elif u.op in _DPU_MATH and dtype is dtypes.half:
       value = self.lower(_tag_precise_adds(_DPU_MATH[u.op](u.src[0]),(u.src[0],)))
     else: raise _RKGenericReject(f"uop {u.op.name} {dtype}")
     return self.values.setdefault(u, value)
