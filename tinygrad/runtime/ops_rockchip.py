@@ -1,5 +1,5 @@
 from __future__ import annotations
-import array, ctypes, functools, itertools, mmap, operator, os, threading, time, typing
+import array, contextlib, ctypes, functools, itertools, mmap, operator, os, threading, time, typing
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, round_up, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
@@ -208,8 +208,8 @@ class RockchipDevice(Compiled):
       mapping = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=meta.handle, reserved=0, offset=0)
       mapped = self.fd_ctl.mmap(0, alloc, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mapping.offset)
     except Exception as exc:
-      try: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=meta.handle, reserved=0, obj_addr=meta.obj_addr)
-      except (OSError, RuntimeError): pass
+      # ctypes zero-initializes the omitted reserved field.
+      with contextlib.suppress(OSError, RuntimeError): rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=meta.handle, obj_addr=meta.obj_addr)
       raise MemoryError(f"RKNPU GEM mapping failed for {alloc} bytes") from exc
     return HCQBuffer(mapped,size,meta=meta,view=MMIOInterface(mapped,size))
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
