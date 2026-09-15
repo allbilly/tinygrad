@@ -657,12 +657,12 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   replacement=replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype); replacement=replacement.alu(Ops.MAX,replacement.const_like(bounds[0])) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; replacement=replacement.const_like(0).alu(Ops.SUB,replacement.const_like(0).alu(Ops.SUB,replacement).alu(Ops.MAX,replacement.const_like(-bounds[1]))) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; suffix_root=root.substitute({value:replacement})  # noqa: E501
   return plan.lower(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),chain=direct or integer and value.arg[0] is Ops.MAX and total<32)  # noqa: E501
 
-def _i16_bit(value:UOp) -> UOp: return _native_min(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
+def _i16_bit(value:UOp) -> UOp: return _native_max(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
 
 def _i16_compare(op:Ops, lhs:UOp, rhs:UOp) -> UOp:
   delta=(rhs if op is Ops.CMPLT else lhs).alu(Ops.SUB,lhs if op is Ops.CMPLT else rhs)
   # The former byte shortcut relied on differences in [-255,255]; every current caller needs the full signed-word clamp.
-  result=_i16_bit(delta if op is Ops.CMPLT else _native_same(delta,_NATIVE_ABS))
+  result=_i16_bit(delta if op is Ops.CMPLT else _native_max(delta,arg=_NATIVE_ABS))
   return result.const_like(1).alu(Ops.SUB,result) if op is Ops.CMPEQ else result
 
 def _i16_select(selector:UOp, yes:UOp, no:UOp) -> UOp:
@@ -1039,14 +1039,14 @@ class RKContext:
       ge=denominator_nonzero.alu(Ops.MUL,one.alu(Ops.SUB,borrow))
       remainder=[left.alu(Ops.ADD,ge.alu(Ops.MUL,right.alu(Ops.SUB,left))) for left,right in zip(shifted,reduced)]; byte_index,weight=bit_index>>3,1<<(bit_index&7)  # noqa: E501
       quotient[byte_index]=quotient[byte_index].alu(Ops.ADD,ge.alu(Ops.MUL,zero.const_like(weight)))
-    packed_raw,sign=(quotient,_native_same(signs[0].alu(Ops.SUB,signs[1]),_NATIVE_ABS)) if u.op is Ops.CDIV else (remainder,signs[0])
+    packed_raw,sign=(quotient,_native_max(signs[0].alu(Ops.SUB,signs[1]),arg=_NATIVE_ABS)) if u.op is Ops.CDIV else (remainder,signs[0])
     return self._pack_bytes(tuple(self.lower(value) for value in _twos_complement(packed_raw,sign)),dtypes.int,u=u)
 
   def _fp16_order(self, value:UOp, negated:bool=False) -> tuple[UOp,UOp]:
     """Classify raw HALF bits with one signed key: both zeros map to zero; abs(key)>0x7c00 marks NaNs."""
     raw=self._carrier(value.arg,dtypes.int16); sign=_i16_bit(raw.const_like(0).alu(Ops.SUB,raw))
     ordered=_i16_select(sign,raw.const_like(-32768).alu(Ops.SUB,raw),raw)
-    nan=_i16_bit(_native_same(ordered,_NATIVE_ABS).alu(Ops.SUB,ordered.const_like(0x7c00)))
+    nan=_i16_bit(_native_max(ordered,arg=_NATIVE_ABS).alu(Ops.SUB,ordered.const_like(0x7c00)))
     return (ordered.const_like(0).alu(Ops.SUB,ordered) if negated else ordered),nan
 
   def _raw_where(self, u:UOp, selector:UOp|None=None) -> UOp:
@@ -1101,8 +1101,8 @@ class RKContext:
     # FP16 Boolean conversion (including nonzero comparisons) uses ABS then positivity, exact for zero, infinity and NaN.
     if dtype is dtypes.uchar and (relu:=_relu_operand(source_u)) is not None: source_u=relu.alu(Ops.MAX,UOp.const(0.0,dtypes.half))
     if source_dtype is dtypes.half and dtype in (dtypes.uchar,dtypes.int): source_u=_dpu_trunc(source_u)
-    if dtype is dtypes.uchar: source_u=source_u.alu(Ops.SUB,_native_same(source_u.alu(Ops.MUL,UOp.const(1.0/256.0,dtypes.half)),
-      _NATIVE_FLOOR).alu(Ops.MUL,UOp.const(256.0,dtypes.half)))
+    if dtype is dtypes.uchar: source_u=source_u.alu(Ops.SUB,_native_max(source_u.alu(Ops.MUL,UOp.const(1.0/256.0,dtypes.half)),arg=_NATIVE_FLOOR)
+      .alu(Ops.MUL,UOp.const(256.0,dtypes.half)))
     elif dtype is dtypes.bool: source_u=_positive_mask(UOp(Ops.MAX,dtypes.half,src=(source_u,source_u),arg=_NATIVE_ABS))
     elif source_dtype is dtypes.bool and dtype in (dtypes.half,dtypes.float): source_u=source_u.where(UOp.const(1.0,dtypes.half),UOp.const(0.0,dtypes.half))  # noqa: E501
     if dtype is dtypes.half and source_dtype is dtypes.float:
@@ -1259,9 +1259,7 @@ def _positive_mask(u:UOp) -> UOp: return UOp(Ops.MAX, dtypes.half, src=(u, u), a
 
 def _half(value:float) -> UOp: return UOp.const(value, dtypes.half)
 
-def _native_min(*values:UOp, dtype:DType|None=None) -> UOp: return UOp(Ops.MAX, dtype or values[0].dtype, src=(values[0],values[1]), arg=_NATIVE_MIN)
-
-def _native_same(value:UOp, arg:str) -> UOp: return UOp(Ops.MAX, value.dtype, src=(value,value), arg=arg)
+def _native_max(value:UOp, other:UOp|None=None, arg:str=_NATIVE_MIN) -> UOp: return UOp(Ops.MAX,value.dtype,src=(value,value if other is None else other),arg=arg)  # noqa: E501
 
 # Turn ordered clamp WHEREs into native DPU EW MIN/MAX stages.
 _native_value,_native_other,_native_yes,_native_no=(UPat.var(name) for name in ("value","other","yes","no"))
@@ -1271,14 +1269,14 @@ _pm_ordered_where=PatternMatcher([
    lambda upper,maximum,lower,constant,value:UOp(Ops.MAX,maximum.dtype,src=(maximum,constant),arg=_NATIVE_MIN) if upper.key==constant.key==lower.src[1].key and lower.src[0].key==value.key and {node.key for node in maximum.src}=={value.key,constant.key} else None),  # noqa: E501
   ((_native_value<_native_other).where(_native_yes,_native_no),
    lambda value,other,yes,no:value.alu(Ops.MAX,other) if (yes.key,no.key)==(other.key,value.key) else
-     _native_min(value,other) if (yes.key,no.key)==(value.key,other.key) else None)])
+     _native_max(value,other) if (yes.key,no.key)==(value.key,other.key) else None)])
 
 def _unwrap_condition(u:UOp) -> UOp: return _strip_cast(u,(dtypes.bool,dtypes.half,dtypes.float))
 
 def _finite_positive_mask(u:UOp) -> UOp:
   """Map finite binary16 values to `u > 0` without the stateful DPU compare path."""
   # Retain all three typed scaling stages and their rounding boundaries in the physical recipe.
-  return _native_min(functools.reduce(lambda value,factor:value.alu(Ops.MUL,factor),(_half(256.0),)*3,u.alu(Ops.MAX,_half(0.0))),_half(1.0))
+  return _native_max(functools.reduce(lambda value,factor:value.alu(Ops.MUL,factor),(_half(256.0),)*3,u.alu(Ops.MAX,_half(0.0))),_half(1.0))
 
 def _relu_cap(positive:UOp, upper_relu:UOp, x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
@@ -1306,7 +1304,7 @@ def _dpu_trunc(source:UOp) -> UOp:
   """Compose truncation from native floor/ceil without mask multiplication on infinities."""
   zero = UOp.const(0.0, dtypes.half)
   negative = zero.alu(Ops.SUB, zero.alu(Ops.SUB, source).alu(Ops.MAX, zero))
-  return _native_same(source.alu(Ops.MAX, zero), _NATIVE_FLOOR).alu(Ops.ADD, _native_same(negative, _NATIVE_CEIL))
+  return _native_max(source.alu(Ops.MAX, zero),arg=_NATIVE_FLOOR).alu(Ops.ADD,_native_max(negative,arg=_NATIVE_CEIL))
 
 def _fold_quadratic(root:UOp) -> UOp|None:
   """Scale sqrt(x*x +/- 1), and stabilize its canonical natural-log envelope."""
@@ -1314,7 +1312,7 @@ def _fold_quadratic(root:UOp) -> UOp|None:
   radical=root if root.op is Ops.SQRT and len(root.src)==1 else next((term for term in logarithm.src[0].src if term.op is Ops.SQRT and len(term.src)==1),None) if logarithm is not None else None  # noqa: E501
   if (matched:=next(((square.src[0],float(offset.arg)) for square,offset in ((radical.src[0].src,radical.src[0].src[::-1]) if radical is not None and radical.src[0].op is Ops.ADD else ()) if square.op is Ops.MUL and len(square.src)==2 and square.src[0].key==square.src[1].key and offset.op is Ops.CONST and float(offset.arg) in (-1.0,1.0) and (logarithm is None or any(term is not radical and term.key==square.src[0].key for term in logarithm.src[0].src))),None)) is None: return None  # noqa: E501
   source,offset=matched; source=source.cast(dtypes.half); magnitude=UOp(Ops.MAX,dtypes.half,src=(source,source),arg=_NATIVE_ABS)
-  scale=_native_min(magnitude,_half(65504.0)).alu(Ops.MAX,_half(1.0)); ratio=source.alu(Ops.FDIV,scale)
+  scale=_native_max(magnitude,_half(65504.0)).alu(Ops.MAX,_half(1.0)); ratio=source.alu(Ops.FDIV,scale)
   scaled=scale.alu(Ops.MUL,ratio.alu(Ops.MUL,ratio).alu(Ops.ADD,_half(offset).alu(Ops.FDIV,scale.alu(Ops.MUL,scale))).sqrt())
   if logarithm is None: return scaled
   result=(magnitude if offset==1 else source).alu(Ops.ADD,scaled).log2().alu(Ops.MUL,_half(math.log(2)))
@@ -1339,7 +1337,7 @@ def _dpu_sin(source:UOp) -> UOp:
   # A second quotient removes the small residual left by the rounded FP16 bulk quotient.
   for _ in range(2):
     quotient=reduced.alu(Ops.MUL,UOp.const(1/(2*math.pi),dtypes.half)); magnitude=UOp(Ops.MAX,dtypes.half,src=(quotient,quotient),arg=_NATIVE_ABS)
-    multiple=_native_same(magnitude.alu(Ops.ADD,UOp.const(0.5,dtypes.half)),_NATIVE_FLOOR).alu(Ops.MUL,_finite_positive_mask(quotient).alu(Ops.MUL,UOp.const(2.0,dtypes.half)).alu(Ops.SUB,one))  # noqa: E501
+    multiple=_native_max(magnitude.alu(Ops.ADD,UOp.const(0.5,dtypes.half)),arg=_NATIVE_FLOOR).alu(Ops.MUL,_finite_positive_mask(quotient).alu(Ops.MUL,UOp.const(2.0,dtypes.half)).alu(Ops.SUB,one))  # noqa: E501
     reduced,reduction_error=_precise_add_parts([reduced,reduction_error,*(multiple.alu(Ops.MUL,UOp.const(-coefficient,dtypes.half)) for coefficient in split)])  # noqa: E501
   invalid=source.alu(Ops.MUL,UOp.const(0.0,dtypes.half))
   magnitude=UOp(Ops.MAX,dtypes.half,src=(reduced,reduced),arg=_NATIVE_ABS); reflected=_finite_positive_mask(magnitude.alu(Ops.SUB,UOp.const(math.pi/2,dtypes.half)))  # noqa: E501
@@ -1361,7 +1359,7 @@ def _dpu_exp2(source:UOp) -> UOp:
   # Split n in [-24,15] into normal exponents a>=-14 and b>=-10 with a+b=n.
   # Each (e+15)*1024 is an exact HALF integer in [1024,30720]; its INT16 bits encode 2**e.
   # Their product also represents subnormal powers exactly, without a general float-to-integer cast policy.
-  parts=(integer.alu(Ops.MAX,_half(-14.0)),_native_min(integer.alu(Ops.ADD,_half(14.0)),zero))
+  parts=(integer.alu(Ops.MAX,_half(-14.0)),_native_max(integer.alu(Ops.ADD,_half(14.0)),zero))
   scale=functools.reduce(operator.mul,(UOp(Ops.CAST,dtypes.int16,src=((part+_half(15))*_half(1024),),arg=_NATIVE_HALF_TO_INT16).bitcast(dtypes.half)
                                      for part in parts))
   result = polyN(bounded.alu(Ops.SUB,integer),[0.0013333558,0.0096181291,0.0555041087,0.2402265069,0.6931471806,1]).alu(Ops.MUL,scale)
