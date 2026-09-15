@@ -227,9 +227,7 @@ class RockchipDevice(Compiled):
   def _sync_buffer(self, buf:HCQBuffer, flags:int):
     self._check_healthy() or rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
-    unique:dict[int,HCQBuffer] = {}
-    for buf in bufs: unique.setdefault(buf.meta.obj_addr,buf)
-    for buf in unique.values(): self._sync_buffer(buf,flags)
+    for buf in {buf.meta.obj_addr:buf for buf in bufs}.values(): self._sync_buffer(buf,flags)
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     if not self._poisoned: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
