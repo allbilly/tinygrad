@@ -186,8 +186,7 @@ class RockchipProgram(Program['RockchipDevice']):
       if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
       elif isinstance(current,RKEWOp): self._run_ew_ops(address,group,rearm)  # type: ignore[arg-type]
       else:
-        touched={(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None}  # type: ignore[union-attr]  # noqa: E501
-        self.dev._sync_buffers(tuple(buffer(kind,index) for kind,index in touched),rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+        self.dev._sync_buffers(tuple(buffer(arg.kind,arg.index) for gather in group for arg in (gather.src,gather.index,gather.dst) if arg is not None),rk.RKNPU_MEM_SYNC_FROM_DEVICE)  # type: ignore[union-attr]  # noqa: E501
         _apply_gathers(group,buffer)  # type: ignore[arg-type]
         self.dev._sync_buffers(tuple(buffer(g.dst.kind,g.dst.index) for g in group),rk.RKNPU_MEM_SYNC_TO_DEVICE)  # type: ignore[union-attr]  # noqa: E501
     if ew_ops: self.dev._native_int16 = ew_ops[-1].mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16)
