@@ -462,7 +462,7 @@ def _lower_cmac_storage_epilogue(output:RKOutput, uops:list[UOp], plan:RKPlan) -
   """Commit one output-shaped FP32 contraction to HALF on CMAC before its ordinary HALF epilogue."""
   store,out,count,index,root=output
   for boundary in (u for u in root.toposort() if u is not root and _typed_cast_source(u,dtypes.half,dtypes.float) is not None):
-    source=boundary.src[0]; terms=tuple(_strip_cast(term) for term in _iter_binary(source,Ops.ADD)) if source.op is Ops.ADD else ()
+    source=boundary.src[0]; terms=tuple(_strip_cast(term) for term in source.split_uop(Ops.ADD)) if source.op is Ops.ADD else ()
     if any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])==8 for node in boundary.toposort()) or len(terms) == 8 and all(term.op is Ops.MUL and term.arg is None and all(src.dtype.scalar() is dtypes.half and _strip_cast(src).op is Ops.LOAD for src in term.src) for term in terms): continue  # noqa: E501
     def append() -> bool:
       fake=plan.parameter(dtypes.half,count); prefix=fake.index(index).store(boundary)
@@ -471,13 +471,6 @@ def _lower_cmac_storage_epilogue(output:RKOutput, uops:list[UOp], plan:RKPlan) -
       return not any(_root_param(load.src[0]) is out for load in _semantic_loads(suffix)) and plan.lower(list(suffix.sink().toposort()),vectorize_reductions=False,chain=not any(isinstance(op,RKCMAC) for op in plan.program))  # noqa: E501
     if plan.lower(append): return True
   return False
-
-def _iter_binary(root:UOp, op:Ops, dtype:DType|None=None, plain:bool=False) -> Iterable[UOp]:
-  stack = [root]
-  while stack:
-    node = stack.pop()
-    if node.op is op and (dtype is None or node.dtype.scalar() is dtype) and (not plain or node.arg is None): stack.extend(reversed(node.src))
-    else: yield node
 
 def _gate_zero_term(term:UOp) -> UOp:
   """Move a static zero-select into its load so padded products keep a linear physical carrier."""
@@ -521,16 +514,16 @@ def _lower_cmac_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   # Unrolling a non-additive MAX yields MAX or a constant, neither of which can supply contraction terms.
   if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and not additive: return False
   # Keep a single mapped product/identity structured; irregular additive bodies retain bounded normalization.
-  ranges=root.src[1:] if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and all(axis.op in (Ops.RANGE,Ops.SPECIAL) and axis.src and axis.src[0].op is Ops.CONST for axis in root.src[1:]) and all(node.op in (Ops.LOAD,Ops.CONST) for node in map(_strip_cast,_iter_binary(_gate_zero_term(root.src[0]),Ops.MUL,plain=True))) else ()  # noqa: E501
+  ranges=root.src[1:] if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and all(axis.op in (Ops.RANGE,Ops.SPECIAL) and axis.src and axis.src[0].op is Ops.CONST for axis in root.src[1:]) and all(node.op in (Ops.LOAD,Ops.CONST) for node in map(_strip_cast,_gate_zero_term(root.src[0]).split_uop(Ops.MUL,lambda node:node.arg is None))) else ()  # noqa: E501
   if (normalized:=root if ranges else _optional_rewrite(functools.partial(_unroll_static_reduces,precise=False),root,errors=(_RKGenericReject,RuntimeError,ValueError))) is None: return False  # noqa: E501
   scale,exact_scale=1.0,True
   while (pair:=_const_operand(root:=_strip_cast(normalized),Ops.MUL)) is not None: normalized,factor=pair[0],float(pair[1].arg); scale*=factor; exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale  # noqa: E501
   bounds=tuple(int(axis.src[0].arg) for axis in ranges); reduction_size=math.prod(bounds); root=_gate_zero_term(root.src[0]) if ranges else root
-  terms=tuple(_gate_zero_term(term) for term in _iter_binary(root,Ops.ADD)) if root.op is Ops.ADD else (_gate_zero_term(root),) if additive else (); terms=tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)); groups=reduction_size*len(terms)  # noqa: E501
+  terms=tuple(_gate_zero_term(term) for term in root.split_uop(Ops.ADD)) if root.op is Ops.ADD else (_gate_zero_term(root),) if additive else (); terms=tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)); groups=reduction_size*len(terms)  # noqa: E501
   if groups < (1 if additive else 4) or groups>_MAX_CMAC_K: return False
   parsed:list[tuple[UOp|None,UOp|None,float]]=[]
   for term in terms:
-    factors=tuple(map(_strip_cast,_iter_binary(_strip_cast(term),Ops.MUL,plain=True))); constants=tuple(node for node in factors if node.op is Ops.CONST); loads=tuple(node for node in factors if node.op is not Ops.CONST); weight=scale*math.prod(float(node.arg) for node in constants)  # noqa: E501
+    factors=tuple(map(_strip_cast,_strip_cast(term).split_uop(Ops.MUL,lambda node:node.arg is None))); constants=tuple(node for node in factors if node.op is Ops.CONST); loads=tuple(node for node in factors if node.op is not Ops.CONST); weight=scale*math.prod(float(node.arg) for node in constants)  # noqa: E501
     if len(constants)>2 or len(constants)>1 and term.dtype.scalar() is not dtypes.float or len(loads)>2 or not exact_scale or any(float_to_fp16(float(node.arg))!=float(node.arg) for node in constants) or not math.isfinite(weight) or len(loads)<2 and float_to_fp16(weight)!=weight or len(loads)==2 and weight!=1.0 or out.dtype.scalar() is dtypes.float and rows==1 and len(loads)==1 and weight==1.0 or any(load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX or _root_param(load.src[0]) is None or len(load.src)>1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg)!=0.0 or math.copysign(1.0,float(load.src[1].arg))<0.0) for load in loads): return False  # noqa: E501
     parsed.append((loads[0] if loads else None,loads[1] if len(loads)>1 else None,weight))
   load_axes={load:frozenset((*(_static_ranges(load.src[0].src[1]) or ()),*(() if len(load.src)<3 else (_static_ranges(load.src[2]) or ()))))-frozenset(ranges) for pair in parsed for load in pair[:2] if load is not None}  # noqa: E501
@@ -643,7 +636,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   if boolean and out.dtype.scalar() is not dtypes.bool or product.dtype.scalar() is not dtypes.half and (bounds is None or not -32768<=bounds[0]<=bounds[1]<=32767) or len(reductions)==1 and (total<32 and not bounded_sum and not short_math and not (integer and value.arg[0] is Ops.MAX) or not (rows>1 and out.dtype.scalar() is dtypes.int or total>416 or len(loads)>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN,Ops.CMPLT,Ops.CMPNE,Ops.WHERE) for node in graph))): return False  # noqa: E501
   mapped_dtype=dtypes.int16 if integer else dtypes.half; gated=_gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product; mapped_terms:tuple[UOp,...]=(gated if gated is not product or unit_sum else body,); product=gated  # noqa: E501
   if product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in product.src) and any(_strip_cast(source).op is not Ops.LOAD for source in product.src):  # noqa: E501
-    factor,multiplier=next(((a,b) for a,b in (product.src,product.src[::-1]) if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD),product.src); products=tuple(term.alu(Ops.MUL,multiplier) for term in _iter_binary(factor,Ops.ADD,dtypes.half,plain=True)) if factor.op is Ops.ADD else (product,); mapped_terms=tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))  # noqa: E501
+    factor,multiplier=next(((a,b) for a,b in (product.src,product.src[::-1]) if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD),product.src); products=tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (product,); mapped_terms=tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))  # noqa: E501
   output_axes=tuple((axis,stride,extent) for axis,stride,extent in reversed(tuple(zip(axes,strides_for_shape(shape),shape))) if extent>1); block=round_up(rows,8) if rows>1 else 1; groups=total*len(mapped_terms); lanes=groups*block  # noqa: E501
   cmac_ai,cmac_ao,_=_cmac_layout(rows,groups); mapped_cmac=not integer and rows>1 and 12*32<groups<=_MAX_CMAC_K and lanes>_MAX_EW_ELEMS_FP16 and cmac_ao<=0x3fff and cmac_ai*cmac_ao*2<=11*32768 and value.arg[0] is Ops.ADD and product.op in (Ops.ADD,Ops.MUL,Ops.WHERE) and not square and not unit_sum  # noqa: E501
   if rows>1 and (value.arg[0] not in ((Ops.MUL,) if boolean else (Ops.ADD,Ops.MAX,Ops.MUL)) or _linear_index(out_index)!=(0,{axis:stride for axis,stride,_ in output_axes}) or lanes>(_MAX_GENERIC_EXPANDED_NODES if boolean else min(_MAX_STATIC_RANGE_ENVS,16*_MAX_GENERIC_UNROLL) if short_math or mapped_cmac or value.arg[0] is Ops.MUL or value.arg[0] is Ops.ADD and product.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN) else _MAX_STATIC_RANGE_ENVS if integer or value.arg[0] is Ops.MAX else _MAX_GENERIC_UNROLL)): return False  # noqa: E501
@@ -765,7 +758,7 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
     return UOp(u.op, dtypes.half, src=(u.src[0],*tuple(_fp32_expr_to_half(src) for src in u.src[1:])) if u.op is Ops.WHERE else tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg if u.op not in (Ops.MUL, Ops.NEG) else None)  # noqa: E501
   if u.op is Ops.ADD:
     # Apply static nonfinite masks after the compensated finite sum: TwoSum arithmetic on infinity produces NaN.
-    terms=[_fp32_expr_to_half(x) for x in _iter_binary(u,Ops.ADD,dtypes.float)]; masks=[term for term in terms if _is_static_expr(term) and any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float) and not math.isfinite(float(node.arg)) for node in term.toposort())]; return functools.reduce(lambda value,mask:value.alu(Ops.ADD,mask),masks,_precise_mul_sum([term for term in terms if term not in masks]))  # noqa: E501
+    terms=[_fp32_expr_to_half(x) for x in u.split_uop(Ops.ADD,lambda node:node.dtype.scalar() is dtypes.float)]; masks=[term for term in terms if _is_static_expr(term) and any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float) and not math.isfinite(float(node.arg)) for node in term.toposort())]; return functools.reduce(lambda value,mask:value.alu(Ops.ADD,mask),masks,_precise_mul_sum([term for term in terms if term not in masks]))  # noqa: E501
   raise _RKGenericReject
 
 def _optional_rewrite(rewrite:Callable[[UOp],UOp], source:UOp, *, errors:tuple[type[Exception],...]=(_RKGenericReject,)) -> UOp|None:
@@ -785,7 +778,7 @@ def _canonical_half_storage(source:UOp) -> UOp:
 
 def _accurate_add_recipe(u:UOp, pure:bool=False) -> UOp|None:
   # Convert only this sum's FLOAT terms; a HALF cast is an opaque rounding boundary.
-  terms=[_fp32_expr_to_half(term) if term.dtype.scalar() is dtypes.float else term for term in _iter_binary(u,Ops.ADD,plain=True)]
+  terms=[_fp32_expr_to_half(term) if term.dtype.scalar() is dtypes.float else term for term in u.split_uop(Ops.ADD,lambda node:node.arg is None)]
   if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2 or any(any(node.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN) for node in term.toposort()) for term in terms) or pure and any(not (term.op is Ops.MUL and term.dtype.scalar() is dtypes.half or term.op is Ops.CONST and float(term.arg) == 0.0) for term in terms): return None  # noqa: E501
   return _precise_mul_sum([term for term in terms if term.op is not Ops.CONST or float(term.arg) != 0.0])
 
