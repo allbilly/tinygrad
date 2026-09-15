@@ -162,7 +162,6 @@ class RockchipProgram(Program['RockchipDevice']):
       yield emit_ew_stage(op._replace(count=min(limit,op.count-start),**flags),address,(start*itemsize*dst_step,start*itemsize*src_step))
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
-    del global_size, local_size, vals, kwargs
     with self.dev._lock: return self._run(bufs,wait)
 
   def _run(self, bufs:tuple[HCQBuffer, ...], wait:bool):
@@ -179,8 +178,7 @@ class RockchipProgram(Program['RockchipDevice']):
     def address(arg:RKArg) -> int: return addresses[arg] if arg in addresses else addresses.setdefault(arg,self._dma(buffer(arg.kind,arg.index))+arg.addend)  # noqa: E501
     start = time.perf_counter()
     ew_ops=tuple(op for op in self.image.program if isinstance(op,RKEWOp))
-    native_int16=any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops)
-    if ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
+    if ew_ops and self.dev._native_int16 and not any(op.mode in (RKEWMode.INT16,RKEWMode.INT16_TO_INT32,RKEWMode.HALF_TO_INT16) for op in ew_ops): self.dev.reset_npu()  # noqa: E501
     for index,group in enumerate(groups:=tuple(tuple(items) for _,items in itertools.groupby(self.image.program[cursor:],type))):
       rearm=index+2<len(groups) and all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in group) and isinstance(groups[index+1][0],RKGather) and (isinstance(next_op:=groups[index+2][0],RKEWOp) and next_op.mode==RKEWMode.BOUNDED or all(isinstance(op,RKEWOp) and op.mode==RKEWMode.INT32_TO_HALF for op in groups[index+2]))  # noqa: E501
       if isinstance(current:=group[0],RKCMAC): self._submit_bodies((emit_cmac_stage(current,address),),True,True)
