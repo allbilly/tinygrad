@@ -1065,7 +1065,6 @@ class RKContext:
        dtype is dtypes.int and source_dtype is dtypes.float: raise _RKGenericReject(f"cast {source_dtype}->{dtype}")
     source_u=u.src[0]
     # FP16 Boolean conversion (including nonzero comparisons) uses ABS then positivity, exact for zero, infinity and NaN.
-    if dtype is dtypes.uchar and (relu:=_relu_operand(source_u)) is not None: source_u=relu.alu(Ops.MAX,UOp.const(0.0,dtypes.half))
     if source_dtype is dtypes.half and dtype in (dtypes.uchar,dtypes.int): source_u=_dpu_trunc(source_u)
     if dtype is dtypes.uchar: source_u=source_u.alu(Ops.SUB,_native_max(source_u.alu(Ops.MUL,UOp.const(1.0/256.0,dtypes.half)),arg=_NATIVE_FLOOR)
       .alu(Ops.MUL,UOp.const(256.0,dtypes.half)))
