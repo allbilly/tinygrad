@@ -289,14 +289,6 @@ def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None
   cache={} if cache is None else cache; cache.update((node,_commit_static(node.dtype,value)) for node,value in env.items())
   return u.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache)
 
-@functools.lru_cache(maxsize=2048)
-def _eval_static_block(u:UOp, axes:tuple[UOp,...], bounds:tuple[int,...], start:int, stop:int) -> RKStatic:
-  if u in axes:
-    stride=strides_for_shape(bounds)[axes.index(u)]; bound=bounds[axes.index(u)]
-    # Keep block-constant coordinates scalar; singleton axes have a canonical zero stride.
-    return 0 if bound==1 else start//stride%bound if start//stride==(stop-1)//stride else tuple(range(start,stop)) if stride==1 and stop<=bound else tuple(lane//stride%bound for lane in range(start,stop))  # noqa: E501
-  return _exec_static(u,tuple(_eval_static_block(source,axes,bounds,start,stop) for source in u.src))
-
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
 def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
   """Return the single statically-sized output store shared by specialized graph matchers."""
@@ -321,8 +313,15 @@ def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_R
   if any(bound<0 for bound in bounds) or count>limit: raise _RKGenericReject("static_index_budget")
   if any((used:=_static_ranges(root)) is None or any(r not in ranges for r in used) for root in roots): raise _RKGenericReject("static_index")  # noqa: E501
   # Validate eagerly, before callers allocate their destination; only evaluation is lazy.
-  return (tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (_eval_static_block(root,axes,bounds,start,stop),))  # noqa: E501
-    for start in range(0,count,block) for stop in (min(start+block,count),))
+  strides=strides_for_shape(bounds)
+  def evaluate(start:int, stop:int) -> tuple[tuple[RKScalar,...],...]:
+    # Keep block-constant coordinates scalar; singleton axes have a canonical zero stride.
+    cache:dict[UOp,RKStatic]={}
+    for axis,stride,bound in zip(axes,strides,bounds):
+      cache[axis]=0 if bound==1 else start//stride%bound if start//stride==(stop-1)//stride else tuple(range(start,stop)) if stride==1 and stop<=bound else tuple(lane//stride%bound for lane in range(start,stop))  # noqa: E501
+    # The block-local cache shares subexpressions across roots without retaining UOps after rendering.
+    return tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (root.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache),))  # noqa: E501
+  return (evaluate(start,min(start+block,count)) for start in range(0,count,block))
 
 def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_static_ranges(out_index) or (); bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges); affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); return ranges if affine is not None and affine[0]==0 and count==math.prod(bounds) and all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None  # noqa: E702,E501
 
@@ -1366,7 +1365,7 @@ class RockchipRenderer(Renderer):
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
-    for cache in (_semantic_loads,_static_ranges,_eval_static_block,_small_gather_offsets,_int_info,_linear_index): cache.cache_clear()
+    for cache in (_semantic_loads,_static_ranges,_small_gather_offsets,_int_info,_linear_index): cache.cache_clear()
     return base64.b64encode(encode_image(image,validate=False)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
