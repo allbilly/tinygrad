@@ -1127,8 +1127,7 @@ class RKContext:
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is dtypes.int16 and (recipe:=_int_info(u)[1]) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
     elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not dtypes.int16): value=self._int32_divmod(u)  # noqa: E501
     elif u.op is Ops.WHERE: value = self._where(u)
-    elif u.op in _DPU_MATH and dtype is dtypes.half:
-      value = self.lower(_tag_precise_adds(_DPU_MATH[u.op](u.src[0]),(u.src[0],)))
+    elif u.op in _DPU_MATH and dtype is dtypes.half: value=self.lower(_expand_math_uops(u))
     else: raise _RKGenericReject(f"uop {u.op.name} {dtype}")
     return self.values.setdefault(u, value)
 
