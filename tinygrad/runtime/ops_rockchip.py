@@ -41,8 +41,7 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
     raw_dst,code=buffer(gather.dst.kind,gather.dst.index),_RAW_FORMATS[gather.itemsize]
     dst=_rk_buffer_view(raw_dst,gather.dst,code,gather.itemsize)
     dst_limit=len(dst)
-    begin,step=(0,1) if gather.index is not None else (gather.dst_addend,gather.dst_stride)
-    span,bounded=slice(begin,begin+gather.count*step,step),begin>=0 and begin+max(0,gather.count-1)*step<dst_limit
+    span,bounded=slice(0,gather.count*gather.dst_stride,gather.dst_stride),max(0,gather.count-1)*gather.dst_stride<dst_limit
     src=_rk_buffer_view(buffer(gather.src.kind,gather.src.index),gather.src,code,gather.itemsize) if gather.src is not None else dst
     src_limit,offsets,overlap=len(src),gather.offsets,src.addr < dst.addr+dst.nbytes and dst.addr < src.addr+src.nbytes
     # Preserve every input before writes, including whole-scratch padding and index-buffer aliases.
@@ -51,7 +50,7 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
       indices=_rk_buffer_view(buffer(gather.index.kind,gather.index.index),gather.index,_INDEX_FORMATS[gather.index_itemsize],gather.index_itemsize)
       if len(indices)<gather.count or dst_limit<gather.count: raise RuntimeError("runtime RKGather exceeds buffer")
       offsets=tuple(indices.mv[:gather.count])
-    if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend:
+    if gather.index is None and gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend:
       ctypes.memset(int(raw_dst.va_addr),0,raw_dst.size)
     if gather.values:
       if not bounded: raise IndexError("RKGather destination exceeds buffer")
@@ -65,12 +64,12 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
     if gather.index is None and bounded:
       payload=_regular_gather_payload(gather,src) if not offsets else array.array(code,
         operator.itemgetter(*offsets)(src.mv) if gather.count>1 and min(offsets)>=0 and max(offsets)<src_limit else
-        (src.mv[index] if 0<=index<src_limit else dst.mv[begin+lane*step] if gather.partial else gather.fill_bits for lane,index in enumerate(offsets)))  # noqa: E501
+        (src.mv[index] if 0<=index<src_limit else dst.mv[lane*gather.dst_stride] if gather.partial else gather.fill_bits for lane,index in enumerate(offsets)))  # noqa: E501
       if payload is not None:
         dst.mv[span]=payload
         continue
     source_indices=offsets or (gather.base+sum((lane//divisor%limit)*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
-    writes=((begin+lane*step,src.mv[index] if 0<=index<src_limit else gather.fill_bits) for lane,index in enumerate(source_indices) if 0<=begin+lane*step<dst_limit and (fill or 0<=index<src_limit))  # noqa: E501
+    writes=((lane*gather.dst_stride,src.mv[index] if 0<=index<src_limit else gather.fill_bits) for lane,index in enumerate(source_indices) if lane*gather.dst_stride<dst_limit and (fill or 0<=index<src_limit))  # noqa: E501
     for lane,value in writes: dst.mv[lane]=value
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):

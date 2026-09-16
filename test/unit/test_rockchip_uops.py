@@ -135,8 +135,8 @@ def _apply_test_gather(gather:RKGather, buffer, linear:dict[int,np.ndarray]) -> 
       dst[:gather.count]=gather.fill_bits
       dst[np.nonzero(valid)[0]]=src[indices[valid]]
     return
-  if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend and not gather.dst_addend: dst[:]=0
-  dst_index=gather.dst_addend+lanes*gather.dst_stride
+  if gather.dst.kind is RKBufferKind.SCRATCH and not gather.partial and not gather.dst.addend: dst[:]=0
+  dst_index=lanes*gather.dst_stride
   if gather.values: dst[dst_index]=gather.values[0] if len(gather.values)==1 else gather.values
   elif gather.offsets:
     assert gather.src is not None
@@ -266,8 +266,8 @@ def _assert_decoded_image_bounds(image:RKImage) -> RKImage:
     return tuple(gather.base+sum(lane//divisor%limit*stride for divisor,limit,stride in gather.axes) for lane in range(gather.count))
   for gather in _static_gathers(decoded):
     if gather.count <= 0: continue
-    dst_indices=tuple(gather.dst_addend+lane*gather.dst_stride for lane in range(gather.count))
-    _assert_scratch_extent(decoded, gather.dst,(max(dst_indices)+1)*gather.itemsize)
+    dst_indices=tuple(lane*gather.dst_stride for lane in range(gather.count))
+    _assert_scratch_extent(decoded, gather.dst,gather.dst.addend+(max(dst_indices)+1)*gather.itemsize)
     if gather.src is not None:
       indices = gather_indices(gather)
       if indices: _assert_scratch_extent(decoded, gather.src, (max(indices)+1)*gather.itemsize)
@@ -939,8 +939,8 @@ def test_runtime_raw_gathers_preserve_bits_masks_and_overlap(itemsize:int, dtype
   destination=_mapped_values(np.zeros(8,dtype=dtype),0x1000)
   buffers={(RKBufferKind.ARG,0):destination}
   def lookup(kind,index): return buffers[kind,index]
-  rockchip_runtime._apply_gathers((RKGather(None,RKArg(RKBufferKind.ARG,0,itemsize),3,values=values,
-    dst_stride=2,dst_addend=1,itemsize=itemsize),),lookup)
+  rockchip_runtime._apply_gathers((RKGather(None,RKArg(RKBufferKind.ARG,0,2*itemsize),3,values=values,
+    dst_stride=2,itemsize=itemsize),),lookup)
   expected=np.zeros(8,dtype=dtype)
   expected[[2,4,6]]=values
   np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),expected)
@@ -948,21 +948,21 @@ def test_runtime_raw_gathers_preserve_bits_masks_and_overlap(itemsize:int, dtype
   source=_mapped_values(np.asarray((10,20,30,40),dtype=dtype),0x2000)
   destination=_mapped_values(np.full(6,99,dtype=dtype),0x3000)
   buffers={(RKBufferKind.ARG,1):source,(RKBufferKind.SCRATCH,0):destination}
-  gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0),4,offsets=(2,-1,9,0),
-                  fill_bits=7,dst_addend=1,itemsize=itemsize)
+  gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.SCRATCH,0,itemsize),4,offsets=(2,-1,9,0),
+                  fill_bits=7,itemsize=itemsize)
   rockchip_runtime._apply_gathers((gather,),lookup)
   np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.asarray((99,30,7,7,10,99),dtype=dtype))
   ctypes.memmove(destination.va_addr,np.full(6,99,dtype=dtype).ctypes.data,destination.size)
   rockchip_runtime._apply_gathers((gather._replace(partial=True),),lookup)
   np.testing.assert_array_equal(np.frombuffer(destination.storage,dtype=dtype),np.asarray((99,30,99,99,10,99),dtype=dtype))
-  rockchip_runtime._apply_gathers((gather._replace(count=1,offsets=(1,),dst_addend=0),),lookup)
+  rockchip_runtime._apply_gathers((gather._replace(dst=gather.dst._replace(addend=0),count=1,offsets=(1,)),),lookup)
   assert np.frombuffer(destination.storage,dtype=dtype)[0]==20
 
   source=_mapped_values(np.arange(10,dtype=dtype),0x3500)
   destination=_mapped_values(np.zeros(10,dtype=dtype),0x3600)
   buffers={(RKBufferKind.ARG,1):source,(RKBufferKind.ARG,0):destination}
-  strided=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0),4,base=1,axes=((1,4,2),),
-                   dst_stride=2,dst_addend=1,itemsize=itemsize)
+  strided=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(RKBufferKind.ARG,0,itemsize),4,base=1,axes=((1,4,2),),
+                   dst_stride=2,itemsize=itemsize)
   rockchip_runtime._apply_gathers((strided,),lookup)
   expected=np.zeros(10,dtype=dtype)
   expected[[1,3,5,7]]=np.asarray((1,3,5,7),dtype=dtype)
@@ -1012,9 +1012,9 @@ def test_runtime_gather_aliasing_preserves_inputs_before_padding(itemsize:int,pa
   step=2 if layout in ("strided","overlapping_views","affine") else 1
   begin=int(layout=="masked")
   offsets=(3,-1,99,0) if layout=="masked" else (3,2,1,0)
-  gather=RKGather(RKArg(RKBufferKind.ARG,1,source_addend*itemsize),RKArg(kind,0,destination_addend*itemsize),4,
+  gather=RKGather(RKArg(RKBufferKind.ARG,1,source_addend*itemsize),RKArg(kind,0,(destination_addend+begin)*itemsize),4,
     offsets=() if layout=="affine" else offsets,axes=((1,4,1),) if layout=="affine" else (),
-    fill_bits=7,partial=partial,dst_stride=step,dst_addend=begin,itemsize=itemsize)
+    fill_bits=7,partial=partial,dst_stride=step,itemsize=itemsize)
   buffers={(RKBufferKind.ARG,1):memory.offset(source_base*itemsize),(kind,0):memory.offset(destination_base*itemsize)}
   expected=values.copy()
   # Scratch initialization owns its whole allocation, including padding outside selected destination lanes.
@@ -1086,8 +1086,8 @@ def test_runtime_signed_affine_blocks_share_bounded_leaf_copy(itemsize:int,axes,
   values=(np.arange(size,dtype=np.uint64)*0x1234567+0x81).astype(f"<u{itemsize}")
   source=_mapped_values(values,0x4000)
   destination=source if alias else _mapped_values(np.full(size,91,dtype=values.dtype),0x8000)
-  gather=RKGather(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0),count,base,axes,
-                  partial=partial,dst_stride=2,dst_addend=dst_addend,itemsize=itemsize)
+  gather=RKGather(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.SCRATCH,0,dst_addend*itemsize),count,base,axes,
+                  partial=partial,dst_stride=2,itemsize=itemsize)
   view=rockchip_runtime._rk_buffer_view(source,gather.src,rockchip_runtime._RAW_FORMATS[itemsize],itemsize)
   payload=rockchip_runtime._regular_gather_payload(gather,view)
   assert payload is not None and payload.tobytes()==values[list(indices)].tobytes()
@@ -1127,8 +1127,8 @@ def test_compact_affine_gather_preserves_full_raw_movement(itemsize,partial,alia
       elif kind=='irregular' and count>2: offsets=(*offsets[:-1],offsets[-1]+1)
       size=max(max(offsets)+2,count*2+3)
       values=(np.arange(size,dtype=np.uint64)*173+37).astype(f'<u{itemsize}')
-      gather=rockchip_renderer.RKGather(rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.ARG,0),rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.SCRATCH,0),count,
-                        offsets=offsets,fill_bits=19,partial=partial,dst_stride=2,dst_addend=dst_addend,itemsize=itemsize)
+      gather=rockchip_renderer.RKGather(rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.ARG,0),rockchip_renderer.RKArg(rockchip_renderer.RKBufferKind.SCRATCH,0,dst_addend*itemsize),count,
+                        offsets=offsets,fill_bits=19,partial=partial,dst_stride=2,itemsize=itemsize)
       axes=tuple(UOp.range(extent,200+i,dtype=dtypes.int) for i,extent in enumerate(shape))
       zero=UOp.const(0,dtypes.int)
       destination=sum((axis*stride for axis,stride in zip(axes,strides_for_shape(shape))),zero)
@@ -1136,7 +1136,7 @@ def test_compact_affine_gather_preserves_full_raw_movement(itemsize,partial,alia
       gate=(destination%3).ne(0) if kind=='masked' else None
       if kind=='irregular' and count>2: address=destination.eq(count-1).where(address+1,address)
       compact=rockchip_renderer._gather_plan(0,0,destination,address,gate,count,gather.fill_bits)._replace(
-        partial=partial,dst_stride=gather.dst_stride,dst_addend=dst_addend,itemsize=itemsize)
+        dst=gather.dst,partial=partial,dst_stride=gather.dst_stride,itemsize=itemsize)
       assert compact._replace(base=gather.base,axes=gather.axes,offsets=gather.offsets)==gather
       actual=compact.offsets or tuple(compact.base+sum(lane//d%extent*stride for d,extent,stride in compact.axes) for lane in range(count))
       assert actual==offsets
@@ -1170,8 +1170,8 @@ def test_raw_offset_copy_preserves_snapshot_fill_and_partial_lanes(itemsize,part
         for lane,index in enumerate(offsets):
           if 0<=index<size: expected[addend+begin+lane*step]=data[index]
           elif not partial: expected[addend+begin+lane*step]=19
-        gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(kind,0,addend*itemsize),count,offsets=offsets,
-                        fill_bits=19,partial=partial,dst_stride=step,dst_addend=begin,itemsize=itemsize)
+        gather=RKGather(RKArg(RKBufferKind.ARG,1),RKArg(kind,0,(addend+begin)*itemsize),count,offsets=offsets,
+                        fill_bits=19,partial=partial,dst_stride=step,itemsize=itemsize)
         rockchip_runtime._apply_gathers((gather,),lambda _kind,index:source if index==1 else destination)
         assert destination.storage.raw==expected.tobytes(),(count,step,begin,kind,offsets[:4])
 
@@ -1633,8 +1633,8 @@ def test_production_abs_and_minimum_keep_generic_typed_images():
       image = decode_image(blob)
       images.append(image)
       records.append((hashlib.sha256(blob).hexdigest(), len(blob), len(_ew_ops(image)), len(_intermediate_gathers(image))))
-  assert records == [("af4cc83284a677f0d879ff2af2b9720f12fc335f75ef1df96ec4597dd74606ff",647,46,0),
-                     ("6b4f9c0fc3228c0d4672c2d1a39e3740806fc4c32fe83268e628729698845bda",258,4,0)]
+  assert records == [("28caaf3e7aa0eeb109aef0de807c2cf08c447cd9b5c16606ec556da8ac70874c",644,46,0),
+                     ("8ffe57078a56d9adbe8d1081221a7be1e0e609c07b656c9887e8a51e0568e398",257,4,0)]
   values=np.resize(np.asarray((-65504,-2048,-3,-1,0,2**-24,2,65504),dtype="<f2"),24)
   other=np.roll(values,7).copy()
   for image,inputs,expected in ((images[0],(values,),np.abs(values)),(images[1],(values,other),np.minimum(values,other))):
@@ -3958,15 +3958,15 @@ def test_fixed_nonzero_rank_two_static_images_preserve_coordinate_matrix_bounds(
     assert decode_image(encode_image(image)) == image
     for gather in _static_gathers(image):
       if gather.dst.kind is RKBufferKind.SCRATCH:
-        assert gather.dst_addend+(gather.count-1)*gather.dst_stride < image.scratch[gather.dst.index]//gather.itemsize
+        assert gather.dst.addend+(gather.count-1)*gather.dst_stride*gather.itemsize < image.scratch[gather.dst.index]
 
   coordinate = images[-1]
   # Bounded counts use the shared mapped INT16 reduction after exact INT32 predicates and raw narrowing.
-  # Resource/image goldens track native-word comparisons; all coordinate-output hashes remain unchanged.
+  # Resource/image goldens track native-word comparisons and the canonical destination-offset format.
   assert (len(coordinate.scratch),len(_static_gathers(coordinate)),len(_ew_ops(coordinate)),len(_output_gathers(coordinate))) == (116,120,7698,1)
   lanes=np.arange(4,dtype="<i4").tobytes()
   assert _execute_raw_dynamic_image(coordinate,16,lanes,lanes) == bytes.fromhex("00000000000000000000000001000000")
-  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="f16a6ec1899ef41a46123420da80f130b0e868537cd184d570e2ed5dd78eeab2"
+  assert hashlib.sha256(encode_image(coordinate)).hexdigest()=="98688fea9ded4bf16edf1482e236e8d831a56524389255ff45cd07a89536d256"
   np.testing.assert_array_equal(_execute_integer_image(coordinate, np.asarray([1, 0, 0, 2], dtype=np.int32),
                                                        np.asarray([0, 1, 6, 7], dtype=np.int32)),
                                 np.asarray([0, 0, 1, 1], dtype=np.int32))

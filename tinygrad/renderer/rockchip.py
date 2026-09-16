@@ -14,7 +14,7 @@ from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 from tinygrad.codegen.simplify import reduce_load_collapse
 from tinygrad.codegen.late.gater import pm_move_gates_from_index
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 36, (1 << 16) - 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 37, (1 << 16) - 1
 
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
 
@@ -32,7 +32,8 @@ class RKGather(NamedTuple):
   # Compile-time values have no source argument; partial gathers preserve lanes populated by another gather.
   values: tuple[int, ...] = (); partial: bool = False
   # Mapped reductions use a destination stride of 8 for 16-byte DPU atom alignment.
-  dst_stride: int = 1; dst_addend: int = 0
+  # The destination byte offset lives in dst.addend; stride remains measured in elements.
+  dst_stride: int = 1
   itemsize: int = 2
   # A runtime index makes this raw movement host-addressed; numeric semantics remain on the NPU.
   index: RKArg|None = None; index_itemsize: int = 4  # type: ignore[assignment]
@@ -124,8 +125,8 @@ def _validate_image(image:RKImage) -> None:
     args,needs,alignments = (op.lhs,op.rhs,op.dst),(op.m*ai*2,ao*ai*2,op.m*ao*4),(2,2,2 if op.out_fp16 else 4)
     if any(arg.kind is not RKBufferKind.SCRATCH or arg.addend < 0 or arg.addend%alignment for arg,alignment in zip(args,alignments)): raise ValueError("CMAC requires aligned scratch buffers")  # noqa: E501
     if any(not 0 <= arg.index < len(image.scratch) or arg.addend+need > image.scratch[arg.index] for arg,need in zip(args,needs)): raise ValueError("CMAC exceeds scratch buffer")  # noqa: E501
-  if any(g.itemsize not in (1,2,4) or (g.src is None) != bool(g.values) or not _fits((g.count,g.fill_bits,g.dst_stride)) or not _fits((g.base,g.dst_addend),signed=True) or g.dst_stride < 1 or g.dst_addend < 0 or len(g.axes)>255 or bool(g.values)+bool(g.offsets)+bool(g.axes)>1 or g.values and (len(g.values) not in (1,g.count) or not _fits(g.values,g.itemsize*8)) or g.offsets and (len(g.offsets)!=g.count or not _fits(g.offsets,signed=True)) or any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes) for g in static): raise ValueError("invalid RKGather")  # noqa: E501
-  if any(h.src is None or h.index is None or h.dst.kind is not RKBufferKind.SCRATCH or h.values or h.offsets or h.axes or h.partial or h.base or h.dst_stride!=1 or h.dst_addend or h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.count,h.fill_bits)) or not _fits((h.src.addend,h.index.addend,h.dst.addend),signed=True) for h in hosts): raise ValueError("invalid runtime RKGather")  # noqa: E501
+  if any(g.itemsize not in (1,2,4) or (g.src is None) != bool(g.values) or not _fits((g.count,g.fill_bits,g.dst_stride)) or not _fits((g.base,g.dst.addend),signed=True) or g.dst_stride < 1 or g.dst.addend < 0 or len(g.axes)>255 or bool(g.values)+bool(g.offsets)+bool(g.axes)>1 or g.values and (len(g.values) not in (1,g.count) or not _fits(g.values,g.itemsize*8)) or g.offsets and (len(g.offsets)!=g.count or not _fits(g.offsets,signed=True)) or any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes) for g in static): raise ValueError("invalid RKGather")  # noqa: E501
+  if any(h.src is None or h.index is None or h.dst.kind is not RKBufferKind.SCRATCH or h.values or h.offsets or h.axes or h.partial or h.base or h.dst_stride!=1 or h.dst.addend or h.itemsize not in (1,2,4) or h.index_itemsize not in (2,4) or not _fits((h.count,h.fill_bits)) or not _fits((h.src.addend,h.index.addend),signed=True) for h in hosts): raise ValueError("invalid runtime RKGather")  # noqa: E501
   if any(not _fits((arg.index,),16) for op in image.program for arg in _op_args(op)): raise ValueError("invalid RKArg")
   if any(op.mode==RKEWMode.HALF_TO_FLOAT and nxt.mode!=RKEWMode.HALF_TO_FLOAT or op.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT16_TO_INT32) and op.dst.kind is RKBufferKind.ARG for op,nxt in zip(ew_ops,ew_ops[1:])): raise ValueError("invalid RKEWOp sequence")  # noqa: E501
   if any(not _fits((op.count,op.ew_cfg,op.mode)) or op.mode >= len(RKEWMode) or not _fits((op.dst.addend,op.lhs.addend,op.rhs.addend),signed=True) or op.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT32_TO_HALF) and (op.count>4 or op.dst!=op.lhs or op.lhs!=op.rhs or op.dst.kind is not RKBufferKind.SCRATCH) for op in ew_ops): raise ValueError("invalid RKEWOp flags")  # noqa: E501
@@ -876,9 +877,9 @@ class RKContext:
 
   def _move_bytes(self, sources:Iterable[UOp], destinations:Iterable[UOp], itemsize:int, unpack:bool) -> None:
     """Move raw bytes between one typed carrier and its INT16 components; each interface owns its cache."""
-    self.program.extend(RKGather(src.arg._replace(addend=0),dest.arg._replace(addend=0),self.count,base=src.arg.addend+(byte if unpack else 0),
-        axes=((1,self.count,itemsize if unpack else 2),),dst_stride=2 if unpack else itemsize,
-        dst_addend=0 if unpack else byte,itemsize=1,partial=not unpack and bool(byte)) for byte,(src,dest) in enumerate(zip(sources,destinations)))
+    self.program.extend(RKGather(src.arg._replace(addend=0),dest.arg._replace(addend=dest.arg.addend+(0 if unpack else byte)),
+        self.count,base=src.arg.addend+(byte if unpack else 0),axes=((1,self.count,itemsize if unpack else 2),),
+        dst_stride=2 if unpack else itemsize,itemsize=1,partial=not unpack and byte>0) for byte,(src,dest) in enumerate(zip(sources,destinations)))
 
   def _unpack_bytes(self, value:UOp, *, copy_wide:bool=True) -> tuple[UOp,...]:
     """Return the raw INT16 byte components, retaining the required copy before reading a wide carrier."""
