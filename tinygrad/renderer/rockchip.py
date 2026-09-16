@@ -1038,22 +1038,6 @@ class RKContext:
     return self._carrier(context.lower(recipe).arg,yes.dtype)
 
   def _where(self, u:UOp) -> UOp:
-    # A static selection produces one physical value, including when another UOp consumes it.
-    if u.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.int,dtypes.uint) and _is_static_expr(u.src[0]):
-      dtype,leaf_ids,routes=u.dtype.scalar(),dict[UOp,int](),dict[UOp,UOp]()
-      for node in u.toposort(gate=lambda node:node.op is Ops.WHERE and node.dtype.scalar() is not dtypes.bool and _is_static_expr(node.src[0])):
-        routes[node]=node.src[0].where(*(routes[arm] if arm in routes else UOp.const(leaf_ids.setdefault(arm,len(leaf_ids)),dtypes.int) for arm in node.src[1:]))  # noqa: E501
-      leaves=tuple(leaf_ids)
-      # Leaf IDs are compile-time data. Share value branches; original Boolean conditions remain opaque.
-      markers=_static_values(self.out_index,routes[u],self.count,int)
-      result=self._scratch(self._layout(dtype),u=u); itemsize,commits=result.dtype.itemsize,list[RKGather]()
-      for leaf in (leaves[marker] for marker in sorted(set(markers))):
-        value=self._operand(leaf,dtype,u is self.root and dtype is dtypes.half and leaf.op is Ops.LOAD and (param:=_root_param(leaf.src[0])) is not None and param.src[0].op is Ops.CONST and int(param.src[0].arg)<self.count)  # noqa: E501
-        if value.dtype is not result.dtype: raise _RKGenericReject("static selection carrier")
-        offsets=tuple(lane+value.arg.addend//itemsize if leaves[marker] is leaf else -1 for lane,marker in enumerate(markers))
-        commits.append(RKGather(value.arg._replace(addend=0),result.arg,self.count,offsets=offsets,partial=bool(commits),itemsize=itemsize))
-      self.program.extend(commits)
-      return result
     if u.dtype.scalar() is dtypes.half and (recipe:=_fold_where_abs(u)) is not None: return self.lower(recipe)
     if (recipe:=_pm_ordered_where.rewrite(u)) is not None: return self.lower(recipe)
     return self._raw_where(u)

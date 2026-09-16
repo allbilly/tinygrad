@@ -1286,22 +1286,29 @@ def test_numeric_output_program_uses_its_self_initializing_dpu_stage():
   assert program.dev.resets == 0
 
 
-def test_program_records_only_the_terminal_native_int16_mode():
+def test_program_rearms_its_first_mode_and_records_its_terminal_mode():
   class FakeDevice:
-    _native_int16 = False
-    def __init__(self): self._lock=threading.Lock()
+    def __init__(self, native_int16:bool):
+      self._lock=threading.Lock()
+      self._native_int16=native_int16
+      self.resets=0
     def _ensure_buffer(self, *_args): raise AssertionError("scratchless program allocated a workspace")
     def _sync_buffers(self, _buffers, _flags): pass
-    def reset_npu(self): self._native_int16=False
+    def reset_npu(self):
+      self._native_int16=False
+      self.resets+=1
   arg=RKArg(RKBufferKind.ARG,0)
-  for modes,expected in (((RKEWMode.INT16,RKEWMode.HALF),False),((RKEWMode.HALF,RKEWMode.INT16),True)):
+  for native_int16,modes,expected,resets in (
+    (False,(RKEWMode.INT16,RKEWMode.HALF),False,0), (False,(RKEWMode.HALF,RKEWMode.INT16),True,0),
+    (True,(RKEWMode.INT16,RKEWMode.HALF),False,0), (True,(RKEWMode.HALF,RKEWMode.INT16),True,1)):
     program=object.__new__(rockchip_runtime.RockchipProgram)
-    program.dev=FakeDevice()
+    program.dev=FakeDevice(native_int16)
     program.image=RKImage(program=tuple(RKEWOp(arg,arg,arg,1,_EW_CFG[Ops.ADD],mode=mode) for mode in modes))
     program._scratch_offsets=(0,)
     program._run_ew_ops=lambda *_args,**_kwargs:None
     program(arg)
     assert program.dev._native_int16 is expected
+    assert program.dev.resets == resets
 
 
 def test_int32_to_half_gather_chain_rearms_only_into_bounded_fp16():
@@ -2022,7 +2029,9 @@ def test_generic_where_selects_infinity_without_mask_multiplication():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(-math.inf, dtypes.half))))
-  assert image is not None and not _ew_ops(image) and len(_output_gathers(image)) == 2
+  assert image is not None and not any(op.mode is RKEWMode.HALF and op.ew_cfg==_EW_CFG[Ops.MUL] for op in _ew_ops(image))
+  values=np.asarray((1.0,-2.0,3.0,4.0),dtype="<f2")
+  assert _execute_raw_dynamic_image(image,8,values.tobytes())==np.asarray((1.0,-2.0,-math.inf,-math.inf),dtype="<f2").tobytes()
 
 
 def test_max_uses_finite_neutral_for_selected_negative_infinity():
@@ -2187,22 +2196,25 @@ def test_guarded_load_with_infinite_fill_falls_through_dynamic_address_probes():
   assert image is not None and any(gather.fill_bits == 0x7c00 for gather in _initial_gathers(image))
 
 
-def test_static_root_where_uses_exact_gathers_and_finite_padding_neutral():
+def test_static_root_where_preserves_masked_negative_infinity():
   source = UOp.param(1, dtypes.half, (3,))
   def selected(i):
     padded = source.index(i).load(UOp.const(-math.inf, dtypes.half), i < UOp.const(3, dtypes.int))
     return (i < UOp.const(4, dtypes.int)).where(padded, UOp.const(0.0, dtypes.half))
   image = _lower_uop_program(_program(dtypes.half, selected))
-  assert image is not None and not _ew_ops(image) and len(_output_gathers(image)) == 1
-  assert any(gather.fill_bits == 0xfbff for gather in _initial_gathers(image))
+  assert image is not None and not any(op.mode is RKEWMode.HALF and op.ew_cfg==_EW_CFG[Ops.MUL] for op in _ew_ops(image))
+  values=np.asarray((-65504.0,-3.5,4.0),dtype="<f2")
+  assert _execute_raw_dynamic_image(image,8,values.tobytes())==np.asarray((*values,-math.inf),dtype="<f2").tobytes()
 
 
 def test_static_root_where_preserves_nonzero_constant_route():
   source = UOp.param(1, dtypes.half, (4,))
   image = _lower_uop_program(_program(dtypes.half,
     lambda i:(i < UOp.const(2, dtypes.int)).where(source.index(i).load(), UOp.const(3.5, dtypes.half))))
-  assert image is not None and not _ew_ops(image) and len(_output_gathers(image)) == 2
+  assert image is not None
   assert struct.pack("<e", 3.5) in _constant_bytes(image)
+  values=np.asarray((-2.0,1.25,0.0,0.0),dtype="<f2")
+  assert _execute_raw_dynamic_image(image,8,values.tobytes())==np.asarray((-2.0,1.25,3.5,3.5),dtype="<f2").tobytes()
 
 
 def test_generic_bool_store_has_explicit_boundary_conversion():
