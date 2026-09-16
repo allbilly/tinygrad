@@ -684,15 +684,6 @@ def _carry_bytes(values:Iterable[UOp], carry:UOp, op:Ops=Ops.ADD) -> tuple[tuple
 def _twos_complement(raw:Iterable[UOp], sign:UOp) -> tuple[UOp, ...]:
   return _carry_bytes((byte.alu(Ops.ADD,byte.const_like(255).alu(Ops.SUB,byte.alu(Ops.MUL,byte.const_like(2))).alu(Ops.MUL,sign)) for byte in raw),sign)[0]  # noqa: E501
 
-def _lower_raw_fp16_bitcast(output:RKOutput, plan:RKPlan) -> bool:
-  """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
-  _,out,n,index,value=output; packed=value.src[0] if value.op is Ops.BITCAST and value.dtype is dtypes.int and len(value.src)==1 else None
-  if packed is None or packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: return False
-  lanes:dict[int,RKGather|None]={int(term.src[1].arg):_typed_load_plan(bitcast.src[0],dtypes.half,index,n,require_offsets=True) for term in packed.src if term.op is Ops.SHL and len(term.src)==2 and term.src[1].op is Ops.CONST and int(term.src[1].arg) in (0,16) for bitcast in (_typed_cast_source(term.src[0],dtypes.uint,dtypes.ushort),) if bitcast is not None and bitcast.op is Ops.BITCAST and len(bitcast.src)==1 and len(bitcast.src[0].src)==1}  # noqa: E501
-  if len(packed.src)!=2 or set(lanes)!={0,16} or (low:=lanes[0]) is None or (high:=lanes[16]) is None or low.src!=high.src or any(a&1 or b!=a+1 for a,b in zip(low.offsets,high.offsets)): return False  # noqa: E501
-  plan.program.append(low._replace(dst=RKArg(RKBufferKind.ARG,out.arg.slot),itemsize=4,offsets=tuple(offset//2 for offset in low.offsets)))
-  return True
-
 def _half_backed_value(value:UOp) -> UOp|None:
   """Normalize a half-backed numeric expression for the exact raw FP16 comparator."""
   original, value = value, _unwrap_condition(value)
@@ -1120,6 +1111,14 @@ class RKContext:
     if u.op is Ops.CONST: value = self._constant(u)
     elif self._is_static_value(u): value = self._static(u)
     elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
+    elif u.op is Ops.BITCAST and u is self.root and dtype is dtypes.int:
+      # Pair adjacent FP16 lane representations into INT32 output storage without numeric conversion.
+      packed=u.src[0] if len(u.src)==1 else None
+      if packed is None or packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: raise _RKGenericReject("raw FP16 pair")
+      lanes:dict[int,RKGather|None]={int(term.src[1].arg):_typed_load_plan(bitcast.src[0],dtypes.half,self.out_index,self.count,require_offsets=True) for term in packed.src if term.op is Ops.SHL and len(term.src)==2 and term.src[1].op is Ops.CONST and int(term.src[1].arg) in (0,16) for bitcast in (_typed_cast_source(term.src[0],dtypes.uint,dtypes.ushort),) if bitcast is not None and bitcast.op is Ops.BITCAST and len(bitcast.src)==1 and len(bitcast.src[0].src)==1}  # noqa: E501
+      if len(packed.src)!=2 or set(lanes)!={0,16} or (low:=lanes[0]) is None or (high:=lanes[16]) is None or low.src!=high.src or any(a&1 or b!=a+1 for a,b in zip(low.offsets,high.offsets)): raise _RKGenericReject("raw FP16 pair")  # noqa: E501
+      self.program.append(low._replace(dst=self.out,itemsize=4,offsets=tuple(offset//2 for offset in low.offsets)))
+      value=self._carrier(self.out,dtypes.int)
     elif u.op is Ops.BITCAST:
       source = self.lower(u.src[0])
       if {dtype,source.dtype}!={dtypes.half,dtypes.int16} or source.dtype is not u.src[0].dtype.scalar():
@@ -1213,7 +1212,6 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   if len(output_stores)>1: return all(plan.lower(list(store.sink().toposort()),vectorize_reductions=vectorize_reductions) for store in output_stores)  # noqa: E501
   local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
   if vectorize_reductions and (_try(plan,local_output,dtypes.float,_lower_linear_contraction) or _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops) or _try(plan,strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops)): return True  # noqa: E501
-  if _try(plan,strict_output,dtypes.int,_lower_raw_fp16_bitcast): return True
   if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
     if (storage_root:=_optional_rewrite(functools.partial(_expand_math_uops,accurate_adds=False),storage_output[4])) is not None: local_output=(*storage_output[:4],storage_root)  # noqa: E501
   if (output:=local_output) is None or len(output[0].src)!=2: raise _RKGenericReject("output store")

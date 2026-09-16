@@ -796,7 +796,7 @@ def test_specialized_dispatch_owns_basic_output_admission(dtype,count):
 @pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool))
 def test_empty_output_bypasses_specialized_lowerers(dtype,monkeypatch):
   def forbidden(*_args): raise AssertionError("empty output reached a specialized lowerer")
-  for name in ("_lower_linear_contraction","_lower_reduction","_lower_cmac_storage_epilogue","_lower_raw_fp16_bitcast"):
+  for name in ("_lower_linear_contraction","_lower_reduction","_lower_cmac_storage_epilogue"):
     monkeypatch.setattr(rockchip_renderer,name,forbidden)
   assert _lower_uop_program(_program(dtype,lambda _:UOp.const(0,dtype),0))==RKImage()
 
@@ -805,7 +805,7 @@ def test_empty_output_bypasses_specialized_lowerers(dtype,monkeypatch):
 def test_production_specialized_lowerers_receive_admitted_outputs(operation,monkeypatch,record_property):
   observed=[]
   domains={"_lower_linear_contraction":(dtypes.float,),"_lower_reduction":(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),
-           "_lower_cmac_storage_epilogue":(dtypes.half,),"_lower_raw_fp16_bitcast":(dtypes.int,),
+           "_lower_cmac_storage_epilogue":(dtypes.half,),
            "_lower_cmac_reduce":(dtypes.half,dtypes.float),"_lower_mapped_reduce":(dtypes.half,dtypes.int,dtypes.bool)}
   for name,domain in domains.items():
     original=getattr(rockchip_renderer,name)

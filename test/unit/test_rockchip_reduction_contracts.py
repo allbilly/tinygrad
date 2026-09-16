@@ -113,14 +113,13 @@ def test_composed_selected_reductions_preserve_raw_load_payloads(special:bool,wi
   assert _execute_raw_dynamic_image(image,count*2,*(payload.tobytes() for payload in payloads),choices.tobytes())==expected
 
 
-@pytest.mark.parametrize('kind',('dense','padded','coefficient_table','raw_pair'))
+@pytest.mark.parametrize('kind',('dense','padded','coefficient_table'))
 @pytest.mark.parametrize('failure',('false','reject','bug'))
 def test_production_owned_emission_rejection_preserves_the_following_program(kind:str, failure:str, monkeypatch):
   with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
     def source(shape, number):
       return Tensor(UOp.new_buffer('ROCKCHIP',math.prod(shape),dtypes.half,num=number)).reshape(shape)
     if kind=='coefficient_table': result=source((2,3,12,20),29000).interpolate(size=(9,31),mode='linear')
-    elif kind=='raw_pair': result=source((2,3,4),29001).permute(1,0,2).bitcast(dtypes.int)
     else:
       m,k,n=(2,32,32) if kind=='dense' else (2,7,3)
       result=source((m,k),29002)@source((k,n),29003)
@@ -131,8 +130,7 @@ def test_production_owned_emission_rejection_preserves_the_following_program(kin
       return tuple(rk.decode_image(next(node.arg for node in to_program(call.src[0],renderer).src if node.op is Ops.BINARY))
                    for call in calls)
     expected=compile_images()
-    name='_lower_raw_fp16_bitcast' if kind=='raw_pair' else '_lower_cmac_reduce'
-    emit=getattr(rk,name)
+    emit=rk._lower_cmac_reduce
     accepted=[]
     def with_rejected_predecessor(*args):
       plan=args[-1]
@@ -153,10 +151,45 @@ def test_production_owned_emission_rejection_preserves_the_following_program(kin
       assert result is emitted
       if result: accepted.append(len(before[0]))
       return result
-    monkeypatch.setattr(rk,name,with_rejected_predecessor)
+    monkeypatch.setattr(rk,'_lower_cmac_reduce',with_rejected_predecessor)
     assert compile_images()==expected
   assert accepted
   if kind=='coefficient_table': assert any(accepted), 'table-backed contraction must exercise a nonzero scratch base'
+
+
+@pytest.mark.parametrize('failure',('false','reject','bug'))
+def test_production_bitcast_context_rejection_preserves_the_following_program(failure:str, monkeypatch):
+  with Context(DEV='ROCKCHIP',DEFAULT_FLOAT='HALF',NOOPT=0):
+    source=Tensor(UOp.new_buffer('ROCKCHIP',24,dtypes.half,num=29001)).reshape(2,3,4)
+    result=source.permute(1,0,2).bitcast(dtypes.int)
+    call=next(node for node in result.schedule_linear().toposort() if node.op is Ops.CALL and node.src[0].op is Ops.SINK)
+    renderer=rk.RockchipRenderer(Target(device='ROCKCHIP'))
+    def compile_image():
+      to_program_cache.clear()
+      return rk.decode_image(next(node.arg for node in to_program(call.src[0],renderer).src if node.op is Ops.BINARY))
+    expected=compile_image()
+    original=rk.RKContext.finish
+    accepted=[]
+    def with_rejected_predecessor(self, materialize=False):
+      if self.root.op is not Ops.BITCAST or self.root.dtype is not dtypes.int: return original(self,materialize)
+      plan=self.plan
+      def state(): return tuple(plan.scratch),tuple(plan.program),dict(plan.bindings),plan.slot
+      before=state()
+      def reject():
+        probe=rk.RKContext((self.store,self.out_param,self.count,self.out_index,self.root),plan)
+        original(probe,materialize)
+        plan.parameter(dtypes.half,3)
+        if failure!='false': raise (ValueError if failure=='bug' else rk._RKGenericReject)('rejected owned emission')
+        return False
+      if failure=='bug':
+        with pytest.raises(ValueError,match='rejected owned emission'): plan.lower(reject)
+      else: assert not plan.lower(reject)
+      assert state()==before
+      accepted.append(len(before[0]))
+      return original(self,materialize)
+    monkeypatch.setattr(rk.RKContext,'finish',with_rejected_predecessor)
+    assert compile_image()==expected
+  assert accepted
 
 
 @pytest.mark.parametrize('rows,width',((9,4001),(16,4095),(16,4096)))
