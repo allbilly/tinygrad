@@ -153,7 +153,7 @@ def test_static_divmod_uses_committed_integer_operands(dtype,operation,form):
   # Scalar exec_alu commits each intermediate; vector shortcuts must agree, including a wrapped zero divisor.
   expected=tuple(rk._eval_static(root,{lane:index}) for index in range(7))
   assert rk._eval_static(root,{lane:tuple(range(7))})==expected
-  assert rk._static_lanes((lane,),root,dependencies=False)==(expected,)
+  assert tuple(rk._static_blocks((lane,),root,dependencies=False))==((expected,),)
 
 
 @pytest.mark.parametrize("count,limit",((7,9),(128,513)))
@@ -252,7 +252,8 @@ def test_production_static_half_encoding_composes(count,pattern,record_property)
 def test_static_collection_preserves_empty_columns(roots,empty):
   size=0 if empty else 7
   lane=UOp.range(size,99705,dtype=rk.dtypes.int)
-  assert rk._static_lanes((lane,),*(lane,lane+1)[:roots],dependencies=False)==tuple(tuple(i+j for i in range(size)) for j in range(roots))
+  blocks=tuple(rk._static_blocks((lane,),*(lane,lane+1)[:roots],dependencies=False))
+  assert blocks==(() if empty else (tuple(tuple(i+j for i in range(size)) for j in range(roots)),))
 
 
 @pytest.mark.parametrize("failure",("conflict","minimum","encoding","missing"))

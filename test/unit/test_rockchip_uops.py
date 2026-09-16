@@ -11,7 +11,7 @@ from tinygrad.helpers import Context, Target, strides_for_shape
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_CEIL, _EW_CFG_FLOOR, _EW_CFG_MIN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
-  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan, _static_lanes,
+  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan,
   _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 import tinygrad.renderer.rockchip as rockchip_renderer
@@ -469,8 +469,8 @@ def test_static_vector_values_match_scalar_typed_evaluation():
   dense_bool=rockchip_renderer._static_values(out_index,(outer<3)&(inner!=2),20,int)
   assert dense_bool==tuple(int(i<3 and j!=2) for i in range(5) for j in range(4)) and all(type(value) is int for value in dense_bool)
   lane=UOp.range(17,102)
-  divided=rockchip_renderer._static_lanes((lane,),UOp(Ops.CDIV,dtypes.int,src=(lane,lane.const_like(3))),dependencies=False)
-  assert divided==(tuple(i//3 for i in range(17)),)
+  divided=tuple(rockchip_renderer._static_blocks((lane,),UOp(Ops.CDIV,dtypes.int,src=(lane,lane.const_like(3))),dependencies=False))
+  assert divided==((tuple(i//3 for i in range(17)),),)
 
 
 def test_static_evaluation_requires_explicit_runtime_binding():
@@ -521,7 +521,7 @@ def test_static_vector_commit_matches_scalar_typed_bits():
 
 def test_renderer_releases_uop_analysis_caches():
   lane=UOp.range(4,103)
-  rockchip_renderer._static_lanes((lane,),lane,dependencies=False)
+  tuple(rockchip_renderer._static_blocks((lane,),lane,dependencies=False))
   assert rockchip_renderer._eval_static_block.cache_info().currsize
   RockchipRenderer(Target(device="ROCKCHIP")).render(_program(dtypes.half,lambda _:UOp.const(0.0,dtypes.half),1))
   caches=(rockchip_renderer._semantic_loads,rockchip_renderer._static_ranges,rockchip_renderer._eval_static_block,
@@ -5147,7 +5147,7 @@ def test_deep_generic_graph_canonicalization_is_iterative():
 
 def test_static_range_environment_allocation_is_bounded():
   axes = [UOp.range(1024, 0), UOp.range(1024, 1)]
-  try: _static_lanes(tuple(axes),*axes,limit=1024)
+  try: rockchip_renderer._static_blocks(tuple(axes),*axes,limit=1024)
   except rockchip_renderer._RKGenericReject as error: assert "static_index_budget" in str(error)
   else: raise AssertionError("oversized static RANGE product was materialized")
 

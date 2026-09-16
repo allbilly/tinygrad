@@ -2,7 +2,7 @@ from __future__ import annotations
 # ruff: noqa: E702
 import array, base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
-from typing import Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
+from typing import Callable, Iterable, Mapping, NamedTuple, TypeVar, cast as typing_cast
 from tinygrad.device import Base64Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
 from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
@@ -268,6 +268,7 @@ def _static_ranges(u:UOp) -> tuple[UOp, ...]|None:
 def _is_static_expr(u:UOp) -> bool: return _static_ranges(u) is not None
 
 RKScalar = int|float|bool; RKStatic = RKScalar|tuple[RKScalar,...]
+RKEncoded = TypeVar("RKEncoded")
 
 def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
   scalar,commit=dtype.scalar(),truncate.get(dtype.scalar(),lambda value:value)
@@ -329,28 +330,23 @@ def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_R
   return (tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (_eval_static_block(root,axes,bounds,start,stop),))  # noqa: E501
     for start in range(0,count,block) for stop in (min(start+block,count),))
 
-def _static_lanes(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_RANGE_ENVS, dependencies:bool=True, block:int=4096) -> tuple[tuple[RKScalar,...],...]:  # noqa: E501
-  """Enumerate one bounded static lane space and evaluate all requested roots in it."""
-  blocks=tuple(_static_blocks(index,*roots,limit=limit,dependencies=dependencies,block=block))
-  return tuple(tuple(itertools.chain.from_iterable(column)) for column in zip(*blocks)) if blocks else ((),)*(len(roots)+isinstance(index,UOp))
-
 def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_static_ranges(out_index) or (); bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges); affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); return ranges if affine is not None and affine[0]==0 and count==math.prod(bounds) and all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None  # noqa: E702,E501
 
-def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[int, ...]:  # noqa: E501
+def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar], RKEncoded], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[RKEncoded, ...]:  # noqa: E501
   """Place compiler-bound values by destination; validate every candidate before a later write can hide it."""
   if encode is int and (dtypes.is_int(scalar:=expr.dtype.scalar()) or dtypes.is_bool(scalar)) and \
      (ranges:=_dense_ranges(out_index,count)) is not None:
-    values=_static_lanes(ranges,expr,dependencies=False,limit=limit,block=block)[0]
+    values=tuple(itertools.chain.from_iterable(chunk[0] for chunk in _static_blocks(ranges,expr,dependencies=False,limit=limit,block=block)))
     if minimum is not None and min(values,default=0)<minimum: raise _RKGenericReject("gather_index")
-    return tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else typing_cast(tuple[int,...],values)
-  missing=object(); result:list[int|object]=[missing]*count
+    return typing_cast(tuple[RKEncoded,...],tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else values)
+  missing=object(); result:list[RKEncoded|object]=[missing]*count
   for dst,value in itertools.chain.from_iterable(zip(map(int,dst_lanes),expr_lanes) for dst_lanes,expr_lanes in _static_blocks(out_index,expr,limit=limit,block=block)):  # noqa: E501
     if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
     encoded=encode(value)
     if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
     result[dst]=encoded
   if any(value is missing for value in result): raise _RKGenericReject("static_index")
-  return typing_cast(tuple[int,...],tuple(result))
+  return typing_cast(tuple[RKEncoded,...],tuple(result))
 
 @functools.lru_cache(maxsize=8192)
 def _linear_index(u:UOp, divided:bool=False, *, opaque:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int, int], int]]|None:
@@ -486,7 +482,7 @@ def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
   try:
     # A fifth term rejects the candidate without expanding the rest of a shared expression.
     if not 2<=len(terms:=tuple(itertools.islice(expand(root,one),5)))<=4 or any(load.op is not Ops.LOAD or _typed_load_plan(load,dtypes.half,out_index,rows) is None for load,_ in terms): return False  # noqa: E501
-    mappings=tuple((_gather_offsets(out_index,load.src[0].src[1],load.src[2] if len(load.src)>2 else None,rows),typing_cast(tuple[float,...],_static_lanes(dense,weight,dependencies=False)[0])) for load,weight in terms)  # noqa: E501
+    mappings=tuple((_gather_offsets(out_index,load.src[0].src[1],load.src[2] if len(load.src)>2 else None,rows),_static_values(out_index,weight,rows,float)) for load,weight in terms)  # noqa: E501
   except (_RKGenericReject,RuntimeError,ValueError,OverflowError): return False
   n=int(dense[-1].src[0].arg); m=rows//n; param=typing_cast(UOp,_root_param(terms[0][0].src[0])); source_count=int(param.src[0].arg); k=source_count//m if m and source_count%m==0 else 0; columns=tuple((offsets[:n],weights[:n]) for offsets,weights in mappings)  # noqa: E501
   if not k or any(_root_param(load.src[0]) is not param for load,_ in terms) or any(not 0<=offset<k for offsets,_ in columns for offset in offsets) or any(offsets[row*n+col]!=row*k+columns[t][0][col] or weights[row*n+col]!=columns[t][1][col] for t,(offsets,weights) in enumerate(mappings) for row in range(m) for col in range(n)): return False  # noqa: E501
