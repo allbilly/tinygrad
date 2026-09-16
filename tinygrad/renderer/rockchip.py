@@ -1,6 +1,6 @@
 from __future__ import annotations
 # ruff: noqa: E702
-import array, base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
+import base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
 from typing import Callable, Iterable, Mapping, NamedTuple, TypeVar, cast as typing_cast
 from tinygrad.device import Base64Compiler
@@ -111,8 +111,7 @@ def _reuse_linear_scratch(image:RKImage, resolve:Callable[[RKArg],RKArg]=lambda 
 
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
-  try: return (array.array(code,values),True)[1] if isinstance(values,tuple) and len(values)>1024 and (code:={(True,8):"b",(True,16):"h",(True,32):"i",(False,8):"B",(False,16):"H",(False,32):"I"}.get((signed,bits))) is not None else all(isinstance(value,int) and low<=value<high for value in values)  # noqa: E501
-  except (OverflowError,TypeError,ValueError): return False
+  return all(isinstance(value,int) and low<=value<high for value in values)
 
 def _validate_image(image:RKImage) -> None:
   gathers=tuple(op for op in image.program if isinstance(op,RKGather)); hosts=tuple(op for op in gathers if op.index is not None); static=tuple(op for op in gathers if op.index is None); ew_ops=tuple(op for op in image.program if isinstance(op,RKEWOp)); cmacs=tuple(op for op in image.program if isinstance(op,RKCMAC))  # noqa: E501
