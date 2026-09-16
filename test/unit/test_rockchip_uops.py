@@ -461,9 +461,10 @@ def test_static_vector_values_match_scalar_typed_evaluation():
   for expr,encode in zip(expressions, (int, int, rockchip_renderer._storage_bits, lambda x:int(bool(x)),
                                        rockchip_renderer._storage_bits, rockchip_renderer._storage_bits)):
     expected = [None]*20
-    for lane in range(20):
-      expected[int(rockchip_renderer._eval_static(out_index,(outer,inner),(5,4),lane,lane+1))] = \
-        encode(rockchip_renderer._eval_static(expr,(outer,inner),(5,4),lane,lane+1))
+    for values in itertools.product(range(5),range(4)):
+      env=dict(zip((outer,inner),values))
+      cache = {}
+      expected[int(rockchip_renderer._eval_static(out_index,env,cache))] = encode(rockchip_renderer._eval_static(expr,env,cache))
     assert rockchip_renderer._static_values(out_index, expr, 20, encode) == tuple(expected)
   dense_bool=rockchip_renderer._static_values(out_index,(outer<3)&(inner!=2),20,int)
   assert dense_bool==tuple(int(i<3 and j!=2) for i in range(5) for j in range(4)) and all(type(value) is int for value in dense_bool)
@@ -472,34 +473,39 @@ def test_static_vector_values_match_scalar_typed_evaluation():
   assert divided==(tuple(i//3 for i in range(17)),)
 
 
-def test_static_evaluation_rejects_runtime_inputs():
+def test_static_evaluation_requires_explicit_runtime_binding():
   lane=UOp.range(3,104)
   load=UOp.param(0,dtypes.int,(3,)).index(lane).load()
   expression=load*3+5
-  with pytest.raises(rockchip_renderer._RKGenericReject,match="non_static_eval"): rockchip_renderer._eval_static(expression,(),(),0,1)
-  assert rockchip_renderer._eval_static(lane*3+5,(lane,),(3,),0,3)==(5,8,11)
+  with pytest.raises(rockchip_renderer._RKGenericReject,match="non_static_eval"): rockchip_renderer._eval_static(expression,{})
+  assert rockchip_renderer._eval_static(expression,{load:(-2,0,7)})==(-1,5,26)
 
 
 @pytest.mark.parametrize("vector",(False,True))
 @pytest.mark.parametrize("preseed",(False,True))
 def test_static_evaluation_preserves_shared_cache_and_bound_frontier(vector:bool,preseed:bool,monkeypatch):
-  lane=UOp.range(3,105)
-  shared=UOp(Ops.MUL,dtypes.int,src=(lane,UOp.const(3,dtypes.int)))
+  load=UOp.param(0,dtypes.int,(3,)).index(UOp.range(3,105)).load()
+  shared=UOp(Ops.MUL,dtypes.int,src=(load,UOp.const(3,dtypes.int)))
   first=UOp(Ops.ADD,dtypes.int,src=(shared,UOp.const(5,dtypes.int)))
   second=UOp(Ops.ADD,dtypes.int,src=(shared,shared))
-  domain=(0,3) if vector else (0,1)
-  rockchip_renderer._eval_static.cache_clear()
-  if preseed: rockchip_renderer._eval_static(shared,(lane,),(3,),*domain)
+  sentinel=UOp.const(123,dtypes.int)
+  cache={sentinel:123}
+  if preseed: cache[shared]=(-6,0,21) if vector else -6
   visited=[]
   execute=rockchip_renderer._exec_static
   def observe(node,operands):
     visited.append(node)
     return execute(node,operands)
   monkeypatch.setattr(rockchip_renderer,"_exec_static",observe)
-  assert rockchip_renderer._eval_static(first,(lane,),(3,),*domain)==((5,8,11) if vector else 5)
-  assert rockchip_renderer._eval_static(second,(lane,),(3,),*domain)==((0,6,12) if vector else 0)
-  assert visited.count(shared)==int(not preseed) and lane not in visited
-  rockchip_renderer._eval_static.cache_clear()
+  env={load:(-2,0,7) if vector else -2}
+  assert rockchip_renderer._eval_static(first,env,cache)==((-1,5,26) if vector else -1)
+  assert rockchip_renderer._eval_static(second,env,cache)==((-12,0,42) if vector else -12)
+  assert visited.count(shared)==int(not preseed) and load not in visited and cache[sentinel]==123
+  # A supplied parent is opaque, and its scalar dtype still commits the supplied value.
+  assert rockchip_renderer._eval_static(first,{first:2**32+7})==7
+  # A memoized value alone must not authorize evaluation of an unbound runtime load.
+  with pytest.raises(rockchip_renderer._RKGenericReject,match="non_static_eval"):
+    rockchip_renderer._eval_static(first,{},cache)
 
 
 def test_static_vector_commit_matches_scalar_typed_bits():
@@ -516,9 +522,9 @@ def test_static_vector_commit_matches_scalar_typed_bits():
 def test_renderer_releases_uop_analysis_caches():
   lane=UOp.range(4,103)
   rockchip_renderer._static_lanes((lane,),lane,dependencies=False)
-  assert rockchip_renderer._eval_static.cache_info().currsize
+  assert rockchip_renderer._eval_static_block.cache_info().currsize
   RockchipRenderer(Target(device="ROCKCHIP")).render(_program(dtypes.half,lambda _:UOp.const(0.0,dtypes.half),1))
-  caches=(rockchip_renderer._semantic_loads,rockchip_renderer._static_ranges,rockchip_renderer._eval_static,
+  caches=(rockchip_renderer._semantic_loads,rockchip_renderer._static_ranges,rockchip_renderer._eval_static_block,
           rockchip_renderer._small_gather_offsets,rockchip_renderer._int_info)
   assert all(cache.cache_info().currsize==0 for cache in caches)
 
