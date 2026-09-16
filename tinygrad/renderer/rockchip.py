@@ -287,15 +287,14 @@ def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None
   return u.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache)
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
-def _outs(uops:list[UOp]) -> tuple[RKOutput|None, RKOutput|None, list[UOp]]:
+def _outs(uops:list[UOp]) -> tuple[RKOutput|None, list[UOp]]:
   """Return the single statically-sized output store shared by specialized graph matchers."""
   stores = [u for u in uops if u.op is Ops.STORE]
   outputs = [(store, root) for store in stores if (root:=_root_param(store.src[0])) is not None]
-  if len(outputs) != 1: return None, None, [store for store,_ in outputs]
+  if len(outputs) != 1: return None, [store for store,_ in outputs]
   store, out_param = outputs[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None, None, []
-  output = store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
-  return (output if len(stores) == 1 else None), output, [store]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None, []
+  return (store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]), [store]
 
 def _admit(o,d)->RKOutput|None: return o if o is not None and o[1].dtype.scalar() in (d if isinstance(d,tuple) else (d,)) else None
 # Specialized lowerers receive nonempty, dtype-admitted outputs; generic lowering owns empty programs.
@@ -1137,7 +1136,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
-  strict_output, local_output, output_stores = _outs(uops)
+  local_output, output_stores = _outs(uops)
   if len(output_stores)>1:
     return all(plan.lower(list(store.sink().toposort()),vectorize_reductions=vectorize_reductions) for store in output_stores)
   local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
