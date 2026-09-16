@@ -9,10 +9,8 @@ from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, identity_element
-from tinygrad.uop.symbolic import sym, pm_fold_cast_const
+from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
-from tinygrad.codegen.simplify import reduce_load_collapse
-from tinygrad.codegen.late.gater import pm_move_gates_from_index
 
 RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 37, (1 << 16) - 1
 
@@ -532,18 +530,8 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   plan.scratch.extend((m*ai*2,ao*ai*2,m*ao*4)); plan.program.extend((*gathers,cmac,commit))
   return True
 
-def _collapse_selected_load(red:UOp) -> UOp|None:
-  """Canonicalize a range-selected load without allocating physical state or reassociating arithmetic."""
-  ranges=red.src[1:]; body=_strip_cast(red.src[0]); source=body.src[1].load() if body.op is Ops.WHERE and body.src[1].op is Ops.INDEX else body.src[1] if body.op is Ops.WHERE else body  # noqa: E501
-  if not ranges or any(axis.op not in (Ops.RANGE,Ops.SPECIAL) or not axis.src or axis.src[0].op is not Ops.CONST for axis in ranges) or body.op is not Ops.WHERE or body.src[2].op is not Ops.CONST or float(body.src[2].arg)!=0.0 or source.op is not Ops.LOAD or source.dtype.scalar() is not dtypes.half or len(source.src)!=1 or source.src[0].op is not Ops.INDEX or (param:=_root_param(source.src[0])) is None or param.src[0].op is not Ops.CONST: return None  # noqa: E501
-  mapping={axis:UOp.range(int(axis.src[0].arg),1+i+max((node.arg[0] for node in red.toposort() if node.op is Ops.RANGE),default=-1),dtype=axis.dtype) for i,axis in enumerate(ranges) if axis.op is Ops.SPECIAL}  # noqa: E501
-  return direct.cast(red.dtype) if (collapsed:=reduce_load_collapse(red.substitute(mapping,walk=True),body.substitute(mapping,walk=True))) is not None and _strip_cast(direct:=graph_rewrite(collapsed,pm_move_gates_from_index+pm_fold_cast_const)).op is Ops.LOAD else None  # noqa: E501
-
-_pm_selected_load = PatternMatcher([(UPat(Ops.REDUCE,(dtypes.half,dtypes.float),arg=(Ops.ADD,0),name="red"),_collapse_selected_load)])
-
 def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
-  """Prefer one dynamic gather or contraction, then map and reduce every remaining bounded reduction on the DPU."""
-  if output[1].dtype.scalar() is dtypes.half and output[2]<=_RKIMAGE_U16_MAX and (root:=graph_rewrite(output[4],_pm_selected_load,name="rockchip selected loads")) is not output[4] and plan.lower(list(output[0].replace(src=(output[0].src[0],root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in root.toposort())): return True  # noqa: E501
+  """Prefer a contraction, then map and reduce bounded reductions on the DPU."""
   return _try(plan,output,(dtypes.half,dtypes.float),_lower_cmac_reduce) or _try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)  # noqa: E501
 
 def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
