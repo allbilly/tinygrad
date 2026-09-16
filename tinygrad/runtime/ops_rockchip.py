@@ -57,7 +57,6 @@ def _apply_gathers(gathers:tuple[RKGather, ...], buffer:typing.Callable[[RKBuffe
       values=array.array(code,gather.values)
       dst.mv[span]=values*gather.count if len(values)==1 else values
       continue
-    assert gather.src is not None
     fill=not gather.partial and bool(gather.offsets or gather.index is not None and gather.dst.kind is RKBufferKind.SCRATCH)
     if fill and not bounded and gather.count: raise IndexError("RKGather destination exceeds buffer")
     # Build one raw payload before assignment; inactive partial lanes retain their existing destination bits.
