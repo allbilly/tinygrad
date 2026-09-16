@@ -283,7 +283,7 @@ def test_streaming_lookup_preserves_repeated_output_environments(monkeypatch,rec
       blocks.append(len(block[0]) if block else 0)
       yield block
   monkeypatch.setattr(rk,"_static_blocks",observe)
-  assert rk._lower_bounded_int_lookup((store,output,count,output_index,root),plan)
+  assert rk._bounded_int_lookup(root,output_index,count,plan) is not None
   assert max(blocks)<=4096 and sum(blocks)>=limit*(count+1)
   table,=[op.values for op in plan.program if isinstance(op,rk.RKGather) and len(op.values)==count*limit]
   np.testing.assert_array_equal(np.fromiter(table,dtype=np.int16).reshape(limit,count),

@@ -771,7 +771,6 @@ def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatc
     assert _transaction_state(args[-1])==before
     if not accepted: return reject(*args)
     return True
-  monkeypatch.setattr(rockchip_renderer,"_lower_bounded_int_lookup",reject)
   monkeypatch.setattr(rockchip_renderer,"_lower_cmac_reduce",reject)
   monkeypatch.setattr(rockchip_renderer,"_lower_mapped_reduce",final_attempt)
   assert rockchip_renderer._lower_reduction(output,[],plan) is accepted
@@ -807,8 +806,7 @@ def test_production_specialized_lowerers_receive_admitted_outputs(operation,monk
   observed=[]
   domains={"_lower_linear_contraction":(dtypes.float,),"_lower_reduction":(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),
            "_lower_cmac_storage_epilogue":(dtypes.half,),"_lower_raw_fp16_bitcast":(dtypes.int,),
-           "_lower_bounded_int_lookup":(dtypes.int,),"_lower_cmac_reduce":(dtypes.half,dtypes.float),
-           "_lower_mapped_reduce":(dtypes.half,dtypes.int,dtypes.bool)}
+           "_lower_cmac_reduce":(dtypes.half,dtypes.float),"_lower_mapped_reduce":(dtypes.half,dtypes.int,dtypes.bool)}
   for name,domain in domains.items():
     original=getattr(rockchip_renderer,name)
     def lowerer(output,*args,_name=name,_domain=domain,_original=original):
