@@ -8,7 +8,7 @@ from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
 from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, identity_element, python_alu
+from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, graph_rewrite, identity_element
 from tinygrad.uop.symbolic import sym, pm_fold_cast_const
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 from tinygrad.codegen.simplify import reduce_load_collapse
@@ -278,15 +278,9 @@ def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
 
 def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
   if node.op in (Ops.CONST,Ops.CAST): return _commit_static(node.dtype,typing_cast(RKScalar,node.arg) if node.op is Ops.CONST else operands[0])  # noqa: E501
-  if not (vectors:=tuple(value for value in operands if isinstance(value,tuple))): return typing_cast(RKStatic,exec_alu(node.op,node.dtype.scalar(),operands))  # noqa: E501
-  if any(len(value)!=len(vectors[0]) for value in vectors): raise _RKGenericReject("static_index")
-  # Symbolic bounds describe pre-wrap arithmetic; only committed operands justify native division shortcuts.
-  minima=tuple(min(value,default=0) if isinstance(value,tuple) else value for value in operands) if node.op in (Ops.CDIV,Ops.CMOD,Ops.FLOORDIV,Ops.FLOORMOD) else ()  # noqa: E501
-  direct=bool(minima) and dtypes.is_int(node.dtype.scalar()) and minima[1]>0 and (node.op in (Ops.FLOORDIV,Ops.FLOORMOD) or minima[0]>=0)
-  # At least one validated vector bounds scalar repeats, including an empty vector.
-  result=tuple(map(operator.floordiv if direct and node.op in (Ops.CDIV,Ops.FLOORDIV) else operator.mod if direct else python_alu[node.op],
-    *(value if isinstance(value,tuple) else itertools.repeat(value) for value in operands)))
-  if dtypes.is_bool(scalar:=node.dtype.scalar()) or dtypes.is_int(scalar) and scalar.min<=min(result,default=0)<=max(result,default=0)<=scalar.max: return result  # noqa: E501
+  if (vectors:=tuple(value for value in operands if isinstance(value,tuple))) and any(len(value)!=len(vectors[0]) for value in vectors): raise _RKGenericReject("static_index")  # noqa: E501
+  scalar,result=node.dtype.scalar(),typing_cast(RKStatic,exec_alu(node.op,node.dtype.scalar(),operands,truncate_output=not vectors,check_invalid=False))  # noqa: E501
+  if not vectors or dtypes.is_bool(scalar) or dtypes.is_int(scalar) and scalar.min<=min(result,default=0)<=max(result,default=0)<=scalar.max: return result  # type: ignore[arg-type]  # noqa: E501
   return _commit_static(node.dtype,result)
 
 def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None=None) -> RKStatic:

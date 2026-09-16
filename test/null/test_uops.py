@@ -153,6 +153,7 @@ class TestExecALU(unittest.TestCase):
     self.assertIs(exec_alu(Ops.CMPLT, dtypes.bool, (Invalid, 1)), Invalid)
     self.assertIs(exec_alu(Ops.CMPNE, dtypes.bool, (Invalid, 1)), Invalid)
     self.assertIs(exec_alu(Ops.ADD, dtypes.weakint, (Invalid, 1)), Invalid)
+    self.assertEqual(exec_alu(Ops.ADD, dtypes.weakint, ((Invalid, 1), 1)), (Invalid, 2))
 
   def test_div(self):
     self.assertEqual(exec_alu(Ops.CDIV, dtypes.int8, (8, 2)), 4)
@@ -221,6 +222,7 @@ class TestExecALU(unittest.TestCase):
 
     # test no truncate
     self.assertEqual(exec_alu(Ops.ADD, dtypes.uint8, (250, 250), truncate_output=False), 500)
+    self.assertEqual(exec_alu(Ops.ADD, dtypes.uint8, ((250, 250), 250), truncate_output=False), (500, 500))
 
 class TestGatedStoreRewrite(unittest.TestCase):
   def test_tiny_gate_store(self):

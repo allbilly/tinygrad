@@ -1295,10 +1295,16 @@ python_alu: dict[Ops, Callable]  = {
   Ops.CMOD: cmod, Ops.CDIV: cdiv, Ops.FLOORDIV: floordiv, Ops.FLOORMOD: floormod,
   Ops.MULACC: lambda x,y,z: (x*y)+z, Ops.WHERE: lambda x,y,z: y if x else z, Ops.CMPEQ: operator.eq}
 
-def exec_alu(op:Ops, dtype:DType, operands, truncate_output=True):
-  if any(isinstance(x, tuple) for x in operands):
-    count = max(len(x) for x in operands if isinstance(x, tuple))
-    return tuple([exec_alu(op, dtype, [x[i] if isinstance(x, tuple) else x for x in operands]) for i in range(count)])
+def exec_alu(op:Ops, dtype:DType, operands, truncate_output=True, check_invalid=True):
+  if (vectors:=tuple(x for x in operands if isinstance(x, tuple))):
+    # Typed callers can skip the linear Invalid scan; the public default preserves lane-wise poison semantics.
+    if any(len(x)!=len(vectors[0]) for x in vectors) or check_invalid and op in GroupOp.Binary and any(x is Invalid or isinstance(x,tuple) and Invalid in x for x in operands): return tuple(exec_alu(op,dtype,[x[i] if isinstance(x,tuple) else x for x in operands],truncate_output,check_invalid) for i in range(max(map(len,vectors))))  # noqa: E501
+    # Symbolic bounds describe pre-wrap arithmetic; only committed operands justify native division shortcuts.
+    minima=tuple(min(x,default=0) if isinstance(x,tuple) else x for x in operands) if op in (Ops.CDIV,Ops.CMOD,Ops.FLOORDIV,Ops.FLOORMOD) else ()  # noqa: E501
+    alu=(operator.floordiv if op in (Ops.CDIV,Ops.FLOORDIV) else operator.mod) if minima and dtypes.is_int(dtype.scalar()) and minima[1]>0 and (op in (Ops.FLOORDIV,Ops.FLOORMOD) or minima[0]>=0) else python_alu[op]  # noqa: E501
+    # At least one validated vector bounds scalar repeats, including an empty vector.
+    result=tuple(map(alu,*(x if isinstance(x,tuple) else itertools.repeat(x) for x in operands)))
+    return tuple(map(truncate_fxn,result)) if truncate_output and (truncate_fxn:=truncate.get(dtype)) is not None else result
   if op in GroupOp.Binary and Invalid in operands: return Invalid
   alu = python_alu[op](*operands)
   if truncate_output and (truncate_fxn:=truncate.get(dtype)) is not None: return truncate_fxn(alu)
