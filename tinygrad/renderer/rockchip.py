@@ -438,20 +438,6 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   return _kahan_sum(expanded) if all(term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) and (len(terms) == 8 and all(all(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) or 64 <= len(terms) <= 512 and any(any(_strip_cast(source).op is not Ops.LOAD for source in term.src) for term in terms)) else _tag_precise_adds((parts:=_precise_add_parts(expanded))[0].alu(Ops.ADD,parts[1]))  # noqa: E501
 
 
-def _lower_cmac_storage_epilogue(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
-  """Commit one output-shaped FP32 contraction to HALF on CMAC before its ordinary HALF epilogue."""
-  store,out,count,index,root=output
-  for boundary in (u for u in root.toposort() if u is not root and _typed_cast_source(u,dtypes.half,dtypes.float) is not None):
-    source=boundary.src[0]; terms=tuple(_strip_cast(term) for term in source.split_uop(Ops.ADD)) if source.op is Ops.ADD else ()
-    if any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])==8 for node in boundary.toposort()) or len(terms) == 8 and all(term.op is Ops.MUL and term.arg is None and all(src.dtype.scalar() is dtypes.half and _strip_cast(src).op is Ops.LOAD for src in term.src) for term in terms): continue  # noqa: E501
-    def append() -> bool:
-      fake=plan.parameter(dtypes.half,count); prefix=fake.index(index).store(boundary)
-      if not _lower_reduction((prefix,fake,count,index,boundary),uops,plan): return False
-      suffix=store.replace(src=(store.src[0],root.substitute({boundary:fake.index(index).load()})))
-      return not any(_root_param(load.src[0]) is out for load in _semantic_loads(suffix)) and plan.lower(list(suffix.sink().toposort()),vectorize_reductions=False,chain=not any(isinstance(op,RKCMAC) for op in plan.program))  # noqa: E501
-    if plan.lower(append): return True
-  return False
-
 def _gate_zero_term(term:UOp) -> UOp:
   """Move a static zero-select into its load so padded products keep a linear physical carrier."""
   term=_strip_cast(term)
@@ -1172,7 +1158,6 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   if vectorize_reductions:
     if _try(plan,local_output,dtypes.float,_lower_linear_contraction): return True
     if _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops): return True
-    if _try(plan,strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops): return True
   if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
     storage_root=_optional_rewrite(functools.partial(_expand_math_uops,accurate_adds=False),storage_output[4])
     if storage_root is not None: local_output=(*storage_output[:4],storage_root)
