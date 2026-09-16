@@ -1095,9 +1095,8 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   # The returned graph owns its live recipes; do not retain the completed memo through the recursive callback's cycle.
   result=rewrite(root); rewrite.cache_clear(); return result
 
-def _finite_int_max_neutrals(root:UOp) -> UOp:
-  """Canonicalize finite FP selector neutrals and simplify integer MAX without changing its semantic constants."""
-  if root.op is Ops.MAX: root=root.substitute({u:u.replace(src=(u.src[0],u.src[1].const_like(-65504.0),u.src[2])) for u in root.toposort() if u.op is Ops.WHERE and u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() in (dtypes.half,dtypes.float) and math.isinf(float(u.src[1].arg)) and float(u.src[1].arg)<0.0})  # noqa: E501
+def _simplify_int_max(root:UOp) -> UOp:
+  """Apply shared MAX identities only to integer nodes, preserving other arithmetic."""
   # Apply shared MAX identities only at integer MAX nodes, leaving arithmetic beneath their operands unchanged.
   return root.substitute({u:folded for u in root.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int and (folded:=sym.rewrite(u)) is not None})  # noqa: E501
 
@@ -1155,7 +1154,7 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
   root=output[4]
   if Ops.REDUCE in (u.op for u in uops): root=_unroll_static_reduces(root)
-  root=_finite_int_max_neutrals(root)
+  root=_simplify_int_max(root)
   if len(root.toposort()) <= 256:
     root=_expand_math_uops(root)
   elif (base:=_strip_cast(root)).dtype.scalar() is dtypes.half:
