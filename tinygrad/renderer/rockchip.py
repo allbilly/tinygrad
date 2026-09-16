@@ -51,8 +51,7 @@ class RKImage(NamedTuple): scratch: tuple[int, ...] = (); program: tuple[RKGathe
 
 def _op_args(op:RKGather|RKEWOp|RKCMAC) -> tuple[RKArg, ...]: return tuple(arg for arg in op if isinstance(arg,RKArg))
 
-def _map_image_args(image:RKImage, fn:Callable[[RKArg], RKArg]) -> RKImage:
-  return image._replace(program=tuple(type(op)._make(fn(arg) if isinstance(arg,RKArg) else arg for arg in op) for op in image.program))
+def _map_op_args(op:RKGather|RKEWOp|RKCMAC, fn:Callable[[RKArg], RKArg]) -> RKGather|RKEWOp|RKCMAC: return type(op)._make(fn(arg) if isinstance(arg,RKArg) else arg for arg in op)  # noqa: E501
 
 class RKPlan:
   """One virtual scratch namespace for every physical value in a compiled program."""
@@ -88,10 +87,10 @@ class RKPlan:
     finally:
       if not accepted: self.program[:],self.scratch[:],self.bindings,self.slot=program,scratch,bindings,virtual
 
-def _reuse_linear_scratch(image:RKImage) -> RKImage:
+def _reuse_linear_scratch(image:RKImage, resolve:Callable[[RKArg],RKArg]=lambda arg:arg) -> RKImage:
   """Color virtual scratch lifetimes across the complete physical execution schedule."""
   prelude:list[RKGather|RKEWOp|RKCMAC] = []; body:list[RKGather|RKEWOp|RKCMAC] = []; ready:set[int] = set(); written:set[RKArg] = set()
-  for op in image.program:
+  for op in (_map_op_args(op,resolve) for op in image.program):
     deps=tuple(arg for arg in ((op.src,op.index) if isinstance(op,RKGather) else ()) if arg is not None); preload=isinstance(op,RKGather) and op.dst.kind is RKBufferKind.SCRATCH and op.dst._replace(addend=0) not in written and all(arg.index in ready if arg.kind is RKBufferKind.SCRATCH else arg._replace(addend=0) not in written for arg in deps) and (not op.partial or op.dst.index in ready)  # noqa: E501
     (prelude if preload else body).append(op); ready.add(op.dst.index) if preload else None
     # A padding write cannot make a previously produced surface available before its producer.
@@ -108,7 +107,7 @@ def _reuse_linear_scratch(image:RKImage) -> RKImage:
     physical[target] = round_up(max(physical.get(target,0), spec),4)
     heapq.heappush(active, (end, target))
     remap[slot] = target
-  return _map_image_args(RKImage(tuple(physical.values()),tuple(prelude+body)),lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)  # noqa: E501
+  return RKImage(tuple(physical.values()),tuple(_map_op_args(op,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg) for op in prelude+body))  # noqa: E501
 
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
@@ -1217,7 +1216,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
   """Finalize one physical plan for the production renderer; unsupported semantics fail closed."""
   plan=RKPlan(uops)
   if not plan.lower(uops,vectorize_reductions=vectorize_reductions): return None
-  if len((image:=_reuse_linear_scratch(_map_image_args(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve))).scratch)>_RKIMAGE_U16_MAX: return None  # noqa: E501
+  if len((image:=_reuse_linear_scratch(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve)).scratch)>_RKIMAGE_U16_MAX: return None  # noqa: E501
   _validate_image(image); return image
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:

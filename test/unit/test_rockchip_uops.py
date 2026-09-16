@@ -608,7 +608,7 @@ def test_image_argument_mapping_preserves_field_order_and_nonbuffer_metadata():
   def remap(arg:RKArg) -> RKArg:
     visited.append(arg)
     return arg._replace(index=arg.index+11,addend=arg.addend+64)
-  mapped=rockchip_renderer._map_image_args(image,remap)
+  mapped=image._replace(program=tuple(rockchip_renderer._map_op_args(op,remap) for op in image.program))
   assert visited==[lhs,source,rhs,index,dst,lhs,rhs,dst,lhs,rhs]
   assert mapped.scratch==image.scratch
   for original,result in zip(image.program,mapped.program):
