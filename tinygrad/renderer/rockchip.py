@@ -1038,8 +1038,6 @@ class RKContext:
     return self._carrier(context.lower(recipe).arg,yes.dtype)
 
   def _where(self, u:UOp) -> UOp:
-    if u is self.root and u.dtype.scalar() is dtypes.uchar and (source:=_typed_cast_source(u.src[1],dtypes.uchar,dtypes.half)) is not None and (condition:=u.src[0]).op is Ops.CMPLT and condition.src[0].op is Ops.CONST and float(condition.src[0].arg)==0.0 and condition.src[1].key==source.key and u.src[2].op is Ops.CONST and int(u.src[2].arg)==0:  # noqa: E501
-      return self.lower(source.alu(Ops.MAX,UOp.const(0.0,dtypes.half)).cast(dtypes.uchar))
     # A static selection produces one physical value, including when another UOp consumes it.
     if u.dtype.scalar() in (dtypes.half,dtypes.int16,dtypes.int,dtypes.uint) and _is_static_expr(u.src[0]):
       dtype,leaf_ids,routes=u.dtype.scalar(),dict[UOp,int](),dict[UOp,UOp]()
