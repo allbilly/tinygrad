@@ -266,6 +266,12 @@ def test_static_placement_validates_across_block_boundaries(failure):
                       unique=failure=="conflict",minimum=0 if failure=="minimum" else None,block=4)
 
 
+def test_dense_integer_placement_ignores_order_only_range_dependency():
+  outer=UOp.range(1025,99707,dtype=rk.dtypes.int)
+  inner=UOp.range(1024,99708,src=(outer,),dtype=rk.dtypes.int)
+  assert rk._static_values(inner,inner,1024,int)==tuple(range(1024))
+
+
 def test_streaming_lookup_preserves_repeated_output_environments(monkeypatch,record_property):
   """A table's entry count is not its static environment count; placement must remain bounded."""
   count,limit=2048,2048

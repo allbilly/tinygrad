@@ -328,13 +328,10 @@ def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_stat
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar], RKEncoded], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[RKEncoded, ...]:  # noqa: E501
   """Place compiler-bound values by destination; validate every candidate before a later write can hide it."""
-  if encode is int and (dtypes.is_int(scalar:=expr.dtype.scalar()) or dtypes.is_bool(scalar)) and \
-     (ranges:=_dense_ranges(out_index,count)) is not None:
-    values=tuple(itertools.chain.from_iterable(chunk[0] for chunk in _static_blocks(ranges,expr,dependencies=False,limit=limit,block=block)))
-    if minimum is not None and min(values,default=0)<minimum: raise _RKGenericReject("gather_index")
-    return typing_cast(tuple[RKEncoded,...],tuple(map(operator.index,typing_cast(tuple[int|bool,...],values))) if dtypes.is_bool(scalar) else values)
+  integer_values = encode is int and (dtypes.is_int(expr.dtype.scalar()) or dtypes.is_bool(expr.dtype.scalar()))
+  dense_integer = integer_values and _dense_ranges(out_index,count) is not None
   missing=object(); result:list[RKEncoded|object]=[missing]*count
-  for dst,value in itertools.chain.from_iterable(zip(map(int,dst_lanes),expr_lanes) for dst_lanes,expr_lanes in _static_blocks(out_index,expr,limit=limit,block=block)):  # noqa: E501
+  for dst,value in itertools.chain.from_iterable(zip(map(int,dst_lanes),expr_lanes) for dst_lanes,expr_lanes in _static_blocks(out_index,expr,dependencies=not dense_integer,limit=limit,block=block)):  # noqa: E501
     if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
     encoded=encode(value)
     if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
