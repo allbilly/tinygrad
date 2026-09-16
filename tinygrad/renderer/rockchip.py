@@ -556,25 +556,6 @@ def _collapse_selected_load(red:UOp) -> UOp|None:
 
 _pm_selected_load = PatternMatcher([(UPat(Ops.REDUCE,(dtypes.half,dtypes.float),arg=(Ops.ADD,0),name="red"),_collapse_selected_load)])
 
-_lookup_source=UPat(Ops.LOAD,dtypes.int,name="source")
-_lookup_guard=((_lookup_source<0).alu(Ops.CMPNE,UPat.const(True,dtypes.bool))&(_lookup_source<UPat.cvar("limit"))).named("gate")
-_lookup_value=UPat(Ops.WHERE,src=(_lookup_guard,UPat.var("value"),UPat.const(0)))
-
-def _bounded_int_lookup(root:UOp, out_index:UOp, count:int, plan:RKPlan) -> UOp|None:
-  """Materialize a static INT16-valued table and return its exact range-gated runtime LOAD."""
-  if count>_FP16_EXACT_INTEGER or not (matches:=_lookup_value.match(root,{})): return None
-  source,gate,value=(matches[0][name] for name in ("source","gate","value")); limit=int(matches[0]["limit"].arg)
-  if not 0<limit<=_FP16_EXACT_INTEGER or tuple(node for node in root.toposort() if node.op is Ops.LOAD)!=(source,): return None
-  try:
-    static_value=not any(node.op in (Ops.RANGE,Ops.SPECIAL) for node in value.toposort(gate=lambda item:item is not source))
-    candidate=UOp.range(limit,1+max((node.arg[0] for node in root.toposort() if node.op is Ops.RANGE),default=-1),dtype=source.dtype)
-    values=_static_values(candidate if static_value else candidate*count+out_index,value.substitute({source:candidate},walk=True),limit if static_value else limit*count,int,limit=_MAX_STATIC_RANGE_ENVS*limit,block=4096 if static_value else count)  # noqa: E501
-  except (_RKGenericReject,ValueError,OverflowError): return None
-  if any(not 0<=item<=32767 for item in values): return None
-  table=plan.parameter(dtypes.int16,len(values))
-  plan.program.append(RKGather(None,plan.resolve(RKArg(RKBufferKind.ARG,table.arg.slot)),len(values),values=values))
-  return table.index(source if static_value else source*count+out_index).load(UOp.const(0,dtypes.int16),gate).cast(dtypes.int)
-
 def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Prefer one dynamic gather or contraction, then map and reduce every remaining bounded reduction on the DPU."""
   if output[1].dtype.scalar() is dtypes.half and output[2]<=_RKIMAGE_U16_MAX and (root:=graph_rewrite(output[4],_pm_selected_load,name="rockchip selected loads")) is not output[4] and plan.lower(list(output[0].replace(src=(output[0].src[0],root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in root.toposort())): return True  # noqa: E501
@@ -1185,19 +1166,28 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
   strict_output, local_output, output_stores = _outs(uops)
-  if len(output_stores)>1: return all(plan.lower(list(store.sink().toposort()),vectorize_reductions=vectorize_reductions) for store in output_stores)  # noqa: E501
+  if len(output_stores)>1:
+    return all(plan.lower(list(store.sink().toposort()),vectorize_reductions=vectorize_reductions) for store in output_stores)
   local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
-  if vectorize_reductions and (_try(plan,local_output,dtypes.float,_lower_linear_contraction) or _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops) or _try(plan,strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops)): return True  # noqa: E501
+  if vectorize_reductions:
+    if _try(plan,local_output,dtypes.float,_lower_linear_contraction): return True
+    if _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops): return True
+    if _try(plan,strict_output,dtypes.half,_lower_cmac_storage_epilogue,uops): return True
   if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
-    if (storage_root:=_optional_rewrite(functools.partial(_expand_math_uops,accurate_adds=False),storage_output[4])) is not None: local_output=(*storage_output[:4],storage_root)  # noqa: E501
+    storage_root=_optional_rewrite(functools.partial(_expand_math_uops,accurate_adds=False),storage_output[4])
+    if storage_root is not None: local_output=(*storage_output[:4],storage_root)
   if (output:=local_output) is None or len(output[0].src)!=2: raise _RKGenericReject("output store")
   if output[2]<=0: return True
   if not ((affine:=typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(output[3]))) is not None and affine[0] == 0 and
           set(affine[1]) == set(_static_ranges(output[3]) or ()) and _affine_output_axes(affine, output[2]) is not None) and \
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
-  root=(lookup if (lookup:=_bounded_int_lookup(output[4],output[3],output[2],plan)) is not None else
-        _finite_int_max_neutrals(_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4]))
-  root = _expand_math_uops(root) if len(root.toposort()) <= 256 else recipe if (base:=_strip_cast(root)).dtype.scalar() is dtypes.half and (recipe:=_accurate_add_recipe(base,pure=True)) is not None else root  # noqa: E501
+  root=output[4]
+  if Ops.REDUCE in (u.op for u in uops): root=_unroll_static_reduces(root)
+  root=_finite_int_max_neutrals(root)
+  if len(root.toposort()) <= 256:
+    root=_expand_math_uops(root)
+  elif (base:=_strip_cast(root)).dtype.scalar() is dtypes.half:
+    if (recipe:=_accurate_add_recipe(base,pure=True)) is not None: root=recipe
   if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject(f"expanded nodes {len(n)}")
   # Rebuild the STORE only after all root rewrites, keeping the physical context's output consistent.
   RKContext((output[0].replace(src=(output[0].src[0],root)),*output[1:4],root),plan).finish(materialize)
