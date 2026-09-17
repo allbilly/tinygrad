@@ -447,17 +447,11 @@ def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_R
     return tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (root.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache),))  # noqa: E501
   return (evaluate(start,min(start+block,count)) for start in range(0,count,block))
 
-def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None:
-  ranges=_static_ranges(out_index) or ()
-  bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges)
-  affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
-  if affine is None or affine[0]!=0 or count!=math.prod(bounds): return None
-  return ranges if all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None
-
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar], RKEncoded], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[RKEncoded, ...]:  # noqa: E501
   """Place compiler-bound values by destination; validate every candidate before a later write can hide it."""
   integer_values = encode is int and (dtypes.is_int(expr.dtype.scalar()) or dtypes.is_bool(expr.dtype.scalar()))
-  dense_integer = integer_values and _dense_ranges(out_index,count) is not None
+  affine = typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)) if integer_values else None
+  dense_integer = affine is not None and _affine_output_axes(affine,count) is not None
   missing=object(); result:list[RKEncoded|object]=[missing]*count
   for dst,value in itertools.chain.from_iterable(zip(map(int,dst_lanes),expr_lanes) for dst_lanes,expr_lanes in _static_blocks(out_index,expr,dependencies=not dense_integer,limit=limit,block=block)):  # noqa: E501
     if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
