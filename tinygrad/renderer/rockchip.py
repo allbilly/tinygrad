@@ -447,7 +447,12 @@ def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_R
     return tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (root.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache),))  # noqa: E501
   return (evaluate(start,min(start+block,count)) for start in range(0,count,block))
 
-def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None: ranges=_static_ranges(out_index) or (); bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges); affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); return ranges if affine is not None and affine[0]==0 and count==math.prod(bounds) and all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None  # noqa: E702,E501
+def _dense_ranges(out_index:UOp, count:int) -> tuple[UOp,...]|None:
+  ranges=_static_ranges(out_index) or ()
+  bounds=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else -1 for r in ranges)
+  affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
+  if affine is None or affine[0]!=0 or count!=math.prod(bounds): return None
+  return ranges if all(affine[1].get(r)==stride for r,stride in zip(ranges,strides_for_shape(bounds))) else None
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar], RKEncoded], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[RKEncoded, ...]:  # noqa: E501
   """Place compiler-bound values by destination; validate every candidate before a later write can hide it."""
@@ -487,7 +492,12 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
     load_index=gate.where(address if address.vmin>=0 else (address<0).where(address.const_like(-2),address),address.const_like(-1))
   return _static_values(out_index,load_index,count,int,unique=False,minimum=-1 if gate is not None else 0)
 
-def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None: ordered=tuple(sorted(affine[1].items(),key=lambda item:abs(item[1]))); limits=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered); return tuple((r,abs(stride),limit) for (r,stride),limit in zip(ordered,limits)) if all(limit>0 and abs(stride)==math.prod(limits[:i]) for i,((_,stride),limit) in enumerate(zip(ordered,limits))) and math.prod(limits)==count and affine[0]==sum((limit-1)*-min(stride,0) for (_,stride),limit in zip(ordered,limits)) else None  # noqa: E702,E501
+def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None:
+  ordered=tuple(sorted(affine[1].items(),key=lambda item:abs(item[1])))
+  limits=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered)
+  valid=all(limit>0 and abs(stride)==math.prod(limits[:i]) for i,((_,stride),limit) in enumerate(zip(ordered,limits)))
+  if not valid or math.prod(limits)!=count or affine[0]!=sum((limit-1)*-min(stride,0) for (_,stride),limit in zip(ordered,limits)): return None
+  return tuple((r,abs(stride),limit) for (r,stride),limit in zip(ordered,limits))
 
 def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
   if gate is None and (out_affine:=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))) is not None and out_affine[0]==0 and _affine_output_axes(out_affine,count) is not None and (linear:=typing_cast(tuple[int,dict[tuple[UOp,int,int],int]]|None,_linear_index(load_index,True))) is not None and all(axis in out_affine[1] for axis,_,_ in linear[1]):  # noqa: E501
