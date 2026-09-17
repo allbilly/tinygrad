@@ -507,64 +507,127 @@ def _lower_linear_contraction(output:RKOutput, plan:RKPlan) -> bool:
 def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   """Append a separable contraction directly to the shared physical plan; mapped reduction owns other bounded shapes."""
   _,out,rows,out_index,root=output
-  if any(isinstance(op,RKCMAC) for op in plan.program) or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and math.prod(int(axis.src[0].arg) for axis in node.src[1:])>_MAX_CMAC_K for node in root.toposort()): return False  # noqa: E501
+  if any(isinstance(op,RKCMAC) for op in plan.program): return False
+  if any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and
+         all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and
+         math.prod(int(axis.src[0].arg) for axis in node.src[1:])>_MAX_CMAC_K for node in root.toposort()): return False
   slots=tuple(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(3))
-  relu_root=_relu_operand(fp32_root if (fp32_root:=_typed_cast_source(root,dtypes.half,dtypes.float)) is not None else root)
-  root=_strip_cast(relu_root if relu_root is not None else root); additive=root.op is Ops.ADD and root.dtype.scalar() is dtypes.float or any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD for node in root.toposort())  # noqa: E501
-  # Keep a single mapped product/identity structured; irregular additive bodies retain bounded normalization.
-  ranges=root.src[1:] if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and all(axis.op in (Ops.RANGE,Ops.SPECIAL) and axis.src and axis.src[0].op is Ops.CONST for axis in root.src[1:]) and all(node.op in (Ops.LOAD,Ops.CONST) for node in map(_strip_cast,_gate_zero_term(root.src[0]).split_uop(Ops.MUL,lambda node:node.arg is None))) else ()  # noqa: E501
-  # A non-additive MAX rejects before the fallback unroll; neither it nor its constant result can supply contraction terms.
-  if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and not additive or (normalized:=root if ranges else _optional_rewrite(functools.partial(_unroll_static_reduces,precise=False),root,errors=(_RKGenericReject,RuntimeError,ValueError))) is None: return False  # noqa: E501
+  fp32_root=_typed_cast_source(root,dtypes.half,dtypes.float)
+  relu_root=_relu_operand(fp32_root if fp32_root is not None else root)
+  root=_strip_cast(relu_root if relu_root is not None else root)
   scale,exact_scale=1.0,True
-  while (pair:=_const_operand(root:=_strip_cast(normalized),Ops.MUL)) is not None: normalized,factor=pair[0],float(pair[1].arg); scale*=factor; exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale  # noqa: E501
-  bounds=tuple(int(axis.src[0].arg) for axis in ranges); root=_gate_zero_term(root.src[0]) if ranges else root
-  terms=tuple(_gate_zero_term(term) for term in root.split_uop(Ops.ADD)) if root.op is Ops.ADD else (_gate_zero_term(root),) if additive else (); terms=tuple(term for term in terms if not (term.op is Ops.CONST and float(term.arg)==0.0)); groups=math.prod(bounds)*len(terms)  # noqa: E501
-  if groups < (1 if additive else 4) or groups>_MAX_CMAC_K: return False
-  parsed:list[tuple[UOp|None,UOp|None,float]]=[]
-  for term in terms:
-    factors=tuple(map(_strip_cast,_strip_cast(term).split_uop(Ops.MUL,lambda node:node.arg is None))); constants=tuple(node for node in factors if node.op is Ops.CONST); loads=tuple(node for node in factors if node.op is not Ops.CONST); weight=scale*math.prod(float(node.arg) for node in constants)  # noqa: E501
-    if len(constants)>2 or len(constants)>1 and term.dtype.scalar() is not dtypes.float or len(loads)>2 or not exact_scale or any(float_to_fp16(float(node.arg))!=float(node.arg) for node in constants) or not math.isfinite(weight) or len(loads)<2 and float_to_fp16(weight)!=weight or len(loads)==2 and weight!=1.0 or out.dtype.scalar() is dtypes.float and rows==1 and len(loads)==1 and weight==1.0 or any(load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX or _root_param(load.src[0]) is None or len(load.src)>1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg)!=0.0 or math.copysign(1.0,float(load.src[1].arg))<0.0) for load in loads): return False  # noqa: E501
-    parsed.append((loads[0] if loads else None,loads[1] if len(loads)>1 else None,weight))
-  load_axes={load:frozenset((*(_static_ranges(load.src[0].src[1]) or ()),*(() if len(load.src)<3 else (_static_ranges(load.src[2]) or ()))))-frozenset(ranges) for pair in parsed for load in pair[:2] if load is not None}  # noqa: E501
-  load_pairs=tuple(typing_cast(tuple[UOp,UOp],pair[:2]) for pair in parsed) if all(pair[0] is not None and pair[1] is not None for pair in parsed) else ()  # noqa: E501
+  while (pair:=_const_operand(root,Ops.MUL)) is not None:
+    root,factor=_strip_cast(pair[0]),float(pair[1].arg)
+    scale*=factor
+    exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale
+  if root.op is not Ops.REDUCE or not isinstance(root.arg,tuple) or root.arg[0] is not Ops.ADD: return False
+  ranges=list(root.src[1:])
+  body=root.src[0]
+  # Adjacent FP32 ADD reductions share one wide accumulation; a cast between them is a rounding boundary.
+  while body.op is Ops.REDUCE and body.dtype is root.dtype and isinstance(body.arg,tuple) and body.arg[0] is Ops.ADD:
+    ranges.extend(body.src[1:])
+    body=body.src[0]
+  if not ranges or any(axis.op not in (Ops.RANGE,Ops.SPECIAL) or not axis.src or axis.src[0].op is not Ops.CONST
+                       for axis in ranges): return False
+  term=_gate_zero_term(body)
+  factors=tuple(map(_strip_cast,_strip_cast(term).split_uop(Ops.MUL,lambda node:node.arg is None)))
+  if any(node.op not in (Ops.LOAD,Ops.CONST) for node in factors): return False
+  bounds=tuple(int(axis.src[0].arg) for axis in ranges)
+  groups=math.prod(bounds)
+  if not 1<=groups<=_MAX_CMAC_K: return False
+  constants=tuple(node for node in factors if node.op is Ops.CONST)
+  loads=tuple(node for node in factors if node.op is not Ops.CONST)
+  weight=scale*math.prod(float(node.arg) for node in constants)
+  if not exact_scale or len(constants)>2 or len(constants)>1 and term.dtype.scalar() is not dtypes.float or len(loads)>2: return False
+  if any(float_to_fp16(float(node.arg))!=float(node.arg) for node in constants) or not math.isfinite(weight): return False
+  if len(loads)<2 and float_to_fp16(weight)!=weight or len(loads)==2 and weight!=1.0: return False
+  if out.dtype.scalar() is dtypes.float and rows==1 and len(loads)==1 and weight==1.0: return False
+  for load in loads:
+    if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX:
+      return False
+    if _root_param(load.src[0]) is None: return False
+    if len(load.src)>1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg)!=0.0 or
+                            math.copysign(1.0,float(load.src[1].arg))<0.0): return False
+  left,right=loads[0] if loads else None,loads[1] if len(loads)>1 else None
+  load_axes={load:frozenset((*(_static_ranges(load.src[0].src[1]) or ()),
+                            *(() if len(load.src)<3 else (_static_ranges(load.src[2]) or ())))) - frozenset(ranges) for load in loads}
+  load_pair=(left,right) if left is not None and right is not None else None
   all_axes=frozenset(_static_ranges(out_index) or ())
-  def align(row_axes:frozenset[UOp]) -> tuple[tuple[UOp|None,UOp|None,float],...]:
+  def align(row_axes:frozenset[UOp]) -> tuple[UOp|None,UOp|None,float]|None:
     # Each factor may vary along only one side of the contraction; constants can occupy either side.
-    # Candidate admission below requires every term; an incomplete orientation must never be emitted.
-    return tuple(aligned for left,right,weight in parsed for aligned in (next(((lhs,rhs,weight) for lhs,rhs in ((left,right),(right,left)) if (lhs is None or load_axes[lhs]<=row_axes) and (rhs is None or load_axes[rhs]<=all_axes-row_axes)),None),) if aligned is not None)  # noqa: E501
-  out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)); output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()  # noqa: E501
+    for lhs,rhs in ((left,right),(right,left)):
+      if (lhs is None or load_axes[lhs]<=row_axes) and (rhs is None or load_axes[rhs]<=all_axes-row_axes): return lhs,rhs,weight
+    return None
+  out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
+  output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()
   # Keep the existing candidate set; aligned contraction ties preserve the first input's orientation.
-  partitions=(all_axes,frozenset(),*sorted((axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+[load_axes[load] for load in (load_pairs[0] if load_pairs and rows>_MAX_GENERIC_UNROLL else ())]) if axes and axes<all_axes),key=lambda axes: bool(groups%32==0 and load_pairs and axes!=load_axes[load_pairs[0][0]])))  # noqa: E501
-  candidates=[(m,n,axes,aligned,ai,ao) for index,axes in enumerate(partitions) for m in (rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes),) for n in (rows//m,) for ai,ao,_ in (_cmac_layout(n,groups),) if _cmac_shape_supported(m,ai,ao) for aligned in (align(axes),) if len(aligned)==len(parsed)]  # noqa: E501
-  diagonal=not candidates; m,n,row_axes,shape_terms,ai,ao=min(candidates,key=lambda shape:(shape[0]==1 and rows>1,shape[0]*shape[4]+shape[5]*shape[4]+2*shape[0]*shape[5])) if candidates else (rows,rows,None,tuple(parsed),*_cmac_layout(rows,groups)[:2])  # noqa: E501
+  extra_axes=[load_axes[load] for load in load_pair] if load_pair is not None and rows>_MAX_GENERIC_UNROLL else []
+  partitions=(all_axes,frozenset(),*sorted(
+    (axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+extra_axes) if axes and axes<all_axes),
+    key=lambda axes: bool(groups%32==0 and load_pair is not None and axes!=load_axes[load_pair[0]])))
+  candidates=[]
+  for index,axes in enumerate(partitions):
+    m=rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes)
+    n=rows//m
+    ai,ao,_=_cmac_layout(n,groups)
+    if _cmac_shape_supported(m,ai,ao) and (aligned:=align(axes)) is not None: candidates.append((m,n,axes,aligned,ai,ao))
+  diagonal=not candidates
+  if candidates:
+    m,n,row_axes,shape_term,ai,ao=min(candidates,key=lambda shape:(
+      shape[0]==1 and rows>1,shape[0]*shape[4]+shape[5]*shape[4]+2*shape[0]*shape[5]))
+  else:
+    m=n=rows
+    row_axes=None
+    shape_term=(left,right,weight)
+    ai,ao,_=_cmac_layout(rows,groups)
   if not _cmac_shape_supported(m,ai,ao): return False
-  fields=tuple((stride,limit,math.prod(extent for previous,_,extent in output_axes[:i] if (previous in row_axes)==(axis in row_axes))*(n if axis in row_axes else 1)) for i,(axis,stride,limit) in enumerate(output_axes)) if row_axes and row_axes<all_axes else ()  # noqa: E501
+  fields=tuple((stride,limit,math.prod(extent for previous,_,extent in output_axes[:i]
+                                      if (previous in row_axes)==(axis in row_axes))*(n if axis in row_axes else 1))
+               for i,(axis,stride,limit) in enumerate(output_axes)) if row_axes and row_axes<all_axes else ()
   gathers=[]
   # Compose physical tile coordinates with the original typed LOADs; static WHERE supplies exact irregular fallback.
   for side,shape in enumerate(((m,ai),(ao//16,ai//32,16,32))):
-    axes=tuple(UOp.range(bound,100+i) for i,bound in enumerate(shape)); zero=axes[0].const_like(0); count=math.prod(shape)
-    destination=sum((axis*stride for axis,stride in zip(axes,strides_for_shape(shape))),zero); point,k=(axes[0],axes[1]) if side==0 else (axes[0]*16+axes[2],axes[1]*32+axes[3])  # noqa: E501
-    position=point if diagonal or side else point*n; source_lane=sum((position//coefficient%limit*stride for stride,limit,coefficient in fields),zero) if fields else position  # noqa: E501
+    tile_axes=tuple(UOp.range(bound,100+i) for i,bound in enumerate(shape))
+    zero=tile_axes[0].const_like(0)
+    count=math.prod(shape)
+    destination=sum((axis*stride for axis,stride in zip(tile_axes,strides_for_shape(shape))),zero)
+    point,k=(tile_axes[0],tile_axes[1]) if side==0 else (tile_axes[0]*16+tile_axes[2],tile_axes[1]*32+tile_axes[3])
+    position=point if diagonal or side else point*n
+    source_lane=sum((position//coefficient%limit*stride for stride,limit,coefficient in fields),zero) if fields else position
     # Physical coordinates increase with the destination address; a negative logical stride reverses its range.
-    mapping={axis:((limit-1-source_lane//stride%limit) if out_affine is not None and out_affine[1][axis]<0 else source_lane//stride%limit).simplify() for axis,stride,limit in output_axes}; mapping.update({axis:(k//len(terms)//stride%bound).simplify() for axis,stride,bound in zip(ranges,strides_for_shape(bounds),bounds)})  # noqa: E501
-    # Each term carries its source parameter (None for literal bits), typed address, and validity mask.
+    mapping={axis:((limit-1-source_lane//stride%limit) if out_affine is not None and out_affine[1][axis]<0 else
+                   source_lane//stride%limit).simplify() for axis,stride,limit in output_axes}
+    mapping.update({axis:(k//stride%bound).simplify() for axis,stride,bound in zip(ranges,strides_for_shape(bounds),bounds)})
     # Substitute only coordinates: arithmetic inside the original index retains its dtype and rounding.
-    mapped=tuple((None if load is None else _root_param(load.src[0]),zero.const_like(_storage_bits(1.0 if side==0 and right is None else weight)) if load is None else load.src[0].src[1].substitute(mapping).cast(dtypes.weakint),((k<groups)&(point<n if side else UOp.const(True,dtypes.bool))&((k%len(terms)).eq(i)))&(load.src[2].substitute(mapping) if load is not None and len(load.src)>2 else UOp.const(True,dtypes.bool))) for i,(left,right,weight) in enumerate(shape_terms) for load in ((left,right)[side],))  # noqa: E501
-    sources=tuple(dict.fromkeys(param for param,_,_ in mapped if param is not None)); seeded=False
-    for source in ((None,) if any(param is None for param,_,_ in mapped) else ())+sources:
-      selected=functools.reduce(lambda value,item:item[2].where(item[1],value),(item for item in mapped if item[0] is source),zero).simplify(); gate=functools.reduce(operator.or_,(item[2] for item in mapped if item[0] is source),UOp.const(False,dtypes.bool)).simplify()  # noqa: E501
-      if source is None:
-        values=_static_values(destination,selected,count,int); seeded=not sources or any(values)
-        if seeded: gathers.append(RKGather(None,slots[side],count,values=(values[0],) if len(set(values))==1 else values))
-      else:
-        if (load_plan:=_typed_load_plan(source.index(selected).load() if gate.op is Ops.CONST and gate.arg else source.index(selected).load(UOp.const(0,dtypes.half),gate),dtypes.half,destination,count)) is None: return False  # noqa: E501
-        gathers.append(load_plan._replace(dst=slots[side],partial=seeded)); seeded=True
+    left,right,weight=shape_term
+    input_load=(left,right)[side]
+    source=None if input_load is None else _root_param(input_load.src[0])
+    address=(zero.const_like(_storage_bits(1.0 if side==0 and right is None else weight)) if input_load is None else
+             input_load.src[0].src[1].substitute(mapping).cast(dtypes.weakint))
+    mask=input_load.src[2].substitute(mapping) if input_load is not None and len(input_load.src)>2 else UOp.const(True,dtypes.bool)
+    gate=(k<groups)&(point<n if side else UOp.const(True,dtypes.bool))&mask
+    selected=gate.where(address,zero).simplify()
+    gate=gate.simplify()
+    if source is None:
+      values=_static_values(destination,selected,count,int)
+      gathers.append(RKGather(None,slots[side],count,values=(values[0],) if len(set(values))==1 else values))
+    else:
+      typed_load=(source.index(selected).load() if gate.op is Ops.CONST and gate.arg else
+                  source.index(selected).load(UOp.const(0,dtypes.half),gate))
+      if (load_plan:=_typed_load_plan(typed_load,dtypes.half,destination,count)) is None: return False
+      gathers.append(load_plan._replace(dst=slots[side]))
   if sum(gather.count for gather in gathers)+rows>_MAX_DYNAMIC_SELECTOR_CELLS: return False
   cmac=RKCMAC(slots[2],slots[0],slots[1],m,n,groups,out.dtype.scalar() is dtypes.half,relu_root is not None)
   # Compose in weak integer arithmetic so shared symbolic rules retain the periodic physical address map.
-  lane=UOp.range(rows,0); position=lane*(rows+1) if diagonal else sum((lane//stride%limit*coefficient for stride,limit,coefficient in fields),lane.const_like(0)) if fields else lane  # noqa: E501
-  commit=_gather_plan(0,0,lane,(position//n*ao*(2 if cmac.out_fp16 else 1)+position%n+(position%n//16*16 if cmac.out_fp16 else 0)).simplify(),None,rows)._replace(src=cmac.dst,dst=RKArg(RKBufferKind.ARG,out.arg.slot),itemsize=2 if cmac.out_fp16 else 4)  # noqa: E501
-  plan.scratch.extend((m*ai*2,ao*ai*2,m*ao*4)); plan.program.extend((*gathers,cmac,commit))
+  lane=UOp.range(rows,0)
+  position=lane*(rows+1) if diagonal else sum((lane//stride%limit*coefficient for stride,limit,coefficient in fields),
+                                               lane.const_like(0)) if fields else lane
+  output_address=(position//n*ao*(2 if cmac.out_fp16 else 1)+position%n+
+                  (position%n//16*16 if cmac.out_fp16 else 0)).simplify()
+  commit=_gather_plan(0,0,lane,output_address,None,rows)._replace(
+    src=cmac.dst,dst=RKArg(RKBufferKind.ARG,out.arg.slot),itemsize=2 if cmac.out_fp16 else 4)
+  plan.scratch.extend((m*ai*2,ao*ai*2,m*ao*4))
+  plan.program.extend((*gathers,cmac,commit))
   return True
 
 def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
