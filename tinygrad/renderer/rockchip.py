@@ -178,9 +178,9 @@ def decode_image(blob:bytes) -> RKImage:
 # Native EW register fields.
 _EW_RELU_BYPASS, _EW_OP_CVT_BYPASS = 1 << 9, 1 << 8
 _EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
-(_EW_CFG_RELU6, _EW_CFG_MIN, _EW_CFG_ABS, _EW_CFG_NEG, _EW_CFG_FLOOR, _EW_CFG_CEIL) = tuple(
+(_EW_CFG_RELU6, _EW_CFG_MIN, _EW_CFG_ABS, _EW_CFG_FLOOR, _EW_CFG_CEIL) = tuple(
   _EW_CFG_COMMON|flags for flags in (1<<10, _EW_RELU_BYPASS|(1<<16), _EW_RELU_BYPASS|(5<<16),
-  _EW_RELU_BYPASS|(6<<16), _EW_RELU_BYPASS|(7<<16), _EW_RELU_BYPASS|(8<<16)))
+  _EW_RELU_BYPASS|(7<<16), _EW_RELU_BYPASS|(8<<16)))
 # DPU data-format registers, indexed by RKEWMode.
 _DPU_PRECISION_DTYPES = {1:dtypes.int16,2:dtypes.half,4:dtypes.int,5:dtypes.float}
 _DPU_DATA_FORMATS = tuple((output<<29)|(source<<26)|(2 if source==5 else source) for output,source in ((5,2),(2,5),(1,1),(4,4),(4,1),(4,2),(1,2),(2,4))+((2,2),)*3)  # noqa: E501
@@ -321,13 +321,13 @@ def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None
   return u.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache)
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
-def _outs(uops:list[UOp]) -> tuple[RKOutput|None, list[UOp]]:
+def _outs(uops:list[UOp]) -> RKOutput|None:
   """Return the single statically-sized output store shared by specialized graph matchers."""
   outputs = [(store, root) for store in uops if store.op is Ops.STORE and (root:=_root_param(store.src[0])) is not None]
-  if len(outputs) != 1: return None, [store for store,_ in outputs]
+  if len(outputs) != 1: return None
   store, out_param = outputs[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None, []
-  return (store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]), [store]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  return store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
 
 def _admit(o,d)->RKOutput|None: return o if o is not None and o[1].dtype.scalar() in (d if isinstance(d,tuple) else (d,)) else None
 # Specialized lowerers receive nonempty, dtype-admitted outputs; generic lowering owns empty programs.
@@ -853,9 +853,9 @@ def _fp32_expr_to_half(u:UOp) -> UOp:
   if u.dtype.scalar() is not dtypes.float: raise _RKGenericReject
   if u.op is Ops.CAST and len(u.src) == 1 and u.src[0].dtype.scalar() in (dtypes.half,dtypes.int,dtypes.int16,dtypes.bool): return u.src[0].cast(dtypes.half)  # noqa: E501
   if u.op is Ops.LOAD or _is_static_expr(u) and u.op is not Ops.WHERE: return u.cast(dtypes.half)
-  if ((u.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN, Ops.NEG) and len(u.src) == 1) or (u.op in (Ops.MUL, Ops.SUB, Ops.MAX) and len(u.src) == 2) or
+  if ((u.op in (Ops.EXP2, Ops.LOG2, Ops.SQRT, Ops.SIN) and len(u.src) == 1) or (u.op in (Ops.MUL, Ops.SUB, Ops.MAX) and len(u.src) == 2) or
       (u.op is Ops.WHERE and len(u.src) == 3 and _is_static_expr(u.src[0]))):
-    return UOp(u.op, dtypes.half, src=(u.src[0],*tuple(_fp32_expr_to_half(src) for src in u.src[1:])) if u.op is Ops.WHERE else tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg if u.op not in (Ops.MUL, Ops.NEG) else None)  # noqa: E501
+    return UOp(u.op, dtypes.half, src=(u.src[0],*tuple(_fp32_expr_to_half(src) for src in u.src[1:])) if u.op is Ops.WHERE else tuple(_fp32_expr_to_half(src) for src in u.src), arg=u.arg if u.op is not Ops.MUL else None)  # noqa: E501
   if u.op is Ops.ADD:
     # Apply static nonfinite masks after the compensated finite sum: TwoSum arithmetic on infinity produces NaN.
     terms=[_fp32_expr_to_half(x) for x in u.split_uop(Ops.ADD,lambda node:node.dtype.scalar() is dtypes.float)]; masks=[term for term in terms if _is_static_expr(term) and any(node.op is Ops.CONST and node.dtype.scalar() in (dtypes.half,dtypes.float) and not math.isfinite(float(node.arg)) for node in term.toposort())]; return functools.reduce(lambda value,mask:value.alu(Ops.ADD,mask),masks,_precise_mul_sum([term for term in terms if term not in masks]))  # noqa: E501
@@ -1008,8 +1008,6 @@ class RKContext:
   def _alu(self, u:UOp) -> UOp:
     # Materialize the reciprocal's denominator first, then reuse ordinary division with the original output owner.
     if u.op is Ops.RECIPROCAL: return self._lower_recipe(self.recipe_owners.get(u,u),u.replace(op=Ops.FDIV,src=(UOp.const(1.0,dtypes.half),self.lower(u.src[0]))))  # noqa: E501
-    if u.op is Ops.NEG:
-      source=self.lower(u.src[0]); return self._emit(self._scratch(source.dtype,u=u),source,source,_EW_CFG_NEG)
     if u.op is Ops.ADD and (recipe:=_pm_relu_cap.rewrite(u)) is not None: return self.lower(recipe)
     # RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates.
     if u.op is Ops.FDIV and u.src[0].op is Ops.CONST and math.isinf(numerator:=float(u.src[0].arg)):
@@ -1234,7 +1232,7 @@ class RKContext:
       value = self._carrier(source.arg,dtype)
     elif u.op is Ops.CAST: value=self._cast(u)
     elif u.op in GroupOp.Comparison or dtype is dtypes.bool and u.op in (Ops.MUL,Ops.MAX,Ops.AND,Ops.OR,Ops.XOR): value=self._compare(u)
-    elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.NEG, Ops.RECIPROCAL): value = self._alu(u)
+    elif u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.RECIPROCAL): value = self._alu(u)
     elif u.op in (Ops.AND,Ops.OR,Ops.XOR) and dtype in (dtypes.int16,dtypes.int) or u.op in (Ops.SHL,Ops.SHR) and dtype in (dtypes.int,dtypes.uint): value=self._integer_bits(u)  # noqa: E501
     elif u.op is Ops.CMOD and dtype is dtypes.int and self.int_layout is dtypes.int16 and (recipe:=_int_info(u)[1]) is not None: value=self.lower(recipe.cast(dtypes.int))  # noqa: E501
     elif u.op in (Ops.CDIV,Ops.CMOD) and dtype is dtypes.int and (u.op is not Ops.CMOD or self.int_layout is not dtypes.int16): value=self._int32_divmod(u)  # noqa: E501
@@ -1330,9 +1328,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
-  local_output, output_stores = _outs(uops)
-  if len(output_stores)>1:
-    return all(plan.lower(list(store.sink().toposort()),vectorize_reductions=vectorize_reductions) for store in output_stores)
+  local_output = _outs(uops)
   local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
   if vectorize_reductions:
     # Prefer a contraction, then map and reduce bounded reductions on the DPU.
