@@ -554,7 +554,10 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
 def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   """Render one canonical mapped reduction, reduce it physically, then compile its dependent scalar suffix."""
   store,out,rows,out_index,root=output
-  reductions=tuple(node for node in root.toposort() if node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] in (Ops.ADD,Ops.MAX,Ops.MUL)); nested={child for value in reductions for child in value.src[0].toposort() if child is not value and child.op is Ops.REDUCE}  # noqa: E501
+  reductions = tuple(node for node in root.toposort()
+                     if node.op is Ops.REDUCE and isinstance(node.arg, tuple) and node.arg[0] in (Ops.ADD, Ops.MAX, Ops.MUL))
+  nested = {child for value in reductions for child in value.src[0].toposort()
+            if child is not value and child.op is Ops.REDUCE}
   if not (outer:=tuple(value for value in reductions if value not in nested)): return False
   value=outer[0]; body=value.src[0]; ranges=list(value.src[1:])
   while (inner:=_strip_cast(body)).op is Ops.REDUCE and isinstance(inner.arg,tuple) and inner.arg[0] is value.arg[0]:
@@ -562,15 +565,49 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   # The first postorder REDUCE has no REDUCE dependencies: select once, without rescanning its body.
   if (nested_value:=next((node for node in body.toposort() if node.op is Ops.REDUCE),None)) is not None: value=nested_value; body=value.src[0]; ranges=list(value.src[1:])  # noqa: E501
   # Materialize precisely the body's external axes, preserving consumer order where they overlap.
-  graph=body.toposort(); axes=tuple(dict.fromkeys(axis for axis in (*(_static_ranges(out_index) or ()),*graph) if axis.op in (Ops.RANGE,Ops.SPECIAL) and axis not in ranges and axis in graph))  # noqa: E501
+  graph = body.toposort()
+  axes = tuple(dict.fromkeys(axis for axis in (*(_static_ranges(out_index) or ()), *graph)
+                             if axis.op in (Ops.RANGE, Ops.SPECIAL) and axis not in ranges and axis in graph))
   if not ranges or any(axis.op not in (Ops.RANGE,Ops.SPECIAL) or not axis.src or axis.src[0].op is not Ops.CONST or int(axis.src[0].arg)<=0 for axis in (*ranges,*axes)): return False  # noqa: E501
   shape=tuple(int(axis.src[0].arg) for axis in axes); rows=math.prod(shape)
   out_index=graph_rewrite(sum((axis*stride for axis,stride in zip(axes,strides_for_shape(shape))),out_index.const_like(0)),sym)
-  loaded_indices={node.src[0] for node in graph if node.op is Ops.LOAD}; body=body.substitute({node:node.load() for node in graph if node.op is Ops.INDEX and node not in loaded_indices},walk=True); extents=tuple(int(axis.src[0].arg) for axis in ranges); total=math.prod(extents); graph=body.toposort(); loads=_semantic_loads(body); unit_sum=total<=_FP16_EXACT_INTEGER and (candidate:=_strip_cast(body)).op is Ops.WHERE and _is_static_expr(candidate.src[0]) and all(src.op is Ops.CONST for src in candidate.src[1:]) and {float(src.arg) for src in candidate.src[1:]}<={0.0,1.0}  # noqa: E501
-  if not 2<=total<=_MAX_GENERIC_UNROLL or rows>16 and out.dtype.scalar() is dtypes.half and value.arg[0] is Ops.ADD and total>416 and (total*round_up(rows,8)>_MAX_GENERIC_UNROLL or not (any(node.op is Ops.WHERE and _is_static_expr(node.src[0]) for node in graph) or any(len(load.src)>2 and _is_static_expr(load.src[2]) for load in loads))) or not loads and not unit_sum: return False  # noqa: E501
-  product=body if out.dtype.scalar() in (dtypes.int,dtypes.bool) else _strip_cast(converted if (converted:=_optional_rewrite(_fp32_expr_to_half,body)) is not None else body)  # noqa: E501
-  boolean=product.dtype.scalar() is dtypes.bool; short_math=value.arg[0] is Ops.ADD and total==16 and rows<=4096 and body.op is Ops.EXP2 and body.dtype.scalar() is dtypes.float and product.op is Ops.EXP2 and product.dtype.scalar() is dtypes.half; integer=boolean or dtypes.is_int(product.dtype.scalar()); bounds=(0,1) if boolean else (int(product.vmin),int(product.vmax)) if product.dtype.scalar() is dtypes.int16 else _int_info(product)[0] if integer else None; bounded_sum=value.arg[0] is Ops.ADD and rows>1 and out.dtype.scalar() is dtypes.int and bounds is not None and -32768<=total*bounds[0]<=total*bounds[1]<=32767  # noqa: E501
-  if boolean and out.dtype.scalar() is not dtypes.bool or product.dtype.scalar() is not dtypes.half and (bounds is None or not -32768<=bounds[0]<=bounds[1]<=32767) or len(reductions)==1 and (total<32 and not bounded_sum and not short_math and not (integer and value.arg[0] is Ops.MAX) or not (rows>1 and out.dtype.scalar() is dtypes.int or total>416 or len(loads)>2 or any(node.op in (Ops.SQRT,Ops.EXP2,Ops.LOG2,Ops.SIN,Ops.CMPLT,Ops.CMPNE,Ops.WHERE) for node in graph))): return False  # noqa: E501
+  loaded_indices = {node.src[0] for node in graph if node.op is Ops.LOAD}
+  body = body.substitute({node:node.load() for node in graph if node.op is Ops.INDEX and node not in loaded_indices}, walk=True)
+  extents = tuple(int(axis.src[0].arg) for axis in ranges)
+  total = math.prod(extents)
+  graph = body.toposort()
+  loads = _semantic_loads(body)
+  unit_sum = (total <= _FP16_EXACT_INTEGER and (candidate := _strip_cast(body)).op is Ops.WHERE and
+              _is_static_expr(candidate.src[0]) and all(src.op is Ops.CONST for src in candidate.src[1:]) and
+              {float(src.arg) for src in candidate.src[1:]} <= {0.0, 1.0})
+  if not 2 <= total <= _MAX_GENERIC_UNROLL: return False
+  oversized_half_sum = (rows > 16 and out.dtype.scalar() is dtypes.half and value.arg[0] is Ops.ADD and total > 416 and
+                        (total*round_up(rows, 8) > _MAX_GENERIC_UNROLL or not (
+                          any(node.op is Ops.WHERE and _is_static_expr(node.src[0]) for node in graph) or
+                          any(len(load.src) > 2 and _is_static_expr(load.src[2]) for load in loads))))
+  if oversized_half_sum or not loads and not unit_sum: return False
+  if out.dtype.scalar() in (dtypes.int, dtypes.bool): product = body
+  else:
+    converted = _optional_rewrite(_fp32_expr_to_half, body)
+    product = _strip_cast(converted if converted is not None else body)
+  boolean = product.dtype.scalar() is dtypes.bool
+  short_math = (value.arg[0] is Ops.ADD and total == 16 and rows <= 4096 and body.op is Ops.EXP2 and
+                body.dtype.scalar() is dtypes.float and product.op is Ops.EXP2 and product.dtype.scalar() is dtypes.half)
+  integer = boolean or dtypes.is_int(product.dtype.scalar())
+  bounds = ((0, 1) if boolean else
+            (int(product.vmin), int(product.vmax)) if product.dtype.scalar() is dtypes.int16 else
+            _int_info(product)[0] if integer else None)
+  bounded_sum = (value.arg[0] is Ops.ADD and rows > 1 and out.dtype.scalar() is dtypes.int and bounds is not None and
+                 -32768 <= total*bounds[0] <= total*bounds[1] <= 32767)
+  invalid_boolean_output = boolean and out.dtype.scalar() is not dtypes.bool
+  invalid_int16_range = product.dtype.scalar() is not dtypes.half and (bounds is None or not -32768 <= bounds[0] <= bounds[1] <= 32767)
+  if invalid_boolean_output or invalid_int16_range: return False
+  if len(reductions) == 1:
+    too_short = total < 32 and not bounded_sum and not short_math and not (integer and value.arg[0] is Ops.MAX)
+    if too_short: return False
+    has_mapped_work = (rows > 1 and out.dtype.scalar() is dtypes.int or total > 416 or len(loads) > 2 or
+                       any(node.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CMPLT, Ops.CMPNE, Ops.WHERE) for node in graph))
+    if not has_mapped_work: return False
   mapped_dtype=dtypes.int16 if integer else dtypes.half; gated=_gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product; mapped_terms:tuple[UOp,...]=(gated if gated is not product or unit_sum else body,); product=gated  # noqa: E501
   if product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in product.src) and any(_strip_cast(source).op is not Ops.LOAD for source in product.src):  # noqa: E501
     factor,multiplier=next(((a,b) for a,b in (product.src,product.src[::-1]) if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD),product.src); products=tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (product,); mapped_terms=tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))  # noqa: E501
