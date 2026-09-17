@@ -704,6 +704,7 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
 
 def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
+  if source.kind is not RKBufferKind.SCRATCH: raise _RKGenericReject("mapped reduction source")
   block=8 if rows==1 else round_up(rows,8)
   groups=lanes if rows==1 else lanes//block
   source_block=1 if rows==1 else block
@@ -715,18 +716,13 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
   else: neutral=_storage_bits(dtypes.int16.min,dtypes.int16) if int16 else _storage_bits(-math.inf)
   first=barrier and not int16
   # Encode bit reversal with affine axes, padding an existing scratch source when its group count is not a power of two.
-  if groups<size and source.kind is RKBufferKind.SCRATCH:
+  if groups<size:
     plan.scratch[source.index]=max(plan.scratch[source.index],source.addend+size*source_block*2)
     plan.program.append(RKGather(None,source._replace(addend=source.addend+groups*source_block*2),
                                  (size-groups)*source_block,values=(neutral,)))
-  offsets:tuple[int,...]=()
-  if groups<size and source.kind is not RKBufferKind.SCRATCH:
-    offsets=tuple(index if (index:=int(f"{lane:0{size.bit_length()-1}b}"[::-1],2))<groups else -1 for lane in range(size))
-    if source_block!=1:
-      offsets=tuple(position*source_block+row if position>=0 else -1 for position in offsets for row in range(source_block))
-  axes=() if offsets else (((1,source_block,1),) if source_block>1 else ())+tuple(
+  axes=(((1,source_block,1),) if source_block>1 else ())+tuple(
     (source_block<<bit,2,source_block<<(size.bit_length()-2-bit)) for bit in range(size.bit_length()-1))
-  plan.program.append(RKGather(source,current,size*source_block,offsets=offsets,axes=axes,fill_bits=neutral,
+  plan.program.append(RKGather(source,current,size*source_block,axes=axes,fill_bits=neutral,
                                dst_stride=block if rows==1 else 1))
   while size>1:
     size//=2
