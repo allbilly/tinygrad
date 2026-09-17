@@ -246,8 +246,8 @@ def decode_image(blob:bytes) -> RKImage:
   except Exception: raise ValueError("invalid RKImage") from None
 
 # Admission and exact-carrier bounds.
-(_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _MAX_RECURSIVE_LOWER_DEPTH, _EW_ELEMS_32BIT, _FP16_EXACT_INTEGER) = (  # noqa: E501
-  0x1001, 0x2001, 64000, 1 << 14, 1 << 20, 4096, 1 << 20, 1 << 22, 512, 8*dtypes.half.itemsize//dtypes.float.itemsize, 1 << 11)
+(_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _MAX_RECURSIVE_LOWER_DEPTH, _EW_ELEMS_32BIT) = (  # noqa: E501
+  0x1001, 0x2001, 64000, 1 << 14, 1 << 20, 4096, 1 << 20, 1 << 22, 512, 8*dtypes.half.itemsize//dtypes.float.itemsize)
 # Native EW register fields.
 _EW_RELU_BYPASS, _EW_OP_CVT_BYPASS = 1 << 9, 1 << 8
 _EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
@@ -716,15 +716,12 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   total = math.prod(extents)
   graph = body.toposort()
   loads = _semantic_loads(body)
-  unit_sum = (total <= _FP16_EXACT_INTEGER and (candidate := _strip_cast(body)).op is Ops.WHERE and
-              _is_static_expr(candidate.src[0]) and all(src.op is Ops.CONST for src in candidate.src[1:]) and
-              {float(src.arg) for src in candidate.src[1:]} <= {0.0, 1.0})
   if not 2 <= total <= _MAX_GENERIC_UNROLL: return False
   oversized_half_sum = (rows > 16 and out.dtype.scalar() is dtypes.half and value.arg[0] is Ops.ADD and total > 416 and
                         (total*round_up(rows, 8) > _MAX_GENERIC_UNROLL or not (
                           any(node.op is Ops.WHERE and _is_static_expr(node.src[0]) for node in graph) or
                           any(len(load.src) > 2 and _is_static_expr(load.src[2]) for load in loads))))
-  if oversized_half_sum or not loads and not unit_sum: return False
+  if oversized_half_sum or not loads: return False
   if out.dtype.scalar() in (dtypes.int, dtypes.bool): product = body
   else:
     converted = _optional_rewrite(_fp32_expr_to_half, body)
@@ -749,7 +746,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
     if not has_mapped_work: return False
   mapped_dtype = dtypes.int16 if integer else dtypes.half
   gated = _gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product
-  mapped_terms:tuple[UOp,...] = (gated if gated is not product or unit_sum else body,)
+  mapped_terms:tuple[UOp,...] = (gated if gated is not product else body,)
   product = gated
   if (product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and
       any(_strip_cast(source).op is Ops.LOAD for source in product.src) and
