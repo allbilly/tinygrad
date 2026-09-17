@@ -645,16 +645,10 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
     n=rows//m
     ai,ao,_=_cmac_layout(n,groups)
     if _cmac_shape_supported(m,ai,ao) and (aligned:=align(axes)) is not None: candidates.append((m,n,axes,aligned,ai,ao))
-  diagonal=not candidates
-  if candidates:
-    m,n,row_axes,shape_term,ai,ao=min(candidates,key=lambda shape:(
-      shape[0]==1 and rows>1,shape[0]*shape[4]+shape[5]*shape[4]+2*shape[0]*shape[5]))
-  else:
-    m=n=rows
-    row_axes=None
-    shape_term=(left,right,weight)
-    ai,ao,_=_cmac_layout(rows,groups)
-  if not _cmac_shape_supported(m,ai,ao): return False
+  # Nonseparable reductions continue through the mapped or generic NPU lowering path.
+  if not candidates: return False
+  m,n,row_axes,shape_term,ai,ao=min(candidates,key=lambda shape:(
+    shape[0]==1 and rows>1,shape[0]*shape[4]+shape[5]*shape[4]+2*shape[0]*shape[5]))
   fields=tuple((stride,limit,math.prod(extent for previous,_,extent in output_axes[:i]
                                       if (previous in row_axes)==(axis in row_axes))*(n if axis in row_axes else 1))
                for i,(axis,stride,limit) in enumerate(output_axes)) if row_axes and row_axes<all_axes else ()
@@ -666,7 +660,7 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
     count=math.prod(shape)
     destination=sum((axis*stride for axis,stride in zip(tile_axes,strides_for_shape(shape))),zero)
     point,k=(tile_axes[0],tile_axes[1]) if side==0 else (tile_axes[0]*16+tile_axes[2],tile_axes[1]*32+tile_axes[3])
-    position=point if diagonal or side else point*n
+    position=point if side else point*n
     source_lane=sum((position//coefficient%limit*stride for stride,limit,coefficient in fields),zero) if fields else position
     # Physical coordinates increase with the destination address; a negative logical stride reverses its range.
     mapping={axis:((limit-1-source_lane//stride%limit) if out_affine is not None and out_affine[1][axis]<0 else
@@ -694,8 +688,8 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   cmac=RKCMAC(slots[2],slots[0],slots[1],m,n,groups,out.dtype.scalar() is dtypes.half,relu_root is not None)
   # Compose in weak integer arithmetic so shared symbolic rules retain the periodic physical address map.
   lane=UOp.range(rows,0)
-  position=lane*(rows+1) if diagonal else sum((lane//stride%limit*coefficient for stride,limit,coefficient in fields),
-                                               lane.const_like(0)) if fields else lane
+  position=sum((lane//stride%limit*coefficient for stride,limit,coefficient in fields),
+               lane.const_like(0)) if fields else lane
   output_address=(position//n*ao*(2 if cmac.out_fp16 else 1)+position%n+
                   (position%n//16*16 if cmac.out_fp16 else 0)).simplify()
   commit=_gather_plan(0,0,lane,output_address,None,rows)._replace(
