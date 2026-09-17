@@ -748,14 +748,8 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   store,out,rows,out_index,root=output
   reductions = tuple(node for node in root.toposort()
                      if node.op is Ops.REDUCE and isinstance(node.arg, tuple) and node.arg[0] in (Ops.ADD, Ops.MAX, Ops.MUL))
-  nested = {child for value in reductions for child in value.src[0].toposort()
-            if child is not value and child.op is Ops.REDUCE}
-  if not (outer:=tuple(value for value in reductions if value not in nested)): return False
-  value=outer[0]; body=value.src[0]; ranges=list(value.src[1:])
-  while (inner:=_strip_cast(body)).op is Ops.REDUCE and isinstance(inner.arg,tuple) and inner.arg[0] is value.arg[0]:
-    body=inner.src[0]; ranges.extend(inner.src[1:])
-  # The first postorder REDUCE has no REDUCE dependencies: select once, without rescanning its body.
-  if (nested_value:=next((node for node in body.toposort() if node.op is Ops.REDUCE),None)) is not None: value=nested_value; body=value.src[0]; ranges=list(value.src[1:])  # noqa: E501
+  if not reductions: return False
+  value=reductions[0]; body=value.src[0]; ranges=list(value.src[1:])
   # Materialize precisely the body's external axes, preserving consumer order where they overlap.
   graph = body.toposort()
   axes = tuple(dict.fromkeys(axis for axis in (*(_static_ranges(out_index) or ()), *graph)
