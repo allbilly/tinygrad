@@ -1222,30 +1222,12 @@ class RKContext:
     nan=_i16_bit(_native_max(ordered,arg=_NATIVE_ABS).alu(Ops.SUB,ordered.const_like(0x7c00)))
     return (ordered.const_like(0).alu(Ops.SUB,ordered) if negated else ordered),nan
 
-  def _raw_where(self, u:UOp, selector:UOp|None=None) -> UOp:
+  def _raw_where(self, u:UOp) -> UOp:
     """Select raw INT16 words with a canonical mask, preserving nonfinite arms without floating arithmetic."""
-    gate = _unwrap_condition(u.src[0])
-    arms = tuple(_unwrap_condition(src) for src in u.src[1:])
-    lhs = None
-    if (gate.op is Ops.CMPLT and gate.src[1].op is Ops.CONST and math.isfinite(float(gate.src[1].arg)) and
-        all(src.dtype.scalar() in (dtypes.half,dtypes.float) for src in gate.src)):
-      lhs = gate.src[0]
-    if selector is None and lhs is not None:
-      threshold = float(gate.src[1].arg)
-      distinct_arm = any(dynamic.key == lhs.key and constant.op is Ops.CONST and
-                         math.isfinite(float(constant.arg)) and float(constant.arg) != threshold
-                         for dynamic,constant in (arms,arms[::-1]))
-      if distinct_arm:
-        # Keep the finite-threshold shortcut: generic condition lowering can emit many more EW stages.
-        value = self.lower(lhs.cast(dtypes.half))
-        nan = self._fp16_order(value)[1]
-        difference = gate.src[1].cast(dtypes.half).alu(Ops.SUB,lhs.cast(dtypes.half))
-        selector = self._convert(None,self.lower(_positive_mask(difference)),dtypes.int16,True)
-        selector = self.lower(selector.alu(Ops.MUL,nan.const_like(1).alu(Ops.SUB,nan)))
     narrow = (u is self.root and u.dtype.scalar() is dtypes.int and
               all(arm.op is Ops.CONST and -32768 <= int(arm.arg) <= 32767 for arm in u.src[1:]))
     yes,no=(self._constant(src,dtypes.int16) if narrow else self.lower(src) for src in u.src[1:])
-    if selector is None: selector = self.lower(u.src[0])
+    selector = self.lower(u.src[0])
     if yes.dtype is not no.dtype: raise _RKGenericReject("selection carrier")
     count = self.count*yes.dtype.itemsize//2
     owns_output = u is self.root and u.dtype.scalar() is dtypes.int16
