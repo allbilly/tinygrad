@@ -14,38 +14,74 @@ from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 
 RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 37, (1 << 16) - 1
 
-class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
+class RKBufferKind(IntEnum):
+  ARG = 0
+  SCRATCH = 1
 
 class RKEWMode(IntEnum):
-  HALF_TO_FLOAT=0; FLOAT_TO_HALF=1; INT16=2; INT32=3; INT16_TO_INT32=4; HALF_TO_INT32=5
-  HALF_TO_INT16=6; INT32_TO_HALF=7; HALF=8; BOUNDED=9; STATEFUL=9; COMPARE=10
+  HALF_TO_FLOAT = 0
+  FLOAT_TO_HALF = 1
+  INT16 = 2
+  INT32 = 3
+  INT16_TO_INT32 = 4
+  HALF_TO_INT32 = 5
+  HALF_TO_INT16 = 6
+  INT32_TO_HALF = 7
+  HALF = 8
+  BOUNDED = 9
+  STATEFUL = 9
+  COMPARE = 10
 
-class RKArg(NamedTuple): kind: RKBufferKind; index: int; addend: int = 0  # type: ignore[assignment]
+class RKArg(NamedTuple):
+  kind: RKBufferKind
+  index: int  # type: ignore[assignment]
+  addend: int = 0
 
 class RKGather(NamedTuple):
   """Materialize an affine or fallback raw-lane index map."""
-  src: RKArg|None; dst: RKArg; count: int; base: int = 0  # type: ignore[assignment]
+  src: RKArg|None
+  dst: RKArg
+  count: int  # type: ignore[assignment]
+  base: int = 0
   # Axes are (destination divisor, range limit, source stride); offsets provide the non-affine fallback.
-  axes: tuple[tuple[int, int, int], ...] = (); offsets: tuple[int, ...] = (); fill_bits: int = 0
+  axes: tuple[tuple[int, int, int], ...] = ()
+  offsets: tuple[int, ...] = ()
+  fill_bits: int = 0
   # Compile-time values have no source argument; partial gathers preserve lanes populated by another gather.
-  values: tuple[int, ...] = (); partial: bool = False
+  values: tuple[int, ...] = ()
+  partial: bool = False
   # Mapped reductions use a destination stride of 8 for 16-byte DPU atom alignment.
   # The destination byte offset lives in dst.addend; stride remains measured in elements.
   dst_stride: int = 1
   itemsize: int = 2
   # A runtime index makes this raw movement host-addressed; numeric semantics remain on the NPU.
-  index: RKArg|None = None; index_itemsize: int = 4  # type: ignore[assignment]
+  index: RKArg|None = None  # type: ignore[assignment]
+  index_itemsize: int = 4
 
 class RKEWOp(NamedTuple):
   """One contiguous DPU elementwise operation."""
-  dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int  # type: ignore[assignment]
-  submit_barrier: bool = False; mode: RKEWMode = RKEWMode.HALF
+  dst: RKArg
+  lhs: RKArg
+  rhs: RKArg
+  count: int  # type: ignore[assignment]
+  ew_cfg: int
+  submit_barrier: bool = False
+  mode: RKEWMode = RKEWMode.HALF
 
 class RKCMAC(NamedTuple):
   """One fixed FP16 matrix contraction with an optional terminal BS ReLU; gathers own only its physical packing."""
-  dst: RKArg; lhs: RKArg; rhs: RKArg; m: int; n: int; k: int; out_fp16: bool = True; relu: bool = False
+  dst: RKArg
+  lhs: RKArg
+  rhs: RKArg
+  m: int
+  n: int
+  k: int
+  out_fp16: bool = True
+  relu: bool = False
 
-class RKImage(NamedTuple): scratch: tuple[int, ...] = (); program: tuple[RKGather|RKEWOp|RKCMAC, ...] = ()
+class RKImage(NamedTuple):
+  scratch: tuple[int, ...] = ()
+  program: tuple[RKGather|RKEWOp|RKCMAC, ...] = ()
 
 def _op_args(op:RKGather|RKEWOp|RKCMAC) -> tuple[RKArg, ...]: return tuple(arg for arg in op if isinstance(arg,RKArg))
 
