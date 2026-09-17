@@ -76,7 +76,14 @@ class RKPlan:
       if any(isinstance(op,RKCMAC) for op in self.program) and any(isinstance(op,RKGather) and op.index is not None for op in self.program): return False  # noqa: E501
       ew=[i for i in range(start,len(self.program)) if isinstance(self.program[i],RKEWOp)]
       if ew and (start or any(isinstance(op,RKCMAC) for op in self.program[:ew[0]])):
-        chained=chain and any(isinstance(op,RKEWOp) for op in self.program[:start]) and all(isinstance(op,RKEWOp) for op in self.program[ew[0]:ew[-1]+1]) and not any(isinstance(op,RKGather) and op.src is not None and (op.src.kind is RKBufferKind.SCRATCH and op.src.index<slots or op.src.kind is RKBufferKind.ARG and op.src.index in self.bindings and op.src.index<virtual) for op in self.program[start:ew[0]])  # noqa: E501
+        chainable_ew = chain and any(isinstance(op, RKEWOp) for op in self.program[:start]) and all(
+          isinstance(op, RKEWOp) for op in self.program[ew[0]:ew[-1]+1])
+        crosses_prior_buffer = chainable_ew and any(
+          isinstance(op, RKGather) and op.src is not None and (
+            op.src.kind is RKBufferKind.SCRATCH and op.src.index < slots or
+            op.src.kind is RKBufferKind.ARG and op.src.index in self.bindings and op.src.index < virtual)
+          for op in self.program[start:ew[0]])
+        chained = chainable_ew and not crosses_prior_buffer
         self.program[ew[0]]=typing_cast(RKEWOp,self.program[ew[0]])._replace(submit_barrier=not chained)
       accepted=True; return True
     except _RKGenericReject:
@@ -428,7 +435,14 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
   # Both accumulators consume the same high-then-residual order; their existing numerical policy is unchanged.
   expanded=_product_terms(terms)
-  return _kahan_sum(expanded) if all(term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) and (len(terms) == 8 and all(all(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms) or 64 <= len(terms) <= 512 and any(any(_strip_cast(source).op is not Ops.LOAD for source in term.src) for term in terms)) else _tag_precise_adds((parts:=_precise_add_parts(expanded))[0].alu(Ops.ADD,parts[1]))  # noqa: E501
+  product_from_load = all(
+    term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and
+    any(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms)
+  fully_loaded_eight = len(terms) == 8 and all(all(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms)
+  mixed_large = 64 <= len(terms) <= 512 and any(any(_strip_cast(source).op is not Ops.LOAD for source in term.src) for term in terms)
+  if product_from_load and (fully_loaded_eight or mixed_large): return _kahan_sum(expanded)
+  high, low = _precise_add_parts(expanded)
+  return _tag_precise_adds(high.alu(Ops.ADD, low))
 
 
 def _gate_zero_term(term:UOp) -> UOp:
@@ -639,20 +653,40 @@ def _half_backed_value(value:UOp) -> UOp|None:
 @functools.lru_cache(maxsize=4096)
 def _int_info(u:UOp) -> tuple[tuple[int, int]|None, UOp|None]:
   """Share exact range admission and the optional HALF arithmetic recipe for one integer graph."""
-  dtype=u.dtype.scalar(); bounds_src=u.src[:1] if u.op is Ops.CAST else u.src[1:] if u.op is Ops.WHERE else u.src
-  valid=dtype in (dtypes.int,dtypes.weakint) and (_is_static_expr(u) or
-    u.op in (Ops.CAST,Ops.WHERE) and len(u.src)==(1 if u.op is Ops.CAST else 3) and all(bound is not None or u.op is Ops.CAST and source.dtype.scalar() in (dtypes.bool,dtypes.int16) for source,bound in zip(bounds_src,(_int_info(node)[0] for node in bounds_src))) or  # noqa: E501
-    u.op is Ops.XOR and len(u.src)==2 and any(marker.op is Ops.CONST and marker.arg==-1 and _int_info(source)[0] is not None for marker,source in (u.src,u.src[::-1])) or  # noqa: E501
-    u.op is Ops.CMOD and len(u.src)==2 and (right:=_int_info(u.src[1])[0]) is not None and right[0]==right[1]!=0 or u.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX) and len(u.src)==2 and all(_int_info(node)[0] is not None for node in bounds_src))  # noqa: E501
-  bounds=((0,max(0,high)) if u.op is Ops.RANGE else (low,high)) if valid and dtype.min <= (low:=int(u.vmin)) <= (high:=int(u.vmax)) <= dtype.max else None  # noqa: E501
+  dtype = u.dtype.scalar()
+  bounds_src = u.src[:1] if u.op is Ops.CAST else u.src[1:] if u.op is Ops.WHERE else u.src
+  valid = dtype in (dtypes.int, dtypes.weakint) and (
+    _is_static_expr(u)
+    or u.op in (Ops.CAST, Ops.WHERE) and len(u.src) == (1 if u.op is Ops.CAST else 3) and all(
+      bound is not None or u.op is Ops.CAST and source.dtype.scalar() in (dtypes.bool, dtypes.int16)
+      for source, bound in zip(bounds_src, (_int_info(node)[0] for node in bounds_src)))
+    or u.op is Ops.XOR and len(u.src) == 2 and any(
+      marker.op is Ops.CONST and marker.arg == -1 and _int_info(source)[0] is not None
+      for marker, source in (u.src, u.src[::-1]))
+    or u.op is Ops.CMOD and len(u.src) == 2 and (right := _int_info(u.src[1])[0]) is not None and right[0] == right[1] != 0
+    or u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX) and len(u.src) == 2 and all(
+      _int_info(node)[0] is not None for node in bounds_src))
+  bounds = None
+  if valid:
+    low, high = int(u.vmin), int(u.vmax)
+    if dtype.min <= low <= high <= dtype.max: bounds = (0, max(0, high)) if u.op is Ops.RANGE else (low, high)
   if u.op is Ops.CONST: recipe=UOp.const(float(u.arg),dtypes.half)
   elif (source:=_typed_cast_source(u,dtypes.int,dtypes.half)) is not None: recipe=_dpu_trunc(source)
   elif (source:=_typed_cast_source(u,dtypes.int,dtypes.bool)) is not None: recipe=source.cast(dtypes.half)
-  elif u.op in (Ops.ADD,Ops.SUB,Ops.MUL,Ops.MAX,Ops.CMOD) and len(u.src)==2 and (mapped:=tuple(_int_info(src)[1] for src in u.src)) and all(x is not None for x in mapped):  # noqa: E501
-    lhs,rhs=typing_cast(tuple[UOp,UOp],mapped); recipe=lhs.alu(Ops.SUB,_dpu_trunc(lhs.alu(Ops.FDIV,rhs)).alu(Ops.MUL,rhs)) if u.op is Ops.CMOD else u.replace(dtype=dtypes.half,src=(lhs,rhs))  # noqa: E501
+  elif (u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.CMOD) and len(u.src) == 2 and
+        (mapped := tuple(_int_info(src)[1] for src in u.src)) and all(x is not None for x in mapped)):
+    lhs, rhs = typing_cast(tuple[UOp, UOp], mapped)
+    if u.op is Ops.CMOD: recipe = lhs.alu(Ops.SUB, _dpu_trunc(lhs.alu(Ops.FDIV, rhs)).alu(Ops.MUL, rhs))
+    else: recipe = u.replace(dtype=dtypes.half, src=(lhs, rhs))
   elif u.op is Ops.WHERE and len(u.src)==3:
-    condition=u.src[0]; compared=tuple(_int_info(src)[1] for src in condition.src) if condition.op in (Ops.CMPLT,Ops.CMPNE,Ops.CMPEQ) and all(src.dtype.scalar() is dtypes.int for src in condition.src) else (); condition=condition.replace(src=typing_cast(tuple[UOp,...],compared)) if compared and all(x is not None for x in compared) else condition  # noqa: E501
-    arms=tuple(_int_info(src)[1] for src in u.src[1:]); recipe=UOp(Ops.WHERE,dtypes.half,src=(condition,*typing_cast(tuple[UOp,...],arms))) if all(x is not None for x in arms) and (not compared or all(x is not None for x in compared)) else None  # noqa: E501
+    condition = u.src[0]
+    compared = (tuple(_int_info(src)[1] for src in condition.src)
+                if condition.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) and
+                   all(src.dtype.scalar() is dtypes.int for src in condition.src) else ())
+    if compared and all(x is not None for x in compared): condition = condition.replace(src=typing_cast(tuple[UOp, ...], compared))
+    arms = tuple(_int_info(src)[1] for src in u.src[1:])
+    recipe = (UOp(Ops.WHERE, dtypes.half, src=(condition, *typing_cast(tuple[UOp, ...], arms)))
+              if all(x is not None for x in arms) and (not compared or all(x is not None for x in compared)) else None)
   else: recipe=None
   return bounds,recipe
 
