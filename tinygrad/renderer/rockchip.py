@@ -590,11 +590,7 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   fp32_root=_typed_cast_source(root,dtypes.half,dtypes.float)
   relu_root=_relu_operand(fp32_root if fp32_root is not None else root)
   root=_strip_cast(relu_root if relu_root is not None else root)
-  scale,exact_scale=1.0,True
-  while (pair:=_const_operand(root,Ops.MUL)) is not None:
-    root,factor=_strip_cast(pair[0]),float(pair[1].arg)
-    scale*=factor
-    exact_scale=exact_scale and factor>0.0 and math.frexp(factor)[0]==0.5 and float_to_fp16(scale)==scale
+  # Leave outer scaling to ordinary lowering so the reduction keeps its UOp rounding boundary.
   if root.op is not Ops.REDUCE or not isinstance(root.arg,tuple) or root.arg[0] is not Ops.ADD: return False
   ranges=list(root.src[1:])
   body=root.src[0]
@@ -611,8 +607,8 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   if not 1<=groups<=_MAX_CMAC_K: return False
   constants=tuple(node for node in factors if node.op is Ops.CONST)
   loads=tuple(node for node in factors if node.op is not Ops.CONST)
-  weight=scale*math.prod(float(node.arg) for node in constants)
-  if not exact_scale or len(constants)>2 or len(constants)>1 and term.dtype.scalar() is not dtypes.float or len(loads)>2: return False
+  weight=math.prod(float(node.arg) for node in constants)
+  if len(constants)>2 or len(constants)>1 and term.dtype.scalar() is not dtypes.float or len(loads)>2: return False
   if any(float_to_fp16(float(node.arg))!=float(node.arg) for node in constants) or not math.isfinite(weight): return False
   if len(loads)<2 and float_to_fp16(weight)!=weight or len(loads)==2 and weight!=1.0: return False
   if out.dtype.scalar() is dtypes.float and rows==1 and len(loads)==1 and weight==1.0: return False
