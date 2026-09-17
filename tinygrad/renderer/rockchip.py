@@ -848,14 +848,10 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   replacement = plan.parameter(mapped_dtype,rows,reduced_arg).index(out_index).load()
   # Boolean MUL/MAX preserves INT16 masks in {0,1}; ordinary comparison consumes them without rebuilding HALF storage.
   replacement = replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype)
-  if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32:
-    replacement = replacement.alu(Ops.MAX,replacement.const_like(bounds[0]))
-    replacement = replacement.const_like(0).alu(Ops.SUB,replacement.const_like(0).alu(
-      Ops.SUB,replacement).alu(Ops.MAX,replacement.const_like(-bounds[1])))
   suffix_root = root.substitute({value:replacement})
   suffix_uops = store.replace(src=(store.src[0],suffix_root)).sink().toposort()
   return plan.lower(list(suffix_uops),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),
-                    chain=direct or integer and value.arg[0] is Ops.MAX and total<32)
+                    chain=direct)
 
 def _i16_bit(value:UOp) -> UOp: return _native_max(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
 
