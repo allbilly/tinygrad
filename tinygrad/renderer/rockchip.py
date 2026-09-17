@@ -528,10 +528,6 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   plan.scratch.extend((m*ai*2,ao*ai*2,m*ao*4)); plan.program.extend((*gathers,cmac,commit))
   return True
 
-def _lower_reduction(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
-  """Prefer a contraction, then map and reduce bounded reductions on the DPU."""
-  return _try(plan,output,(dtypes.half,dtypes.float),_lower_cmac_reduce) or _try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)  # noqa: E501
-
 def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
   block=8 if rows==1 else round_up(rows,8); groups=lanes if rows==1 else lanes//block; source_block=1 if rows==1 else block
@@ -1141,7 +1137,9 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
   if vectorize_reductions:
     if _try(plan,local_output,dtypes.float,_lower_linear_contraction): return True
-    if _try(plan,local_output,(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),_lower_reduction,uops): return True
+    # Prefer a contraction, then map and reduce bounded reductions on the DPU.
+    if (_try(plan,local_output,(dtypes.half,dtypes.float),_lower_cmac_reduce) or
+        _try(plan,local_output,(dtypes.half,dtypes.int,dtypes.bool),_lower_mapped_reduce,uops)): return True
   if any(u.dtype.scalar() is dtypes.float for u in uops) and (storage_output:=_admit(local_output,dtypes.half)) is not None:
     storage_root=_optional_rewrite(functools.partial(_expand_math_uops,accurate_adds=False),storage_output[4])
     if storage_root is not None: local_output=(*storage_output[:4],storage_root)
