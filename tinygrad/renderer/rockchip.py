@@ -554,15 +554,12 @@ def _kahan_sum(terms:tuple[UOp,...]|list[UOp]) -> UOp:
   return _tag_precise_adds(total)
 
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
-  """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
-  # Both accumulators consume the same high-then-residual order; their existing numerical policy is unchanged.
+  """Recover FP16 product residuals while preserving the loaded eight-product HALF epilogue."""
+  # Preserve the loaded eight-product HALF epilogue; otherwise accumulate highs before residuals in three halves.
   expanded=_product_terms(terms)
-  product_from_load = all(
-    term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and
-    any(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms)
-  fully_loaded_eight = len(terms) == 8 and all(all(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms)
-  mixed_large = 64 <= len(terms) <= 512 and any(any(_strip_cast(source).op is not Ops.LOAD for source in term.src) for term in terms)
-  if product_from_load and (fully_loaded_eight or mixed_large): return _kahan_sum(expanded)
+  if len(terms)==8 and all(term.op is Ops.MUL and term.arg is None and term.dtype.scalar() is dtypes.half and
+                           all(_strip_cast(source).op is Ops.LOAD for source in term.src) for term in terms):
+    return _kahan_sum(expanded)
   high, low = _precise_add_parts(expanded)
   return _tag_precise_adds(high.alu(Ops.ADD, low))
 
