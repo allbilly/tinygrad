@@ -358,8 +358,6 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
     load_index=gate.where(address if address.vmin>=0 else (address<0).where(address.const_like(-2),address),address.const_like(-1))
   return _static_values(out_index,load_index,count,int,unique=False,minimum=-1 if gate is not None else 0)
 
-_small_gather_offsets=functools.lru_cache(maxsize=2048)(_gather_offsets)
-
 def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[tuple[UOp, int, int], ...]|None: ordered=tuple(sorted(affine[1].items(),key=lambda item:abs(item[1]))); limits=tuple(int(r.src[0].arg) if r.src and r.src[0].op is Ops.CONST else 0 for r,_ in ordered); return tuple((r,abs(stride),limit) for (r,stride),limit in zip(ordered,limits)) if all(limit>0 and abs(stride)==math.prod(limits[:i]) for i,((_,stride),limit) in enumerate(zip(ordered,limits))) and math.prod(limits)==count and affine[0]==sum((limit-1)*-min(stride,0) for (_,stride),limit in zip(ordered,limits)) else None  # noqa: E702,E501
 
 def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
@@ -367,7 +365,7 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
     axes=tuple((out_affine[1][axis]*divisor,min(ceildiv(int(axis.src[0].arg),divisor),period) if period else ceildiv(int(axis.src[0].arg),divisor),stride,axis) for (axis,divisor,period),stride in sorted(linear[1].items(),key=lambda item:out_affine[1][item[0][0]]*item[0][1]) if stride)  # noqa: E501
     # Every period must reset with its logical RANGE; a ragged final range may end partway through a period.
     if all((bound:=int(axis.src[0].arg))*out_affine[1][axis]%(step*limit)==0 or bound*out_affine[1][axis]==count for step,limit,_,axis in axes): return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,linear[0],tuple((step,limit,stride) for step,limit,stride,_ in axes),fill_bits=fill_bits)  # noqa: E501
-  return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=(_small_gather_offsets if count<=4096 else _gather_offsets)(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
+  return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=_gather_offsets(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
 
 def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None, require_offsets:bool=False) -> RKGather|None:
   """Validate a typed source and return its physical affine or exact-offset gather."""
@@ -1302,7 +1300,7 @@ class RockchipRenderer(Renderer):
   def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
-    for cache in (_semantic_loads,_static_ranges,_small_gather_offsets,_int_info,_linear_index): cache.cache_clear()
+    for cache in (_semantic_loads,_static_ranges,_int_info,_linear_index): cache.cache_clear()
     return base64.b64encode(encode_image(image,validate=False)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
