@@ -579,9 +579,6 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   """Append a separable contraction directly to the shared physical plan; mapped reduction owns other bounded shapes."""
   _,out,rows,out_index,root=output
   if any(isinstance(op,RKCMAC) for op in plan.program): return False
-  if any(node.op is Ops.REDUCE and isinstance(node.arg,tuple) and node.arg[0] is Ops.ADD and
-         all(axis.src and axis.src[0].op is Ops.CONST for axis in node.src[1:]) and
-         math.prod(int(axis.src[0].arg) for axis in node.src[1:])>_MAX_CMAC_K for node in root.toposort()): return False
   slots=tuple(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(3))
   fp32_root=_typed_cast_source(root,dtypes.half,dtypes.float)
   relu_root=_relu_operand(fp32_root if fp32_root is not None else root)
