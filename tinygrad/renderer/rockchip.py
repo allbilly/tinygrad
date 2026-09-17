@@ -1223,22 +1223,38 @@ class RKContext:
 
   def _raw_where(self, u:UOp, selector:UOp|None=None) -> UOp:
     """Select raw INT16 words with a canonical mask, preserving nonfinite arms without floating arithmetic."""
-    gate,arms=_unwrap_condition(u.src[0]),tuple(_unwrap_condition(src) for src in u.src[1:])
-    lhs=gate.src[0] if gate.op is Ops.CMPLT and gate.src[1].op is Ops.CONST and math.isfinite(float(gate.src[1].arg)) and all(src.dtype.scalar() in (dtypes.half,dtypes.float) for src in gate.src) else None  # noqa: E501
-    if selector is None and lhs is not None and any(dynamic.key==lhs.key and constant.op is Ops.CONST and math.isfinite(float(constant.arg)) and float(constant.arg)!=float(gate.src[1].arg) for dynamic,constant in (arms,arms[::-1])):  # noqa: E501
-      value=self.lower(lhs.cast(dtypes.half)); nan=self._fp16_order(value)[1]
-      selector=self._convert(None,self.lower(_positive_mask(gate.src[1].cast(dtypes.half).alu(Ops.SUB,lhs.cast(dtypes.half)))),dtypes.int16,True)
-      selector=self.lower(selector.alu(Ops.MUL,nan.const_like(1).alu(Ops.SUB,nan)))
-    narrow=u is self.root and u.dtype.scalar() is dtypes.int and all(arm.op is Ops.CONST and -32768<=int(arm.arg)<=32767 for arm in u.src[1:])  # noqa: E501
+    gate = _unwrap_condition(u.src[0])
+    arms = tuple(_unwrap_condition(src) for src in u.src[1:])
+    lhs = None
+    if (gate.op is Ops.CMPLT and gate.src[1].op is Ops.CONST and math.isfinite(float(gate.src[1].arg)) and
+        all(src.dtype.scalar() in (dtypes.half,dtypes.float) for src in gate.src)):
+      lhs = gate.src[0]
+    if selector is None and lhs is not None:
+      threshold = float(gate.src[1].arg)
+      distinct_arm = any(dynamic.key == lhs.key and constant.op is Ops.CONST and
+                         math.isfinite(float(constant.arg)) and float(constant.arg) != threshold
+                         for dynamic,constant in (arms,arms[::-1]))
+      if distinct_arm:
+        # Keep the finite-threshold shortcut: generic condition lowering can emit many more EW stages.
+        value = self.lower(lhs.cast(dtypes.half))
+        nan = self._fp16_order(value)[1]
+        difference = gate.src[1].cast(dtypes.half).alu(Ops.SUB,lhs.cast(dtypes.half))
+        selector = self._convert(None,self.lower(_positive_mask(difference)),dtypes.int16,True)
+        selector = self.lower(selector.alu(Ops.MUL,nan.const_like(1).alu(Ops.SUB,nan)))
+    narrow = (u is self.root and u.dtype.scalar() is dtypes.int and
+              all(arm.op is Ops.CONST and -32768 <= int(arm.arg) <= 32767 for arm in u.src[1:]))
     yes,no=(self._constant(src,dtypes.int16) if narrow else self.lower(src) for src in u.src[1:])
     if selector is None: selector = self.lower(u.src[0])
     if yes.dtype is not no.dtype: raise _RKGenericReject("selection carrier")
-    count=self.count*yes.dtype.itemsize//2
-    owns_output=u is self.root and u.dtype.scalar() is dtypes.int16
-    lane,out=UOp.range(count,0,dtype=dtypes.int),self.out_param if owns_output else self.plan.parameter(dtypes.int16,count)
-    if count!=self.count: selector=self._slot(RKGather(selector.arg,RKArg(RKBufferKind.SCRATCH,0),count,axes=((2,self.count,1),)),dtypes.int16,count*2)  # noqa: E501
-    recipe=_i16_select(selector,self._carrier(yes.arg,dtypes.int16),self._carrier(no.arg,dtypes.int16))
-    context=RKContext((out.index(lane).store(recipe),out,count,lane,recipe),self.plan)
+    count = self.count*yes.dtype.itemsize//2
+    owns_output = u is self.root and u.dtype.scalar() is dtypes.int16
+    lane = UOp.range(count,0,dtype=dtypes.int)
+    out = self.out_param if owns_output else self.plan.parameter(dtypes.int16,count)
+    if count != self.count:
+      repeated = RKGather(selector.arg,RKArg(RKBufferKind.SCRATCH,0),count,axes=((2,self.count,1),))
+      selector = self._slot(repeated,dtypes.int16,count*2)
+    recipe = _i16_select(selector,self._carrier(yes.arg,dtypes.int16),self._carrier(no.arg,dtypes.int16))
+    context = RKContext((out.index(lane).store(recipe),out,count,lane,recipe),self.plan)
     return self._carrier(context.lower(recipe).arg,yes.dtype)
 
   def _where(self, u:UOp) -> UOp:
