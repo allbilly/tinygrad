@@ -471,18 +471,32 @@ def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar
 def _linear_index(u:UOp, divided:bool=False, *, opaque:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int, int], int]]|None:
   """Collect scaled address terms, or exact byte-reconstruction terms with nonlinear/native nodes opaque."""
   # Widening an integer index to weakint keeps its value; retain float-to-integer rounding inside the static evaluator.
-  if divided and u.op is Ops.CAST and len(u.src) == 1 and (u.dtype.scalar() in (dtypes.int,dtypes.uint) or u.dtype.scalar() is dtypes.weakint and dtypes.is_int(u.src[0].dtype.scalar())): u=u.src[0]  # noqa: E501
+  if divided and u.op is Ops.CAST and len(u.src)==1 and (
+    u.dtype.scalar() in (dtypes.int,dtypes.uint) or
+    u.dtype.scalar() is dtypes.weakint and dtypes.is_int(u.src[0].dtype.scalar())
+  ):
+    u=u.src[0]
   if u.op is Ops.CONST: return int(u.arg), {}
   # A zero period means no modulo. This affects addresses only, not opaque byte-reconstruction terms.
-  period=int(u.src[1].arg) if divided and u.op in (Ops.CMOD,Ops.FLOORMOD) and u.src[1].op is Ops.CONST and int(u.src[1].arg)>0 else 0; axis=u.src[0] if period else u  # noqa: E501
+  period=int(u.src[1].arg) if divided and u.op in (Ops.CMOD,Ops.FLOORMOD) and u.src[1].op is Ops.CONST and int(u.src[1].arg)>0 else 0
+  axis=u.src[0] if period else u
   if period and axis.vmin>=0 and axis.vmax<period: return _linear_index(axis,divided,opaque=opaque)
   if axis.op in (Ops.RANGE, Ops.SPECIAL): return 0, {((axis,1,period) if divided else axis):1}
-  if divided and axis.op in (Ops.CDIV,Ops.FLOORDIV) and len(axis.src)==2 and axis.src[0].op in (Ops.RANGE,Ops.SPECIAL) and axis.src[1].op is Ops.CONST and int(axis.src[1].arg)>0: return 0,{(axis.src[0],int(axis.src[1].arg),period):1}  # noqa: E501
+  if (divided and axis.op in (Ops.CDIV,Ops.FLOORDIV) and len(axis.src)==2 and
+      axis.src[0].op in (Ops.RANGE,Ops.SPECIAL) and axis.src[1].op is Ops.CONST and int(axis.src[1].arg)>0):
+    return 0,{(axis.src[0],int(axis.src[1].arg),period):1}
   if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL) or opaque and u.arg is not None: return (0,{u:1}) if opaque else None
-  if (lhs:=_linear_index(u.src[0],divided,opaque=opaque)) is None or (rhs:=_linear_index(u.src[1],divided,opaque=opaque)) is None or u.op is Ops.MUL and lhs[1] and rhs[1]: return (0,{u:1}) if opaque else None  # noqa: E501
-  if u.op is Ops.MUL: scale,affine=(lhs[0],rhs) if not lhs[1] else (rhs[0],lhs); return affine[0]*scale,{key:coefficient*scale for key,coefficient in affine[1].items() if not opaque or coefficient*scale}  # noqa: E701,E702,E501
+  lhs=_linear_index(u.src[0],divided,opaque=opaque)
+  if lhs is None: return (0,{u:1}) if opaque else None
+  rhs=_linear_index(u.src[1],divided,opaque=opaque)
+  if rhs is None or u.op is Ops.MUL and lhs[1] and rhs[1]: return (0,{u:1}) if opaque else None
+  if u.op is Ops.MUL:
+    scale,affine=(lhs[0],rhs) if not lhs[1] else (rhs[0],lhs)
+    return affine[0]*scale,{key:coefficient*scale for key,coefficient in affine[1].items() if not opaque or coefficient*scale}
   # Keep first-seen term order: a set union makes byte-reconstruction schedules depend on UOp allocation identities.
-  sign=-1 if u.op is Ops.SUB else 1; return lhs[0]+sign*rhs[0],{key:value for key in {**lhs[1],**rhs[1]} if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}  # noqa: E702,E501
+  sign=-1 if u.op is Ops.SUB else 1
+  factors={key:value for key in {**lhs[1],**rhs[1]} if (value:=lhs[1].get(key,0)+sign*rhs[1].get(key,0))}
+  return lhs[0]+sign*rhs[0],factors
 
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   # Reserve -1 for an inactive lane; an active negative address must still reject the plan.
