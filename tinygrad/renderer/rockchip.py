@@ -1118,6 +1118,7 @@ class RKContext:
       signed_one=UOp.const(-1.0 if numerator < 0 else 1.0,dtypes.half)
       return self.lower(signed_one.alu(Ops.FDIV,u.src[1]).alu(Ops.FDIV,UOp.const(0.0,dtypes.half)))
     dtype, int_range = u.dtype.scalar(), _int_info(u)[0] if u.dtype.scalar() is dtypes.int else None
+    if u.op is Ops.MAX and dtype is dtypes.int and (rewritten:=sym.rewrite(u)) is not None: return self.lower(rewritten)
     bounded = self.int_layout is dtypes.int or self.int_layout is dtypes.int16 and int_range is not None and -32768 <= int_range[0] <= int_range[1] <= 32767  # noqa: E501
     if dtype is dtypes.int and not bounded: raise _RKGenericReject(f"alu {u.op.name} {dtype} bounds={int_range}")
     expected = self._layout(dtype); finite_min=u.op is Ops.MAX and dtype is dtypes.half
@@ -1388,11 +1389,6 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   rewrite.cache_clear()
   return result
 
-def _simplify_int_max(root:UOp) -> UOp:
-  """Apply shared MAX identities only to integer nodes, preserving other arithmetic."""
-  # Apply shared MAX identities only at integer MAX nodes, leaving arithmetic beneath their operands unchanged.
-  return root.substitute({u:folded for u in root.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int and (folded:=sym.rewrite(u)) is not None})  # noqa: E501
-
 def _fold_static_terms(op:Ops, dtype:DType, terms:list[UOp], balanced:bool) -> UOp:
   while balanced and len(terms)>1: terms=[UOp(op,dtype,src=(terms[i],terms[i+1])) for i in range(0,len(terms)-1,2)]+(terms[-1:] if len(terms)&1 else [])  # noqa: E501
   return terms[0] if balanced else functools.reduce(lambda value,term:UOp(op,dtype,src=(value,term)),terms[1:],terms[0])
@@ -1446,7 +1442,6 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
   root=output[4]
   if Ops.REDUCE in (u.op for u in uops): root=_unroll_static_reduces(root)
-  root=_simplify_int_max(root)
   if len(root.toposort()) <= 256:
     root=_expand_math_uops(root)
   elif (base:=_strip_cast(root)).dtype.scalar() is dtypes.half:
