@@ -1336,6 +1336,7 @@ class RKContext:
 
 def _math_early(ctx:tuple[bool,bool], u:UOp) -> UOp|None:
   accurate_adds,bounded_recipes=ctx
+  if bounded_recipes and (recipe:=_fold_quadratic(u)) is not None: return recipe
   if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src)==1 and u.src[0].dtype.scalar() is dtypes.float:
     if u.src[0].op is Ops.SIN:
       source=u.src[0].src[0]
@@ -1358,13 +1359,11 @@ def _math_late(u:UOp) -> UOp|None:
   if u.op is Ops.LOG2 and u.src[0].op is Ops.WHERE: raise _RKGenericReject
   return _tag_precise_adds(_DPU_MATH[u.op](u.src[0]),(u.src[0],))
 
-_pm_math_early=PatternMatcher([(UPat((Ops.CAST,Ops.ADD),name="u"),_math_early)])
+_pm_math_early=PatternMatcher([(UPat((Ops.CAST,Ops.ADD,Ops.MUL,Ops.SQRT),name="u"),_math_early)])
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  nodes=root.toposort()
-  bounded_recipes=len(nodes)<=_MAX_OPTIONAL_RECIPE_NODES
-  if bounded_recipes: root=root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})
+  bounded_recipes=len(root.toposort())<=_MAX_OPTIONAL_RECIPE_NODES
   return graph_rewrite(root,_pm_math_late,ctx=(accurate_adds,bounded_recipes),bpm=_pm_math_early,walk=True)
 
 def _fold_static_terms(op:Ops, dtype:DType, terms:list[UOp], balanced:bool) -> UOp:
