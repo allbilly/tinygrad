@@ -674,29 +674,81 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
     has_mapped_work = (rows > 1 and out.dtype.scalar() is dtypes.int or total > 416 or len(loads) > 2 or
                        any(node.op in (Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CMPLT, Ops.CMPNE, Ops.WHERE) for node in graph))
     if not has_mapped_work: return False
-  mapped_dtype=dtypes.int16 if integer else dtypes.half; gated=_gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product; mapped_terms:tuple[UOp,...]=(gated if gated is not product or unit_sum else body,); product=gated  # noqa: E501
-  if product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and any(_strip_cast(source).op is Ops.LOAD for source in product.src) and any(_strip_cast(source).op is not Ops.LOAD for source in product.src):  # noqa: E501
-    factor,multiplier=next(((a,b) for a,b in (product.src,product.src[::-1]) if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD),product.src); products=tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (product,); mapped_terms=tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))  # noqa: E501
-  output_axes=tuple((axis,stride,extent) for axis,stride,extent in reversed(tuple(zip(axes,strides_for_shape(shape),shape))) if extent>1); block=round_up(rows,8) if rows>1 else 1; groups=total*len(mapped_terms); lanes=groups*block  # noqa: E501
+  mapped_dtype = dtypes.int16 if integer else dtypes.half
+  gated = _gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product
+  mapped_terms:tuple[UOp,...] = (gated if gated is not product or unit_sum else body,)
+  product = gated
+  if (product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and
+      any(_strip_cast(source).op is Ops.LOAD for source in product.src) and
+      any(_strip_cast(source).op is not Ops.LOAD for source in product.src)):
+    factor,multiplier = next(((a,b) for a,b in (product.src,product.src[::-1])
+                              if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD), product.src)
+    products = (tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(
+      Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (product,))
+    mapped_terms = tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))
+  output_axes = tuple((axis,stride,extent) for axis,stride,extent in reversed(tuple(zip(axes,strides_for_shape(shape),shape))) if extent>1)
+  block = round_up(rows,8) if rows>1 else 1
+  groups = total*len(mapped_terms)
+  lanes = groups*block
   # Larger EW-friendly maps and boolean reductions have a different expansion budget from ordinary rows.
   wide_ew_reduce = short_math or value.arg[0] is Ops.MUL or (value.arg[0] is Ops.ADD and product.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN))
   lane_limit = (_MAX_GENERIC_EXPANDED_NODES if boolean else
                 min(_MAX_STATIC_RANGE_ENVS,16*_MAX_GENERIC_UNROLL) if wide_ew_reduce else
                 _MAX_STATIC_RANGE_ENVS if integer or value.arg[0] is Ops.MAX else _MAX_GENERIC_UNROLL)
-  if rows>1 and (value.arg[0] not in ((Ops.MUL,) if boolean else (Ops.ADD,Ops.MAX,Ops.MUL)) or _linear_index(out_index)!=(0,{axis:stride for axis,stride,_ in output_axes}) or lanes>lane_limit): return False  # noqa: E501
-  lane=UOp.range(lanes,1+max((u.arg[0] for u in uops if u.op is Ops.RANGE and isinstance(u.arg,tuple)),default=-1),dtype=dtypes.int); row_lane=lane.alu(Ops.CMOD,lane.const_like(block)); logical=lane.alu(Ops.CDIV,lane.const_like(block)); logical=logical.alu(Ops.CMOD,logical.const_like(total)) if len(mapped_terms)>1 else logical; output_row=row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(row_lane,row_lane.const_like(0)) if block>rows else row_lane  # noqa: E501
-  replacements={axis:point.alu(Ops.CDIV,point.const_like(stride)).alu(Ops.CMOD,point.const_like(extent)) if stride>1 else point.alu(Ops.CMOD,point.const_like(extent)) for point,dimensions in ((logical,zip(ranges,strides_for_shape(extents),extents)),(output_row,output_axes)) for axis,stride,extent in dimensions}  # noqa: E501
-  terms=tuple(graph_rewrite(mapped,sym) if boolean else mapped for term in mapped_terms for mapped in (term.substitute(replacements,walk=True),))  # noqa: E501
-  mapped_body=functools.reduce(lambda selected,item:lane.alu(Ops.CMPLT,lane.const_like((item[0]+1)*total*block)).where(item[1],selected),reversed(tuple(enumerate(terms[:-1]))),terms[-1]); mapped_body=row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(mapped_body,mapped_body.const_like(0 if value.arg[0] is Ops.ADD else dtypes.int16.min if integer else -math.inf)) if block>rows else mapped_body  # noqa: E501
-  padded=mapped_body.op is Ops.WHERE and mapped_body.src[2].op is Ops.CONST and mapped_body.src[2].arg==0 and _is_static_expr(mapped_body.src[0]); weighted_body,pad=(mapped_body.src[1],mapped_body.src[0]) if padded else (mapped_body,None); weighted=next((condition.cast(dtypes.int16)*weight.cast(dtypes.int16) for cast,weight in (weighted_body.src,weighted_body.src[::-1]) if (condition:=_typed_cast_source(cast,dtypes.int,dtypes.bool)) is not None and _is_static_expr(weight)),None) if integer and value.arg[0] is Ops.ADD and bounds is not None and -32768<=total*bounds[0]<=total*bounds[1]<=32767 and weighted_body.op is Ops.MUL else None; weighted=weighted if weighted is None or pad is None else weighted*pad.cast(dtypes.int16)  # noqa: E501
-  start=len(plan.program); fake=plan.parameter(mapped_dtype,lanes); sink=fake.index(lane).store(weighted if weighted is not None else mapped_body.cast(mapped_dtype) if boolean or bounded_sum else mapped_body).end(lane).sink()  # noqa: E501
-  if not plan.lower(list(graph_rewrite(sink,pm_lower_index_dtype,ctx={}).toposort() if integer else sink.toposort()),vectorize_reductions=False,materialize=True): return False  # noqa: E501
-  direct=mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
+  if rows>1:
+    allowed_ops = (Ops.MUL,) if boolean else (Ops.ADD,Ops.MAX,Ops.MUL)
+    if value.arg[0] not in allowed_ops or _linear_index(out_index)!=(0,{axis:stride for axis,stride,_ in output_axes}) or lanes>lane_limit:
+      return False
+  lane = UOp.range(lanes, 1+max((u.arg[0] for u in uops if u.op is Ops.RANGE and isinstance(u.arg,tuple)),default=-1), dtype=dtypes.int)
+  row_lane = lane.alu(Ops.CMOD,lane.const_like(block))
+  logical = lane.alu(Ops.CDIV,lane.const_like(block))
+  if len(mapped_terms)>1: logical = logical.alu(Ops.CMOD,logical.const_like(total))
+  output_row = row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(row_lane,row_lane.const_like(0)) if block>rows else row_lane
+  replacements = {
+    axis:point.alu(Ops.CDIV,point.const_like(stride)).alu(Ops.CMOD,point.const_like(extent)) if stride>1
+      else point.alu(Ops.CMOD,point.const_like(extent))
+    for point,dimensions in ((logical,zip(ranges,strides_for_shape(extents),extents)),(output_row,output_axes))
+    for axis,stride,extent in dimensions
+  }
+  terms = tuple(graph_rewrite(mapped,sym) if boolean else mapped for term in mapped_terms
+                for mapped in (term.substitute(replacements,walk=True),))
+  mapped_body = terms[-1]
+  for i,term in reversed(tuple(enumerate(terms[:-1]))):
+    mapped_body = lane.alu(Ops.CMPLT,lane.const_like((i+1)*total*block)).where(term,mapped_body)
+  if block>rows:
+    neutral = 0 if value.arg[0] is Ops.ADD else dtypes.int16.min if integer else -math.inf
+    mapped_body = row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(mapped_body,mapped_body.const_like(neutral))
+  padded = (mapped_body.op is Ops.WHERE and mapped_body.src[2].op is Ops.CONST and mapped_body.src[2].arg==0 and
+            _is_static_expr(mapped_body.src[0]))
+  weighted_body,pad = (mapped_body.src[1],mapped_body.src[0]) if padded else (mapped_body,None)
+  weighted = None
+  if (integer and value.arg[0] is Ops.ADD and bounds is not None and
+      -32768<=total*bounds[0]<=total*bounds[1]<=32767 and weighted_body.op is Ops.MUL):
+    weighted = next((condition.cast(dtypes.int16)*weight.cast(dtypes.int16)
+                     for cast,weight in (weighted_body.src,weighted_body.src[::-1])
+                     if (condition:=_typed_cast_source(cast,dtypes.int,dtypes.bool)) is not None and _is_static_expr(weight)),None)
+  if weighted is not None and pad is not None: weighted = weighted*pad.cast(dtypes.int16)
+  start = len(plan.program)
+  fake = plan.parameter(mapped_dtype,lanes)
+  stored_body = weighted if weighted is not None else mapped_body.cast(mapped_dtype) if boolean or bounded_sum else mapped_body
+  sink = fake.index(lane).store(stored_body).end(lane).sink()
+  mapped_uops = graph_rewrite(sink,pm_lower_index_dtype,ctx={}).toposort() if integer else sink.toposort()
+  if not plan.lower(list(mapped_uops),vectorize_reductions=False,materialize=True): return False
+  direct = mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
   # Reduce materialized terms in the ordinary EW tree, retaining the HALF boundary for consumers.
-  replacement=plan.parameter(mapped_dtype,rows,_reduce_mapped_rows(plan,plan.resolve(RKArg(RKBufferKind.ARG,fake.arg.slot)),lanes,_EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)).index(out_index).load()  # noqa: E501
+  reduced_arg = _reduce_mapped_rows(plan,plan.resolve(RKArg(RKBufferKind.ARG,fake.arg.slot)),lanes,
+                                    _EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)
+  replacement = plan.parameter(mapped_dtype,rows,reduced_arg).index(out_index).load()
   # Boolean MUL/MAX preserves INT16 masks in {0,1}; ordinary comparison consumes them without rebuilding HALF storage.
-  replacement=replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype); replacement=replacement.alu(Ops.MAX,replacement.const_like(bounds[0])) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; replacement=replacement.const_like(0).alu(Ops.SUB,replacement.const_like(0).alu(Ops.SUB,replacement).alu(Ops.MAX,replacement.const_like(-bounds[1]))) if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32 else replacement; suffix_root=root.substitute({value:replacement})  # noqa: E501
-  return plan.lower(list(store.replace(src=(store.src[0],suffix_root)).sink().toposort()),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),chain=direct or integer and value.arg[0] is Ops.MAX and total<32)  # noqa: E501
+  replacement = replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype)
+  if integer and not boolean and bounds is not None and value.arg[0] is Ops.MAX and total<32:
+    replacement = replacement.alu(Ops.MAX,replacement.const_like(bounds[0]))
+    replacement = replacement.const_like(0).alu(Ops.SUB,replacement.const_like(0).alu(
+      Ops.SUB,replacement).alu(Ops.MAX,replacement.const_like(-bounds[1])))
+  suffix_root = root.substitute({value:replacement})
+  suffix_uops = store.replace(src=(store.src[0],suffix_root)).sink().toposort()
+  return plan.lower(list(suffix_uops),vectorize_reductions=any(node.op is Ops.REDUCE for node in suffix_root.toposort()),
+                    chain=direct or integer and value.arg[0] is Ops.MAX and total<32)
 
 def _i16_bit(value:UOp) -> UOp: return _native_max(value.alu(Ops.MAX,value.const_like(0)),value.const_like(1))
 
@@ -1203,22 +1255,38 @@ class RKContext:
 
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  if (bounded_recipes:=len(nodes:=root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES): root=root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})  # noqa: E501
+  nodes = root.toposort()
+  bounded_recipes = len(nodes) <= _MAX_OPTIONAL_RECIPE_NODES
+  if bounded_recipes:
+    root = root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})
+
   @functools.cache
   def rewrite(u:UOp) -> UOp:
     if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
-      if u.src[0].op is Ops.SIN: return rewrite(_tag_precise_adds(_dpu_sin(u.src[0].src[0]),(u.src[0].src[0],)))
+      if u.src[0].op is Ops.SIN:
+        source = u.src[0].src[0]
+        return rewrite(_tag_precise_adds(_dpu_sin(source), (source,)))
       if (recipe:=_optional_rewrite(_canonical_half_storage,u.src[0])) is not None: return recipe
-    if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None and (recipe:=_accurate_add_recipe(u)) is not None: return recipe  # noqa: E501
+    if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
+      if (recipe:=_accurate_add_recipe(u)) is not None: return recipe
+
     mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
-    if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped): mapped=UOp(Ops.WHERE,dtypes.half,src=(mapped.src[0],mapped.src[1].cast(dtypes.half),mapped.src[2].cast(dtypes.half)),arg=mapped.arg) if mapped.op is Ops.WHERE else mapped.src[0].cast(dtypes.half).alu(mapped.op,mapped.src[1].cast(dtypes.half))  # noqa: E501
-    if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half: mapped=mapped.src[0]  # noqa: E501
-    if mapped.op is Ops.WHERE and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==3 and (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)  # noqa: E501
+    if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped):
+      if mapped.op is Ops.WHERE:
+        mapped = UOp(Ops.WHERE, dtypes.half, src=(mapped.src[0], mapped.src[1].cast(dtypes.half), mapped.src[2].cast(dtypes.half)),
+                     arg=mapped.arg)
+      else: mapped = mapped.src[0].cast(dtypes.half).alu(mapped.op, mapped.src[1].cast(dtypes.half))
+    if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half:
+      mapped = mapped.src[0]
+    if mapped.op is Ops.WHERE and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==3:
+      if (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
     if mapped.op not in _DPU_MATH or mapped.op is Ops.TRUNC and (mapped.dtype.scalar() is not dtypes.half or _is_static_expr(mapped)): return mapped
     if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
     return rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
   # The returned graph owns its live recipes; do not retain the completed memo through the recursive callback's cycle.
-  result=rewrite(root); rewrite.cache_clear(); return result
+  result = rewrite(root)
+  rewrite.cache_clear()
+  return result
 
 def _simplify_int_max(root:UOp) -> UOp:
   """Apply shared MAX identities only to integer nodes, preserving other arithmetic."""
