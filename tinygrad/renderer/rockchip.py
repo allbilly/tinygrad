@@ -658,10 +658,6 @@ def _int_info(u:UOp) -> tuple[tuple[int, int]|None, UOp|None]:
 
 class _RKGenericReject(Exception): pass
 
-def _has_runtime_address(root:UOp) -> bool:
-  """True when a value LOAD obtains its address or gate from another runtime LOAD."""
-  return any(_semantic_loads(load.src[0].src[1]) or len(load.src)>2 and _semantic_loads(load.src[2]) for load in _semantic_loads(root) if load.src and load.src[0].op is Ops.INDEX)  # noqa: E501
-
 def _fp32_expr_to_half(u:UOp) -> UOp:
   """Represent a float ADD/MUL expression with a three-half expansion at its FP16 storage boundary."""
   if u.dtype.scalar() is dtypes.half or u.op is Ops.CONST and u.dtype.scalar() in (dtypes.weakfloat,dtypes.float): return u if u.dtype.scalar() is dtypes.half else UOp.const(float(u.arg),dtypes.half)  # noqa: E501
@@ -1073,7 +1069,7 @@ def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   if (bounded_recipes:=len(nodes:=root.toposort()) <= _MAX_OPTIONAL_RECIPE_NODES): root=root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})  # noqa: E501
   @functools.cache
   def rewrite(u:UOp) -> UOp:
-    if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float and not _has_runtime_address(u.src[0]):  # noqa: E501
+    if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
       if u.src[0].op is Ops.SIN: return rewrite(_tag_precise_adds(_dpu_sin(u.src[0].src[0]),(u.src[0].src[0],)))
       if (recipe:=_optional_rewrite(_canonical_half_storage,u.src[0])) is not None: return recipe
     if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None and (recipe:=_accurate_add_recipe(u)) is not None: return recipe  # noqa: E501
