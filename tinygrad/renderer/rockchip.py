@@ -289,8 +289,7 @@ def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
 def _outs(uops:list[UOp]) -> tuple[RKOutput|None, list[UOp]]:
   """Return the single statically-sized output store shared by specialized graph matchers."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  outputs = [(store, root) for store in stores if (root:=_root_param(store.src[0])) is not None]
+  outputs = [(store, root) for store in uops if store.op is Ops.STORE and (root:=_root_param(store.src[0])) is not None]
   if len(outputs) != 1: return None, [store for store,_ in outputs]
   store, out_param = outputs[0]
   if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None, []
