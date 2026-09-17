@@ -884,18 +884,9 @@ def _half_backed_value(value:UOp) -> UOp|None:
 def _int_info(u:UOp) -> tuple[tuple[int, int]|None, UOp|None]:
   """Share exact range admission and the optional HALF arithmetic recipe for one integer graph."""
   dtype = u.dtype.scalar()
-  bounds_src = u.src[:1] if u.op is Ops.CAST else u.src[1:] if u.op is Ops.WHERE else u.src
+  # Only operations with conservative UOp intervals may choose a narrower physical integer carrier.
   valid = dtype in (dtypes.int, dtypes.weakint) and (
-    _is_static_expr(u)
-    or u.op in (Ops.CAST, Ops.WHERE) and len(u.src) == (1 if u.op is Ops.CAST else 3) and all(
-      bound is not None or u.op is Ops.CAST and source.dtype.scalar() in (dtypes.bool, dtypes.int16)
-      for source, bound in zip(bounds_src, (_int_info(node)[0] for node in bounds_src)))
-    or u.op is Ops.XOR and len(u.src) == 2 and any(
-      marker.op is Ops.CONST and marker.arg == -1 and _int_info(source)[0] is not None
-      for marker, source in (u.src, u.src[::-1]))
-    or u.op is Ops.CMOD and len(u.src) == 2 and (right := _int_info(u.src[1])[0]) is not None and right[0] == right[1] != 0
-    or u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX) and len(u.src) == 2 and all(
-      _int_info(node)[0] is not None for node in bounds_src))
+    _is_static_expr(u) or u.op in (Ops.CAST, Ops.WHERE, Ops.XOR, Ops.CMOD, Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX))
   bounds = None
   if valid:
     low, high = int(u.vmin), int(u.vmax)
