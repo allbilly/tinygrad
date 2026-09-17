@@ -791,19 +791,9 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   if block>rows:
     neutral = 0 if value.arg[0] is Ops.ADD else dtypes.int16.min if integer else -math.inf
     mapped_body = row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(mapped_body,mapped_body.const_like(neutral))
-  padded = (mapped_body.op is Ops.WHERE and mapped_body.src[2].op is Ops.CONST and mapped_body.src[2].arg==0 and
-            _is_static_expr(mapped_body.src[0]))
-  weighted_body,pad = (mapped_body.src[1],mapped_body.src[0]) if padded else (mapped_body,None)
-  weighted = None
-  if (integer and value.arg[0] is Ops.ADD and bounds is not None and
-      -32768<=total*bounds[0]<=total*bounds[1]<=32767 and weighted_body.op is Ops.MUL):
-    weighted = next((condition.cast(dtypes.int16)*weight.cast(dtypes.int16)
-                     for cast,weight in (weighted_body.src,weighted_body.src[::-1])
-                     if (condition:=_typed_cast_source(cast,dtypes.int,dtypes.bool)) is not None and _is_static_expr(weight)),None)
-  if weighted is not None and pad is not None: weighted = weighted*pad.cast(dtypes.int16)
   start = len(plan.program)
   fake = plan.parameter(mapped_dtype,lanes)
-  stored_body = weighted if weighted is not None else mapped_body.cast(mapped_dtype) if boolean or bounded_sum else mapped_body
+  stored_body = mapped_body.cast(mapped_dtype) if boolean or bounded_sum else mapped_body
   sink = fake.index(lane).store(stored_body).end(lane).sink()
   mapped_uops = graph_rewrite(sink,pm_lower_index_dtype,ctx={}).toposort() if integer else sink.toposort()
   if not plan.lower(list(mapped_uops),vectorize_reductions=False,materialize=True): return False
