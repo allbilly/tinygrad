@@ -596,7 +596,6 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
                        for axis in ranges): return False
   term=_gate_zero_term(body)
   factors=tuple(map(_strip_cast,_strip_cast(term).split_uop(Ops.MUL,lambda node:node.arg is None)))
-  if any(node.op not in (Ops.LOAD,Ops.CONST) for node in factors): return False
   bounds=tuple(int(axis.src[0].arg) for axis in ranges)
   groups=math.prod(bounds)
   if not 1<=groups<=_MAX_CMAC_K: return False
