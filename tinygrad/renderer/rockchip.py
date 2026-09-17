@@ -1334,40 +1334,38 @@ class RKContext:
     result=self.lower(self.root)
     self._finish_value(result,dtype,materialize)
 
+def _math_early(ctx:tuple[bool,bool], u:UOp) -> UOp|None:
+  accurate_adds,bounded_recipes=ctx
+  if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src)==1 and u.src[0].dtype.scalar() is dtypes.float:
+    if u.src[0].op is Ops.SIN:
+      source=u.src[0].src[0]
+      return _tag_precise_adds(_dpu_sin(source),(source,))
+    if (recipe:=_optional_rewrite(_canonical_half_storage,u.src[0])) is not None: return recipe
+  if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
+    return _accurate_add_recipe(u)
+  return None
+
+def _math_late(u:UOp) -> UOp|None:
+  if u.dtype.scalar() is dtypes.float and u.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(u):
+    if u.op is Ops.WHERE:
+      return UOp(Ops.WHERE,dtypes.half,src=(u.src[0],u.src[1].cast(dtypes.half),u.src[2].cast(dtypes.half)),arg=u.arg)
+    return u.src[0].cast(dtypes.half).alu(u.op,u.src[1].cast(dtypes.half))
+  if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src)==1 and u.src[0].dtype.scalar() is dtypes.half:
+    return u.src[0]
+  if u.op is Ops.WHERE and u.dtype.scalar() is dtypes.half and len(u.src)==3:
+    if (absolute:=_fold_where_abs(u)) is not None: return absolute
+  if u.op not in _DPU_MATH or u.op is Ops.TRUNC and (u.dtype.scalar() is not dtypes.half or _is_static_expr(u)): return None
+  if u.op is Ops.LOG2 and u.src[0].op is Ops.WHERE: raise _RKGenericReject
+  return _tag_precise_adds(_DPU_MATH[u.op](u.src[0]),(u.src[0],))
+
+_pm_math_early=PatternMatcher([(UPat((Ops.CAST,Ops.ADD),name="u"),_math_early)])
+
 def _expand_math_uops(root:UOp, *, accurate_adds:bool=True) -> UOp:
   """Expand semantic math UOps before physical allocation so the complete recipe has one liveness graph."""
-  nodes = root.toposort()
-  bounded_recipes = len(nodes) <= _MAX_OPTIONAL_RECIPE_NODES
-  if bounded_recipes:
-    root = root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})
-
-  @functools.cache
-  def rewrite(u:UOp) -> UOp:
-    if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src) == 1 and u.src[0].dtype.scalar() is dtypes.float:
-      if u.src[0].op is Ops.SIN:
-        source = u.src[0].src[0]
-        return rewrite(_tag_precise_adds(_dpu_sin(source), (source,)))
-      if (recipe:=_optional_rewrite(_canonical_half_storage,u.src[0])) is not None: return recipe
-    if accurate_adds and bounded_recipes and u.op is Ops.ADD and u.dtype.scalar() is dtypes.half and u.arg is None:
-      if (recipe:=_accurate_add_recipe(u)) is not None: return recipe
-
-    mapped = u.replace(src=tuple(rewrite(src) for src in u.src))
-    if mapped.dtype.scalar() is dtypes.float and mapped.op in (Ops.WHERE,Ops.ADD,Ops.MUL) and not _is_static_expr(mapped):
-      if mapped.op is Ops.WHERE:
-        mapped = UOp(Ops.WHERE, dtypes.half, src=(mapped.src[0], mapped.src[1].cast(dtypes.half), mapped.src[2].cast(dtypes.half)),
-                     arg=mapped.arg)
-      else: mapped = mapped.src[0].cast(dtypes.half).alu(mapped.op, mapped.src[1].cast(dtypes.half))
-    if mapped.op is Ops.CAST and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==1 and mapped.src[0].dtype.scalar() is dtypes.half:
-      mapped = mapped.src[0]
-    if mapped.op is Ops.WHERE and mapped.dtype.scalar() is dtypes.half and len(mapped.src)==3:
-      if (absolute:=_fold_where_abs(mapped)) is not None: mapped = rewrite(absolute)
-    if mapped.op not in _DPU_MATH or mapped.op is Ops.TRUNC and (mapped.dtype.scalar() is not dtypes.half or _is_static_expr(mapped)): return mapped
-    if mapped.op is Ops.LOG2 and mapped.src[0].op is Ops.WHERE: raise _RKGenericReject
-    return rewrite(_tag_precise_adds(_DPU_MATH[mapped.op](mapped.src[0]), (mapped.src[0],)))
-  # The returned graph owns its live recipes; do not retain the completed memo through the recursive callback's cycle.
-  result = rewrite(root)
-  rewrite.cache_clear()
-  return result
+  nodes=root.toposort()
+  bounded_recipes=len(nodes)<=_MAX_OPTIONAL_RECIPE_NODES
+  if bounded_recipes: root=root.substitute({u:recipe for u in nodes if (recipe:=_fold_quadratic(u)) is not None})
+  return graph_rewrite(root,_pm_math_late,ctx=(accurate_adds,bounded_recipes),bpm=_pm_math_early,walk=True)
 
 def _fold_static_terms(op:Ops, dtype:DType, terms:list[UOp], balanced:bool) -> UOp:
   while balanced and len(terms)>1: terms=[UOp(op,dtype,src=(terms[i],terms[i+1])) for i in range(0,len(terms)-1,2)]+(terms[-1:] if len(terms)&1 else [])  # noqa: E501
@@ -1566,6 +1564,7 @@ def _dpu_log2(source:UOp) -> UOp:
   return result.alu(Ops.ADD, domain_correction).alu(Ops.ADD, inf_correction)
 
 _DPU_MATH = {Ops.SQRT:_dpu_sqrt, Ops.EXP2:_dpu_exp2, Ops.LOG2:_dpu_log2, Ops.SIN:_dpu_sin, Ops.TRUNC:_dpu_trunc}
+_pm_math_late=PatternMatcher([(UPat((Ops.CAST,Ops.WHERE,Ops.ADD,Ops.MUL,*_DPU_MATH),name="u"),_math_late)])
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4, direct_reduces = False, False, False, True
   code_for_op = dict.fromkeys((*_EW_CFG,*_DPU_MATH), lambda: None)
