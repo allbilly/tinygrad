@@ -49,31 +49,44 @@ class RKImage(NamedTuple): scratch: tuple[int, ...] = (); program: tuple[RKGathe
 
 def _op_args(op:RKGather|RKEWOp|RKCMAC) -> tuple[RKArg, ...]: return tuple(arg for arg in op if isinstance(arg,RKArg))
 
-def _map_op_args(op:RKGather|RKEWOp|RKCMAC, fn:Callable[[RKArg], RKArg]) -> RKGather|RKEWOp|RKCMAC: return type(op)._make(fn(arg) if isinstance(arg,RKArg) else arg for arg in op)  # noqa: E501
+def _map_op_args(op:RKGather|RKEWOp|RKCMAC, fn:Callable[[RKArg], RKArg]) -> RKGather|RKEWOp|RKCMAC:
+  return type(op)._make(fn(arg) if isinstance(arg,RKArg) else arg for arg in op)
 
 class RKPlan:
   """One virtual scratch namespace for every physical value in a compiled program."""
   def __init__(self, uops:list[UOp]):
-    self.scratch:list[int]=[]; self.program:list[RKGather|RKEWOp|RKCMAC]=[]
+    self.scratch:list[int]=[]
+    self.program:list[RKGather|RKEWOp|RKCMAC]=[]
     # Compiler-only parameters bind physical carriers; lifetime coloring drops unused reservations.
-    self.bindings:dict[int,RKArg]={}; self.slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=-1)
+    self.bindings:dict[int,RKArg]={}
+    self.slot=1+max((u.arg.slot for u in uops if u.op is Ops.PARAM),default=-1)
 
   def parameter(self, dtype:DType, count:int, source:RKArg|None=None) -> UOp:
-    slot=self.slot; self.slot+=1; self.bindings[slot]=RKArg(RKBufferKind.SCRATCH,len(self.scratch)) if source is None else self.resolve(source)
+    slot=self.slot
+    self.slot+=1
+    self.bindings[slot]=RKArg(RKBufferKind.SCRATCH,len(self.scratch)) if source is None else self.resolve(source)
     if source is None: self.scratch.append(max(64,round_up(count,8)*dtype.itemsize))
     return UOp.param(slot,dtype,(count,))
 
   def resolve(self, arg:RKArg) -> RKArg:
     if arg.kind is not RKBufferKind.ARG or arg.index not in self.bindings: return arg
-    return (target:=self.bindings[arg.index])._replace(addend=target.addend+arg.addend)
+    target=self.bindings[arg.index]
+    return target._replace(addend=target.addend+arg.addend)
 
   def lower(self, uops:list[UOp]|Callable[[],bool], *, vectorize_reductions:bool=True, materialize:bool=False, chain:bool=False) -> bool:
     # Preserve existing entries as well as appends; contexts retain references to these lists.
-    program,scratch,bindings,virtual=self.program[:],self.scratch[:],self.bindings.copy(),self.slot
-    start,slots,accepted=len(program),len(scratch),False
+    program=self.program[:]
+    scratch=self.scratch[:]
+    bindings=self.bindings.copy()
+    virtual=self.slot
+    start,slots=len(program),len(scratch)
+    accepted=False
     try:
-      if not (uops() if callable(uops) else _lower_into(self,uops,vectorize_reductions=vectorize_reductions,materialize=materialize)): return False
-      if any(isinstance(op,RKCMAC) for op in self.program) and any(isinstance(op,RKGather) and op.index is not None for op in self.program): return False  # noqa: E501
+      lowered=uops() if callable(uops) else _lower_into(self,uops,vectorize_reductions=vectorize_reductions,materialize=materialize)
+      if not lowered: return False
+      if any(isinstance(op,RKCMAC) for op in self.program) and any(
+        isinstance(op,RKGather) and op.index is not None for op in self.program
+      ): return False
       ew=[i for i in range(start,len(self.program)) if isinstance(self.program[i],RKEWOp)]
       if ew and (start or any(isinstance(op,RKCMAC) for op in self.program[:ew[0]])):
         chainable_ew = chain and any(isinstance(op, RKEWOp) for op in self.program[:start]) and all(
@@ -85,34 +98,58 @@ class RKPlan:
           for op in self.program[start:ew[0]])
         chained = chainable_ew and not crosses_prior_buffer
         self.program[ew[0]]=typing_cast(RKEWOp,self.program[ew[0]])._replace(submit_barrier=not chained)
-      accepted=True; return True
+      accepted=True
+      return True
     except _RKGenericReject:
       if os.getenv("ROCKCHIP_UOPS_DEBUG","0")=="1": raise
       return False
     finally:
-      if not accepted: self.program[:],self.scratch[:],self.bindings,self.slot=program,scratch,bindings,virtual
+      if not accepted:
+        self.program[:]=program
+        self.scratch[:]=scratch
+        self.bindings=bindings
+        self.slot=virtual
 
 def _reuse_linear_scratch(image:RKImage, resolve:Callable[[RKArg],RKArg]=lambda arg:arg) -> RKImage:
   """Color virtual scratch lifetimes across the complete physical execution schedule."""
-  prelude:list[RKGather|RKEWOp|RKCMAC] = []; body:list[RKGather|RKEWOp|RKCMAC] = []; ready:set[int] = set(); written:set[RKArg] = set()
+  prelude:list[RKGather|RKEWOp|RKCMAC] = []
+  body:list[RKGather|RKEWOp|RKCMAC] = []
+  ready:set[int] = set()
+  written:set[RKArg] = set()
   for op in (_map_op_args(op,resolve) for op in image.program):
-    deps=tuple(arg for arg in ((op.src,op.index) if isinstance(op,RKGather) else ()) if arg is not None); preload=isinstance(op,RKGather) and op.dst.kind is RKBufferKind.SCRATCH and op.dst._replace(addend=0) not in written and all(arg.index in ready if arg.kind is RKBufferKind.SCRATCH else arg._replace(addend=0) not in written for arg in deps) and (not op.partial or op.dst.index in ready)  # noqa: E501
-    (prelude if preload else body).append(op); ready.add(op.dst.index) if preload else None
-    # A padding write cannot make a previously produced surface available before its producer.
-    if not preload: written.add(op.dst._replace(addend=0)); ready.discard(op.dst.index) if op.dst.kind is RKBufferKind.SCRATCH else None
+    deps=tuple(arg for arg in ((op.src,op.index) if isinstance(op,RKGather) else ()) if arg is not None)
+    preload=(
+      isinstance(op,RKGather) and op.dst.kind is RKBufferKind.SCRATCH and op.dst._replace(addend=0) not in written and
+      all(arg.index in ready if arg.kind is RKBufferKind.SCRATCH else arg._replace(addend=0) not in written for arg in deps) and
+      (not op.partial or op.dst.index in ready)
+    )
+    if preload:
+      prelude.append(op)
+      ready.add(op.dst.index)
+    else:
+      body.append(op)
+      # A padding write cannot make a previously produced surface available before its producer.
+      written.add(op.dst._replace(addend=0))
+      if op.dst.kind is RKBufferKind.SCRATCH: ready.discard(op.dst.index)
   events:dict[int,list[int]]={}
-  for event,arg in ((event,arg) for event,args in enumerate(map(_op_args,itertools.chain(prelude,body))) for arg in args if arg.kind is RKBufferKind.SCRATCH):  # noqa: E501
-    events.setdefault(arg.index,[event,event])[1]=event
+  for event,op in enumerate(itertools.chain(prelude,body)):
+    for arg in _op_args(op):
+      if arg.kind is RKBufferKind.SCRATCH: events.setdefault(arg.index,[event,event])[1]=event
   if any(not 0 <= slot < len(image.scratch) for slot in events) or not _fits(image.scratch): raise ValueError("invalid virtual scratch allocation")
   # Physical IDs are inserted densely; capacity updates retain their serialization order.
-  remap:dict[int,int]={}; physical:dict[int,int]={}; active:list[tuple[int,int]]=[]
+  remap:dict[int,int]={}
+  physical:dict[int,int]={}
+  active:list[tuple[int,int]]=[]
   for start,end,slot in sorted(((points[0], points[1], slot) for slot,points in events.items()), key=lambda item:(item[0], item[2])):
-    spec,target=image.scratch[slot],heapq.heappop(active)[1] if active and active[0][0]<start else len(physical)
+    spec=image.scratch[slot]
+    target=heapq.heappop(active)[1] if active and active[0][0]<start else len(physical)
     # One physical slot can back byte, half-word and word views over disjoint lifetimes.
     physical[target] = round_up(max(physical.get(target,0), spec),4)
     heapq.heappush(active, (end, target))
     remap[slot] = target
-  return RKImage(tuple(physical.values()),tuple(_map_op_args(op,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg) for op in prelude+body))  # noqa: E501
+  return RKImage(tuple(physical.values()),tuple(
+    _map_op_args(op,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)
+    for op in prelude+body))
 
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
