@@ -235,14 +235,18 @@ def _validate_image(image:RKImage) -> None:
     if invalid: raise ValueError("invalid RKEWOp flags")
 
 def encode_image(image:RKImage, *, validate:bool=True) -> bytes:
-  _validate_image(image) if validate else None; return RKIMAGE_MAGIC+struct.pack("<H",RKIMAGE_VERSION)+zlib.compress(pickle.dumps(image,5),1)
+  if validate:
+    _validate_image(image)
+  return RKIMAGE_MAGIC+struct.pack("<H",RKIMAGE_VERSION)+zlib.compress(pickle.dumps(image,5),1)
 
 def decode_image(blob:bytes) -> RKImage:
   try:
     if blob[:4] != RKIMAGE_MAGIC or struct.unpack_from("<H", blob, 4)[0] != RKIMAGE_VERSION: raise ValueError
-    codec=zlib.decompressobj(); stream=io.BytesIO(codec.decompress(blob[6:]))
+    codec=zlib.decompressobj()
+    stream=io.BytesIO(codec.decompress(blob[6:]))
     if codec.unused_data or not codec.eof or type(image:=pickle.load(stream)) is not RKImage or stream.read(1): raise ValueError
-    _validate_image(image); return image
+    _validate_image(image)
+    return image
   except Exception: raise ValueError("invalid RKImage") from None
 
 # Admission and exact-carrier bounds.
@@ -256,7 +260,9 @@ _EW_CFG_COMMON = (1 << 28) | (2 << 22) | (1 << 7) | (1 << 6)
   _EW_RELU_BYPASS|(7<<16), _EW_RELU_BYPASS|(8<<16)))
 # DPU data-format registers, indexed by RKEWMode.
 _DPU_PRECISION_DTYPES = {1:dtypes.int16,2:dtypes.half,4:dtypes.int,5:dtypes.float}
-_DPU_DATA_FORMATS = tuple((output<<29)|(source<<26)|(2 if source==5 else source) for output,source in ((5,2),(2,5),(1,1),(4,4),(4,1),(4,2),(1,2),(2,4))+((2,2),)*3)  # noqa: E501
+_DPU_DATA_FORMATS = tuple(
+  (output<<29)|(source<<26)|(2 if source==5 else source)
+  for output,source in ((5,2),(2,5),(1,1),(4,4),(4,1),(4,2),(1,2),(2,4))+((2,2),)*3)
 # Batch-size and batch-normalization registers used by compare stages.
 (_BS_BN_BYPASS, _BS_OW_FP32_SCALAR, _BS_CFG_COMPARE, _BS_ALU_COMPARE, _BS_MUL_COMPARE, _BN_CFG_COMPARE, _BN_MUL_COMPARE,
  _BN_RELUX_COMPARE) = (1|(1<<1)|(1<<4)|(1<<6), (1<<8)|(1<<5)|(1<<2)|(1<<1), 0x40040, 0x33800000, 0x40000000, 0x40082, 0x7c000000, 0x3f800000)
@@ -264,17 +270,25 @@ _DPU_DATA_FORMATS = tuple((output<<29)|(source<<26)|(2 if source==5 else source)
  _NATIVE_RELU6) = tuple("rockchip_"+name for name in "abs ceil floor mask_mul min positive_mask precise_add relu6".split())
 _NATIVE_HALF_TO_INT16 = "rockchip_integral_half_to_int16"
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
-_EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in ((Ops.ADD,2<<16), (Ops.SUB,4<<16), (Ops.MUL,_EW_OP_CVT_BYPASS|1<<2), (Ops.MAX,0), (Ops.FDIV,_EW_OP_CVT_BYPASS|3<<16))}  # noqa: E501
+_EW_CFG = {op:_EW_CFG_COMMON|_EW_RELU_BYPASS|flags for op,flags in (
+  (Ops.ADD,2<<16), (Ops.SUB,4<<16), (Ops.MUL,_EW_OP_CVT_BYPASS|1<<2), (Ops.MAX,0),
+  (Ops.FDIV,_EW_OP_CVT_BYPASS|3<<16))}
 def _cmd(target:int, reg:int, value:int=0) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _storage_bits(value:int|float|bool, dtype:DType=dtypes.half) -> int:
   return int.from_bytes(struct.pack(f"<{dtype.fmt}",float(value)),"little") if dtypes.is_float(dtype) else int(value)&((1<<(dtype.itemsize*8))-1)
 
-def _cmac_layout(n:int, k:int) -> tuple[int, int, int]: aligned_k,align_out=max(32,round_up(k,32)),max(32,round_up(n,32)); align_in=max(aligned_k,align_out); return align_in,align_out,align_in if align_in != aligned_k else k  # noqa: E501
+def _cmac_layout(n:int, k:int) -> tuple[int, int, int]:
+  aligned_k = max(32,round_up(k,32))
+  aligned_output = max(32,round_up(n,32))
+  aligned_input = max(aligned_k,aligned_output)
+  return aligned_input,aligned_output,aligned_input if aligned_input != aligned_k else k
 
 # RK3588 accepts wide K when M=1; 4096 covers every compensated mapped path while multi-row K remains CBUF-limited.
 _MAX_CMAC_K=128*32
-def _cmac_shape_supported(m:int, ai:int, ao:int) -> bool: return 0<m<=0x7ff and ai<=_MAX_CMAC_K and ao<=0x3fff and m*ai*2<=10*32768 and ao*ai*2<=11*32768 and (m==1 or ai<=12*32)  # noqa: E501
+def _cmac_shape_supported(m:int, ai:int, ao:int) -> bool:
+  return (0<m<=0x7ff and ai<=_MAX_CMAC_K and ao<=0x3fff and m*ai*2<=10*32768 and
+          ao*ai*2<=11*32768 and (m==1 or ai<=12*32))
 
 def emit_cmac_stage(op:RKCMAC, address:Callable[[RKArg],int]) -> tuple[int, ...]:
   """Emit the 45-qword GEMM body; terminal BS ReLU preserves the runtime-owned four-qword PC tail."""
@@ -306,7 +320,10 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
   D, R, data_format = _DPU, rk, _DPU_DATA_FORMATS[mode]
   output_dtype,input_dtype = (_DPU_PRECISION_DTYPES[(data_format>>shift)&7] for shift in (29,26))
   special,compare,int16_to_int32 = mode != RKEWMode.HALF, mode == RKEWMode.COMPARE, mode == RKEWMode.INT16_TO_INT32
-  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if mode==RKEWMode.INT32 else _EW_ELEMS_32BIT if output_dtype.itemsize==4 or input_dtype.itemsize==4 else _MAX_EW_ELEMS_FP16  # noqa: E501
+  if int16_to_int32: limit = 8
+  elif mode==RKEWMode.INT32: limit = _MAX_EW_ELEMS_FP16//2
+  elif output_dtype.itemsize==4 or input_dtype.itemsize==4: limit = _EW_ELEMS_32BIT
+  else: limit = _MAX_EW_ELEMS_FP16
   if not 0 < count <= limit: raise ValueError(f"{'initialized EW' if special else 'EW fp16'} count {count} out of range")
   lanes, is_div = (4 if input_dtype.itemsize==4 else 8), ew_cfg == _EW_CFG[Ops.FDIV]
   width = (count + lanes-1) // lanes - 1
@@ -336,14 +353,19 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
     (_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,R.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
     (_RDMA,R.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if input_dtype.itemsize==4 else 2)<<2)))
   # The DPU input precision at bits 26..28 feeds both nonoverlapping RDMA precision fields (15..17 and 5..7).
-  rdma_feature = ((data_format>>26)&7)*((1<<15)|(1<<5))|(15<<11)|(0 if is_div or input_dtype in (dtypes.int16,dtypes.float) else 1<<3)|1  # noqa: E501
+  rdma_feature = (((data_format>>26)&7)*((1<<15)|(1<<5)) | (15<<11) |
+                  (0 if is_div or input_dtype in (dtypes.int16,dtypes.float) else 1<<3) | 1)
   return tuple(_cmd(*reg) for reg in regs), rdma_feature
 
 def emit_ew_stage(op:RKEWOp, address:Callable[[RKArg],int], offsets:tuple[int,int]=(0,0)) -> tuple[int, ...]:
   """Build one DPU EW command body without its PC-chain tail."""
   # Tile byte offsets belong to destination/source roles, even when their RKArgs alias.
   commands,feature = _stage_template(op.count,op.ew_cfg,op.mode)
-  return commands+tuple(_cmd(target,reg,address(arg)+offset) for target,reg,arg,offset in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,op.dst,offsets[0]),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,op.lhs,offsets[1]),(_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,op.rhs,offsets[1])))+(_cmd(_RDMA,rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,feature),)  # noqa: E501
+  addresses = ((_DPU,rk.REG_DPU_DST_BASE_ADDR,op.dst,offsets[0]),
+               (_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,op.lhs,offsets[1]),
+               (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,op.rhs,offsets[1]))
+  return commands+tuple(_cmd(target,reg,address(arg)+offset) for target,reg,arg,offset in addresses)+(
+    _cmd(_RDMA,rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,feature),)
 
 def _root_param(u:UOp) -> UOp|None: return root if (root:=u.buf_uop).op is Ops.PARAM else None
 
