@@ -11,7 +11,7 @@ from tinygrad.helpers import Context, Target, strides_for_shape
 from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMAC, RKImage, RKEWMode, RKEWOp,
   RKGather,
   _EW_CFG, _EW_CFG_ABS, _EW_CFG_CEIL, _EW_CFG_FLOOR, _EW_CFG_MIN, _MAX_EW_ELEMS_FP16, _RKIMAGE_U16_MAX,
-  _canonical_half_storage, _finite_int_max_neutrals, _fp32_expr_to_half, _gather_plan,
+  _canonical_half_storage, _expand_math_uops, _fp32_expr_to_half, _gather_plan,
   _lower_uop_program, _reuse_linear_scratch, _unroll_static_reduces, RockchipRenderer, decode_image, emit_cmac_stage, encode_image)
 from tinygrad.runtime import ops_rockchip as rockchip_runtime
 import tinygrad.renderer.rockchip as rockchip_renderer
@@ -759,7 +759,7 @@ def test_plan_finalization_failure_restores_checkpoint(monkeypatch):
 def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatch):
   plan=_seed_transaction_plan()
   before=_transaction_state(plan)
-  output=rockchip_renderer._outs(_program(dtype,lambda _:UOp.const(0,dtype),4))[0]
+  output=rockchip_renderer._outs(_program(dtype,lambda _:UOp.const(0,dtype),4))
   assert output is not None
   def reject(*args):
     target=args[-1]
@@ -773,7 +773,8 @@ def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatc
     return True
   monkeypatch.setattr(rockchip_renderer,"_lower_cmac_reduce",reject)
   monkeypatch.setattr(rockchip_renderer,"_lower_mapped_reduce",final_attempt)
-  assert rockchip_renderer._lower_reduction(output,[],plan) is accepted
+  assert not rockchip_renderer._try(plan,output,(dtypes.half,dtypes.float),rockchip_renderer._lower_cmac_reduce)
+  assert rockchip_renderer._try(plan,output,(dtypes.half,dtypes.int,dtypes.bool),rockchip_renderer._lower_mapped_reduce,[]) is accepted
   assert _transaction_state(plan)==before
 
 
@@ -782,7 +783,7 @@ def test_reduction_alternatives_rollback_independently(dtype,accepted,monkeypatc
 def test_specialized_dispatch_owns_basic_output_admission(dtype,count):
   plan=_seed_transaction_plan()
   before=_transaction_state(plan)
-  output=None if dtype is None else rockchip_renderer._outs(_program(dtype,lambda _:UOp.const(0,dtype),count))[0]
+  output=None if dtype is None else rockchip_renderer._outs(_program(dtype,lambda _:UOp.const(0,dtype),count))
   calls=[]
   def lowerer(received,target):
     assert received is output and target is plan
@@ -796,7 +797,7 @@ def test_specialized_dispatch_owns_basic_output_admission(dtype,count):
 @pytest.mark.parametrize("dtype",(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool))
 def test_empty_output_bypasses_specialized_lowerers(dtype,monkeypatch):
   def forbidden(*_args): raise AssertionError("empty output reached a specialized lowerer")
-  for name in ("_lower_linear_contraction","_lower_reduction","_lower_cmac_storage_epilogue"):
+  for name in ("_lower_cmac_reduce","_lower_mapped_reduce"):
     monkeypatch.setattr(rockchip_renderer,name,forbidden)
   assert _lower_uop_program(_program(dtype,lambda _:UOp.const(0,dtype),0))==RKImage()
 
@@ -804,9 +805,7 @@ def test_empty_output_bypasses_specialized_lowerers(dtype,monkeypatch):
 @pytest.mark.parametrize("operation",("sum","argmax","bitcast","wide_matmul"))
 def test_production_specialized_lowerers_receive_admitted_outputs(operation,monkeypatch,record_property):
   observed=[]
-  domains={"_lower_linear_contraction":(dtypes.float,),"_lower_reduction":(dtypes.half,dtypes.float,dtypes.int,dtypes.bool),
-           "_lower_cmac_storage_epilogue":(dtypes.half,),
-           "_lower_cmac_reduce":(dtypes.half,dtypes.float),"_lower_mapped_reduce":(dtypes.half,dtypes.int,dtypes.bool)}
+  domains={"_lower_cmac_reduce":(dtypes.half,dtypes.float),"_lower_mapped_reduce":(dtypes.half,dtypes.int,dtypes.bool)}
   for name,domain in domains.items():
     original=getattr(rockchip_renderer,name)
     def lowerer(output,*args,_name=name,_domain=domain,_original=original):
@@ -3376,7 +3375,10 @@ def test_multisource_cmac_resource_cap_charges_each_partial_surface(monkeypatch)
   for term in terms[1:]: value = value+term
   monkeypatch.setattr(rockchip_renderer,"_MAX_DYNAMIC_SELECTOR_CELLS",1070)
   uops = _program(dtypes.half,lambda _i:value.cast(dtypes.half),count=1)
-  assert (output:=rockchip_renderer._outs(uops)[1]) is not None and not rockchip_renderer._lower_reduction(output,uops,rockchip_renderer.RKPlan(uops))
+  assert (output:=rockchip_renderer._outs(uops)) is not None
+  plan=rockchip_renderer.RKPlan(uops)
+  assert not rockchip_renderer._try(plan,output,(dtypes.half,dtypes.float),rockchip_renderer._lower_cmac_reduce)
+  assert not plan.program
 
 
 def test_scaled_pure_sum_routes_cmac_weights_but_scaled_dot_stays_generic():
@@ -5151,7 +5153,7 @@ def test_static_structural_expansion_is_bounded():
 def test_deep_generic_graph_canonicalization_is_iterative():
   value = UOp.const(0, dtypes.int)
   for _ in range(4096): value = value + UOp.const(1, dtypes.int)
-  rewritten = _finite_int_max_neutrals(value)
+  rewritten = _expand_math_uops(value)
   assert rewritten.key == value.key
 
 

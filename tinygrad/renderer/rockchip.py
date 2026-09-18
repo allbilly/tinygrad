@@ -1332,8 +1332,6 @@ def _math_late(u:UOp) -> UOp|None:
     if u.op is Ops.WHERE:
       return UOp(Ops.WHERE,dtypes.half,src=(u.src[0],u.src[1].cast(dtypes.half),u.src[2].cast(dtypes.half)),arg=u.arg)
     return u.src[0].cast(dtypes.half).alu(u.op,u.src[1].cast(dtypes.half))
-  if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and len(u.src)==1 and u.src[0].dtype.scalar() is dtypes.half:
-    return u.src[0]
   if u.op is Ops.WHERE and u.dtype.scalar() is dtypes.half and len(u.src)==3:
     if (absolute:=_fold_where_abs(u)) is not None: return absolute
   if u.op not in _DPU_MATH or u.op is Ops.TRUNC and (u.dtype.scalar() is not dtypes.half or _is_static_expr(u)): return None
