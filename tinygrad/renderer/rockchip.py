@@ -2,7 +2,7 @@ from __future__ import annotations
 # ruff: noqa: E702
 import base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
-from typing import Callable, Iterable, Mapping, NamedTuple, TypeVar, cast as typing_cast
+from typing import Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
 from tinygrad.device import Base64Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
 from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
@@ -394,7 +394,6 @@ def _static_ranges(u:UOp) -> tuple[UOp, ...]|None:
 def _is_static_expr(u:UOp) -> bool: return _static_ranges(u) is not None
 
 RKScalar = int|float|bool; RKStatic = RKScalar|tuple[RKScalar,...]
-RKEncoded = TypeVar("RKEncoded")
 
 def _commit_static(dtype:DType, value:RKStatic) -> RKStatic:
   scalar,commit=dtype.scalar(),truncate.get(dtype.scalar(),lambda value:value)
@@ -447,19 +446,19 @@ def _static_blocks(index:UOp|tuple[UOp,...], *roots:UOp, limit:int=_MAX_STATIC_R
     return tuple(value if isinstance(value,tuple) else (value,)*(stop-start) for root in roots for value in (root.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache),))  # noqa: E501
   return (evaluate(start,min(start+block,count)) for start in range(0,count,block))
 
-def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar], RKEncoded], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[RKEncoded, ...]:  # noqa: E501
+def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[RKScalar], int], *, unique:bool=True, minimum:int|None=None, limit:int=_MAX_STATIC_RANGE_ENVS, block:int=4096) -> tuple[int, ...]:  # noqa: E501
   """Place compiler-bound values by destination; validate every candidate before a later write can hide it."""
   integer_values = encode is int and (dtypes.is_int(expr.dtype.scalar()) or dtypes.is_bool(expr.dtype.scalar()))
   affine = typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index)) if integer_values else None
   dense_integer = affine is not None and _affine_output_axes(affine,count) is not None
-  missing=object(); result:list[RKEncoded|object]=[missing]*count
+  result:list[int|None]=[None]*count
   for dst,value in itertools.chain.from_iterable(zip(map(int,dst_lanes),expr_lanes) for dst_lanes,expr_lanes in _static_blocks(out_index,expr,dependencies=not dense_integer,limit=limit,block=block)):  # noqa: E501
     if not 0<=dst<count or minimum is not None and int(value)<minimum: raise _RKGenericReject("static_index")
     encoded=encode(value)
-    if unique and result[dst] is not missing and result[dst]!=encoded: raise _RKGenericReject("static_index")
+    if unique and result[dst] is not None and result[dst]!=encoded: raise _RKGenericReject("static_index")
     result[dst]=encoded
-  if any(value is missing for value in result): raise _RKGenericReject("static_index")
-  return typing_cast(tuple[RKEncoded,...],tuple(result))
+  if any(value is None for value in result): raise _RKGenericReject("static_index")
+  return typing_cast(tuple[int,...],tuple(result))
 
 @functools.lru_cache(maxsize=8192)
 def _linear_index(u:UOp, divided:bool=False, *, opaque:bool=False) -> tuple[int, dict[UOp|tuple[UOp, int, int], int]]|None:
