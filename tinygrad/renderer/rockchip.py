@@ -754,11 +754,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   graph = body.toposort()
   loads = _semantic_loads(body)
   if not 2 <= total <= _MAX_GENERIC_UNROLL: return False
-  oversized_half_sum = (rows > 16 and out.dtype.scalar() is dtypes.half and value.arg[0] is Ops.ADD and total > 416 and
-                        (total*round_up(rows, 8) > _MAX_GENERIC_UNROLL or not (
-                          any(node.op is Ops.WHERE and _is_static_expr(node.src[0]) for node in graph) or
-                          any(len(load.src) > 2 and _is_static_expr(load.src[2]) for load in loads))))
-  if oversized_half_sum or not loads: return False
+  if not loads: return False
   if out.dtype.scalar() in (dtypes.int, dtypes.bool): product = body
   else:
     converted = _optional_rewrite(_fp32_expr_to_half, body)
