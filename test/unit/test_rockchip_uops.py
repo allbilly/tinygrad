@@ -3069,6 +3069,16 @@ def test_static_dot_reduce_owns_accurate_physical_recipe():
   assert _gather_lanes(_output_gathers(image)[0]) == (0, 65) and not _ew_ops(image)
 
 
+def test_broadcast_dot_retains_singleton_cmac_partition():
+  out, lhs, rhs = (UOp.param(slot,dtypes.half,(size,)) for slot,size in enumerate((2048,32,32)))
+  row, column, axis = UOp.range(32,0), UOp.range(64,1), UOp.range(32,2,AxisType.REDUCE)
+  product = lhs.index(axis).load()*rhs.index(axis).load()
+  reduced = UOp(Ops.REDUCE,dtypes.float,src=(product.cast(dtypes.float),axis),arg=(Ops.ADD,0))
+  image = _lower_uop_program(list(out.index(row*64+column).store(reduced.cast(dtypes.half)).end(row,column,axis).sink().toposort()))
+  assert image is not None and _cmac(image) is not None and (_cmac(image).m,_cmac(image).n,_cmac(image).k)==(64,32,32)
+  assert not _ew_ops(image) and decode_image(encode_image(image)) == image
+
+
 def test_vectorized_mul_add_reduction_retains_product_residuals_and_relu():
   groups = 64
   rows = _MAX_EW_ELEMS_FP16+1

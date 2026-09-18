@@ -639,12 +639,14 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   all_axes=frozenset(_static_ranges(out_index) or ())
   out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
   output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()
-  # A separable load supplies its own row axis set; full and empty partitions cover the degenerate orientations.
-  single_axis_partitions={frozenset((axis,)) for axis,_,_ in output_axes}
+  # Aligned contraction ties preserve the first input's orientation.
+  extra_axes=[load_axes[left],load_axes[right]] if rows>_MAX_GENERIC_UNROLL else []
+  partitions=(all_axes,frozenset(),*sorted(
+    (axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+extra_axes) if axes and axes<all_axes),
+    key=lambda axes: bool(groups%32==0 and axes!=load_axes[left])))
   candidates=[]
-  for axes in dict.fromkeys((all_axes,frozenset(),load_axes[left],load_axes[right])):
-    if axes not in (all_axes,frozenset()) and (not axes<all_axes or rows<=_MAX_GENERIC_UNROLL and axes not in single_axis_partitions): continue
-    m=rows if axes==all_axes else math.prod(limit for axis,_,limit in output_axes if axis in axes)
+  for index,axes in enumerate(partitions):
+    m=rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes)
     n=rows//m
     ai,ao,_=_cmac_layout(n,groups)
     # Each factor may vary along only one side of the contraction.
@@ -678,9 +680,8 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
     assert source is not None
     address=input_load.src[0].src[1].substitute(mapping).cast(dtypes.weakint)
     mask=input_load.src[2].substitute(mapping) if len(input_load.src)>2 else UOp.const(True,dtypes.bool)
-    gate=(k<groups)&(point<n if side else UOp.const(True,dtypes.bool))&mask
+    gate=((k<groups)&(point<n if side else UOp.const(True,dtypes.bool))&mask).simplify()
     selected=gate.where(address,zero).simplify()
-    gate=gate.simplify()
     typed_load=(source.index(selected).load() if gate.op is Ops.CONST and gate.arg else
                 source.index(selected).load(UOp.const(0,dtypes.half),gate))
     gathers.append(_typed_load_plan(typed_load,dtypes.half,destination,count)._replace(dst=slots[side]))
@@ -748,8 +749,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   extents = tuple(int(axis.src[0].arg) for axis in ranges)
   total = math.prod(extents)
   loads = _semantic_loads(body)
-  if not 2 <= total <= _MAX_GENERIC_UNROLL: return False
-  if not loads: return False
+  if not loads or not 2 <= total <= _MAX_GENERIC_UNROLL: return False
   if out.dtype.scalar() in (dtypes.int, dtypes.bool): product = body
   else:
     converted = _optional_rewrite(_fp32_expr_to_half, body)
@@ -1424,8 +1424,7 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   if not ((affine:=typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(output[3]))) is not None and affine[0] == 0 and
           set(affine[1]) == set(_static_ranges(output[3]) or ()) and _affine_output_axes(affine, output[2]) is not None) and \
      _static_values(output[3], output[3], output[2], int) != tuple(range(output[2])): return False
-  root=output[4]
-  if Ops.REDUCE in (u.op for u in uops): root=_unroll_static_reduces(root)
+  root=_unroll_static_reduces(output[4]) if Ops.REDUCE in (u.op for u in uops) else output[4]
   if len(root.toposort()) <= 256:
     root=_expand_math_uops(root)
   if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject(f"expanded nodes {len(n)}")
