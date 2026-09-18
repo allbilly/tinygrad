@@ -507,20 +507,42 @@ def _affine_output_axes(affine:tuple[int, dict[UOp, int]], count:int) -> tuple[t
   return tuple((r,abs(stride),limit) for (r,stride),limit in zip(ordered,limits))
 
 def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
-  if gate is None and (out_affine:=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))) is not None and out_affine[0]==0 and _affine_output_axes(out_affine,count) is not None and (linear:=typing_cast(tuple[int,dict[tuple[UOp,int,int],int]]|None,_linear_index(load_index,True))) is not None and all(axis in out_affine[1] for axis,_,_ in linear[1]):  # noqa: E501
-    axes=tuple((out_affine[1][axis]*divisor,min(ceildiv(int(axis.src[0].arg),divisor),period) if period else ceildiv(int(axis.src[0].arg),divisor),stride,axis) for (axis,divisor,period),stride in sorted(linear[1].items(),key=lambda item:out_affine[1][item[0][0]]*item[0][1]) if stride)  # noqa: E501
-    # Every period must reset with its logical RANGE; a ragged final range may end partway through a period.
-    if all((bound:=int(axis.src[0].arg))*out_affine[1][axis]%(step*limit)==0 or bound*out_affine[1][axis]==count for step,limit,_,axis in axes): return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,linear[0],tuple((step,limit,stride) for step,limit,stride,_ in axes),fill_bits=fill_bits)  # noqa: E501
-  return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=_gather_offsets(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
+  source, destination = RKArg(RKBufferKind.ARG, src_index), RKArg(RKBufferKind.SCRATCH, dst_index)
+  if gate is None:
+    out_affine = typing_cast(tuple[int, dict[UOp, int]]|None, _linear_index(out_index))
+    if out_affine is not None and out_affine[0] == 0 and _affine_output_axes(out_affine, count) is not None:
+      linear = typing_cast(tuple[int, dict[tuple[UOp, int, int], int]]|None, _linear_index(load_index, True))
+      if linear is not None and all(axis in out_affine[1] for axis, _, _ in linear[1]):
+        terms = sorted(linear[1].items(), key=lambda item:out_affine[1][item[0][0]] * item[0][1])
+        axes = []
+        for (axis, divisor, period), stride in terms:
+          if not stride: continue
+          step = out_affine[1][axis] * divisor
+          limit = ceildiv(int(axis.src[0].arg), divisor)
+          axes.append((step, min(limit, period) if period else limit, stride, axis))
+        # Every period must reset with its logical RANGE; a ragged final range may end partway through a period.
+        if all((bound := int(axis.src[0].arg)) * out_affine[1][axis] % (step * limit) == 0 or
+               bound * out_affine[1][axis] == count for step, limit, _, axis in axes):
+          return RKGather(source, destination, count, linear[0], tuple((step, limit, stride) for step, limit, stride, _ in axes),
+                          fill_bits=fill_bits)
+  return RKGather(source, destination, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
 def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None) -> RKGather|None:
   """Validate a typed source and return its physical affine or exact-offset gather."""
-  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX or len(load.src)>1 and load.src[1].op is not Ops.CONST and fill_bits is None: return None  # noqa: E501
-  if (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST: return None
-  gate,fill_bits=load.src[2] if len(load.src)>2 else None,fill_bits if fill_bits is not None else _storage_bits(load.src[1].arg if len(load.src)>1 else 0) if dtype is dtypes.half else 0  # noqa: E501
+  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX: return None
+  if len(load.src) > 1 and load.src[1].op is not Ops.CONST and fill_bits is None: return None
+  if (param := _root_param(load.src[0])) is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST:
+    return None
+  gate = load.src[2] if len(load.src) > 2 else None
+  if fill_bits is None: fill_bits = _storage_bits(load.src[1].arg if len(load.src) > 1 else 0) if dtype is dtypes.half else 0
   try:
-    gather=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits)
-    if (bounds:=(min(gather.offsets,default=0),max(gather.offsets,default=-1)) if gather.offsets else tuple(gather.base+sum(fn((limit-1)*stride,0) for _,limit,stride in gather.axes) for fn in (min,max)))[0] < (0 if not gather.offsets else -1) or bounds[1] >= int(param.src[0].arg): raise _RKGenericReject("gather_index")  # noqa: E501
+    gather = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, count, fill_bits)
+    if gather.offsets:
+      low, high = min(gather.offsets, default=0), max(gather.offsets, default=-1)
+    else:
+      low = gather.base + sum(min((limit - 1) * stride, 0) for _, limit, stride in gather.axes)
+      high = gather.base + sum(max((limit - 1) * stride, 0) for _, limit, stride in gather.axes)
+    if low < (-1 if gather.offsets else 0) or high >= int(param.src[0].arg): raise _RKGenericReject("gather_index")
     return gather
   except _RKGenericReject: return None
 
