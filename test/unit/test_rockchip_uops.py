@@ -4119,9 +4119,10 @@ def test_typed_load_bounds_reject_out_of_range_but_keep_offset_sentinel():
       def typed(index:UOp, gate:UOp|None=None):
         load=source.index(index).load() if gate is None else source.index(index).load(default,gate)
         return rockchip_renderer._typed_load_plan(load,dtype,lane,count)
-      assert typed(lane-1) is None and typed(lane+1) is None
+      with pytest.raises(rockchip_renderer._RKGenericReject): typed(lane-1)
+      with pytest.raises(rockchip_renderer._RKGenericReject): typed(lane+1)
       assert typed(lane) is not None and (sentinel:=typed(lane-1,lane>0)) is not None and sentinel.offsets==(-1,*range(count-1))
-      assert typed((lane!=0).where(0,-2)) is None
+      with pytest.raises(rockchip_renderer._RKGenericReject): typed((lane!=0).where(0,-2))
       if dtype is not dtypes.bool:
         assert _lower_uop_program(_dynamic_load_program(count=count, dtype=dtype, normalized=True)) is not None
 

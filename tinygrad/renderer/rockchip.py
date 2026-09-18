@@ -528,20 +528,18 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
                           fill_bits=fill_bits)
   return RKGather(source, destination, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
-def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None) -> RKGather|None:
-  """Validate a typed source and return its physical affine or exact-offset gather."""
-  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX: return None
-  if len(load.src) > 1 and load.src[1].op is not Ops.CONST and fill_bits is None: return None
+def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None) -> RKGather:
+  """Validate a typed source and return its gather, rejecting unsupported physical addresses."""
+  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX: raise _RKGenericReject
+  if len(load.src) > 1 and load.src[1].op is not Ops.CONST and fill_bits is None: raise _RKGenericReject
   if (param := _root_param(load.src[0])) is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST:
-    return None
+    raise _RKGenericReject
   gate = load.src[2] if len(load.src) > 2 else None
   if fill_bits is None: fill_bits = _storage_bits(load.src[1].arg if len(load.src) > 1 else 0) if dtype is dtypes.half else 0
-  try:
-    gather = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, count, fill_bits)
-    low, high = gather.source_bounds()
-    if low < (-1 if gather.offsets else 0) or high >= int(param.src[0].arg): raise _RKGenericReject("gather_index")
-    return gather
-  except _RKGenericReject: return None
+  gather = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, count, fill_bits)
+  low, high = gather.source_bounds()
+  if low < (-1 if gather.offsets else 0) or high >= int(param.src[0].arg): raise _RKGenericReject("gather_index")
+  return gather
 
 def _relu_operand(u:UOp) -> UOp|None:
   if (folded:=_pm_ordered_where.rewrite(u)) is not None: u=folded
@@ -689,8 +687,7 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
     gate=gate.simplify()
     typed_load=(source.index(selected).load() if gate.op is Ops.CONST and gate.arg else
                 source.index(selected).load(UOp.const(0,dtypes.half),gate))
-    if (load_plan:=_typed_load_plan(typed_load,dtypes.half,destination,count)) is None: return False
-    gathers.append(load_plan._replace(dst=slots[side]))
+    gathers.append(_typed_load_plan(typed_load,dtypes.half,destination,count)._replace(dst=slots[side]))
   if sum(gather.count for gather in gathers)+rows>_MAX_DYNAMIC_SELECTOR_CELLS: return False
   cmac=RKCMAC(slots[2],slots[0],slots[1],m,n,groups,out.dtype.scalar() is dtypes.half,relu_root is not None)
   # Compose in weak integer arithmetic so shared symbolic rules retain the periodic physical address map.
@@ -1042,7 +1039,7 @@ class RKContext:
       gather=RKGather(RKArg(RKBufferKind.ARG,param.arg.slot),RKArg(RKBufferKind.SCRATCH,0),self.count,fill_bits=fill_bits,
         itemsize=dtype.itemsize,index=address.arg,index_itemsize=address.dtype.itemsize)
     else:
-      if (plan:=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=fill_bits)) is None: raise _RKGenericReject
+      plan=_typed_load_plan(u,dtype,self.out_index,self.count,fill_bits=fill_bits)
       if dtype not in (dtypes.float,dtypes.bool) and gate is None and index.key == self.out_index.key and int(param.src[0].arg) == self.count:
         return self._carrier(RKArg(RKBufferKind.ARG,param.arg.slot),layout)
       gather=plan._replace(itemsize=dtype.itemsize,dst_stride=2 if dtype is dtypes.bool else 1,
