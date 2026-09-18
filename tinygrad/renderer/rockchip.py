@@ -1157,22 +1157,37 @@ class RKContext:
 
   def _compare(self, u:UOp) -> UOp:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src):
-      expression=next((v for v,m in (u.src,u.src[::-1]) if u.op is Ops.CMPNE and m.op is Ops.CONST and bool(m.arg) and m.dtype.scalar() is dtypes.bool),None); sources=tuple(_half_backed_value(src) for src in expression.src) if expression is not None and expression.op is Ops.CMPLT else ()  # noqa: E501,E702
+      expression = next((value for value,mask in (u.src,u.src[::-1])
+                         if u.op is Ops.CMPNE and mask.op is Ops.CONST and bool(mask.arg) and mask.dtype.scalar() is dtypes.bool), None)
+      sources = tuple(_half_backed_value(src) for src in expression.src) if expression is not None and expression.op is Ops.CMPLT else ()
       if sources and all(src is not None for src in sources):
-        less=self.lower(typing_cast(UOp,expression)); unordered=tuple(self._fp16_order(self._operand(src,dtypes.half))[1] for src in typing_cast(tuple[UOp,UOp],sources)); one=less.const_like(1)  # noqa: E501
-        return self._lower_recipe(u,one.alu(Ops.SUB,less).alu(Ops.MUL,one.alu(Ops.SUB,unordered[0].alu(Ops.MAX,unordered[1]))))
-      lhs,rhs=(self.lower(src) for src in u.src); op=Ops.AND if u.op is Ops.MUL else Ops.OR if u.op is Ops.MAX else u.op
-      complement=next((other for source,other in zip(u.src,(rhs,lhs)) if op in (Ops.XOR,Ops.CMPNE) and source.op is Ops.CONST and bool(source.arg)),None)  # noqa: E501
-      result=lhs.const_like(1).alu(Ops.SUB,complement) if complement is not None else lhs.alu(Ops.MUL if op is Ops.AND else Ops.MAX,rhs) if op in (Ops.AND,Ops.OR) else _i16_compare(op,lhs,rhs)  # noqa: E501
+        less = self.lower(typing_cast(UOp, expression))
+        unordered = tuple(self._fp16_order(self._operand(src,dtypes.half))[1] for src in typing_cast(tuple[UOp,UOp],sources))
+        one = less.const_like(1)
+        return self._lower_recipe(u, one.alu(Ops.SUB,less).alu(Ops.MUL,one.alu(Ops.SUB,unordered[0].alu(Ops.MAX,unordered[1]))))
+      lhs,rhs = (self.lower(src) for src in u.src)
+      op = Ops.AND if u.op is Ops.MUL else Ops.OR if u.op is Ops.MAX else u.op
+      complement = next((other for source,other in zip(u.src,(rhs,lhs))
+                         if op in (Ops.XOR,Ops.CMPNE) and source.op is Ops.CONST and bool(source.arg)), None)
+      if complement is not None: result = lhs.const_like(1).alu(Ops.SUB,complement)
+      elif op in (Ops.AND,Ops.OR): result = lhs.alu(Ops.MUL if op is Ops.AND else Ops.MAX,rhs)
+      else: result = _i16_compare(op,lhs,rhs)
       return self._lower_recipe(u,result)
     if (pair:=_const_operand(u,Ops.CMPNE,0.0)) is not None and (u is self.root or any(src.op is Ops.INDEX for src in u.src)):
       source=pair[0] if pair[0].op is Ops.LOAD else pair[0].load()
       if source.dtype.scalar() is dtypes.half and source.src[0].op is Ops.INDEX: return self._cast(u.replace(op=Ops.CAST,src=(source,)))
-    if (integer16:=all(src.dtype.scalar() is dtypes.int16 for src in u.src)) or all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src):  # noqa: E501
-      if not integer16 and self.int_layout is dtypes.int16 and (half_sources:=tuple(_int_info(src)[1] for src in u.src)) and all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))  # noqa: E501
+    integer16 = all(src.dtype.scalar() is dtypes.int16 for src in u.src)
+    integer32 = all(src.dtype.scalar() is dtypes.int or src.op is Ops.CONST and src.dtype.scalar() is dtypes.weakint for src in u.src)
+    if integer16 or integer32:
+      if not integer16 and self.int_layout is dtypes.int16:
+        half_sources = tuple(_int_info(src)[1] for src in u.src)
+        if all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))
       values=tuple(self._operand(src,dtypes.int16 if integer16 else dtypes.int) for src in u.src)
       if values[0].dtype is dtypes.int16: return self._lower_recipe(u,_i16_compare(u.op,*values))
-      components=tuple(tuple(self._slot(RKGather(source.arg,RKArg(RKBufferKind.SCRATCH,0),self.count,base=word,axes=((1,self.count,2),)),dtypes.int16) for word in (0,1)) for source in (self._emit(self._scratch(dtypes.int),value,value,_EW_CFG[Ops.MAX]) for value in values))  # noqa: E501
+      copies = (self._emit(self._scratch(dtypes.int),value,value,_EW_CFG[Ops.MAX]) for value in values)
+      components = tuple(tuple(self._slot(
+        RKGather(source.arg,RKArg(RKBufferKind.SCRATCH,0),self.count,base=word,axes=((1,self.count,2),)),dtypes.int16)
+        for word in (0,1)) for source in copies)
     else:
       half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
@@ -1181,8 +1196,11 @@ class RKContext:
         if source.op is not Ops.MAX or source.arg is not None or len(source.src)!=2: return self._fp16_order(self._operand(source,dtypes.half))
         parts=tuple(self._fp16_order(self._operand(src,dtypes.half)) for src in source.src)
         return tuple(left.alu(Ops.MAX,right) for left,right in zip(*parts))
-      classified=tuple(self._fp16_order(self._operand(src,dtypes.half)) if u.op is Ops.CMPLT else classify(src) for src in typing_cast(tuple[UOp,UOp],half_sources))  # noqa: E501
-      result=_i16_compare(Ops.CMPEQ if u.op is Ops.CMPNE else u.op,classified[0][0],classified[1][0]); result=result.alu(Ops.MUL,result.const_like(1).alu(Ops.SUB,classified[0][1].alu(Ops.MAX,classified[1][1])))  # noqa: E501
+      classified = tuple(self._fp16_order(self._operand(src,dtypes.half)) if u.op is Ops.CMPLT else classify(src)
+                         for src in typing_cast(tuple[UOp,UOp],half_sources))
+      result = _i16_compare(Ops.CMPEQ if u.op is Ops.CMPNE else u.op,classified[0][0],classified[1][0])
+      unordered = classified[0][1].alu(Ops.MAX,classified[1][1])
+      result = result.alu(Ops.MUL,result.const_like(1).alu(Ops.SUB,unordered))
       return self.lower(result.const_like(1).alu(Ops.SUB,result) if u.op is Ops.CMPNE else result)
     return self.lower(_compare_int32_words(u.op,*components))
 

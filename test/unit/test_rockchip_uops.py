@@ -4033,7 +4033,9 @@ def test_int32_selector_images_preserve_full_width_values_and_bounds():
   gate=UOp(Ops.AND,dtypes.bool,src=(upper,nonnegative))
   selected=gate.where(loaded*10+lane.cast(dtypes.int),loaded.const_like(0))
   lookup=_lower_uop_program(list(out.index(lane).store(selected).end(lane).sink().toposort()))
-  assert lookup is not None and _ew_ops(lookup)[-1].mode is RKEWMode.INT16_TO_INT32
+  # The full-width result can leave through a raw gather rather than a final widening EW stage.
+  assert lookup is not None and any(op.mode is RKEWMode.INT32 for op in _ew_ops(lookup))
+  assert sum(gather.itemsize for gather in _output_gathers(lookup)) == 4
   values=np.asarray((-2**31,-1,0,1,3,4,2**31-1,2),dtype="<i4")
   np.testing.assert_array_equal(np.frombuffer(_execute_raw_dynamic_image(lookup,count*4,values.tobytes()),dtype="<i4"),
                                 np.asarray((0,0,2,13,34,0,0,27),dtype="<i4"))
