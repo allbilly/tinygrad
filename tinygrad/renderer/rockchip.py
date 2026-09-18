@@ -612,11 +612,10 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   bounds=tuple(int(axis.src[0].arg) for axis in ranges)
   groups=math.prod(bounds)
   if not 1<=groups<=_MAX_CMAC_K: return False
-  if len(factors)!=2 or any(node.op is not Ops.LOAD for node in factors): return False
+  if len(factors)!=2: return False
   left,right=factors
   for load in (left,right):
-    if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX:
-      return False
+    if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX: return False
     if _root_param(load.src[0]) is None: return False
     if len(load.src)>1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg)!=0.0 or
                             math.copysign(1.0,float(load.src[1].arg))<0.0): return False
