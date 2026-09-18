@@ -1482,15 +1482,38 @@ def _dpu_trunc(source:UOp) -> UOp:
 
 def _fold_quadratic(root:UOp) -> UOp|None:
   """Scale sqrt(x*x +/- 1), and stabilize its canonical natural-log envelope."""
-  logarithm=next((logarithm for logarithm,scale in ((root.src,root.src[::-1]) if root.op is Ops.MUL and len(root.src)==2 else ()) if scale.op is Ops.CONST and abs(float(scale.arg)-math.log(2))<1e-12 and logarithm.op is Ops.LOG2 and len(logarithm.src)==1 and logarithm.src[0].op is Ops.ADD),None)  # noqa: E501
-  radical=root if root.op is Ops.SQRT and len(root.src)==1 else next((term for term in logarithm.src[0].src if term.op is Ops.SQRT and len(term.src)==1),None) if logarithm is not None else None  # noqa: E501
-  if (matched:=next(((square.src[0],float(offset.arg)) for square,offset in ((radical.src[0].src,radical.src[0].src[::-1]) if radical is not None and radical.src[0].op is Ops.ADD else ()) if square.op is Ops.MUL and len(square.src)==2 and square.src[0].key==square.src[1].key and offset.op is Ops.CONST and float(offset.arg) in (-1.0,1.0) and (logarithm is None or any(term is not radical and term.key==square.src[0].key for term in logarithm.src[0].src))),None)) is None: return None  # noqa: E501
-  source,offset=matched; source=source.cast(dtypes.half); magnitude=UOp(Ops.MAX,dtypes.half,src=(source,source),arg=_NATIVE_ABS)
-  scale=_native_max(magnitude,_half(65504.0)).alu(Ops.MAX,_half(1.0)); ratio=source.alu(Ops.FDIV,scale)
+  logarithm=None
+  if root.op is Ops.MUL and len(root.src)==2:
+    for candidate,scale in (root.src,root.src[::-1]):
+      if (scale.op is Ops.CONST and abs(float(scale.arg)-math.log(2))<1e-12 and
+          candidate.op is Ops.LOG2 and len(candidate.src)==1 and candidate.src[0].op is Ops.ADD):
+        logarithm=candidate
+        break
+  radical=root if root.op is Ops.SQRT and len(root.src)==1 else next(
+    (term for term in logarithm.src[0].src if term.op is Ops.SQRT and len(term.src)==1),None) if logarithm is not None else None
+  if radical is None or radical.src[0].op is not Ops.ADD: return None
+  matched=None
+  for square,constant in (radical.src[0].src,radical.src[0].src[::-1]):
+    if (square.op is Ops.MUL and len(square.src)==2 and square.src[0].key==square.src[1].key and
+        constant.op is Ops.CONST and float(constant.arg) in (-1.0,1.0) and
+        (logarithm is None or any(term is not radical and term.key==square.src[0].key for term in logarithm.src[0].src))):
+      matched=(square.src[0],float(constant.arg))
+      break
+  if matched is None: return None
+  source,offset=matched
+  source=source.cast(dtypes.half)
+  magnitude=UOp(Ops.MAX,dtypes.half,src=(source,source),arg=_NATIVE_ABS)
+  scale=_native_max(magnitude,_half(65504.0)).alu(Ops.MAX,_half(1.0))
+  ratio=source.alu(Ops.FDIV,scale)
   scaled=scale.alu(Ops.MUL,ratio.alu(Ops.MUL,ratio).alu(Ops.ADD,_half(offset).alu(Ops.FDIV,scale.alu(Ops.MUL,scale))).sqrt())
   if logarithm is None: return scaled
-  result=(magnitude if offset==1 else source).alu(Ops.ADD,scaled).log2().alu(Ops.MUL,_half(math.log(2)))
-  return result.alu(Ops.MUL,source.alu(Ops.FDIV,magnitude.alu(Ops.MAX,_half(2**-24)))) if offset==1 else result.alu(Ops.ADD,(valid:=_half(1).alu(Ops.SUB,_finite_positive_mask(_half(1).alu(Ops.SUB,source)))).alu(Ops.FDIV,valid).alu(Ops.SUB,_half(1)))  # noqa: E501
+  leading=magnitude if offset==1 else source
+  result=leading.alu(Ops.ADD,scaled).log2().alu(Ops.MUL,_half(math.log(2)))
+  if offset==1:
+    correction=source.alu(Ops.FDIV,magnitude.alu(Ops.MAX,_half(2**-24)))
+    return result.alu(Ops.MUL,correction)
+  valid=_half(1).alu(Ops.SUB,_finite_positive_mask(_half(1).alu(Ops.SUB,source)))
+  return result.alu(Ops.ADD,valid.alu(Ops.FDIV,valid).alu(Ops.SUB,_half(1)))
 def _dpu_sqrt(source:UOp) -> UOp:
   """Approximate FP16 sqrt with range-independent Babylonian iterations on DPU EW."""
   source, zero, one = source.cast(dtypes.half), _half(0.0), _half(1.0); finite = UOp(Ops.MAX, source.dtype, src=(source.alu(Ops.MAX, zero), UOp.const(65504.0, dtypes.half)), arg=_NATIVE_MIN)  # noqa: E501
