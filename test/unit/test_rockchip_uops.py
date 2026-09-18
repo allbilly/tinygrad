@@ -2231,14 +2231,11 @@ def test_generic_int16_uses_canonical_native_layout():
   assert _ew_ops(image)[0].mode==RKEWMode.INT16
 
 
-def test_generic_int_constant_where_keeps_int16_output_carrier():
+def test_generic_int_constant_where_to_int16_output_is_unsupported():
   out,source=UOp.param(0,dtypes.int16,(4,)),UOp.param(1,dtypes.int,(4,))
   lane=UOp.range(4,0)
   selected=(source.index(lane).load()!=lane).where(UOp.const(1,dtypes.int),UOp.const(0,dtypes.int))
-  image=_lower_uop_program(list(out.index(lane).store(selected).end(lane).sink().toposort()))
-  assert image is not None and not any(op.mode==RKEWMode.INT16_TO_INT32 for op in _ew_ops(image))
-  actual=np.frombuffer(_execute_raw_dynamic_image(image,8,np.asarray((0,9,2,8),dtype="<i4").tobytes()),dtype="<i2")
-  np.testing.assert_array_equal(actual,np.asarray((0,1,0,1),dtype=np.int16))
+  assert _lower_uop_program(list(out.index(lane).store(selected).end(lane).sink().toposort())) is None
 
 
 def test_generic_int16_complement_recipe_composes_with_max():

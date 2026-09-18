@@ -1230,9 +1230,7 @@ class RKContext:
 
   def _raw_where(self, u:UOp) -> UOp:
     """Select raw INT16 words with a canonical mask, preserving nonfinite arms without floating arithmetic."""
-    narrow = (u is self.root and u.dtype.scalar() is dtypes.int and
-              all(arm.op is Ops.CONST and -32768 <= int(arm.arg) <= 32767 for arm in u.src[1:]))
-    yes,no=(self._constant(src,dtypes.int16) if narrow else self.lower(src) for src in u.src[1:])
+    yes,no=(self.lower(src) for src in u.src[1:])
     selector = self.lower(u.src[0])
     if yes.dtype is not no.dtype: raise _RKGenericReject("selection carrier")
     count = self.count*yes.dtype.itemsize//2
