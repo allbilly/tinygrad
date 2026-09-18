@@ -25,7 +25,7 @@ def _regular_gather_payload(gather:RKGather, src:MMIOInterface) -> array.array|N
   axes,code=tuple(sorted(gather.axes)),_RAW_FORMATS[gather.itemsize]
   if not axes or any(divisor<=0 or limit<=0 or stride==0 for divisor,limit,stride in axes): return None
   periods=tuple(divisor*limit for divisor,limit,_ in axes)
-  low,high=(gather.base+sum(fn((limit-1)*stride,0) for _,limit,stride in axes) for fn in (min,max))
+  low,high=gather.source_bounds()
   if gather.count%periods[-1] or any(divisor%period for period,(divisor,_,_) in zip(periods,axes[1:])) or \
      low<0 or high>=len(src): return None
   def block(index:int, base:int) -> bytes|bytearray:

@@ -58,6 +58,10 @@ class RKGather(NamedTuple):
   index: RKArg|None = None  # type: ignore[assignment]
   index_itemsize: int = 4
 
+  def source_bounds(self) -> tuple[int, int]:
+    if self.offsets: return min(self.offsets), max(self.offsets)
+    return typing_cast(tuple[int, int], tuple(self.base + sum(fn((limit - 1) * stride, 0) for _, limit, stride in self.axes) for fn in (min, max)))
+
 class RKEWOp(NamedTuple):
   """One contiguous DPU elementwise operation."""
   dst: RKArg
@@ -534,11 +538,7 @@ def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bi
   if fill_bits is None: fill_bits = _storage_bits(load.src[1].arg if len(load.src) > 1 else 0) if dtype is dtypes.half else 0
   try:
     gather = _gather_plan(param.arg.slot, 0, out_index, load.src[0].src[1], gate, count, fill_bits)
-    if gather.offsets:
-      low, high = min(gather.offsets, default=0), max(gather.offsets, default=-1)
-    else:
-      low = gather.base + sum(min((limit - 1) * stride, 0) for _, limit, stride in gather.axes)
-      high = gather.base + sum(max((limit - 1) * stride, 0) for _, limit, stride in gather.axes)
+    low, high = gather.source_bounds()
     if low < (-1 if gather.offsets else 0) or high >= int(param.src[0].arg): raise _RKGenericReject("gather_index")
     return gather
   except _RKGenericReject: return None
