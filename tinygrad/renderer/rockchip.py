@@ -613,26 +613,20 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   groups=math.prod(bounds)
   if not 1<=groups<=_MAX_CMAC_K: return False
   if len(factors)!=2 or any(node.op is not Ops.LOAD for node in factors): return False
-  loads=factors
-  for load in loads:
+  left,right=factors
+  for load in (left,right):
     if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or not load.src or load.src[0].op is not Ops.INDEX:
       return False
     if _root_param(load.src[0]) is None: return False
     if len(load.src)>1 and (load.src[1].op is not Ops.CONST or float(load.src[1].arg)!=0.0 or
                             math.copysign(1.0,float(load.src[1].arg))<0.0): return False
-  left,right=loads
   load_axes={load:frozenset((*(_static_ranges(load.src[0].src[1]) or ()),
-                            *(() if len(load.src)<3 else (_static_ranges(load.src[2]) or ())))) - frozenset(ranges) for load in loads}
+                            *(() if len(load.src)<3 else (_static_ranges(load.src[2]) or ())))) - frozenset(ranges) for load in (left,right)}
   all_axes=frozenset(_static_ranges(out_index) or ())
-  def align(row_axes:frozenset[UOp]) -> tuple[UOp,UOp]|None:
-    # Each factor may vary along only one side of the contraction.
-    for lhs,rhs in ((left,right),(right,left)):
-      if load_axes[lhs]<=row_axes and load_axes[rhs]<=all_axes-row_axes: return lhs,rhs
-    return None
   out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
   output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()
   # Keep the existing candidate set; aligned contraction ties preserve the first input's orientation.
-  extra_axes=[load_axes[load] for load in loads] if rows>_MAX_GENERIC_UNROLL else []
+  extra_axes=[load_axes[left],load_axes[right]] if rows>_MAX_GENERIC_UNROLL else []
   partitions=(all_axes,frozenset(),*sorted(
     (axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+extra_axes) if axes and axes<all_axes),
     key=lambda axes: bool(groups%32==0 and axes!=load_axes[left])))
@@ -641,7 +635,10 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
     m=rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes)
     n=rows//m
     ai,ao,_=_cmac_layout(n,groups)
-    if _cmac_shape_supported(m,ai,ao) and (aligned:=align(axes)) is not None: candidates.append((m,n,axes,aligned,ai,ao))
+    # Each factor may vary along only one side of the contraction.
+    aligned=next(((lhs,rhs) for lhs,rhs in ((left,right),(right,left))
+                  if load_axes[lhs]<=axes and load_axes[rhs]<=all_axes-axes),None)
+    if _cmac_shape_supported(m,ai,ao) and aligned is not None: candidates.append((m,n,axes,aligned,ai,ao))
   # Nonseparable reductions continue through the mapped or generic NPU lowering path.
   if not candidates: return False
   m,n,row_axes,shape_term,ai,ao=min(candidates,key=lambda shape:(
