@@ -938,10 +938,11 @@ def _canonical_half_storage(source:UOp) -> UOp:
   # without their markers; never compensate those instructions a second time.
   return _tag_precise_adds(converted if len(graph:=source.toposort()) > 64 else graph_rewrite(graph_rewrite(converted,_pm_half_storage_algebra+sym,name="rockchip half storage algebra"),pm_commit_weak,name="rockchip commit storage constants"),tuple(node for node in graph if node.dtype.scalar() is dtypes.half))  # noqa: E501
 
-def _accurate_add_recipe(u:UOp, pure:bool=False) -> UOp|None:
+def _accurate_add_recipe(u:UOp) -> UOp|None:
   # Convert only this sum's FLOAT terms; a HALF cast is an opaque rounding boundary.
   terms=[_fp32_expr_to_half(term) if term.dtype.scalar() is dtypes.float else term for term in u.split_uop(Ops.ADD,lambda node:node.arg is None)]
-  if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2 or any(any(node.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN) for node in term.toposort()) for term in terms) or pure and any(not (term.op is Ops.MUL and term.dtype.scalar() is dtypes.half or term.op is Ops.CONST and float(term.arg) == 0.0) for term in terms): return None  # noqa: E501
+  if sum(term.op is Ops.MUL and term.arg is None for term in terms) < 2 or any(
+    any(node.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN) for node in term.toposort()) for term in terms): return None
   return _precise_mul_sum([term for term in terms if term.op is not Ops.CONST or float(term.arg) != 0.0])
 
 _FIXED_LAYOUTS = {dtypes.half:dtypes.half, dtypes.float:dtypes.half, dtypes.int16:dtypes.int16, dtypes.uchar:dtypes.int16, dtypes.bool:dtypes.int16, dtypes.uint:dtypes.int}  # noqa: E501
@@ -1419,8 +1420,6 @@ def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, 
   if Ops.REDUCE in (u.op for u in uops): root=_unroll_static_reduces(root)
   if len(root.toposort()) <= 256:
     root=_expand_math_uops(root)
-  elif (base:=_strip_cast(root)).dtype.scalar() is dtypes.half:
-    if (recipe:=_accurate_add_recipe(base,pure=True)) is not None: root=recipe
   if len(n:=root.toposort()) > _MAX_GENERIC_EXPANDED_NODES: raise _RKGenericReject(f"expanded nodes {len(n)}")
   # Rebuild the STORE only after all root rewrites, keeping the physical context's output consistent.
   RKContext((output[0].replace(src=(output[0].src[0],root)),*output[1:4],root),plan).finish(materialize)
