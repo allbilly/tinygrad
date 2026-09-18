@@ -756,7 +756,6 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   body = body.substitute({node:node.load() for node in graph if node.op is Ops.INDEX and node not in loaded_indices}, walk=True)
   extents = tuple(int(axis.src[0].arg) for axis in ranges)
   total = math.prod(extents)
-  graph = body.toposort()
   loads = _semantic_loads(body)
   if not 2 <= total <= _MAX_GENERIC_UNROLL: return False
   if not loads: return False
