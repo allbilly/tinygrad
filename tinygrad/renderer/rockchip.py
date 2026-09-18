@@ -904,10 +904,8 @@ def _int_info(u:UOp) -> tuple[tuple[int, int]|None, UOp|None]:
   # Only operations with conservative UOp intervals may choose a narrower physical integer carrier.
   valid = dtype in (dtypes.int, dtypes.weakint) and (
     _is_static_expr(u) or u.op in (Ops.CAST, Ops.WHERE, Ops.XOR, Ops.CMOD, Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX))
-  bounds = None
-  if valid:
-    low, high = int(u.vmin), int(u.vmax)
-    if dtype.min <= low <= high <= dtype.max: bounds = (0, max(0, high)) if u.op is Ops.RANGE else (low, high)
+  bounds = (int(u.vmin), int(u.vmax)) if valid else None
+  if bounds is not None and not dtype.min <= bounds[0] <= bounds[1] <= dtype.max: bounds = None
   if u.op is Ops.CONST: recipe=UOp.const(float(u.arg),dtypes.half)
   elif (source:=_typed_cast_source(u,dtypes.int,dtypes.half)) is not None: recipe=_dpu_trunc(source)
   elif (source:=_typed_cast_source(u,dtypes.int,dtypes.bool)) is not None: recipe=source.cast(dtypes.half)
