@@ -1565,8 +1565,8 @@ def test_typed_load_dependencies_cover_masked_address_variation():
                               ((row*5+column).cast(dtypes.ushort),None,tuple(range(15))),
                               (row.const_like(0),column%2<1,tuple(0 if c%2<1 else -1 for _ in range(3) for c in range(5)))):
     load=source.index(index).load() if gate is None else source.index(index).load(UOp.const(0.0,dtypes.half),gate)
-    plan=rockchip_renderer._typed_load_plan(load,dtypes.half,output_index,15,require_offsets=True)
-    assert plan is not None and plan.offsets==expected
+    plan=rockchip_renderer._typed_load_plan(load,dtypes.half,output_index,15)
+    assert plan is not None and _gather_lanes(plan)==expected
 
 
 def test_physical_half_recipe_materializes_strong_float_constant_at_boundary():
@@ -1927,7 +1927,7 @@ def test_production_fp16_pair_bitcast_fused_transfer_uses_raw_gather():
       program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
       images.append(decode_image(next(u.arg for u in program.src if u.op is Ops.BINARY)))
   assert all(len(_initial_gathers(image))==1 and _initial_gathers(image)[0].itemsize==4 and not _ew_ops(image) for image in images)
-  assert [_initial_gathers(image)[0].offsets for image in images] == [tuple(range(12)),(0,1,6,7,2,3,8,9,4,5,10,11)]
+  assert [_gather_lanes(_initial_gathers(image)[0]) for image in images] == [tuple(range(12)),(0,1,6,7,2,3,8,9,4,5,10,11)]
 
 
 def test_zero_count_raw_fp16_bitcast_uses_empty_generic_image():

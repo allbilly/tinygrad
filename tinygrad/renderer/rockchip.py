@@ -513,7 +513,7 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
     if all((bound:=int(axis.src[0].arg))*out_affine[1][axis]%(step*limit)==0 or bound*out_affine[1][axis]==count for step,limit,_,axis in axes): return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,linear[0],tuple((step,limit,stride) for step,limit,stride,_ in axes),fill_bits=fill_bits)  # noqa: E501
   return RKGather(RKArg(RKBufferKind.ARG,src_index),RKArg(RKBufferKind.SCRATCH,dst_index),count,offsets=_gather_offsets(out_index,load_index,gate,count),fill_bits=fill_bits)  # noqa: E501
 
-def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None, require_offsets:bool=False) -> RKGather|None:
+def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bits:int|None=None) -> RKGather|None:
   """Validate a typed source and return its physical affine or exact-offset gather."""
   if load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or not load.src or load.src[0].op is not Ops.INDEX or len(load.src)>1 and load.src[1].op is not Ops.CONST and fill_bits is None: return None  # noqa: E501
   if (param:=_root_param(load.src[0])) is None or param.dtype.scalar() is not dtype or not param.src or param.src[0].op is not Ops.CONST: return None
@@ -521,7 +521,7 @@ def _typed_load_plan(load:UOp, dtype:DType, out_index:UOp, count:int, *, fill_bi
   try:
     gather=_gather_plan(param.arg.slot,0,out_index,load.src[0].src[1],gate,count,fill_bits)
     if (bounds:=(min(gather.offsets,default=0),max(gather.offsets,default=-1)) if gather.offsets else tuple(gather.base+sum(fn((limit-1)*stride,0) for _,limit,stride in gather.axes) for fn in (min,max)))[0] < (0 if not gather.offsets else -1) or bounds[1] >= int(param.src[0].arg): raise _RKGenericReject("gather_index")  # noqa: E501
-    return gather._replace(base=0,axes=(),offsets=_gather_offsets(out_index,load.src[0].src[1],gate,count)) if require_offsets and not gather.offsets else gather  # noqa: E501
+    return gather
   except _RKGenericReject: return None
 
 def _relu_operand(u:UOp) -> UOp|None:
@@ -1280,12 +1280,23 @@ class RKContext:
     elif u.op in (Ops.INDEX, Ops.LOAD): value = self.lower(u.load()) if u.op is Ops.INDEX else self._load(u)
     elif u.op is Ops.BITCAST and u is self.root and dtype is dtypes.int:
       # Pair adjacent FP16 lane representations into INT32 output storage without numeric conversion.
-      packed=u.src[0] if len(u.src)==1 else None
-      if packed is None or packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: raise _RKGenericReject("raw FP16 pair")
-      lanes:dict[int,RKGather|None]={int(term.src[1].arg):_typed_load_plan(bitcast.src[0],dtypes.half,self.out_index,self.count,require_offsets=True) for term in packed.src if term.op is Ops.SHL and len(term.src)==2 and term.src[1].op is Ops.CONST and int(term.src[1].arg) in (0,16) for bitcast in (_typed_cast_source(term.src[0],dtypes.uint,dtypes.ushort),) if bitcast is not None and bitcast.op is Ops.BITCAST and len(bitcast.src)==1 and len(bitcast.src[0].src)==1}  # noqa: E501
-      if len(packed.src)!=2 or set(lanes)!={0,16} or (low:=lanes[0]) is None or (high:=lanes[16]) is None or low.src!=high.src or any(a&1 or b!=a+1 for a,b in zip(low.offsets,high.offsets)): raise _RKGenericReject("raw FP16 pair")  # noqa: E501
-      self.program.append(low._replace(dst=self.out,itemsize=4,offsets=tuple(offset//2 for offset in low.offsets)))
-      value=self._carrier(self.out,dtypes.int)
+      packed = u.src[0] if len(u.src) == 1 else None
+      if packed is None or packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint or len(packed.src) != 2:
+        raise _RKGenericReject("raw FP16 pair")
+      lanes: dict[int, RKGather | None] = {}
+      for term in packed.src:
+        if (term.op is not Ops.SHL or len(term.src) != 2 or term.src[1].op is not Ops.CONST or
+            int(term.src[1].arg) not in (0, 16)): continue
+        bitcast = _typed_cast_source(term.src[0], dtypes.uint, dtypes.ushort)
+        if bitcast is not None and bitcast.op is Ops.BITCAST and len(bitcast.src) == 1:
+          lanes[int(term.src[1].arg)] = _typed_load_plan(bitcast.src[0], dtypes.half, self.out_index, self.count)
+      low, high = (lanes.get(shift) for shift in (0, 16))
+      if (low is None or high is None or low.src != high.src or low.offsets or high.offsets or
+          low.axes != high.axes or low.base & 1 or high.base != low.base+1 or
+          any(stride & 1 for _, _, stride in low.axes)): raise _RKGenericReject("raw FP16 pair")
+      axes = tuple((divisor, limit, stride//2) for divisor, limit, stride in low.axes)
+      self.program.append(low._replace(dst=self.out, itemsize=4, base=low.base//2, axes=axes))
+      value = self._carrier(self.out, dtypes.int)
     elif u.op is Ops.BITCAST:
       source = self.lower(u.src[0])
       if {dtype,source.dtype}!={dtypes.half,dtypes.int16} or source.dtype is not u.src[0].dtype.scalar():
