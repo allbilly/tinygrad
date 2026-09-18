@@ -4894,11 +4894,12 @@ def test_cmac_candidate_filter_keeps_later_valid_layout():
 
 def test_cmac_extent_bound_rejects_before_static_unroll(monkeypatch):
   def reduction(depth:int):
-    out,source=UOp.param(0,dtypes.half,(1,)),UOp.param(1,dtypes.half,(depth,))
+    out,left,right=UOp.param(0,dtypes.half,(1,)),UOp.param(1,dtypes.half,(depth,)),UOp.param(2,dtypes.half,(depth,))
     axis=UOp.range(depth,0,AxisType.REDUCE)
-    reduced=UOp(Ops.REDUCE,dtypes.float,src=(source.index(axis).load().cast(dtypes.float),axis),arg=(Ops.ADD,0))
+    product=left.index(axis).load().cast(dtypes.float)*right.index(axis).load().cast(dtypes.float)
+    reduced=UOp(Ops.REDUCE,dtypes.float,src=(product,axis),arg=(Ops.ADD,0))
     uops=list(out.index(0).store(reduced.cast(dtypes.half)).sink().toposort())
-    output=rockchip_renderer._outs(uops)[1]
+    output=rockchip_renderer._outs(uops)
     assert output is not None
     return output,uops
   output,uops=reduction(4096)
