@@ -1482,24 +1482,19 @@ def _dpu_trunc(source:UOp) -> UOp:
 def _fold_quadratic(root:UOp) -> UOp|None:
   """Scale sqrt(x*x +/- 1), and stabilize its canonical natural-log envelope."""
   logarithm=None
-  if root.op is Ops.MUL and len(root.src)==2:
-    for candidate,scale in (root.src,root.src[::-1]):
-      if (scale.op is Ops.CONST and abs(float(scale.arg)-math.log(2))<1e-12 and
-          candidate.op is Ops.LOG2 and len(candidate.src)==1 and candidate.src[0].op is Ops.ADD):
-        logarithm=candidate
-        break
+  if (pair:=_const_operand(root,Ops.MUL)) is not None:
+    candidate,scale=pair
+    if (abs(float(scale.arg)-math.log(2))<1e-12 and candidate.op is Ops.LOG2 and
+        len(candidate.src)==1 and candidate.src[0].op is Ops.ADD): logarithm=candidate
   radical=root if root.op is Ops.SQRT and len(root.src)==1 else next(
     (term for term in logarithm.src[0].src if term.op is Ops.SQRT and len(term.src)==1),None) if logarithm is not None else None
   if radical is None or radical.src[0].op is not Ops.ADD: return None
-  matched=None
-  for square,constant in (radical.src[0].src,radical.src[0].src[::-1]):
-    if (square.op is Ops.MUL and len(square.src)==2 and square.src[0].key==square.src[1].key and
-        constant.op is Ops.CONST and float(constant.arg) in (-1.0,1.0) and
-        (logarithm is None or any(term is not radical and term.key==square.src[0].key for term in logarithm.src[0].src))):
-      matched=(square.src[0],float(constant.arg))
-      break
-  if matched is None: return None
-  source,offset=matched
+  if (pair:=_const_operand(radical.src[0],Ops.ADD)) is None: return None
+  square,constant=pair
+  if (square.op is not Ops.MUL or len(square.src)!=2 or square.src[0].key!=square.src[1].key or
+      float(constant.arg) not in (-1.0,1.0) or
+      logarithm is not None and not any(term is not radical and term.key==square.src[0].key for term in logarithm.src[0].src)): return None
+  source,offset=square.src[0],float(constant.arg)
   source=source.cast(dtypes.half)
   magnitude=UOp(Ops.MAX,dtypes.half,src=(source,source),arg=_NATIVE_ABS)
   scale=_native_max(magnitude,_half(65504.0)).alu(Ops.MAX,_half(1.0))
