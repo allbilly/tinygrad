@@ -764,8 +764,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
     converted = _optional_rewrite(_fp32_expr_to_half, body)
     product = _strip_cast(converted if converted is not None else body)
   boolean = product.dtype.scalar() is dtypes.bool
-  short_math = (value.arg[0] is Ops.ADD and total == 16 and rows <= 4096 and body.op is Ops.EXP2 and
-                body.dtype.scalar() is dtypes.float and product.op is Ops.EXP2 and product.dtype.scalar() is dtypes.half)
+  short_math = value.arg[0] is Ops.ADD and total == 16 and rows <= 4096 and body.op is Ops.EXP2 and body.dtype.scalar() is dtypes.float
   integer = boolean or dtypes.is_int(product.dtype.scalar())
   bounds = ((0, 1) if boolean else
             (int(product.vmin), int(product.vmax)) if product.dtype.scalar() is dtypes.int16 else
@@ -798,7 +797,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   groups = total*len(mapped_terms)
   lanes = groups*block
   # Larger EW-friendly maps and boolean reductions have a different expansion budget from ordinary rows.
-  wide_ew_reduce = short_math or value.arg[0] is Ops.MUL or (value.arg[0] is Ops.ADD and product.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN))
+  wide_ew_reduce = value.arg[0] is Ops.MUL or (value.arg[0] is Ops.ADD and product.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN))
   lane_limit = (_MAX_GENERIC_EXPANDED_NODES if boolean else
                 min(_MAX_STATIC_RANGE_ENVS,16*_MAX_GENERIC_UNROLL) if wide_ew_reduce else
                 _MAX_STATIC_RANGE_ENVS if integer or value.arg[0] is Ops.MAX else _MAX_GENERIC_UNROLL)
