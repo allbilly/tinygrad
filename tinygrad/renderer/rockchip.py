@@ -639,14 +639,12 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   all_axes=frozenset(_static_ranges(out_index) or ())
   out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
   output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()
-  # Keep the existing candidate set; aligned contraction ties preserve the first input's orientation.
-  extra_axes=[load_axes[left],load_axes[right]] if rows>_MAX_GENERIC_UNROLL else []
-  partitions=(all_axes,frozenset(),*sorted(
-    (axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+extra_axes) if axes and axes<all_axes),
-    key=lambda axes: bool(groups%32==0 and axes!=load_axes[left])))
+  # A separable load supplies its own row axis set; full and empty partitions cover the degenerate orientations.
+  single_axis_partitions={frozenset((axis,)) for axis,_,_ in output_axes}
   candidates=[]
-  for index,axes in enumerate(partitions):
-    m=rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes)
+  for axes in dict.fromkeys((all_axes,frozenset(),load_axes[left],load_axes[right])):
+    if axes not in (all_axes,frozenset()) and (not axes<all_axes or rows<=_MAX_GENERIC_UNROLL and axes not in single_axis_partitions): continue
+    m=rows if axes==all_axes else math.prod(limit for axis,_,limit in output_axes if axis in axes)
     n=rows//m
     ai,ao,_=_cmac_layout(n,groups)
     # Each factor may vary along only one side of the contraction.
