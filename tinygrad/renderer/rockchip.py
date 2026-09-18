@@ -2,7 +2,7 @@ from __future__ import annotations
 # ruff: noqa: E702
 import base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
-from typing import Callable, Iterable, Mapping, NamedTuple, cast as typing_cast
+from typing import Callable, Iterable, NamedTuple, cast as typing_cast
 from tinygrad.device import Base64Compiler
 from tinygrad.dtype import DType, dtypes, float_to_fp16, truncate
 from tinygrad.helpers import ceildiv, polyN, round_up, strides_for_shape
@@ -407,11 +407,9 @@ def _exec_static(node:UOp, operands:tuple[RKStatic,...]) -> RKStatic:
   if not vectors or dtypes.is_bool(scalar) or dtypes.is_int(scalar) and scalar.min<=min(result,default=0)<=max(result,default=0)<=scalar.max: return result  # type: ignore[arg-type]  # noqa: E501
   return _commit_static(node.dtype,result)
 
-def _eval_static(u:UOp, env:Mapping[UOp,RKStatic], cache:dict[UOp,RKStatic]|None=None) -> RKStatic:
-  """Evaluate compiler-bound UOps, committing each intermediate to its scalar dtype."""
-  if any(node.op not in _STATIC_OPS for node in u.toposort(gate=lambda item:item not in env)): raise _RKGenericReject("non_static_eval")
-  cache={} if cache is None else cache; cache.update((node,_commit_static(node.dtype,value)) for node,value in env.items())
-  return u.topovisit(lambda node:_exec_static(node,tuple(cache[source] for source in node.src)),cache)
+def _eval_static(u:UOp) -> RKScalar:
+  """Evaluate a range-free scalar through the shared blocked static evaluator."""
+  return next(iter(_static_blocks((),u)))[0][0]
 
 RKOutput = tuple[UOp, UOp, int, UOp, UOp]
 def _outs(uops:list[UOp]) -> RKOutput|None:
@@ -1011,7 +1009,7 @@ class RKContext:
 
   def _static(self, u:UOp) -> UOp:
     dtype, layout = u.dtype.scalar(), self._layout(u.dtype.scalar())
-    if not _static_ranges(u): return self._constant(UOp.const(typing_cast(int|float|bool,_eval_static(u,{})),dtype))
+    if not _static_ranges(u): return self._constant(UOp.const(_eval_static(u),dtype))
     values = _static_values(self.out_index,u,self.count,_storage_bits if layout is dtypes.half else int)
     if dtype is dtypes.int and layout is dtypes.int16 and any(not -32768 <= value <= 32767 for value in values): raise _RKGenericReject
     encoded = values if layout is dtypes.half else tuple(map(operator.and_,values,itertools.repeat(0xffffffff if layout is dtypes.int else 0xffff)))
@@ -1408,7 +1406,7 @@ _pm_unroll_static_reduce=PatternMatcher([(UPat(Ops.REDUCE,name="u"),_unroll_redu
 def _unroll_static_reduces(root:UOp, precise:bool=True) -> UOp:
   """Interpret canonical static REDUCE structure; horizontal reductions retain their specified order."""
   # Rewrite original children before their parent, without traversing the replacement recipes a second time.
-  result=(expanded:=graph_rewrite(root,_pm_unroll_static_reduce,ctx=(precise,root.dtype.scalar() is dtypes.half),walk=True,enter_calls=True)).substitute({u:u.const_like(typing_cast(int|float|bool,_eval_static(u,{}))) for u in expanded.toposort() if _is_static_expr(u) and not _static_ranges(u)},walk=True)  # noqa: E501
+  result=(expanded:=graph_rewrite(root,_pm_unroll_static_reduce,ctx=(precise,root.dtype.scalar() is dtypes.half),walk=True,enter_calls=True)).substitute({u:u.const_like(_eval_static(u)) for u in expanded.toposort() if _is_static_expr(u) and not _static_ranges(u)},walk=True)  # noqa: E501
   return result.substitute({u:u.replace(src=(u.src[0],u.src[1].simplify(),*u.src[2:])) for u in result.toposort() if u.op is Ops.INDEX and len(u.src)>1},walk=True)  # noqa: E501
 
 def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKImage|None:
