@@ -3134,7 +3134,7 @@ def test_production_composite_product_sum_uses_balanced_mapped_reduction():
     program = to_program(ast,RockchipRenderer(Target(device="ROCKCHIP")))
   image = decode_image(next(u for u in program.src if u.op is Ops.BINARY).arg)
   assert not _typed_ops(image,RKCMAC)
-  assert len(_ew_ops(image))==72 and len(image.program)==87
+  assert len(_ew_ops(image))==51 and len(image.program)==96
   logits_values=np.zeros(shape,dtype="<f2")
   target_values=np.zeros(shape,dtype="<f2")
   target_values[:,0]=1

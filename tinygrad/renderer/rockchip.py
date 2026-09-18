@@ -774,14 +774,12 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   mapped_dtype = dtypes.int16 if integer else dtypes.half
   gated = _gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product
   mapped_terms:tuple[UOp,...] = (gated if gated is not product else body,)
-  if (gated.op is Ops.MUL and gated.dtype.scalar() is dtypes.half and
-      any(_strip_cast(source).op is Ops.LOAD for source in gated.src) and
-      any(_strip_cast(source).op is not Ops.LOAD for source in gated.src)):
+  if gated.op is Ops.MUL and gated.dtype.scalar() is dtypes.half:
     factor,multiplier = next(((a,b) for a,b in (gated.src,gated.src[::-1])
-                              if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD), gated.src)
-    products = (tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(
-      Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (gated,))
-    mapped_terms = tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))
+                              if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD), (None,None))
+    if factor is not None and multiplier is not None:
+      mapped_terms = tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(
+        Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None))
   output_axes = tuple((axis,stride,extent) for axis,stride,extent in reversed(tuple(zip(axes,strides_for_shape(shape),shape))) if extent>1)
   block = round_up(rows,8) if rows>1 else 1
   groups = total*len(mapped_terms)
