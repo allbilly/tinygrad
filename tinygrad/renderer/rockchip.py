@@ -1234,7 +1234,6 @@ class RKContext:
     return self._carrier(context.lower(recipe).arg,yes.dtype)
 
   def _where(self, u:UOp) -> UOp:
-    if u.dtype.scalar() is dtypes.half and (recipe:=_fold_where_abs(u)) is not None: return self.lower(recipe)
     if (recipe:=_pm_ordered_where.rewrite(u)) is not None: return self.lower(recipe)
     return self._raw_where(u)
 
