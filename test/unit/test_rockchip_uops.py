@@ -4569,7 +4569,8 @@ def test_wide_int32_cdiv_cmod_physical_semantics_and_composition():
   for select,expression in enumerate(expressions):
     image = _lower_uop_program(_int32_binary_program(expression, len(lhs)))
     assert image is not None and not _runtime_gathers(image)
-    assert len(_ew_ops(image)) == (2545,2499,2547)[select] and decode_image(encode_image(image)) == image
+    # The two wide operands feed raw gathers directly; neither needs an identity EW copy.
+    assert len(_ew_ops(image)) == (2543,2497,2545)[select] and decode_image(encode_image(image)) == image
     expected = []
     for left,right in zip(lhs.tolist(), rhs.tolist()):
       if select == 2: left, right = _wrap_int32(left+1), _wrap_int32(right*3)

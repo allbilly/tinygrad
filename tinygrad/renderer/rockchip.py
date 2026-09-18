@@ -1048,12 +1048,11 @@ class RKContext:
         self.count,base=src.arg.addend+(byte if unpack else 0),axes=((1,self.count,itemsize if unpack else 2),),
         dst_stride=2 if unpack else itemsize,itemsize=1,partial=not unpack and byte>0) for byte,(src,dest) in enumerate(zip(sources,destinations)))
 
-  def _unpack_bytes(self, value:UOp, *, copy_wide:bool=True) -> tuple[UOp,...]:
-    """Return the raw INT16 byte components, retaining the required copy before reading a wide carrier."""
+  def _unpack_bytes(self, value:UOp) -> tuple[UOp,...]:
+    """Return raw INT16 byte components directly from the typed physical carrier."""
     if value.arg not in self.raw_components:
-      source=self._emit(self._scratch(dtypes.int),value,value,_EW_CFG[Ops.MAX]) if value.dtype.itemsize==4 and copy_wide else value
       self.raw_components[value.arg]=tuple(self._scratch(dtypes.int16) for _ in range(value.dtype.itemsize))
-      self._move_bytes(itertools.repeat(source),self.raw_components[value.arg],value.dtype.itemsize,True)
+      self._move_bytes(itertools.repeat(value),self.raw_components[value.arg],value.dtype.itemsize,True)
     return self.raw_components[value.arg]
 
   def _pack_bytes(self, parts:tuple[UOp,...], layout:DType, *, u:UOp) -> UOp:
@@ -1125,7 +1124,7 @@ class RKContext:
     planes:dict[UOp,tuple[UOp,...]]={}
     # Seed opaque inputs in operand order; only unseeded fusion nodes enter postorder.
     def visit(node:UOp) -> bool:
-      if node not in planes and (node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype): planes[node]=tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8)) if node.op is Ops.CONST else tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(self.lower(node),copy_wide=False))))  # noqa: E501
+      if node not in planes and (node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype): planes[node]=tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8)) if node.op is Ops.CONST else tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(self.lower(node)))))  # noqa: E501
       return node not in planes
     for node in u.toposort(gate=visit):
       if node.op in (Ops.SHL,Ops.SHR):
