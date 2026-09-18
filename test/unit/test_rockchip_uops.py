@@ -2166,10 +2166,23 @@ def test_native_where_patterns_compare_semantic_keys_across_tags():
     selected=UOp(Ops.WHERE,dtypes.half,src=(value<zero,negative,value.rtag("no")))
     assert rockchip_renderer._fold_where_abs(selected)==UOp(Ops.MAX,dtypes.half,src=(value,value),arg=rockchip_renderer._NATIVE_ABS)
     assert rockchip_renderer._fold_where_abs(selected.replace(src=(value<zero,negative,other))) is None
-  positive=UOp(Ops.FDIV,dtypes.half,src=(value.const_like(1),value))
-  negative=UOp(Ops.FDIV,dtypes.half,src=(value.const_like(-1),value.rtag("negative denominator")))
-  selected=UOp(Ops.WHERE,dtypes.half,src=(positive<zero,negative,positive.rtag("no")))
-  assert rockchip_renderer._fold_where_abs(selected)==UOp(Ops.MAX,dtypes.half,src=(positive,positive),arg=rockchip_renderer._NATIVE_ABS)
+
+
+def test_reciprocal_ratio_where_uses_generic_raw_selection():
+  values=np.asarray((-math.inf,-3,-1,-0.0,0.0,1,3,math.inf),dtype="<f2")
+  source=UOp.param(1,dtypes.half,(len(values),))
+  def selected(i):
+    value=source.index(i).load()
+    positive=value.const_like(1.0).alu(Ops.FDIV,value)
+    negative=value.const_like(-1.0).alu(Ops.FDIV,value)
+    return (positive<positive.const_like(0.0)).where(negative,positive).bitcast(dtypes.int16)
+  image=_lower_uop_program(_program(dtypes.int16,selected,count=len(values)))
+  assert image is not None and _ew_ops(image)
+  with np.errstate(invalid="ignore",divide="ignore"):
+    positive=(1/values).astype("<f2")
+    negative=(-1/values).astype("<f2")
+    expected=np.where(positive<0,negative,positive).view("<u2")
+    assert _execute_raw_dynamic_image(image,len(values)*2,values.tobytes())==expected.tobytes()
 
 
 def test_generic_static_index_becomes_gather():

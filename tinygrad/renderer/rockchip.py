@@ -1368,7 +1368,6 @@ def _math_late(u:UOp) -> UOp|None:
   if u.op is Ops.WHERE and u.dtype.scalar() is dtypes.half and len(u.src)==3:
     if (absolute:=_fold_where_abs(u)) is not None: return absolute
   if u.op not in _DPU_MATH or u.op is Ops.TRUNC and (u.dtype.scalar() is not dtypes.half or _is_static_expr(u)): return None
-  if u.op is Ops.LOG2 and u.src[0].op is Ops.WHERE: raise _RKGenericReject
   return _tag_precise_adds(_DPU_MATH[u.op](u.src[0]),(u.src[0],))
 
 _pm_math_early=PatternMatcher([(UPat((Ops.CAST,Ops.ADD,Ops.MUL,Ops.SQRT),name="u"),_math_early)])
@@ -1475,12 +1474,9 @@ def _relu_cap(positive:UOp, upper_relu:UOp, x:UOp) -> UOp|None:
 
 _pm_relu_cap=PatternMatcher([((UPat.var("positive")+UPat.var("upper_relu")*UPat.const(-1)).named("x"),_relu_cap)])
 
-_abs_ratio=UPat(Ops.FDIV,src=(UPat.cvar("positive"),UPat.var("denominator")),name="value")
 _pm_where_abs=PatternMatcher([
   ((_native_value<0).where(UPat.any(_native_other.f(Ops.NEG),_native_other.alu(Ops.MUL,UPat.const(-1))),_native_no).named("root"),
-   lambda value,other,no,root:UOp(Ops.MAX,root.dtype,src=(value,value),arg=_NATIVE_ABS) if value.key==other.key==no.key else None),
-  ((_abs_ratio<0).where(UPat(Ops.FDIV,src=(UPat.cvar("negative"),UPat.var("other_denominator"))),_native_no).named("root"),
-   lambda positive,negative,denominator,other_denominator,value,no,root:UOp(Ops.MAX,root.dtype,src=(value,value),arg=_NATIVE_ABS) if value.key==no.key and denominator.key==other_denominator.key and float(positive.arg)==-float(negative.arg) else None)])  # noqa: E501
+   lambda value,other,no,root:UOp(Ops.MAX,root.dtype,src=(value,value),arg=_NATIVE_ABS) if value.key==other.key==no.key else None)])
 
 def _fold_where_abs(x:UOp) -> UOp|None:
   """Recognize a well-formed HALF `WHERE(x < 0, -x, x)` before an unselected infinity can contaminate a mask blend."""
