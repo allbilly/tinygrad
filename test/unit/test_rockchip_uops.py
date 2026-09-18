@@ -166,7 +166,7 @@ def _execute_raw_dynamic_image(image:RKImage, output_bytes:int, *inputs:bytes) -
       assert op.ew_cfg in (_EW_CFG[Ops.ADD],_EW_CFG[Ops.MAX])
       conversion_view(op.dst,destination_dtype)[:]=(lhs+rhs if op.ew_cfg==_EW_CFG[Ops.ADD] else np.maximum(lhs,rhs)).astype(destination_dtype)
       return
-    if op.mode in (RKEWMode.HALF,RKEWMode.STATEFUL,RKEWMode.COMPARE,RKEWMode.BOUNDED):
+    if op.mode in (RKEWMode.HALF,RKEWMode.BOUNDED,RKEWMode.COMPARE):
       def fp16(arg:RKArg) -> np.ndarray: return np.frombuffer(buffer(arg.kind,arg.index),dtype="<f2",count=op.count,offset=arg.addend)
       lhs,rhs=fp16(op.lhs).copy(),fp16(op.rhs).copy()
       if op.mode==RKEWMode.COMPARE: value=(lhs>0).astype("<f2")
@@ -1419,7 +1419,7 @@ def test_runtime_tiling_modes_keep_exact_stage_bodies():
     ("977a482cf35150b50d77165dff1011411d14b1fe6b70a3bd6846252176c07d40", ((31,31),),
       RKEWOp(external[0],external[1],external[2],large,add)),
     ("bb30c192a115976317e2ed0341666192a4d3bcf758e0910f5f1ec09a1d44b215", ((31,),),
-      RKEWOp(external[0],external[1],external[2],17,add,mode=RKEWMode.STATEFUL)),
+      RKEWOp(external[0],external[1],external[2],17,add,mode=RKEWMode.BOUNDED)),
     ("2f075321eab33020cf9ae176f91235110c26e2e01e3d4790070c5f6e85f00d88", ((31,31),),
       RKEWOp(external[0],external[1],external[2],large,add,mode=RKEWMode.HALF_TO_INT16)),)
   def address(arg:RKArg) -> int: return 0x10000000+int(arg.kind)*0x01000000+arg.index*0x00100000+arg.addend
@@ -1455,9 +1455,9 @@ def test_runtime_chain_flush_preserves_mixed_boundaries():
     ((op(),*(op(count=1,mode=RKEWMode.HALF_TO_FLOAT) for _ in range(17))),
      (("submit",(31,)),("submit",(32,)*16),("reset",),("submit",(32,)),("reset",))),
     ((op(count=large),op(count=large)), (("submit",(31,18,31,18)),)),
-    ((op(),op(count=large,barrier=True,mode=RKEWMode.STATEFUL),op(count=large),op(barrier=True)),
+    ((op(),op(count=large,barrier=True,mode=RKEWMode.BOUNDED),op(count=large),op(barrier=True)),
      (("submit",(31,)),("submit",(31,31)),("submit",(31,31)),("submit",(31,)))),
-    ((op(mode=RKEWMode.STATEFUL),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
+    ((op(mode=RKEWMode.BOUNDED),*(op() for _ in range(rockchip_runtime._MAX_EW_GROUP_OPS))),
      (("submit",(31,)+(18,)*(rockchip_runtime._MAX_EW_GROUP_OPS-1)),("submit",(31,)))),
   )
   def address(arg:RKArg) -> int: return 0x10000000+int(arg.kind)*0x100000+arg.index*0x10000+arg.addend
@@ -1511,7 +1511,7 @@ def test_native_ew_configs_keep_their_exact_register_values():
     ("_EW_CFG_RELU6","_EW_CFG_MIN","_EW_CFG_ABS","_EW_CFG_NEG","_EW_CFG_FLOOR","_EW_CFG_CEIL")) == (
     0x108004c0,0x108102c0,0x108502c0,0x108602c0,0x108702c0,0x108802c0)
   arg=RKArg(RKBufferKind.ARG,0)
-  relu6=RKEWOp(arg,arg,arg,4,rockchip_renderer._EW_CFG_RELU6,mode=RKEWMode.STATEFUL)
+  relu6=RKEWOp(arg,arg,arg,4,rockchip_renderer._EW_CFG_RELU6,mode=RKEWMode.BOUNDED)
   assert rockchip_renderer._cmd(rockchip_renderer._DPU,rockchip_renderer.rk.REG_DPU_EW_RELUX_CMP_VALUE,
     rockchip_renderer._EW_RELUX_CMP_RELU6) in rockchip_renderer.emit_ew_stage(relu6,lambda _arg:0x10000000)
 
@@ -1610,7 +1610,7 @@ def test_production_scatter_add_keeps_nonfinite_terms_out_of_kahan():
     linear=source.scatter(dim=1,index=index,src=math.inf,reduce="add").schedule_linear()
     to_program_cache.clear()
     image=decode_image(to_program(linear.src[0].src[0],RockchipRenderer(Target(device="ROCKCHIP"))).src[-1].arg)
-  half_ops=[op for op in _ew_ops(image) if op.mode in (RKEWMode.HALF,RKEWMode.STATEFUL)]
+  half_ops=[op for op in _ew_ops(image) if op.mode in (RKEWMode.HALF,RKEWMode.BOUNDED)]
   assert half_ops and all(op.ew_cfg==_EW_CFG[Ops.ADD] for op in half_ops)
 
 

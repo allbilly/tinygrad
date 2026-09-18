@@ -29,7 +29,6 @@ class RKEWMode(IntEnum):
   INT32_TO_HALF = 7
   HALF = 8
   BOUNDED = 9
-  STATEFUL = 9
   COMPARE = 10
 
 class RKArg(NamedTuple):
@@ -726,7 +725,7 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
   while size>1:
     size//=2
     count=size*block
-    mode=RKEWMode.INT16 if int16 else RKEWMode.STATEFUL if first else RKEWMode.HALF
+    mode=RKEWMode.INT16 if int16 else RKEWMode.BOUNDED if first else RKEWMode.HALF
     plan.program.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,
                                submit_barrier=first,mode=mode))
     first,current,target=False,target,current
