@@ -1182,10 +1182,9 @@ class RKContext:
         if all(src is not None for src in half_sources): return self.lower(u.replace(src=typing_cast(tuple[UOp,...],half_sources)))
       values=tuple(self._operand(src,dtypes.int16 if integer16 else dtypes.int) for src in u.src)
       if values[0].dtype is dtypes.int16: return self._lower_recipe(u,_i16_compare(u.op,*values))
-      copies = (self._emit(self._scratch(dtypes.int),value,value,_EW_CFG[Ops.MAX]) for value in values)
       components = tuple(tuple(self._slot(
         RKGather(source.arg,RKArg(RKBufferKind.SCRATCH,0),self.count,base=word,axes=((1,self.count,2),)),dtypes.int16)
-        for word in (0,1)) for source in copies)
+        for word in (0,1)) for source in values)
     else:
       half_sources = u.src if all(src.dtype.scalar() is dtypes.half for src in u.src) else tuple(_half_backed_value(src) for src in u.src)
       if u.op not in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ) or any(src is None for src in half_sources): raise _RKGenericReject
