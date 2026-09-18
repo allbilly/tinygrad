@@ -767,21 +767,20 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   mapped_dtype = dtypes.int16 if integer else dtypes.half
   gated = _gate_zero_term(product) if product.op is Ops.WHERE and _strip_cast(product.src[1]).op is Ops.LOAD else product
   mapped_terms:tuple[UOp,...] = (gated if gated is not product else body,)
-  product = gated
-  if (product.op is Ops.MUL and product.dtype.scalar() is dtypes.half and
-      any(_strip_cast(source).op is Ops.LOAD for source in product.src) and
-      any(_strip_cast(source).op is not Ops.LOAD for source in product.src)):
-    factor,multiplier = next(((a,b) for a,b in (product.src,product.src[::-1])
-                              if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD), product.src)
+  if (gated.op is Ops.MUL and gated.dtype.scalar() is dtypes.half and
+      any(_strip_cast(source).op is Ops.LOAD for source in gated.src) and
+      any(_strip_cast(source).op is not Ops.LOAD for source in gated.src)):
+    factor,multiplier = next(((a,b) for a,b in (gated.src,gated.src[::-1])
+                              if a.op is Ops.ADD and _strip_cast(b).op is Ops.LOAD), gated.src)
     products = (tuple(term.alu(Ops.MUL,multiplier) for term in factor.split_uop(
-      Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (product,))
+      Ops.ADD,lambda node:node.dtype.scalar() is dtypes.half and node.arg is None)) if factor.op is Ops.ADD else (gated,))
     mapped_terms = tuple(term if i<len(products) else _tag_precise_adds(term) for i,term in enumerate(_product_terms(products)))
   output_axes = tuple((axis,stride,extent) for axis,stride,extent in reversed(tuple(zip(axes,strides_for_shape(shape),shape))) if extent>1)
   block = round_up(rows,8) if rows>1 else 1
   groups = total*len(mapped_terms)
   lanes = groups*block
   # Larger EW-friendly maps and boolean reductions have a different expansion budget from ordinary rows.
-  wide_ew_reduce = value.arg[0] is Ops.MUL or (value.arg[0] is Ops.ADD and product.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN))
+  wide_ew_reduce = value.arg[0] is Ops.MUL or (value.arg[0] is Ops.ADD and gated.op in (Ops.EXP2,Ops.LOG2,Ops.SQRT,Ops.SIN))
   lane_limit = (_MAX_GENERIC_EXPANDED_NODES if boolean else
                 min(_MAX_STATIC_RANGE_ENVS,16*_MAX_GENERIC_UNROLL) if wide_ew_reduce else
                 _MAX_STATIC_RANGE_ENVS if integer or value.arg[0] is Ops.MAX else _MAX_GENERIC_UNROLL)
@@ -814,7 +813,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   sink = fake.index(lane).store(stored_body).end(lane).sink()
   mapped_uops = graph_rewrite(sink,pm_lower_index_dtype,ctx={}).toposort() if integer else sink.toposort()
   if not plan.lower(list(mapped_uops),vectorize_reductions=False,materialize=True): return False
-  direct = mapped_dtype is dtypes.half and product.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
+  direct = mapped_dtype is dtypes.half and gated.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
   # Reduce materialized terms in the ordinary EW tree, retaining the HALF boundary for consumers.
   reduced_arg = _reduce_mapped_rows(plan,plan.resolve(RKArg(RKBufferKind.ARG,fake.arg.slot)),lanes,
                                     _EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)
