@@ -796,6 +796,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   row_lane = lane.alu(Ops.CMOD,lane.const_like(block))
   logical = lane.alu(Ops.CDIV,lane.const_like(block))
   if len(mapped_terms)>1: logical = logical.alu(Ops.CMOD,logical.const_like(total))
+  # Padded rows reuse row zero for safe loads; the row-preserving EW tree never mixes them into observed rows.
   output_row = row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(row_lane,row_lane.const_like(0)) if block>rows else row_lane
   replacements = {
     axis:point.alu(Ops.CDIV,point.const_like(stride)).alu(Ops.CMOD,point.const_like(extent)) if stride>1
@@ -808,9 +809,6 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   mapped_body = terms[-1]
   for i,term in reversed(tuple(enumerate(terms[:-1]))):
     mapped_body = lane.alu(Ops.CMPLT,lane.const_like((i+1)*total*block)).where(term,mapped_body)
-  if block>rows:
-    neutral = 0 if value.arg[0] is Ops.ADD else dtypes.int16.min if integer else -math.inf
-    mapped_body = row_lane.alu(Ops.CMPLT,row_lane.const_like(rows)).where(mapped_body,mapped_body.const_like(neutral))
   start = len(plan.program)
   fake = plan.parameter(mapped_dtype,lanes)
   stored_body = mapped_body.cast(mapped_dtype) if boolean or bounded_sum else mapped_body
