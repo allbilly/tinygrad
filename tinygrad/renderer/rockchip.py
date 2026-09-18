@@ -332,13 +332,13 @@ def _stage_template(count:int, ew_cfg:int, mode:RKEWMode=RKEWMode.HALF) -> tuple
     (D,R.REG_DPU_DATA_CUBE_WIDTH,width),(D,R.REG_DPU_DATA_CUBE_HEIGHT,0),(D,R.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
     (D,R.REG_DPU_DATA_CUBE_CHANNEL,0 if output_dtype is dtypes.float and count == 1 else ((lanes-1)<<16)|(lanes-1)))
   if special:
-    pipeline = (((D,R.REG_DPU_BS_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BN_CFG,_BS_BN_BYPASS),(D,R.REG_DPU_BS_ALU_CFG,0),(D,R.REG_DPU_BS_MUL_CFG,0),
+    # Compare stages write their final BS/BN values once, while other special stages initialize the bypass values.
+    bs_cfg,bs_alu,bs_mul,bn_cfg,bn_mul,bn_relux = ((_BS_CFG_COMPARE,_BS_ALU_COMPARE,_BS_MUL_COMPARE,
+      _BN_CFG_COMPARE,_BN_MUL_COMPARE,_BN_RELUX_COMPARE) if compare else (_BS_BN_BYPASS,0,0,_BS_BN_BYPASS,0,0))
+    pipeline = (((D,R.REG_DPU_BS_CFG,bs_cfg),(D,R.REG_DPU_BN_CFG,bn_cfg),(D,R.REG_DPU_BS_ALU_CFG,bs_alu),(D,R.REG_DPU_BS_MUL_CFG,bs_mul),
       (D,R.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 or output_dtype is dtypes.float and count == 1 else 2),
       (D,R.REG_DPU_WDMA_SIZE_0,(0 if count == 1 else 3) if output_dtype is dtypes.float else lanes-1),(D,R.REG_DPU_WDMA_SIZE_1,width),
-      (D,R.REG_DPU_BN_MUL_CFG,0),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,0))
-      + (((D,R.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(D,R.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),(D,R.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),
-      (D,R.REG_DPU_BN_CFG,_BN_CFG_COMPARE),(D,R.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),
-      (D,R.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE)) if compare else ())
+      (D,R.REG_DPU_BN_MUL_CFG,bn_mul),(D,R.REG_DPU_BN_RELUX_CMP_VALUE,bn_relux))
       + (((D,R.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),) if ew_cfg == _EW_CFG_RELU6 else ())
       + ((D,R.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if input_dtype is dtypes.int else \
       ew_cfg & ~_EW_OP_CVT_BYPASS if input_dtype is dtypes.int16 else ew_cfg),
