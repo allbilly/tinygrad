@@ -699,7 +699,7 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   plan.program.extend((*gathers,cmac,commit))
   return True
 
-def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
+def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, reduction:Ops, rows:int=1, int16:bool=False, barrier:bool=True) -> RKArg:
   """Reduce one mapped surface through atom-aligned carriers; bit reversal retains the balanced tree order."""
   if source.kind is not RKBufferKind.SCRATCH: raise _RKGenericReject("mapped reduction source")
   block=8 if rows==1 else round_up(rows,8)
@@ -708,9 +708,8 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
   size=1<<(groups-1).bit_length()
   current,target=(RKArg(RKBufferKind.SCRATCH,len(plan.scratch)+i) for i in range(2))
   plan.scratch.extend((_scratch_bytes(size*block),)*2)
-  if cfg==_EW_CFG[Ops.ADD]: neutral=0
-  elif cfg==_EW_CFG[Ops.MUL]: neutral=1 if int16 else _storage_bits(1)
-  else: neutral=_storage_bits(dtypes.int16.min,dtypes.int16) if int16 else _storage_bits(-math.inf)
+  dtype=dtypes.int16 if int16 else dtypes.half
+  neutral=_storage_bits(identity_element(reduction,dtype),dtype)
   first=barrier and not int16
   # Encode bit reversal with affine axes, padding an existing scratch source when its group count is not a power of two.
   if groups<size:
@@ -725,7 +724,7 @@ def _reduce_mapped_rows(plan:RKPlan, source:RKArg, lanes:int, cfg:int, rows:int=
     size//=2
     count=size*block
     mode=RKEWMode.INT16 if int16 else RKEWMode.BOUNDED if first else RKEWMode.HALF
-    plan.program.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,cfg,
+    plan.program.append(RKEWOp(target,current,current._replace(addend=current.addend+count*2),count,_EW_CFG[reduction],
                                submit_barrier=first,mode=mode))
     first,current,target=False,target,current
   return current
@@ -821,7 +820,7 @@ def _lower_mapped_reduce(output:RKOutput, uops:list[UOp], plan:RKPlan) -> bool:
   direct = mapped_dtype is dtypes.half and gated.op is Ops.LOAD and not any(isinstance(op,RKEWOp) for op in plan.program[start:])
   # Reduce materialized terms in the ordinary EW tree, retaining the HALF boundary for consumers.
   reduced_arg = _reduce_mapped_rows(plan,plan.resolve(RKArg(RKBufferKind.ARG,fake.arg.slot)),lanes,
-                                    _EW_CFG[value.arg[0]],rows,int16=integer,barrier=not direct)
+                                    value.arg[0],rows,int16=integer,barrier=not direct)
   replacement = plan.parameter(mapped_dtype,rows,reduced_arg).index(out_index).load()
   # Boolean MUL/MAX preserves INT16 masks in {0,1}; ordinary comparison consumes them without rebuilding HALF storage.
   replacement = replacement.alu(Ops.CMPNE,replacement.const_like(0)) if boolean else replacement.cast(value.dtype)
