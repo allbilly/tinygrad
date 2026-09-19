@@ -194,52 +194,7 @@ def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
   return all(isinstance(value,int) and low<=value<high for value in values)
 
-def _validate_image(image:RKImage) -> None:
-  gathers = tuple(op for op in image.program if isinstance(op, RKGather))
-  hosts = tuple(op for op in gathers if op.index is not None)
-  ew_ops = tuple(op for op in image.program if isinstance(op, RKEWOp))
-  cmacs = tuple(op for op in image.program if isinstance(op, RKCMAC))
-  if (len(image.scratch) > _RKIMAGE_U16_MAX or any(type(op) not in (RKGather, RKEWOp, RKCMAC) for op in image.program) or
-      any(not _fits((size,)) for size in image.scratch)):
-    raise ValueError("invalid RKImage header")
-  if len(cmacs) > 1 or cmacs and hosts: raise ValueError("invalid CMAC schedule")
-  for cmac in cmacs:
-    ai,ao,_ = _cmac_layout(cmac.n,cmac.k)
-    if not _cmac_shape_supported(cmac.m,ai,ao): raise ValueError("CMAC shape out of range")
-    args,needs,alignments = (cmac.lhs,cmac.rhs,cmac.dst),(cmac.m*ai*2,ao*ai*2,cmac.m*ao*4),(2,2,2 if cmac.out_fp16 else 4)
-    if any(arg.kind is not RKBufferKind.SCRATCH or arg.addend < 0 or arg.addend % alignment for arg,alignment in zip(args,alignments)):
-      raise ValueError("CMAC requires aligned scratch buffers")
-    if any(not 0 <= arg.index < len(image.scratch) or arg.addend + need > image.scratch[arg.index] for arg,need in zip(args,needs)):
-      raise ValueError("CMAC exceeds scratch buffer")
-  for g in (op for op in gathers if op.index is None):
-    invalid = bool(g.itemsize not in (1,2,4) or (g.src is None) != bool(g.values) or not _fits((g.count,g.fill_bits,g.dst_stride)) or
-               not _fits((g.base,g.dst.addend), signed=True) or g.dst_stride < 1 or g.dst.addend < 0 or len(g.axes) > 255 or
-               bool(g.values) + bool(g.offsets) + bool(g.axes) > 1 or
-               g.values and (len(g.values) not in (1,g.count) or not _fits(g.values,g.itemsize*8)) or
-               g.offsets and (len(g.offsets) != g.count or not _fits(g.offsets,signed=True)) or
-               any(not _fits(axis[:2]) or not _fits(axis[2:],signed=True) for axis in g.axes))
-    if invalid: raise ValueError("invalid RKGather")
-  for h in hosts:
-    invalid = bool(h.src is None or h.index is None or h.dst.kind is not RKBufferKind.SCRATCH or h.values or h.offsets or h.axes or
-               h.partial or h.base or h.dst_stride != 1 or h.dst.addend or h.itemsize not in (1,2,4) or
-               h.index_itemsize not in (2,4) or not _fits((h.count,h.fill_bits)) or
-               not _fits((h.src.addend,h.index.addend),signed=True))
-    if invalid: raise ValueError("invalid runtime RKGather")
-  if any(not _fits((arg.index,),16) for op in image.program for arg in _op_args(op)): raise ValueError("invalid RKArg")
-  for ew,nxt in zip(ew_ops,ew_ops[1:]):
-    if (ew.mode == RKEWMode.HALF_TO_FLOAT and nxt.mode != RKEWMode.HALF_TO_FLOAT or
-        ew.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT16_TO_INT32) and ew.dst.kind is RKBufferKind.ARG):
-      raise ValueError("invalid RKEWOp sequence")
-  for ew in ew_ops:
-    invalid = (not _fits((ew.count,ew.ew_cfg,ew.mode)) or ew.mode >= len(RKEWMode) or
-               not _fits((ew.dst.addend,ew.lhs.addend,ew.rhs.addend),signed=True) or
-               ew.mode in (RKEWMode.HALF_TO_INT32,RKEWMode.INT32_TO_HALF) and
-               (ew.count > 4 or ew.dst != ew.lhs or ew.lhs != ew.rhs or ew.dst.kind is not RKBufferKind.SCRATCH))
-    if invalid: raise ValueError("invalid RKEWOp flags")
-
-def encode_image(image:RKImage, *, validate:bool=True) -> bytes:
-  if validate:
-    _validate_image(image)
+def encode_image(image:RKImage) -> bytes:
   return RKIMAGE_MAGIC+struct.pack("<H",RKIMAGE_VERSION)+zlib.compress(pickle.dumps(image,5),1)
 
 def decode_image(blob:bytes) -> RKImage:
@@ -248,7 +203,6 @@ def decode_image(blob:bytes) -> RKImage:
     codec=zlib.decompressobj()
     stream=io.BytesIO(codec.decompress(blob[6:]))
     if codec.unused_data or not codec.eof or type(image:=pickle.load(stream)) is not RKImage or stream.read(1): raise ValueError
-    _validate_image(image)
     return image
   except Exception: raise ValueError("invalid RKImage") from None
 
@@ -1401,7 +1355,7 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
   plan=RKPlan(uops)
   if not plan.lower(uops,vectorize_reductions=vectorize_reductions): return None
   if len((image:=_reuse_linear_scratch(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve)).scratch)>_RKIMAGE_U16_MAX: return None  # noqa: E501
-  _validate_image(image); return image
+  return image
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
   if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
@@ -1586,7 +1540,7 @@ class RockchipRenderer(Renderer):
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
     for cache in (_semantic_loads,_static_ranges,_int_info,_linear_index): cache.cache_clear()
-    return base64.b64encode(encode_image(image,validate=False)).decode()
+    return base64.b64encode(encode_image(image)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
   """Expose one 16-lane local bool tile that the renderer consumes as grouped DPU reduction work."""
