@@ -799,21 +799,6 @@ def _compare_int32_words(op:Ops, lhs:tuple[UOp,...], rhs:tuple[UOp,...]) -> UOp:
   low=_i16_compare(Ops.CMPLT,lhs[0],rhs[0]).alu(Ops.ADD,_i16_bit(rhs[0].const_like(0).alu(Ops.SUB,rhs[0]))).alu(Ops.SUB,_i16_bit(lhs[0].const_like(0).alu(Ops.SUB,lhs[0])))  # noqa: E501
   return _i16_compare(Ops.CMPLT,lhs[1],rhs[1]).alu(Ops.ADD,equal[1].alu(Ops.MUL,low))
 
-def _carry_bytes(values:Iterable[UOp], carry:UOp, op:Ops=Ops.ADD) -> tuple[tuple[UOp,...],UOp]:
-  """Normalize least-significant-first byte coefficients, retaining the exact carry or borrow recipe."""
-  # Addition inputs [0,255] plus carry and subtraction inputs [-255,255] minus borrow fit INT16 exactly.
-  # SHL doubles raw bytes and applies the incoming bit after wrapping, preserving the original shared expression graph.
-  result=[]
-  for value in values:
-    total=value.alu(Ops.ADD,value) if op is Ops.SHL else value.alu(Ops.SUB if op is Ops.SUB else Ops.ADD,carry)
-    next_carry=_i16_bit(value.alu(Ops.SUB,value.const_like(127)) if op is Ops.SHL else total.const_like(0).alu(Ops.SUB,total) if op is Ops.SUB else total.alu(Ops.SUB,total.const_like(255)))  # noqa: E501
-    normalized=total.alu(Ops.ADD if op is Ops.SUB else Ops.SUB,next_carry.alu(Ops.MUL,total.const_like(256)))
-    result.append(normalized.alu(Ops.ADD,carry) if op is Ops.SHL else normalized); carry=next_carry
-  return tuple(result),carry
-
-def _twos_complement(raw:Iterable[UOp], sign:UOp) -> tuple[UOp, ...]:
-  return _carry_bytes((byte.alu(Ops.ADD,byte.const_like(255).alu(Ops.SUB,byte.alu(Ops.MUL,byte.const_like(2))).alu(Ops.MUL,sign)) for byte in raw),sign)[0]  # noqa: E501
-
 def _half_backed_value(value:UOp) -> UOp|None:
   """Normalize a half-backed numeric expression for the exact raw FP16 comparator."""
   original, value = value, _unwrap_condition(value)
@@ -1149,21 +1134,15 @@ class RKContext:
     return self.lower(_compare_int32_words(u.op,*components))
 
   def _int32_divmod(self, u:UOp) -> UOp:
+    """Evaluate the supported small INT32 division domain through exact FP16 integers."""
     if not 1 <= self.count <= _MAX_EW_ELEMS_FP16: raise _RKGenericReject
-    raw=tuple(self._unpack_bytes(self._operand(src,dtypes.int)) for src in u.src)
-    signs=tuple(_i16_bit(value[3].alu(Ops.SUB,value[3].const_like(127))) for value in raw)
-    numerator,denominator=(_twos_complement(value,sign) for value,sign in zip(raw,signs))
-    denominator_nonzero=functools.reduce(lambda x,y:x.alu(Ops.MAX,y),map(_i16_bit,denominator)); one=denominator_nonzero.const_like(1)
-    numerator_bits=tuple(itertools.chain.from_iterable(map(_byte_bits,numerator)))
-    zero=numerator[0].const_like(0); remainder,quotient=[zero]*4,[zero]*4
-    for bit_index in range(31, -1, -1):
-      shifted,_=_carry_bytes(remainder,numerator_bits[bit_index],Ops.SHL)
-      reduced,borrow=_carry_bytes((left.alu(Ops.SUB,right) for left,right in zip(shifted,denominator)),zero,Ops.SUB)
-      ge=denominator_nonzero.alu(Ops.MUL,one.alu(Ops.SUB,borrow))
-      remainder=[left.alu(Ops.ADD,ge.alu(Ops.MUL,right.alu(Ops.SUB,left))) for left,right in zip(shifted,reduced)]; byte_index,weight=bit_index>>3,1<<(bit_index&7)  # noqa: E501
-      quotient[byte_index]=quotient[byte_index].alu(Ops.ADD,ge.alu(Ops.MUL,zero.const_like(weight)))
-    packed_raw,sign=(quotient,_native_max(signs[0].alu(Ops.SUB,signs[1]),arg=_NATIVE_ABS)) if u.op is Ops.CDIV else (remainder,signs[0])
-    return self._pack_bytes(tuple(self.lower(value) for value in _twos_complement(packed_raw,sign)),dtypes.int,u=u)
+    lhs,rhs=(self._operand(src,dtypes.int) for src in u.src)
+    halves=tuple(self._convert(None,source,dtypes.half) for source in (lhs,rhs))
+    quotient_half=self.lower(_dpu_trunc(halves[0].alu(Ops.FDIV,halves[1])))
+    quotient=self._convert(u if u.op is Ops.CDIV else None,quotient_half,dtypes.int)
+    if u.op is Ops.CDIV: return quotient
+    product=self._emit(self._scratch(dtypes.int),quotient,rhs,_EW_CFG[Ops.MUL])
+    return self._emit(self._scratch(dtypes.int,u=u),lhs,product,_EW_CFG[Ops.SUB])
 
   def _fp16_order(self, value:UOp, negated:bool=False) -> tuple[UOp,UOp]:
     """Classify raw HALF bits with one signed key: both zeros map to zero; abs(key)>0x7c00 marks NaNs."""

@@ -140,13 +140,14 @@ class RockchipProgram(Program['RockchipDevice']):
         for first,last in zip(splits,splits[1:]):
           run=group[first:last]; precision=precisions[last-1]  # noqa: E702
           tiles=((emit_ew_stage(op,address),) if not info[1] else self._tile(op,info[1],address,*info[2:],mode=M.BOUNDED if i==0 and op.mode in (M.HALF,M.BOUNDED) else M.HALF if op.mode==M.BOUNDED else op.mode) for i,op in enumerate(run) for info in (_EW_MODE_INFO[op.mode],))  # noqa: E501
-          bodies=() if precision<0 else tuple(itertools.chain.from_iterable(zip(*tiles) if tiled else tiles)); capacity=1 if precision<0 else 16 if precision==128 else len(bodies)  # noqa: E501,E702
+          bodies=() if precision<0 else tuple(itertools.chain.from_iterable(zip(*tiles) if tiled else tiles))
+          capacity=1 if precision<0 else 16 if precision>=64 else len(bodies)
           reset=last<len(group) and ((following:=group[last].mode)==M.COMPARE and bool(precision) or following!=M.COMPARE and not _EW_MODE_INFO[following][0] and following!=M.INT16_TO_INT32 and precision not in (0,16))  # noqa: E501
           # Negative precision streams standalone comparison tiles through the same batch loop.
           for start,chunk in enumerate(itertools.batched(itertools.chain.from_iterable(tiles) if precision<0 else bodies,capacity)):
             for batch in itertools.batched(chunk,min(len(chunk),_MAX_PC_TASKS if tiled else limit)): self._submit_bodies(batch,precision<0)
-            # A full 16-body FLOAT flush has already emptied the chain; rearm suppresses its normal reset.
-            # Only a remaining partial FLOAT chain can require the following mode's transition reset.
+            # A full 16-body wide-conversion flush has already emptied the chain; rearm suppresses its normal reset.
+            # Only a remaining partial conversion chain can require the following mode's transition reset.
             if precision>=64 and not rearm or precision>=0 and reset and (start+1)*capacity>=len(bodies) and (precision!=128 or len(bodies)%16): self.dev.reset_npu()  # noqa: E501
 
   def _tile(self, op:RKEWOp, limit:int, address, itemsize:int=2, dst_step:int=1, src_step:int=1, **flags):
