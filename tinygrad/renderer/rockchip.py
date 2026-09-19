@@ -12,8 +12,6 @@ from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, 
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 
-_RKIMAGE_U16_MAX = (1 << 16) - 1
-
 class RKBufferKind(IntEnum):
   ARG = 0
   SCRATCH = 1
@@ -174,7 +172,7 @@ def _reuse_linear_scratch(image:RKImage, resolve:Callable[[RKArg],RKArg]=lambda 
   for event,op in enumerate(itertools.chain(prelude,body)):
     for arg in _op_args(op):
       if arg.kind is RKBufferKind.SCRATCH: events.setdefault(arg.index,[event,event])[1]=event
-  if any(not 0 <= slot < len(image.scratch) for slot in events) or not _fits(image.scratch): raise ValueError("invalid virtual scratch allocation")
+  if any(not 0<=slot<len(image.scratch) for slot in events) or any(not 0<=size<1<<32 for size in image.scratch): raise ValueError("invalid scratch")
   # Physical IDs are inserted densely; capacity updates retain their serialization order.
   remap:dict[int,int]={}
   physical:dict[int,int]={}
@@ -189,10 +187,6 @@ def _reuse_linear_scratch(image:RKImage, resolve:Callable[[RKArg],RKArg]=lambda 
   return RKImage(tuple(physical.values()),tuple(
     _map_op_args(op,lambda arg:arg._replace(index=remap[arg.index]) if arg.kind is RKBufferKind.SCRATCH else arg)
     for op in prelude+body))
-
-def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
-  low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
-  return all(isinstance(value,int) and low<=value<high for value in values)
 
 # Admission and exact-carrier bounds.
 (_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _MAX_RECURSIVE_LOWER_DEPTH, _EW_ELEMS_32BIT) = (  # noqa: E501
@@ -1308,11 +1302,9 @@ def _lower_uop_program(uops:list[UOp], *, vectorize_reductions:bool=True) -> RKI
   """Finalize one physical plan for the production renderer; unsupported semantics fail closed."""
   plan=RKPlan(uops)
   if not plan.lower(uops,vectorize_reductions=vectorize_reductions): return None
-  if len((image:=_reuse_linear_scratch(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve)).scratch)>_RKIMAGE_U16_MAX: return None  # noqa: E501
-  return image
+  return _reuse_linear_scratch(RKImage(tuple(plan.scratch),tuple(plan.program)),plan.resolve)
 
 def _lower_into(plan:RKPlan, uops:list[UOp], *, vectorize_reductions:bool=True, materialize:bool=False) -> bool:
-  if any(u.op is Ops.PARAM and not 0 <= u.arg.slot <= _RKIMAGE_U16_MAX for u in uops): return False
   local_output = _outs(uops)
   local_output = _admit(local_output,(dtypes.half,dtypes.float,dtypes.int16,dtypes.int,dtypes.bool,dtypes.uchar))
   if vectorize_reductions:
