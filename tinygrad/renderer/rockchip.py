@@ -780,10 +780,12 @@ def _i16_compare(op:Ops, lhs:UOp, rhs:UOp) -> UOp:
 def _i16_select(selector:UOp, yes:UOp, no:UOp) -> UOp:
   return selector.alu(Ops.MUL,yes).alu(Ops.ADD,selector.const_like(1).alu(Ops.SUB,selector).alu(Ops.MUL,no))
 
-def _byte_bits(value:UOp) -> tuple[UOp, ...]:
-  """Split one unsigned byte expression into exact least-significant-first INT16 bit planes."""
-  result, remainder = typing_cast(list[UOp|None],[None]*8),value
-  for bit in range(7,0,-1):
+def _word_bits(value:UOp) -> tuple[UOp, ...]:
+  """Split one signed INT16 word into exact least-significant-first two's-complement bit planes."""
+  result = typing_cast(list[UOp|None],[None]*16)
+  result[15] = sign = _i16_bit(value.const_like(0).alu(Ops.SUB,value))
+  remainder = value.alu(Ops.SUB,sign.alu(Ops.MUL,value.const_like(-32768)))
+  for bit in range(14,0,-1):
     result[bit]=flag=_i16_bit(remainder.alu(Ops.SUB,value.const_like((1<<bit)-1)))
     remainder=remainder.alu(Ops.SUB,flag.alu(Ops.MUL,value.const_like(1<<bit)))
   result[0]=remainder; return typing_cast(tuple[UOp,...],tuple(result))
@@ -885,7 +887,6 @@ class RKContext:
     # Initialize per-context state before checking the root-derived layout.
     self.plan=plan or RKPlan(list(self.store.sink().toposort())); self.scratch=self.plan.scratch; self.program=self.plan.program
     self.values:dict[UOp,UOp]={}; self.materialized_values:dict[tuple,UOp]={}
-    self.raw_components:dict[RKArg,tuple[UOp,...]]={}
     self.recipe_owners:dict[UOp,UOp]={}
     nodes=self.root.toposort(); value_nodes=self.root.toposort(gate=lambda node:node.op is not Ops.LOAD); self.semantic_nodes=set(nodes); self.bounded_chain=any(node.op is Ops.MAX and node.arg == _NATIVE_POSITIVE_MASK for node in nodes)  # noqa: E501
     int_range=_int_info(self.root)[0] if self.root.dtype.scalar() is dtypes.int else None
@@ -974,25 +975,17 @@ class RKContext:
     mode=RKEWMode.INT16 if integer16 else RKEWMode.INT32 if integer32 else RKEWMode.COMPARE if compare else RKEWMode.BOUNDED if self.bounded_chain or barrier else RKEWMode.HALF  # noqa: E501
     self.program.append(RKEWOp(dst.arg,lhs.arg,rhs.arg,self.count,cfg,submit_barrier=barrier,mode=mode)); self.bounded_chain |= compare; return dst
 
-  def _move_bytes(self, sources:Iterable[UOp], destinations:Iterable[UOp], itemsize:int, unpack:bool) -> None:
-    """Move raw bytes between one typed carrier and its INT16 components; each interface owns its cache."""
-    self.program.extend(RKGather(src.arg._replace(addend=0),dest.arg._replace(addend=dest.arg.addend+(0 if unpack else byte)),
-        self.count,base=src.arg.addend+(byte if unpack else 0),axes=((1,self.count,itemsize if unpack else 2),),
-        dst_stride=2 if unpack else itemsize,itemsize=1,partial=not unpack and byte>0) for byte,(src,dest) in enumerate(zip(sources,destinations)))
+  def _unpack_words(self, value:UOp) -> tuple[UOp,...]:
+    """Return the raw INT16 words of one typed carrier."""
+    return tuple(self._slot(RKGather(value.arg,RKArg(RKBufferKind.SCRATCH,0),self.count,base=word,
+      axes=((1,self.count,value.dtype.itemsize//2),),itemsize=2),dtypes.int16) for word in range(value.dtype.itemsize//2))
 
-  def _unpack_bytes(self, value:UOp) -> tuple[UOp,...]:
-    """Return raw INT16 byte components directly from the typed physical carrier."""
-    if value.arg not in self.raw_components:
-      self.raw_components[value.arg]=tuple(self._scratch(dtypes.int16) for _ in range(value.dtype.itemsize))
-      self._move_bytes(itertools.repeat(value),self.raw_components[value.arg],value.dtype.itemsize,True)
-    return self.raw_components[value.arg]
-
-  def _pack_bytes(self, parts:tuple[UOp,...], layout:DType, *, u:UOp) -> UOp:
-    """Return one typed carrier, preserving padding, partial writes and raw nonfinite payloads."""
-    if len(parts)!=layout.itemsize: raise _RKGenericReject
+  def _pack_words(self, parts:tuple[UOp,...], layout:DType, *, u:UOp) -> UOp:
+    """Pack raw INT16 words into one typed carrier without interpreting their payloads."""
+    if len(parts)!=layout.itemsize//2: raise _RKGenericReject
     value=self._scratch(layout,u=u)
-    self._move_bytes(parts,itertools.repeat(value),layout.itemsize,False)
-    self.raw_components[value.arg] = parts
+    self.program.extend(RKGather(part.arg,value.arg._replace(addend=value.arg.addend+word*2),self.count,
+      axes=((1,self.count,1),),dst_stride=len(parts),itemsize=2,partial=word>0) for word,part in enumerate(parts))
     return value
 
   def _lower_recipe(self, owner:UOp, recipe:UOp) -> UOp:
@@ -1056,7 +1049,10 @@ class RKContext:
     planes:dict[UOp,tuple[UOp,...]]={}
     # Seed opaque inputs in operand order; only unseeded fusion nodes enter postorder.
     def visit(node:UOp) -> bool:
-      if node not in planes and (node.op not in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) or node.dtype is not u.dtype): planes[node]=tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8)) if node.op is Ops.CONST else tuple(itertools.chain.from_iterable(map(_byte_bits,self._unpack_bytes(self.lower(node)))))  # noqa: E501
+      fused = node.op in (Ops.AND,Ops.OR,Ops.XOR,Ops.SHL,Ops.SHR) and node.dtype is u.dtype
+      if node not in planes and not fused:
+        planes[node] = (tuple(UOp.const((int(node.arg)>>bit)&1,dtypes.int16) for bit in range(layout.itemsize*8))
+                        if node.op is Ops.CONST else tuple(itertools.chain.from_iterable(map(_word_bits,self._unpack_words(self.lower(node))))))
       return node not in planes
     for node in u.toposort(gate=visit):
       if node.op in (Ops.SHL,Ops.SHR):
@@ -1073,17 +1069,10 @@ class RKContext:
       lhs,rhs=(planes[source] for source in node.src)
       planes[node]=tuple(left.alu(Ops.MUL,right) if node.op is Ops.AND else left.alu(Ops.ADD,right).alu(Ops.SUB,left.alu(Ops.MUL,right).alu(Ops.MUL,left.const_like(1 if node.op is Ops.OR else 2)))  # noqa: E501
         for left,right in zip(lhs,rhs))
-    # Expansion always produces whole bytes; _pack_bytes validates their count against the destination layout.
-    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(byte[1:],1)),byte[0]) for byte in itertools.batched(planes[u],8))  # noqa: E501
-    # Only byte reconstruction is reassociated; native bit extraction remains opaque and exact.
-    # Raw carrier atoms are bytes; opaque bit products/shift adjustments have absolute value at most one.
-    # Bound every partial sum by the sum of absolute terms, retaining the original recipe if it could saturate.
-    affines=(typing_cast(tuple[int,dict[UOp,int]],_linear_index(part,opaque=True)) for part in raw)
-    return self._pack_bytes(tuple(self.lower(part if
-      abs(offset)+sum(abs(scale)*(255 if term.op is Ops.NOOP else 1) for term,scale in factors.items())>32767 else _fold_static_terms(Ops.ADD,dtypes.int16,  # noqa: E501
-      [term if scale==1 else term.alu(Ops.MUL,term.const_like(scale)) for term,scale in factors.items()] +
-      ([UOp.const(offset,dtypes.int16)] if offset or not factors else []),False))
-      for part,(offset,factors) in zip(raw,affines)),layout,u=u)
+    # Add the signed bit last so every native INT16 partial remains representable.
+    raw=tuple(sum((plane.alu(Ops.MUL,plane.const_like(1<<bit)) for bit,plane in enumerate(word[1:15],1)),word[0]).alu(
+      Ops.ADD,word[15].alu(Ops.MUL,word[15].const_like(-32768))) for word in itertools.batched(planes[u],16))
+    return self._pack_words(tuple(map(self.lower,raw)),layout,u=u)
 
   def _compare(self, u:UOp) -> UOp:
     if all(src.dtype.scalar() is dtypes.bool for src in u.src):
