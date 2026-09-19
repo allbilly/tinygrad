@@ -1,8 +1,8 @@
 from __future__ import annotations
-import array, contextlib, ctypes, functools, itertools, mmap, operator, os, threading, time, typing
+import array, contextlib, ctypes, functools, itertools, mmap, operator, os, pickle, threading, time, typing, zlib
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, round_up, to_mv
-from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer, decode_image,
+from tinygrad.renderer.rockchip import (RKBufferKind, RKEWMode, RockchipRenderer, RockchipBoolRenderer,
   emit_ew_stage, emit_cmac_stage, RKArg, RKGather, RKEWOp, RKCMAC, _MAX_EW_ELEMS_FP16, _cmd as _pc)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer, MMIOInterface
@@ -85,7 +85,7 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
-    self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
+    self.dev, self.name, self.image = dev, obj.name, pickle.loads(zlib.decompress(obj.lib))
     self._scratch_offsets=(0,*itertools.accumulate(round_up(size,4096) for size in self.image.scratch)); self._ew_modes={op.mode for op in self.image.program if isinstance(op,RKEWOp)}  # noqa: E501,E702
 
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)

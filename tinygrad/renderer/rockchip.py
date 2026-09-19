@@ -1,6 +1,6 @@
 from __future__ import annotations
 # ruff: noqa: E702
-import base64, functools, heapq, io, itertools, math, operator, os, pickle, struct, zlib
+import base64, functools, heapq, itertools, math, operator, os, pickle, struct, zlib
 from enum import IntEnum
 from typing import Callable, Iterable, NamedTuple, cast as typing_cast
 from tinygrad.device import Base64Compiler
@@ -12,7 +12,7 @@ from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, exec_alu, 
 from tinygrad.uop.symbolic import sym
 from tinygrad.uop.weak import pm_commit_weak, pm_lower_index_dtype
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, _RKIMAGE_U16_MAX = b"RKIM", 37, (1 << 16) - 1
+_RKIMAGE_U16_MAX = (1 << 16) - 1
 
 class RKBufferKind(IntEnum):
   ARG = 0
@@ -193,18 +193,6 @@ def _reuse_linear_scratch(image:RKImage, resolve:Callable[[RKArg],RKArg]=lambda 
 def _fits(values:Iterable[int], bits:int=32, signed:bool=False) -> bool:
   low,high=(-(1<<(bits-1)),1<<(bits-1)) if signed else (0,1<<bits)
   return all(isinstance(value,int) and low<=value<high for value in values)
-
-def encode_image(image:RKImage) -> bytes:
-  return RKIMAGE_MAGIC+struct.pack("<H",RKIMAGE_VERSION)+zlib.compress(pickle.dumps(image,5),1)
-
-def decode_image(blob:bytes) -> RKImage:
-  try:
-    if blob[:4] != RKIMAGE_MAGIC or struct.unpack_from("<H", blob, 4)[0] != RKIMAGE_VERSION: raise ValueError
-    codec=zlib.decompressobj()
-    stream=io.BytesIO(codec.decompress(blob[6:]))
-    if codec.unused_data or not codec.eof or type(image:=pickle.load(stream)) is not RKImage or stream.read(1): raise ValueError
-    return image
-  except Exception: raise ValueError("invalid RKImage") from None
 
 # Admission and exact-carrier bounds.
 (_DPU, _RDMA, _MAX_EW_ELEMS_FP16, _MAX_GENERIC_UNROLL, _MAX_GENERIC_EXPANDED_NODES, _MAX_OPTIONAL_RECIPE_NODES, _MAX_STATIC_RANGE_ENVS, _MAX_DYNAMIC_SELECTOR_CELLS, _MAX_RECURSIVE_LOWER_DEPTH, _EW_ELEMS_32BIT) = (  # noqa: E501
@@ -1540,7 +1528,7 @@ class RockchipRenderer(Renderer):
   def render(self, uops:list[UOp]) -> str:
     if (image:=_lower_uop_program(uops)) is None: raise RuntimeError("RKPLAN_REJECT:generic_uops " + repr([(i, u.op.name, str(u.dtype)) for i,u in enumerate(uops)]))  # noqa: E501
     for cache in (_semantic_loads,_static_ranges,_int_info,_linear_index): cache.cache_clear()
-    return base64.b64encode(encode_image(image)).decode()
+    return base64.b64encode(zlib.compress(pickle.dumps(image,5),1)).decode()
 
 class RockchipBoolRenderer(RockchipRenderer):
   """Expose one 16-lane local bool tile that the renderer consumes as grouped DPU reduction work."""
