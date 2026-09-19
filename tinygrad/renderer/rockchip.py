@@ -573,11 +573,8 @@ def _lower_cmac_reduce(output:RKOutput, plan:RKPlan) -> bool:
   all_axes=frozenset(_static_ranges(out_index) or ())
   out_affine=typing_cast(tuple[int,dict[UOp,int]]|None,_linear_index(out_index))
   output_axes=(_affine_output_axes(out_affine,rows) if out_affine is not None else None) or ()
-  # Aligned contraction ties preserve the first input's orientation.
-  extra_axes=[load_axes[left],load_axes[right]] if rows>_MAX_GENERIC_UNROLL else []
-  partitions=(all_axes,frozenset(),*sorted(
-    (axes for axes in dict.fromkeys([frozenset((axis,)) for axis,_,_ in output_axes]+extra_axes) if axes and axes<all_axes),
-    key=lambda axes: bool(groups%32==0 and axes!=load_axes[left])))
+  # Operand-derived partitions preserve the first input's orientation on aligned contraction ties.
+  partitions=tuple(dict.fromkeys((all_axes,frozenset(),load_axes[left],load_axes[right])))
   candidates=[]
   for index,axes in enumerate(partitions):
     m=rows if index==0 else 1 if index==1 else math.prod(limit for axis,_,limit in output_axes if axis in axes)
