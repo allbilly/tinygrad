@@ -1336,8 +1336,6 @@ def _native_max(value:UOp, other:UOp|None=None, arg:str=_NATIVE_MIN) -> UOp: ret
 _native_value,_native_other,_native_yes,_native_no=(UPat.var(name) for name in ("value","other","yes","no"))
 # Semantic keys deliberately ignore tags; repeated pattern names would require object identity.
 _pm_ordered_where=PatternMatcher([
-  (((UPat.var("upper")<UPat(Ops.MAX,name="maximum"))|UPat(Ops.CMPLT,name="lower")).where(UPat.cvar("constant"),_native_value),
-   lambda upper,maximum,lower,constant,value:UOp(Ops.MAX,maximum.dtype,src=(maximum,constant),arg=_NATIVE_MIN) if upper.key==constant.key==lower.src[1].key and lower.src[0].key==value.key and {node.key for node in maximum.src}=={value.key,constant.key} else None),  # noqa: E501
   ((_native_value<_native_other).where(_native_yes,_native_no),
    lambda value,other,yes,no:value.alu(Ops.MAX,other) if (yes.key,no.key)==(other.key,value.key) else
      _native_max(value,other) if (yes.key,no.key)==(value.key,other.key) else None)])
